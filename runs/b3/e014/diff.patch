@@ -1,0 +1,97 @@
+--- e004/train.py
++++ e014/train.py
+@@ -42,5 +42,5 @@
+ 
+ # ---------------------------------------------------------------- settings
+-MODEL = "efficientnet_b0"
++MODELS = ("efficientnet_b0", "convnext_nano")  # ensemble of two backbones
+ PRETRAINED = True
+ IMG_SIZE = 160
+@@ -172,40 +172,46 @@
+                                         num_workers=workers, pin_memory=True)
+ 
+-    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
+-    model = model.to(device).to(memory_format=torch.channels_last)
+     crit = nn.CrossEntropyLoss()
+-    opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+     amp = dict(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda")
+ 
+-    # Train until the budget minus the reserve is used up: 5% warm-up, then cosine decay.
++    # Train each ensemble member for an equal share of the remaining budget: 5% warm-up, cosine decay.
+     t_start = time.time()
+     t_end = deadline - RESERVE_S
+-    budget = max(1.0, t_end - t_start)
+-    steps, epoch, done = 0, 0, False
+-    model.train()
+-    while not done:
+-        tot, nb = 0.0, 0
+-        for xt, xw, y in dl_tr:
+-            frac = min(1.0, (time.time() - t_start) / budget)
+-            f = frac / 0.05 if frac < 0.05 else 0.5 * (1 + math.cos(math.pi * (frac - 0.05) / 0.95))
+-            for pg in opt.param_groups:
+-                pg["lr"] = LR * max(f, 1e-3)
+-            xt = xt.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+-            xw = xw.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+-            y = y.to(device, non_blocking=True)
+-            with torch.autocast(**amp):
+-                loss = crit((model(xt) + model(xw)) / 2, y)
+-            opt.zero_grad(set_to_none=True)
+-            loss.backward()
+-            opt.step()
+-            tot += loss.item(); nb += 1; steps += 1
+-            if time.time() >= t_end:
+-                done = True
++    per_model = max(1.0, (t_end - t_start) / len(MODELS))
++    steps, epoch = 0, 0
++    models = []
++    for name in MODELS:
++        model = timm.create_model(name, pretrained=PRETRAINED, num_classes=4)
++        model = model.to(device).to(memory_format=torch.channels_last)
++        opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
++        m_end = time.time() + per_model
++        model.train()
++        while True:
++            tot, nb = 0.0, 0
++            for xt, xw, y in dl_tr:
++                frac = min(1.0, (time.time() - t_start) / (per_model * len(MODELS)))
++                f = frac / 0.05 if frac < 0.05 else 0.5 * (1 + math.cos(math.pi * (frac - 0.05) / 0.95))
++                for pg in opt.param_groups:
++                    pg["lr"] = LR * max(f, 1e-3)
++                xt = xt.to(device, non_blocking=True).to(memory_format=torch.channels_last)
++                xw = xw.to(device, non_blocking=True).to(memory_format=torch.channels_last)
++                y = y.to(device, non_blocking=True)
++                with torch.autocast(**amp):
++                    loss = crit((model(xt) + model(xw)) / 2, y)
++                opt.zero_grad(set_to_none=True)
++                loss.backward()
++                opt.step()
++                tot += loss.item(); nb += 1; steps += 1
++                if time.time() >= m_end:
++                    break
++            print(f"{name} epoch {epoch}: loss {tot / max(nb, 1):.4f}, {steps} steps, {time.time() - T0:.0f}s", flush=True)
++            epoch += 1
++            if time.time() >= m_end:
+                 break
+-        print(f"epoch {epoch}: loss {tot / max(nb, 1):.4f}, {steps} steps, {time.time() - T0:.0f}s", flush=True)
+-        epoch += 1
+-
+-    # Classify every eval detection; one prediction per class with score = detector conf x class probability.
+-    model.eval()
++        model.eval()
++        models.append(model)
++
++    # Classify every eval detection with every model; one prediction per class with
++    # score = detector conf x mean class probability.
+     probs = []
+     with torch.no_grad(), torch.autocast(**amp):
+@@ -213,5 +219,9 @@
+             xt = xt.to(device).to(memory_format=torch.channels_last)
+             xw = xw.to(device).to(memory_format=torch.channels_last)
+-            probs.append(torch.softmax(((model(xt) + model(xw)) / 2).float(), 1).cpu())
++            acc = None
++            for model in models:
++                z = ((model(xt) + model(xw)) / 2).float()
++                acc = torch.softmax(z, 1) if acc is None else acc + torch.softmax(z, 1)
++            probs.append((acc / len(models)).cpu())
+     probs = torch.cat(probs).numpy()
+     os.makedirs(args.out, exist_ok=True)

@@ -1,0 +1,635 @@
+===== attempt 1 =====
+Let me analyze the situation carefully.
+
+Current best: e003 with 5-seed val mAP@0.5 = 0.6317
+Per-class AP: pore 0.517, deposit 0.622, discontinuity 0.780, stain 0.608
+
+The reference numbers:
+- one-step 4-class detector (baseline to beat): 0.638 mAP@0.5
+- stage-1 boxes with perfect classes (ceiling): 0.758 mAP@0.5
+- stage-1 boxes scored as single class 'defect': 0.755 mAP@0.5
+
+So we're at 0.6317, the baseline to beat is 0.638, and the ceiling is 0.758. We're still below the baseline!
+
+What's been tried:
+- e001: background class → 0.5691 (rejected)
+- e002: adding detector boxes matched to GT → 0.6293 (new best)
+- e003: adding low-res GT crops → 0.6317 (new best)
+- e004: prob² scoring → 0.6211 (rejected)
+- e005: background class + (1-p_bg) → 0.6039 (rejected)
+- e006: focal loss → 0.6123 (rejected)
+- e007: mixup → 0.6233 (rejected)
+
+Key observations:
+1. We're still below the baseline of 0.638. Need to improve.
+2. The ceiling is 0.758, so there's a lot of room.
+3. Pore (0.517) and stain (0.608) are the weakest classes.
+4. Background class approaches have failed (e001, e005).
+5. Scoring changes (prob²) failed.
+6. Focal loss failed.
+7. Mixup failed.
+8. Adding detector boxes helped (e002).
+9. Adding low-res crops helped (e003).
+
+What ideas are left?
+- Architecture changes: try a different backbone (convnext, resnet, etc.)
+- Test-time augmentation (TTA): multiple crops, flips at inference
+- Different scoring: maybe using a different combination
+- More aggressive augmentation
+- Training on more data / different sampling
+- Using the detector confidence more cleverly
+- Two-crop → three-crop or different context sizes
+- Data augmentation: color jitter, random erasing, etc.
+- Learning rate schedule changes
+- Batch size changes
+- Training longer (but we're time-constrained)
+
+Let me think about what could give the biggest gain:
+
+1. **Architecture**: The current model is EfficientNet-B0. Maybe a different architecture would help. But the time budget is tight (180s, ~120s for training). A larger model might not train as well in the same time.
+
+2. **Test-time augmentation (TTA)**: At inference, we could do multiple augmentations (flip H, flip V, maybe 2 scales) and average the probabilities. This doesn't cost training time, only inference time. The reserve is 55s, and prediction currently takes about 39s (162-123). With TTA we'd need more inference time. Let's think: 41879 detections × 2 views = 83758 forward passes currently. With TTA (say 4 augmentations: original, flipH, flipV, flipHV), that's 4× the inference. 39s × 4 = 156s, which exceeds the 55s reserve. So we'd need to reduce the reserve or be smarter.
+
+Actually wait, let me re-read the log:
+- Loading: 17s
+- Training: 123s (epoch 0) + 2s (epoch 1) = ~125s
+- Prediction + writing: 162 - 125 = 37s
+
+So prediction takes about 37s. With 4× TTA it would be ~148s, way over the 55s reserve. We'd need to reduce training time or find a more efficient TTA.
+
+Actually, maybe we can do a lighter TTA: just horizontal flip. That's 2× inference = ~74s. Still over 55s. Hmm.
+
+Wait, but the reserve is something we set. We could reduce it. The total budget is 180s. Loading is 17s. If training takes 125s, that leaves 38s for prediction. With 2× TTA, prediction would be ~74s. Total: 17+125+74 = 216s > 180s. Too much.
+
+What if we reduce training? We have 2 epochs in ~125s. If we train for only 1 epoch (~62s), we'd have 180-17-62 = 101s for prediction. With 2× TTA: ~74s. That works. But training for only 1 epoch might hurt.
+
+Actually, let me reconsider. The training time per epoch: epoch 0 took 123-17 = 106s (411 steps), epoch 1 took 125-123 = 2s (421 steps). Wait that doesn't make sense. Let me re-read.
+
+"epoch 0: loss 0.4479, 411 steps, 123s" - so at the end of epoch 0, total time is 123s.
+"epoch 1: loss 0.2744, 421 steps, 125s" - at the end of epoch 1, total time is 125s.
+
+So epoch 0 took 123-17 = 106s, epoch 1 took 125-123 = 2s. That's weird. Oh wait, the training budget is deadline - RESERVE_S = 180 - 55 = 125s. So training stops at 125s. Epoch 0 runs from 17s to 123s (106s), then epoch 1 starts and immediately hits the time limit at 125s (only 2s in). So effectively we're training for about 1.02 epochs.
+
+That's a very short training! Only ~1 epoch. The model is barely trained. This is a key insight.
+
+With only 1 epoch of training, the model is undertrained. The loss goes from 0.4479 to 0.2744 in just 1 epoch. More training would help.
+
+But we're time-constrained. Options:
+1. Reduce the reserve to allow more training time
+2. Make training faster (smaller model, larger batch, etc.)
+3. Use a more efficient optimizer
+
+Actually, the reserve is 55s. Prediction takes 37s. So we have 18s of slack. We could reduce the reserve to 40s, giving us 15s more training. But that's marginal.
+
+What about making the model faster? If we use a smaller/faster model, we can train more steps in the same time. But the model quality might suffer.
+
+What about increasing the batch size? Currently 64. If we go to 128, we'd do half as many steps but each step is more efficient. Actually with the time budget, we'd do fewer steps but each step processes more data. The total data seen per unit time might be similar or better.
+
+Actually, let me think about this differently. The key issue is we're only getting ~1 epoch of training. The model sees 26347 samples per epoch. With batch size 64, that's 411 steps per epoch. In 106s, that's ~4 steps/second.
+
+What if we try a different approach entirely?
+
+**Idea: Use a pre-trained model more effectively.** The model is initialized with ImageNet pretraining, which is great for classification. But we're only training for 1 epoch. What if we use a lower learning rate to avoid destroying the pretrained features? Currently LR=1e-3 with AdamW. Maybe 3e-4 or 5e-4 would be better for 1 epoch of training.
+
+Actually, that's a good idea. With only 1 epoch, a high LR might overfit or destroy useful pretrained features. A lower LR would make the model adapt more gently.
+
+But wait, the loss is still going down (0.4479 → 0.2744), so the model is learning. The question is whether it's learning enough.
+
+**Idea: Test-time augmentation with just horizontal flip.** This is cheap (2× inference) and often helps 1-3% in classification. The inference would take ~74s instead of 37s. We'd need to reduce the reserve.
+
+Let me calculate: Loading 17s + Training ~106s (1 epoch) + Prediction with flip 74s = 197s > 180s. Too much.
+
+What if we reduce training? If we train for 90s instead of 106s, we'd have 180-17-90 = 73s for prediction. With flip: 74s. Just barely fits. But training for less time hurts.
+
+Alternatively, what if we make the model faster? If we use convnext_pico or mobilenetv3, inference would be faster.
+
+Actually, let me think about what's most likely to help given the constraints:
+
+1. **Lower LR**: Simple change, might help with 1 epoch of training. Low risk.
+2. **TTA with flip**: Would need to reduce reserve or training time. Moderate risk.
+3. **Different architecture**: Could help or hurt. Need to test.
+4. **Larger batch size**: Might help with training efficiency.
+5. **More aggressive data augmentation**: Already tried mixup (failed). What about random erasing, color jitter?
+
+Let me think about what's most promising...
+
+Actually, I notice something: the per-class APs are pore 0.517, deposit 0.622, discontinuity 0.780, stain 0.608. The weak classes are pore and stain. The brief says "Pore and deposit are the weak classes; stain is often confused with deposit and background."
+
+What if we do class-specific augmentation? For example, for pore and stain, apply more aggressive augmentation to help the model generalize better.
+
+Or what about **oversampling the weak classes**? If we sample pore and stain more frequently during training, the model might learn them better.
+
+Actually, let me think about the scoring more carefully. Currently: score = conf × prob[c]. The detector conf is the same for all classes of a given box. So the ranking across classes is determined solely by prob[c]. The ranking across boxes is determined by conf × prob[c].
+
+What if we use a different scoring? For example:
+- score = conf^a × prob[c]^b for some a, b
+- score = conf × prob[c] / (1 + prob_bg) if we had a background class
+- score = conf × max(0, prob[c] - threshold)
+
+But e004 tried prob² and it failed. So the scoring direction might not be the issue.
+
+Let me reconsider. The main issue is that we're at 0.6317 and the baseline is 0.638. We need to beat 0.638. The ceiling is 0.758.
+
+The biggest lever might be **training quality**. With only 1 epoch, the model is undertrained. Let me think about how to train better in the same time.
+
+**Idea: Reduce the number of images loaded / use a faster data pipeline.** The loading takes 17s. If we can reduce that, we get more training time. But 17s is already small.
+
+**Idea: Use a faster model for training but keep the same architecture.** Actually, the model is already EfficientNet-B0 which is quite fast.
+
+**Idea: Use a lower resolution for training.** Currently IMG_SIZE=160. If we use 128, the model would be faster per step, allowing more steps. But the quality might suffer.
+
+**Idea: Use a 1-crop model instead of 2-crop.** Currently we do 2 forward passes per sample (tight + wide). If we use 1 crop, we'd do 2× more steps in the same time. But the 2-crop approach was the starting point and presumably helps.
+
+Wait, actually, let me reconsider the 2-crop approach. The model does 2 forward passes per sample and averages the logits. This effectively doubles the compute per sample. If we instead used 1 crop, we'd get 2× the training steps. But we'd lose the multi-scale information.
+
+What if we use 1 crop but with a larger context? Or what if we keep 2 crops but use a smaller image size?
+
+Actually, let me think about a completely different angle. The brief says:
+"stage-1 boxes with perfect classes (ceiling for stage 2): 0.758 mAP@0.5"
+"stage-1 boxes scored as a single class 'defect': 0.755 mAP@0.5"
+
+This means the stage-1 boxes are very good - they cover the defects well. The issue is purely classification. If we could classify perfectly, we'd get 0.758.
+
+The current classifier gets macro-F1 ~0.87 with perfect boxes. But on detector boxes, it's worse. The gap between 0.6317 and 0.758 is 0.126, which is huge.
+
+What's causing the gap?
+1. Wrong class assignments (classification errors)
+2. Poor ranking (false alarms scoring too high)
+3. Missed defects (boxes that don't overlap GT)
+
+Since the stage-1 boxes scored as single class get 0.755, the boxes themselves are good. The issue is classification.
+
+With macro-F1 0.87 on perfect boxes, the classifier is decent. But on detector boxes (which are slightly misplaced), it's worse.
+
+The key insight: **the classifier needs to be more robust to box misplacement**. The detector boxes are not perfect - they're slightly off. The classifier was originally trained on perfect boxes, and we added some detector boxes (e002) which helped.
+
+What if we add MORE detector boxes to training? Currently we add all matched detector boxes (IoU ≥ 0.5). What about boxes with IoU < 0.5 that still partially overlap? Or what about adding jittered versions of GT boxes?
+
+Actually, e002 added matched detector boxes and it helped (0.6293 → from e000's ~0.63). e003 added low-res crops and helped a bit more (0.6317).
+
+What if we **augment the detector boxes with additional jitter**? The current training jitter is ±10% center shift and 0.85-1.2 scale. What if we increase this for detector boxes specifically?
+
+Or what if we **duplicate GT boxes with various jitter levels** to simulate detector box misplacement?
+
+Actually, let me think about a simpler idea: **increase the training data by duplicating samples with different augmentations**. This is a form of data augmentation that doesn't require changing the model or loss.
+
+Wait, I already tried mixup (e007) and it failed. What about other augmentations?
+
+Let me think about **test-time augmentation** more carefully. The simplest TTA is horizontal flip. At inference:
+- For each box, compute probs for original and flipped crop
+- Average the probs (after flipping back the class probabilities, which for H-flip is just the same since classes don't change)
+
+Actually for H-flip, the class probabilities don't change (we're just flipping the image, not the class). So we average the two probability vectors.
+
+The cost is 2× inference. Currently inference takes 37s. With 2× TTA, it would be ~74s.
+
+Total: 17 (loading) + 106 (training) + 74 (inference) = 197s > 180s.
+
+To make it fit:
+- Reduce reserve from 55 to 40: training budget becomes 140s. Training would use ~123s (same as before since it's limited by data, not time... wait, actually training is limited by the time budget).
+
+Hmm, let me recalculate. The training loop runs until t_end = deadline - RESERVE_S. With RESERVE_S=55, t_end = 180-55 = 125s. Training starts at ~17s, so it runs for 108s. With RESERVE_S=40, t_end = 140s, training runs for 123s. That's 15s more training.
+
+But with 2× TTA, inference takes 74s. Total: 17 + 123 + 74 = 214s. Way over.
+
+The problem is that 2× TTA doubles inference time, and we don't have enough budget.
+
+What if we do TTA only on a subset of boxes? For example, only the top-N boxes by confidence? But that's complicated and might not help much.
+
+What if we use a faster model? If we use convnext_pico or mobilenetv3, inference would be faster. But we'd need to retrain.
+
+Actually, let me think about this differently. The inference time is dominated by the number of forward passes. Currently: 41879 boxes × 2 views = 83758 forward passes in 37s. That's ~2264 passes/second.
+
+With 2× TTA: 167516 passes. At 2264 passes/s, that's 74s.
+
+To fit in 55s reserve: we need 167516 passes in 55s = 3046 passes/s. That's 34% faster. Not achievable with the same model.
+
+What if we reduce the number of boxes? We could filter out very low-confidence boxes before inference. But that might hurt recall.
+
+OK, TTA with flip is not feasible within the time budget unless we make significant changes to the model or training.
+
+Let me think about other ideas:
+
+**Idea: Use a lower learning rate.** With only 1 epoch of training, the model might be overfitting to the training data or destroying pretrained features. A lower LR (e.g., 3e-4 instead of 1e-3) might give better generalization.
+
+This is a simple change with low risk. Let me try this.
+
+Actually, wait. The loss is still decreasing significantly (0.4479 → 0.2744 in 1 epoch). If we lower the LR, the loss might not decrease as much, and the model might be undertrained. But the final quality might be better due to better generalization.
+
+Hmm, this is a gamble. Let me think of something more principled.
+
+**Idea: Use a cosine LR schedule with a lower peak.** Currently the LR starts at 1e-3 and decays. With 1 epoch, the cosine decay barely kicks in. What if we use a lower peak LR (5e-4) with a shorter warmup?
+
+**Idea: Use SGD instead of AdamW.** SGD with momentum might generalize better with limited training. But this is a bigger change.
+
+**Idea: Increase batch size to 128.** This would halve the number of steps but each step is more efficient. The effective LR would be higher (since we're averaging over more samples). We might need to adjust the LR.
+
+Actually, with a larger batch, we see more data per step, so we might need fewer steps to converge. But with the time budget, we'd do fewer steps. The tradeoff is unclear.
+
+**Idea: Use a different augmentation strategy.** Instead of mixup (which failed), try:
+- Random erasing (cutout)
+- Color jitter (brightness, contrast, saturation, hue)
+- Random affine transformations
+
+The current augmentation is: H flip, V flip, brightness 0.8-1.2, center jitter ±10%, scale 0.85-1.2.
+
+What about adding **color jitter**? Weld images might have varying lighting conditions. Color augmentation could help the model be more robust to lighting variations.
+
+Let me try adding color jitter (contrast, saturation, hue) to the training augmentation. This is a focused change that could help with generalization.
+
+Actually, the current brightness augmentation (0.8-1.2) already covers some of this. But contrast and saturation jitter would add more diversity.
+
+Let me think about what's most likely to help given the constraints:
+
+1. The model is undertrained (1 epoch)
+2. Pore and stain are weak classes
+3. Box misplacement is an issue
+4. Time budget is tight
+
+I think the most impactful change would be to **improve training efficiency** so we can train for more than 1 epoch. The model is clearly still learning (loss dropping fast).
+
+How to train faster:
+- Larger batch size (fewer steps, more data per step)
+- Smaller image size (faster per step)
+- 1 crop instead of 2 (2× fewer forward passes per sample)
+- Faster model
+
+Let me try **increasing batch size to 128**. This would halve the number of steps per epoch (from 411 to ~205), but each step processes 2× the data. The total data per epoch is the same, but the number of optimizer updates is halved. With AdamW, this might be fine.
+
+Actually, the issue is that with a larger batch, we do fewer gradient updates. The model might not learn as well. But with the time budget, we might be able to do more epochs.
+
+Let me calculate: With batch size 128, each epoch has ~205 steps. Each step takes roughly the same time as before (since the GPU is the bottleneck and we're processing 2× the data per step, it might take ~2× as long per step). So each epoch takes ~2× as long. We'd do ~0.5 epochs instead of 1. That's worse!
+
+Wait, no. With batch size 64, each step processes 64 samples. With batch size 128, each step processes 128 samples. The time per step is roughly proportional to the batch size (for GPU-bound workloads). So:
+- Batch 64: 411 steps × t_step = 106s → t_step ≈ 0.258s
+- Batch 128: 205 steps × 2×t_step = 205 × 0.516s = 106s
+
+So the total time per epoch is the same! We'd still do ~1 epoch. The difference is that we do half as many optimizer updates. This might hurt or help depending on the LR.
+
+Actually, for GPU-bound workloads, the time per step doesn't scale linearly with batch size. There's some overhead. But roughly, the total time per epoch is similar.
+
+So increasing batch size doesn't help with training speed. It just changes the number of optimizer updates.
+
+What about **reducing image size**? If we use IMG_SIZE=128 instead of 160, the model would be faster per step (roughly (128/160)² = 0.64× the compute). So each epoch would take ~64s instead of 106s. We could do ~1.65 epochs instead of 1. That's 65% more training!
+
+But the quality might suffer from the smaller image. Let me think...
+
+The boxes are defect regions. At 160×160, a defect box of, say, 50×50 pixels would be scaled to about 50/50×160 = 160 pixels in the crop (if the crop is 50×50 and we resize to 160×160). At 128×128, it would be 128 pixels. The relative detail is the same, just fewer absolute pixels.
+
+For a small defect, the detail might be lost at 128. But for classification, the relative features might be preserved.
+
+This is a reasonable experiment. Let me try IMG_SIZE=128.
+
+Actually wait, I need to be more careful. The crop is created at the original resolution (s×s where s is the crop size in pixels), then resized to IMG_SIZE×IMG_SIZE. So the information content depends on the original crop size, not IMG_SIZE. Reducing IMG_SIZE from 160 to 128 means we're downsampling the crop more, losing some detail.
+
+For small defects, this could hurt. For large defects, it might not matter.
+
+Hmm, let me think of another approach.
+
+**Idea: Use 1 crop instead of 2.** Currently we do 2 forward passes per sample (tight 1.5× + wide 2.5×). If we use 1 crop (say the wide 2.5×), we'd do 2× more steps in the same time. This would give us ~2 epochs of training.
+
+The question is whether the 2-crop approach is important. The starting point used 2 crops, and presumably it was chosen because it helps. But with the time constraint, maybe 1 crop with more training is better.
+
+Let me try: use only the wide crop (2.5× context) and train for 2 epochs.
+
+This is a significant change but it directly addresses the undertraining issue.
+
+Actually, let me reconsider. The 2-crop approach averages logits from two views. This is like a simple ensemble. If we use 1 crop, we lose this ensemble effect. But we gain 2× more training steps.
+
+The tradeoff is:
+- 2 crops, 1 epoch: ensemble effect + 1 epoch training
+- 1 crop, 2 epochs: no ensemble + 2 epochs training
+
+Which is better? Hard to say a priori. Let me try 1 crop.
+
+Wait, but the inference also uses 2 crops. If I change to 1 crop for training, I should also use 1 crop for inference. The inference time would be halved (from 37s to ~18s), giving more time for training.
+
+Let me calculate:
+- Loading: 17s
+- Training with 1 crop: ~53s per epoch (half of 106s)
+- With 125s training budget: ~2.35 epochs
+- Inference with 1 crop: ~18s
+- Total: 17 + 125 + 18 = 160s < 180s ✓
+
+This fits! And we get 2.35 epochs of training instead of 1.
+
+But wait, the reserve is 55s. Inference takes 18s. So we have 37s of slack. We could reduce the reserve to 25s, giving us 155s for training. That's ~2.9 epochs.
+
+Actually, let me keep the reserve at 55s to be safe. Training budget: 125s. With 1 crop, each epoch takes ~53s. So we get 2.35 epochs.
+
+This seems like a good experiment. Let me go with it.
+
+The change:
+1. Remove the tight crop from training and inference
+2. Use only the wide crop (2.5× context)
+3. Keep everything else the same
+
+Let me write the code changes.
+
+Actually, I need to be careful about how the dataset and model work. Currently:
+- BoxDataset returns (view_tight, view_wide, cls)
+- The model does: loss = crit((model(xt) + model(xw)) / 2, y)
+- Inference: probs = softmax((model(xt) + model(xw)) / 2)
+
+To use 1 crop:
+- BoxDataset returns (view_wide, cls) or just (view, cls)
+- The model does: loss = crit(model(x), y)
+- Inference: probs = softmax(model(x))
+
+Let me restructure the code.
+
+Actually, I want to keep the change minimal and focused. Let me just change the dataset to return 1 view, and change the model to do 1 forward pass.
+
+Here's my plan:
+1. In BoxDataset.__getitem__, only create the wide crop (CONTEXT=2.5)
+2. Return a single view instead of two
+3. In training, do 1 forward pass
+4. In inference, do 1 forward pass
+
+Let me write the SEARCH/REPLACE blocks.
+
+Wait, I also want to make sure the DataLoader batch format is consistent. Currently the batch has (xt, xw, y) where xt and xw are both (B, 3, 160, 160). With 1 crop, it would be (x, y) where x is (B, 3, 160, 160).
+
+Let me write the changes:
+
+1. BoxDataset.__getitem__: Change to return single view
+2. Training loop: Change to single forward pass
+3. Inference: Change to single forward pass
+
+Let me look at the current code more carefully:
+
+```python
+def __getitem__(self, i):
+    r = self.rows[i]
+    img = self.images[r["image"]]
+    fh = fv = False
+    bright = 1.0
+    if self.train:  # same flips and brightness for both views
+        fh, fv, bright = random.random() < 0.5, random.random() < 0.5, random.uniform(0.8, 1.2)
+    views = []
+    for ctx in (TIGHT_CONTEXT, CONTEXT):
+        x = make_crop(img, r, ctx, self.train)
+        if fh:
+            x = x[:, ::-1]
+        if fv:
+            x = x[::-1, :]
+        if self.train:
+            x = np.clip(x * bright, 0, 1)
+        x = (x - MEAN) / STD
+        views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))
+    return views[0], views[1], r.get("cls", -1)
+```
+
+I need to change this to only create the wide crop:
+
+```python
+def __getitem__(self, i):
+    r = self.rows[i]
+    img = self.images[r["image"]]
+    fh = fv = False
+    bright = 1.0
+    if self.train:
+        fh, fv, bright = random.random() < 0.5, random.random() < 0.5, random.uniform(0.8, 1.2)
+    x = make_crop(img, r, CONTEXT, self.train)
+    if fh:
+        x = x[:, ::-1]
+    if fv:
+        x = x[::-1, :]
+    if self.train:
+        x = np.clip(x * bright, 0, 1)
+    x = (x - MEAN) / STD
+    return torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))), r.get("cls", -1)
+```
+
+And the training loop:
+```python
+for xt, xw, y in dl_tr:
+    ...
+    xt = xt.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+    xw = xw.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+    y = y.to(device, non_blocking=True)
+    with torch.autocast(**amp):
+        loss = crit((model(xt) + model(xw)) / 2, y)
+```
+
+Change to:
+```python
+for x, y in dl_tr:
+    ...
+    x = x.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+    y = y.to(device, non_blocking=True)
+    with torch.autocast(**amp):
+        loss = crit(model(x), y)
+```
+
+And inference:
+```python
+for xt, xw, _ in dl_ev:
+    xt = xt.to(device).to(memory_format=torch.channels_last)
+    xw = xw.to(device).to(memory_format=torch.channels_last)
+    probs.append(torch.softmax(((model(xt) + model(xw)) / 2).float(), 1).cpu())
+```
+
+Change to:
+```python
+for x, _ in dl_ev:
+    x = x.to(device).to(memory_format=torch.channels_last)
+    probs.append(torch.softmax(model(x).float(), 1).cpu())
+```
+
+Also need to update the DataLoader creation since the dataset now returns 2 items instead of 3.
+
+Let me also think about whether to adjust the batch size. With 1 crop, each sample is half the compute. So we could potentially use a larger batch size. But let's keep it at 64 for simplicity.
+
+Actually, with 1 crop, the batch size in terms of GPU memory is halved. So we could use batch size 128. But let's keep it at 64 to keep the change focused.
+
+Let me also think about whether to adjust the LR. With 2× more epochs, the cosine schedule would decay more. The current schedule is:
+- 5% warmup
+- 95% cosine decay
+
+With 2.35 epochs instead of 1, the cosine decay would be more gradual. The LR would start at 1e-3, warm up for 5% of the time, then decay. This should be fine.
+
+OK let me write the changes. I'll make the following edits:
+
+1. Change BoxDataset.__getitem__ to return single view
+2. Change training loop to use single view
+3. Change inference to use single view
+4. Update DataLoader batch unpacking
+
+Let me be very careful with the SEARCH/REPLACE blocks.
+
+Actually, I realize I should also consider: with 1 crop, the model sees less context. The tight crop (1.5×) focuses on the defect, while the wide crop (2.5×) includes more surrounding context. Using only the wide crop means the model sees more context but less focus on the defect.
+
+For classification, the surrounding context might help (e.g., to distinguish stain from background). But the tight crop might be important for small defects.
+
+This is a risk. But the potential benefit of 2× more training is significant.
+
+Let me go with this experiment.
+
+Wait, actually, I want to reconsider. Maybe instead of removing the tight crop, I should keep both crops but make the model faster. For example, by using a smaller image size.
+
+If I use IMG_SIZE=128 instead of 160:
+- Compute per forward pass: (128/160)² = 0.64×
+- With 2 crops: 0.64× the time per sample
+- Training time per epoch: 0.64 × 106s = 68s
+- With 125s budget: 1.84 epochs
+- Inference time: 0.64 × 37s = 24s
+- Total: 17 + 125 + 24 = 166s < 180s ✓
+
+This gives 1.84 epochs with 2 crops, vs 2.35 epochs with 1 crop. The 2-crop approach at 128 might be better than 1-crop at 160.
+
+Hmm, but I'm not sure. Let me go with the 1-crop approach since it's a cleaner experiment (isolating the effect of more training vs. multi-crop ensemble).
+
+Actually, you know what, let me think about this more carefully. The 2-crop approach is essentially a 2-model ensemble (same model, different inputs). This is known to help by 1-3% in classification. The 1-crop approach loses this benefit but gains 2× more training.
+
+The question is: is 2× more training (1→2.35 epochs) worth more than a 2-model ensemble?
+
+In deep learning, more training generally helps, especially when the model is undertrained. The loss is still dropping fast (0.4479→0.2744), suggesting the model hasn't converged. So more training should help.
+
+On the other hand, the ensemble effect is immediate and doesn't require more training. But it's a fixed benefit.
+
+I think the 1-crop approach is more likely to help because the model is clearly undertrained. Let me go with it.
+
+Let me write the final changes:
+
+```python
+# In BoxDataset.__getitem__:
+# Change from returning 2 views to 1 view
+
+# In training loop:
+# Change from 2 forward passes to 1
+
+# In inference:
+# Change from 2 forward passes to 1
+```
+
+Let me write the exact SEARCH/REPLACE blocks now.
+
+Block 1: Change BoxDataset.__getitem__
+
+SEARCH:
+```
+    def __getitem__(self, i):
+        r = self.rows[i]
+        img = self.images[r["image"]]
+        fh = fv = False
+        bright = 1.0
+        if self.train:  # same flips and brightness for both views
+            fh, fv, bright = random.random() < 0.5, random.random() < 0.5, random.uniform(0.8, 1.2)
+        views = []
+        for ctx in (TIGHT_CONTEXT, CONTEXT):
+            x = make_crop(img, r, ctx, self.train)
+            if fh:
+                x = x[:, ::-1]
+            if fv:
+                x = x[::-1, :]
+            if self.train:
+                x = np.clip(x * bright, 0, 1)
+            x = (x - MEAN) / STD
+            views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))
+        return views[0], views[1], r.get("cls", -1)
+```
+
+REPLACE:
+```
+    def __getitem__(self, i):
+        r = self.rows[i]
+        img = self.images[r["image"]]
+        fh = fv = False
+        bright = 1.0
+        if self.train:
+            fh, fv, bright = random.random() < 0.5, random.random() < 0.5, random.uniform(0.8, 1.2)
+        x = make_crop(img, r, CONTEXT, self.train)
+        if fh:
+            x = x[:, ::-1]
+        if fv:
+            x = x[::-1, :]
+        if self.train:
+            x = np.clip(x * bright, 0, 1)
+        x = (x - MEAN) / STD
+        return torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))), r.get("cls", -1)
+```
+
+Block 2: Change training loop
+
+SEARCH:
+```
+        for xt, xw, y in dl_tr:
+            frac = min(1.0, (time.time() - t_start) / budget)
+            f = frac / 0.05 if frac < 0.05 else 0.5 * (1 + math.cos(math.pi * (frac - 0.05) / 0.95))
+            for pg in opt.param_groups:
+                pg["lr"] = LR * max(f, 1e-3)
+            xt = xt.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            xw = xw.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            y = y.to(device, non_blocking=True)
+            with torch.autocast(**amp):
+                loss = crit((model(xt) + model(xw)) / 2, y)
+```
+
+REPLACE:
+```
+        for x, y in dl_tr:
+            frac = min(1.0, (time.time() - t_start) / budget)
+            f = frac / 0.05 if frac < 0.05 else 0.5 * (1 + math.cos(math.pi * (frac - 0.05) / 0.95))
+            for pg in opt.param_groups:
+                pg["lr"] = LR * max(f, 1e-3)
+            x = x.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            y = y.to(device, non_blocking=True)
+            with torch.autocast(**amp):
+                loss = crit(model(x), y)
+```
+
+Block 3: Change inference
+
+SEARCH:
+```
+    probs = []
+    with torch.no_grad(), torch.autocast(**amp):
+        for xt, xw, _ in dl_ev:
+            xt = xt.to(device).to(memory_format=torch.channels_last)
+            xw = xw.to(device).to(memory_format=torch.channels_last)
+            probs.append(torch.softmax(((model(xt) + model(xw)) / 2).float(), 1).cpu())
+```
+
+REPLACE:
+```
+    probs = []
+    with torch.no_grad(), torch.autocast(**amp):
+        for x, _ in dl_ev:
+            x = x.to(device).to(memory_format=torch.channels_last)
+            probs.append(torch.softmax(model(x).float(), 1).cpu())
+```
+
+These three changes should be sufficient. Let me verify that the DataLoader will work correctly with the new dataset format.
+
+The DataLoader uses default collation, which stacks the tensors. With the old format (view1, view2, cls), the batch would be (B, 3, 160, 160), (B, 3, 160, 160), (B,). With the new format (view, cls), the batch would be (B, 3, 160, 160), (B,).
+
+The DataLoader creation doesn't specify a collate_fn, so it uses the default. This should work fine.
+
+Let me also check: the eval DataLoader has batch_size=256. With 1 crop, each batch is half the size in terms of GPU memory. So we could increase it, but let's keep it at 256 for now.
+
+I think this is a good, focused experiment. The hypothesis is: switching from 2-crop to 1-crop will allow ~2.3× more training epochs, which will improve mAP because the model is currently undertrained (loss still dropping fast after 1 epoch).
+
+Let me finalize the reply.
+
+Wait, one more thing: I should also consider whether to adjust the RESERVE_S. Currently it's 55s. With 1 crop, inference takes ~18s. So we have 37s of slack. We could reduce RESERVE_S to 30s, giving us 150s for training instead of 125s. That's 20% more training.
+
+But the brief says "Keep a safety margin." So let's keep RESERVE_S at 55s to be safe. The 37s slack is enough.
+
+Actually, let me reconsider. The reserve is for "prediction and writing." With 1 crop, prediction takes ~18s and writing takes a few seconds. So 55s is very safe. We could reduce it to 30s for more training. But the risk is that if something goes wrong (e.g., slower inference due to system load), we might time out.
+
+Let me keep RESERVE_S at 55s. The 2.35 epochs should be a good improvement over 1 epoch.
+
+OK, I'm confident in this experiment. Let me write the final reply.
+
+Hmm, actually let me reconsider one more time. Is there a risk that the wide crop alone (2.5× context) is not enough? For small defects, the 2.5× context might include too much background, making it harder to classify. The tight crop (1.5×) was specifically designed to focus on the defect.
+
+But the model was originally designed with both crops, and the wide crop alone should still contain the defect. The 2.5× context means the crop side is 2.5× the long side of the box. So for a 50×50 box, the crop is 125×125 pixels. The defect occupies 50/125 = 40% of the crop width. That's still a significant portion.
+
+For a very small box (10×10), the crop is 25×25 pixels. The defect occupies 10/25 = 40% of the crop. Still significant.
+
+I think the wide crop alone should be fine. Let me proceed.
+
+One more consideration: the TIGHT_CONTEXT constant is now unused. I should remove it or leave it (it's just a constant, no harm).
+
+Let me finalize.

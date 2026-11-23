@@ -1,0 +1,446 @@
+===== attempt 1 =====
+Let me analyze the current state and think about what to try next.
+
+Current best: e016, 5-seed val mAP@0.5 = 0.6411
+- EfficientNet-B0, IMG_SIZE=224, single wide crop (2.5x), H-flip TTA
+- Trained on GT crops (high+low res) + matched detector boxes (IoU≥0.5)
+- Score = detector conf × class probability
+- Per-class AP: pore 0.537, deposit 0.635, discontinuity 0.780, stain 0.612
+
+Key observations:
+1. Pore (0.537) and stain (0.612) are the weakest classes
+2. The ceiling is 0.758 (stage-1 boxes with perfect classes)
+3. Single-class scoring gets 0.755, so the ranking within a class matters a lot
+4. The one-step 4-class baseline is 0.638, we're at 0.6411 - barely above it
+5. The gap to ceiling (0.758) is large, meaning classification errors are the main issue
+
+What's been tried and rejected:
+- Background class (e001, e005) - hurt
+- Squaring prob (e004) - hurt
+- Focal loss (e006) - hurt
+- Mixup (e007) - hurt
+- Batch size 32 (e010) - hurt
+- Weighted sampling (e011) - hurt
+- V-flip TTA (e012) - hurt
+- EfficientNet-B2 (e013) - hurt
+- Max prob multiplier (e014) - hurt
+- ConvNeXt-Nano (e015) - hurt (badly)
+
+What worked:
+- Adding detector boxes to training (e002)
+- Adding low-res crops (e003)
+- Single wide crop instead of two-crop (e008) - freed up time for more epochs
+- H-flip TTA (e009)
+- IMG_SIZE 224 (e016)
+
+The training log shows only 2 epochs with 660 steps in ~164s. The model is undertrained. With IMG_SIZE=224, each step is slower. Let me think about what could help.
+
+Ideas to consider:
+
+1. **Learning rate / optimizer tuning**: Current LR=1e-3 with AdamW. Maybe a higher LR or different schedule could help. But the training is very short (2 epochs, 660 steps). The model might benefit from a higher initial LR to converge faster.
+
+2. **More aggressive augmentation**: The current augmentation is light (H-flip, V-flip, brightness 0.8-1.2, geometric jitter in make_crop). Maybe stronger augmentation could help generalization.
+
+3. **Different scoring**: The score is conf × prob. What about using the detector conf differently? The detector conf might be noisy. What if we use conf^0.5 or some other transformation?
+
+4. **Training on more data / different sampling**: The training set has 26347 boxes. Maybe the ratio of GT to detector boxes matters.
+
+5. **Warmup + longer effective training**: The 5% warmup means the first ~33 steps are warming up. With only 660 steps total, that's a significant fraction.
+
+6. **Reduce RESERVE_S**: Currently 55s reserved. The run finishes at 164s out of 180s budget. If we reduce reserve to say 30s, we get ~25s more training. That's about 15% more steps.
+
+7. **Use a different backbone**: resnet18, resnet34, regnety_016, etc. haven't been tried. But ConvNeXt-Nano was terrible (0.5833), and EfficientNet-B2 was slightly worse. Maybe a smaller model trains faster and gets more epochs?
+
+8. **Two-stage training**: First train on GT crops only (cleaner signal), then fine-tune on all data including detector boxes.
+
+9. **Score calibration**: The detector conf distribution might not be well-calibrated. What if we use a different combination?
+
+10. **Reduce batch size to get more steps**: Tried in e010 (batch 32) and it hurt. But that was at IMG_SIZE=160. At IMG_SIZE=224, the dynamics might be different. Actually, smaller batch = more steps but each step is slower (more overhead). Probably not helpful.
+
+11. **Increase training data by using both high AND low res GT crops more aggressively**: Already using both.
+
+12. **Different crop context**: Currently CONTEXT=2.5. What about 3.0 or 2.0? More context might help the model understand the local scene.
+
+13. **Learning rate**: 1e-3 might be too high or too low. For fine-tuning a pretrained model, 1e-3 is on the high side. But with only 660 steps, maybe we want to train harder. Actually, for a pretrained model being fine-tuned, 1e-3 is reasonable. But maybe 3e-4 or 5e-4 would be better?
+
+Wait, let me reconsider. The key issue is that we're at 0.6411 vs ceiling 0.758. The gap is 0.117. This means the classifier is making a lot of errors. The per-class APs show pore (0.537) and stain (0.612) are weak.
+
+Let me think about what's most likely to help:
+
+- The model only gets ~2 epochs of training. That's very undertrained.
+- The training data is 26347 boxes.
+- With batch size 64, that's ~411 steps per epoch.
+
+What if we could get more effective training? Options:
+a) Reduce reserve time (from 55s to 30s) → ~25s more training → ~15% more steps
+b) Use a faster model (smaller) → more steps in same time
+c) Use a smaller image size → more steps (but e016 showed 224 > 160)
+d) Use fewer images to load (but we need all eval images)
+
+Actually, wait. Let me reconsider the scoring. The current score is `conf * prob[c]`. The detector conf is the same for all 4 classes of a given box. So the ranking within a box is purely by prob. The ranking across boxes is by conf * prob.
+
+What if the detector conf is poorly calibrated? For example, if the detector gives high conf to false alarms, then conf * prob won't help much. 
+
+Actually, a key insight: the "single class 'defect'" scoring gets 0.755. This means the detector boxes are very good at finding defects (just not classifying them). The 4-class scoring drops to 0.641. So the classification is the bottleneck.
+
+Let me think about what could improve classification:
+1. More training (more steps)
+2. Better data (augmentation, sampling)
+3. Better model
+4. Better inference (TTA)
+
+For (1): The most straightforward way to get more training is to reduce the reserve. Currently RESERVE_S=55. The prediction phase takes about 164-125=39s (from the log: epoch 1 ends at 125s, done at 164s). So we could reduce RESERVE_S to about 40s and gain ~15s of training. That's about 10% more steps.
+
+Actually, let me look at the log more carefully:
+- Loading: 17s
+- Epoch 0: 17s to 94s = 77s, 411 steps
+- Epoch 1: 94s to 125s = 31s, 660 total steps (so 249 steps in epoch 1, which was cut short)
+- Prediction: 125s to 164s = 39s
+
+So the training budget is deadline - RESERVE_S = 180 - 55 = 125s. Training started at 17s, so effective training time is 125-17 = 108s. That gives 660 steps.
+
+If I reduce RESERVE_S to 40, training budget becomes 180-40=140s, effective training time is 140-17=123s. That's 123/108 * 660 ≈ 755 steps. About 14% more steps.
+
+But wait, the prediction phase also needs to run. With 41879 eval detections at batch 256, that's 164 batches. Each batch is a forward pass on GPU. The prediction takes 39s currently. If we reduce reserve, we need to make sure prediction still finishes. 39s prediction + some overhead for writing = ~45s. So RESERVE_S=40 might be tight. Let's say RESERVE_S=45 to be safe. That gives training budget of 135s, effective 118s, about 724 steps. ~10% more.
+
+Hmm, that's a modest gain. Let me think of something with bigger potential.
+
+Actually, what about **learning rate**? With only 660 steps, the cosine schedule goes from LR (1e-3) down to near 0. The 5% warmup means the first 33 steps ramp up. Then cosine decay over the remaining 627 steps.
+
+What if we use a higher LR, say 3e-3? For fine-tuning a pretrained model, this might be too aggressive and cause the pretrained features to be destroyed. But with only 660 steps, maybe we want to train harder.
+
+Alternatively, what about **removing the warmup** and using a constant LR or a different schedule? With only 660 steps, the warmup eats 5% of the budget.
+
+Actually, let me think about a different angle. What about **training for more epochs by making each step faster**?
+
+The model is EfficientNet-B0 at 224x224. What if we use a smaller model? Let's think about what's available:
+- convnext_pico (very small)
+- convnext_atto (very small)
+- resnet18
+- regnety_016
+- mobilenetv3_large_100
+
+These would be faster per step, allowing more epochs. But they have less capacity. The question is whether more training steps on a smaller model beats fewer steps on a larger model.
+
+Actually, e015 tried ConvNeXt-Nano and got 0.5833, which was bad. But that was at IMG_SIZE=160. At 224, it might be different. Still, the drop was significant.
+
+Let me think about another angle: **the scoring function**.
+
+Currently: score = conf * prob[c]
+
+What if we use: score = conf * prob[c] / sum(prob) = conf * prob[c] (since sum(prob)=1, this is the same)
+
+What about: score = conf^alpha * prob[c]^beta?
+
+e004 tried prob^2 (i.e., conf * prob^2) and it hurt. e014 tried conf * prob * max_prob and it hurt.
+
+What about a temperature on the softmax? Using a lower temperature (sharper probabilities) or higher temperature (softer)?
+
+Actually, the softmax is already applied. The temperature would be: softmax(logits / T). With T < 1, probabilities become more peaked. With T > 1, they become flatter.
+
+If we use T < 1 (sharper), then for correct class, prob goes up, for wrong classes, prob goes down. This would improve the ranking within a box. But it might also over-boost false alarms where the model is confidently wrong.
+
+Hmm, but e004 (squaring prob) is similar to T < 1 and it hurt. So probably not the way to go.
+
+Let me think about **data augmentation** more carefully. The current augmentation:
+- H-flip (50%)
+- V-flip (50%)
+- Brightness (0.8-1.2)
+- Geometric jitter in make_crop (center shift ±10% of side, side scale 0.85-1.2)
+
+What about:
+- Color jitter (hue, saturation, contrast)
+- Random erasing
+- Stronger geometric transforms (rotation)
+- Cutout
+
+But e007 (mixup) and e011 (weighted sampling) both hurt. The model might be sensitive to the training data distribution.
+
+Actually, let me reconsider. The key weakness is pore (0.537) and stain (0.612). Pore is a small hole in the weld. Stain is a discoloration. These are visually different from deposit (extra material) and discontinuity (gap in the weld).
+
+What if the issue is that the crops don't capture enough context for pore and stain? Pore is small, so at 2.5x context, the crop might be mostly background. Stain might blend into the surrounding weld.
+
+What about increasing CONTEXT to 3.0 or 3.5? This would give more surrounding context. But it also means the defect is a smaller fraction of the crop, making it harder to detect.
+
+Alternatively, what about using a **multi-scale** approach? Feed both a tight crop and a wide crop, but that was the original two-crop approach which was slower.
+
+Wait, actually the original two-crop approach (e000) had both tight (1.5x) and wide (2.5x) crops through the same model, with logits averaged. e008 switched to single wide crop and it improved. So the tight crop wasn't helping.
+
+Let me think about **optimizer**. Currently AdamW with LR=1e-3, weight_decay=0.05. What about:
+- SGD with momentum? Sometimes works better for fine-tuning.
+- Different weight decay?
+- Different LR?
+
+Actually, for fine-tuning a pretrained model with limited steps, SGD with momentum and a higher LR (like 1e-2) with a cosine schedule might work well. But this is a big change.
+
+Let me focus on something more targeted. The per-class APs are:
+- pore: 0.537
+- deposit: 0.635
+- discontinuity: 0.780
+- stain: 0.612
+
+Pore is the weakest. What makes pore hard? It's a small dark spot. At 2.5x context, it might be a small feature in the crop. The model might struggle to distinguish it from stain (also a small dark feature) or just noise.
+
+What if we use **class-specific augmentation**? For pore, we could apply stronger contrast augmentation to make the dark spots more prominent. But this is complex and might not help.
+
+Let me think about a simpler change. What about **increasing the number of training steps by reducing the batch size**? e010 tried batch 32 at IMG_SIZE=160 and it hurt. But at IMG_SIZE=224, the dynamics are different. With batch 32 at 224, each step is about the same time (GPU-bound), so we'd get about 2x the steps. But the LR was scaled proportionally in e010, which might have been the issue.
+
+Actually, let me re-read e010: "Reducing batch size from 64 to 32 (with proportionally scaled LR) doubles the number of optimizer updates within the same wall-clock budget." The score was 0.6229, down from 0.6387. So it hurt. The proportional LR scaling (LR/2 = 5e-4) might have been too low.
+
+What if we reduce batch to 32 but keep LR at 1e-3? That would give more steps at the same LR. But this is a different experiment than e010.
+
+Hmm, but the rule says "one idea per turn." Let me pick the most promising one.
+
+Let me reconsider the time budget. The run takes 164s out of 180s. The prediction takes 39s. If I reduce RESERVE_S from 55 to 40, I get 15s more training. But I need to make sure prediction still fits. 39s prediction + 5s overhead = 44s. So RESERVE_S=45 should be safe. That gives 10s more training, about 7% more steps.
+
+Actually, let me think about this differently. What's the most impactful change I can make?
+
+The gap to ceiling is 0.117 mAP. The classification is the bottleneck. To improve classification, I need either:
+1. Better training (more steps, better data, better model)
+2. Better inference (TTA, ensemble)
+3. Better scoring
+
+For (1), the most impactful thing might be to **train for more steps**. The model is clearly undertrained (loss still dropping at epoch 1: 0.2859 vs 0.5211 at epoch 0).
+
+To get more steps, I can:
+a) Reduce RESERVE_S (small gain, ~7-10%)
+b) Use a faster model (bigger change, risky)
+c) Reduce IMG_SIZE (but 224 > 160 was shown)
+d) Use a smaller batch (tried, hurt)
+
+Actually, what about **not loading all images at once**? The loading takes 17s. If I could reduce that... but I need all eval images for prediction and all training images for training. 2255 images. That's a lot of I/O.
+
+Wait, what about **using a faster image loading method**? Currently using PIL. What about using torchvision's functional? Probably similar speed.
+
+Let me think about another angle: **the training data composition**. Currently:
+- 14128 GT crops (high + low res)
+- 12219 matched detector boxes (IoU ≥ 0.5)
+
+Total: 26347 boxes.
+
+What if the detector boxes are noisy and dilute the training signal? What if I only use GT crops? That was the original approach (e000) which got 0.638 (one-step baseline). e002 added detector boxes and improved to 0.6293... wait, that's lower than 0.638? Let me re-read.
+
+Oh wait, e000 was the starting point (two-crop, 0.638 was the one-step baseline, not e000's score). Let me re-read the history.
+
+e000: starting point (not in the table, it's the base)
+e001: e000 + background class → 0.5691 (rejected)
+e002: e000 + detector boxes → 0.6368 (new best)
+e003: e002 + low-res crops → 0.6296 (new best)
+e008: e003 + single wide crop → 0.6409 (new best)
+e009: e008 + H-flip TTA → 0.6396 (new best)
+e016: e009 + IMG_SIZE 224 → 0.6423 (new best, 5-seed 0.6411)
+
+So e002 (adding detector boxes) improved from the starting point. The starting point score isn't in the table but it was the base for e001 and e002.
+
+OK so the current training data is a mix of GT and detector boxes. This seems good.
+
+Let me think about what else could help. What about **label smoothing**? Cross-entropy with label smoothing (e.g., 0.1) can improve generalization. It's a simple change.
+
+Or what about **using a different loss function**? e006 tried focal loss and it hurt. What about KL divergence or something else?
+
+Actually, let me think about **the scoring more carefully**. 
+
+The score is `conf * prob[c]`. For a given box, the 4 class scores sum to `conf * sum(prob) = conf`. So the total "mass" per box is proportional to the detector confidence.
+
+In mAP@0.5, for each class, we rank all predictions of that class by score and compute precision-recall. The ranking within a class is what matters.
+
+For class c, the score is `conf * prob[c]`. Two boxes with the same prob[c] but different conf will be ranked by conf. Two boxes with the same conf but different prob[c] will be ranked by prob[c].
+
+The issue is: a false alarm (background box) with high detector conf and moderate prob for some class will score higher than a true detection with lower detector conf and high prob. This is bad for ranking.
+
+What if we could better separate true detections from false alarms? The background class idea (e001, e005) tried this but hurt. Maybe the issue was how it was implemented.
+
+Actually, let me think about a **simpler scoring change**. What if we use `conf * prob[c] * (prob[c] - max_other_prob)`? No, that's getting complicated and e014 (max prob multiplier) already hurt.
+
+What about just using `prob[c]` without the detector conf? The detector conf might be adding noise. But the single-class scoring (which uses conf) gets 0.755, so conf is useful for ranking.
+
+Hmm, what about `conf^0.5 * prob[c]`? This would reduce the influence of conf and give more weight to the classifier. Or `conf^2 * prob[c]` to increase conf's influence.
+
+Actually, let me think about this from a different angle. The per-class APs:
+- pore: 0.537
+- deposit: 0.635
+- discontinuity: 0.780
+- stain: 0.612
+
+Discontinuity is the easiest (0.780). Pore is the hardest (0.537). The gap between best and worst is 0.243.
+
+What if the issue with pore is that the detector conf is lower for pore boxes (because pores are smaller and harder to detect)? Then conf * prob[pore] would be lower, hurting the ranking.
+
+What if we use a **class-specific conf scaling**? For pore, use conf^0.5; for discontinuity, use conf^1.5. But this is ad hoc and might not generalize.
+
+Let me try a different approach. What about **using the detector conf as a separate feature** in the classifier? Instead of just cropping and classifying, we could feed the detector conf as an additional input. But this requires modifying the model architecture, which is a bigger change.
+
+OK let me just pick the most promising simple change. I think the most impactful thing is to **get more training steps**. The model is undertrained. Let me reduce RESERVE_S to get more training time.
+
+Current: RESERVE_S = 55, run finishes at 164s/180s.
+Prediction takes ~39s. Writing takes a few seconds. So 45s reserve should be safe.
+
+If I set RESERVE_S = 45, training budget = 180 - 45 = 135s. Training starts at ~17s. Effective training time = 135 - 17 = 118s. Currently it's 125 - 17 = 108s. So 118/108 = 1.09, about 9% more steps. That's ~720 steps vs 660.
+
+That's a modest improvement. Let me think if there's something better.
+
+Actually, what about **increasing the learning rate**? With only 660 steps, the model might not be training hard enough. LR=1e-3 with cosine decay means the effective LR is quite low after the first epoch.
+
+What if I use LR=2e-3 or 3e-3? For fine-tuning a pretrained model, 3e-3 might be too aggressive, but 2e-3 could be reasonable.
+
+Or what about **removing the warmup** and using a pure cosine schedule? The 5% warmup means the first 33 steps have low LR. Removing it would give a slight boost.
+
+Actually, let me think about **the batch size and LR interaction**. With batch 64 and LR 1e-3, the effective batch size is 64. If I use batch 128, I get half the steps but each step is more stable. The LR might need to be higher. But this is getting complicated.
+
+Let me just go with a simple, safe change: **reduce RESERVE_S from 55 to 40** to get more training steps. The prediction phase takes 39s, so 40s reserve is tight but should work. Actually, let me be safer and use 45.
+
+Wait, actually, I just realized something. The prediction loop processes 41879 detections at batch 256, which is 164 batches. Each batch is a forward pass on 256 images of 224x224. That's not trivial. 39s for 164 batches means ~240ms per batch. That's reasonable for GPU inference.
+
+But what if I could speed up prediction? For example, by using a larger batch size (512) to reduce overhead? Or by using torch.compile? torch.compile might help but could also add overhead for compilation.
+
+Actually, let me think about a completely different idea. What about **training a second model and ensembling**? The time budget is 180s. Currently, training takes ~108s and prediction takes ~39s. If I could train two smaller models in parallel... but I don't have parallel GPU access.
+
+What about training one model for 60s, then another for 60s, and ensembling? That would give 60s of training each, which is less than the current 108s. Probably not helpful.
+
+OK, let me go with a focused change. I'll try **increasing the learning rate to 2e-3** to train harder in the limited steps available. The hypothesis is that with only ~660 steps, a higher LR will allow the model to converge more, especially for the weak classes (pore, stain).
+
+Actually wait, I should be more careful. Let me think about what's most likely to give a >0.01 improvement (above the noise floor).
+
+The noise is ±0.005 to 0.01. So I need a change that's likely to give >0.01 improvement.
+
+Reducing RESERVE_S by 10s gives ~7% more steps. That's probably ~0.002-0.005 improvement. Below noise.
+
+Increasing LR by 2x might help or hurt. It's a coin flip.
+
+Let me think about something with a bigger potential impact.
+
+What about **using both high and low res crops with different augmentation strategies**? Or **using a curriculum** (train on easy examples first, then hard ones)?
+
+Actually, here's an idea: **use the detector confidence as a training weight**. Boxes with high detector conf are more likely to be true detections, so weight them more. Boxes with low conf are noisier. This is different from class weighting (which hurt) because it's based on detection confidence, not class.
+
+But this is complex to implement and might not help.
+
+Let me think about **the crop context** again. Currently CONTEXT=2.5. What if I try CONTEXT=3.0? More context might help the model understand the local scene better, especially for stain (which blends into the surrounding weld) and pore (which needs context to distinguish from noise).
+
+But more context also means the defect is a smaller fraction of the crop, making it harder to detect. It's a trade-off.
+
+Actually, you know what, let me try something I haven't considered: **using a different pretrained backbone that's faster per step**. 
+
+Available models: convnext_atto, convnext_nano, convnext_pico, efficientnet_b0, efficientnet_b2, mobilenetv3_large_100, regnety_016, resnet18, resnet26d, resnet34, resnet50, tf_efficientnetv2_b0
+
+I've tried:
+- efficientnet_b0 (current, 4M params)
+- efficientnet_b2 (e013, 6.6M params, hurt)
+- convnext_nano (e015, 5M params, hurt badly)
+
+Not tried:
+- convnext_atto (very small, ~0.25M params)
+- convnext_pico (very small, ~0.15M params)
+- mobilenetv3_large_100 (~5.4M params)
+- regnety_016 (~5.3M params)
+- resnet18 (~11.7M params)
+- resnet26d (~15.7M params)
+- resnet34 (~21.8M params)
+- resnet50 (~25.6M params)
+- tf_efficientnetv2_b0 (~5.6M params)
+
+The smaller models (convnext_atto, convnext_pico) would be much faster per step, allowing many more epochs. But they have very little capacity. The question is whether 10x more training steps on a tiny model beats 1x on EfficientNet-B0.
+
+Given that convnext_nano (5M params, similar to B0) hurt badly (0.5833 vs 0.6411), I'm skeptical that a smaller model would help. The capacity seems to matter.
+
+What about tf_efficientnetv2_b0? It's similar size to B0 but a different architecture. It might have different inductive biases that work better for this task. But it's a long shot.
+
+What about resnet18? It's a classic architecture, 11.7M params, well-pretrained. It might be faster per step than EfficientNet-B0 at 224x224 (ResNet uses standard convolutions, EfficientNet uses depthwise separable). Actually, at 224x224, ResNet-18 is probably similar speed to EfficientNet-B0.
+
+Hmm, I'm going in circles. Let me just pick the most reasonable change.
+
+I think the most promising change is to **reduce RESERVE_S to allow more training** combined with a **slightly higher learning rate**. But that's two changes, and the rule says one idea per turn.
+
+Let me go with **reducing RESERVE_S from 55 to 40**. The hypothesis is that the model is undertrained (loss still dropping), and getting ~25% more training steps will improve classification accuracy, especially for the weak classes.
+
+Wait, 55 to 40 is 15s more. Training currently uses 108s. 15s more is 15/108 = 14% more. That's about 750 steps vs 660. That could give ~0.003-0.008 improvement. Still might be below noise.
+
+Hmm. Let me think about what would give a bigger boost.
+
+Actually, here's an idea I haven't tried: **using a two-phase training approach**. Phase 1: train on GT crops only (cleaner signal) for half the time. Phase 2: fine-tune on all data (GT + detector boxes) for the other half. The hypothesis is that starting with clean GT crops establishes good features, then adding detector boxes makes it robust to misplacement.
+
+But this is complex and might not help. The current approach already mixes GT and detector boxes from the start.
+
+OK here's another idea: **use a higher resolution for the tight crop**. Wait, we're using single wide crop now (2.5x). There's no tight crop.
+
+What about **using CONTEXT=2.0 instead of 2.5**? A tighter crop means the defect is a larger fraction of the image, making it easier to classify. But less context. The original two-crop used 1.5x tight + 2.5x wide, and the wide crop dominated. e008 switched to single 2.5x and it helped (probably because of the extra training time). What if 2.0x is better than 2.5x?
+
+Actually, I think 2.5x is a reasonable context. Let me not change that.
+
+Let me try a different angle: **the number of prediction rows**. Currently, for each eval box, we write 4 rows (one per class). What if we only write the top-2 classes? This would reduce the number of rows and might improve the ranking (fewer false positives per class). But the problem statement says "several rows with different classes for the same box are allowed; leaving a box out drops it." So writing fewer rows means dropping some class predictions for that box.
+
+If I only write the top-2 classes, I'm saying "this box is either class A or class B." For mAP, this means the box contributes to the ranking of classes A and B but not C and D. If the true class is C or D, the box is missed. If the true class is A or B, it's detected.
+
+This is a risky change. It might help if the model is often wrong about the 3rd and 4th most likely classes, but it might hurt if the true class is sometimes the 3rd or 4th most likely.
+
+Actually, for mAP, writing all 4 rows means each box contributes to all 4 class rankings. Writing only 2 rows means it only contributes to 2 class rankings. For the 2 classes it contributes to, the ranking is cleaner (no dilution from the other 2 classes' scores). For the 2 classes it doesn't contribute to, the box is simply absent.
+
+I think writing all 4 rows is generally better because it doesn't lose information. The mAP computation handles the ranking correctly.
+
+OK, I'm overthinking this. Let me just go with a concrete change.
+
+**Decision: Reduce RESERVE_S from 55 to 40 to get more training steps.**
+
+The hypothesis: The model is undertrained (loss 0.2859 at end of epoch 1, still dropping). Getting ~25% more training steps (by reducing the reserve from 55s to 40s) will improve classification accuracy, especially for the weak pore and stain classes. The prediction phase takes ~39s, so 40s reserve is safe.
+
+Wait, 55 to 40 is only 15s. Training uses 108s currently. 15/108 = 14% more. Let me check: deadline = 180. RESERVE_S = 40. t_end = 140. Training starts at ~17s. Effective training time = 140 - 17 = 123s. Currently 125 - 17 = 108s. 123/108 = 1.14. So 14% more steps. ~750 steps vs 660.
+
+That's a modest improvement. Let me see if there's a better change.
+
+Actually, what if I combine reducing RESERVE_S with a **smaller image size for training only**? No, that's two changes.
+
+What about **using a faster data loading pipeline**? The loading takes 17s. If I could reduce that to 10s, I'd get 7s more training. But that's a small gain.
+
+OK here's my final decision. Let me try **increasing the learning rate from 1e-3 to 2e-3**. The hypothesis is that with only ~660 steps, the model needs a higher LR to make meaningful progress. The current LR with cosine decay means the effective LR drops to near 0 by the end, and the model might not be training hard enough in the limited steps.
+
+Actually, for fine-tuning a pretrained model, 2e-3 with AdamW is reasonable. 1e-3 is a bit conservative. With only 660 steps, a higher LR would help the model converge faster.
+
+But wait, I should be careful. If the LR is too high, the pretrained features get destroyed and the model overfits. With 26347 training samples and 660 steps (about 2.5 epochs), overfitting is unlikely. So a higher LR should be safe.
+
+Let me go with LR = 2e-3.
+
+Hmm, actually, let me reconsider. The loss went from 0.5211 to 0.2859 in 2 epochs. That's a significant drop, suggesting the model is learning well. A higher LR might cause it to converge even faster, or it might cause instability.
+
+For AdamW, the LR is more forgiving than for SGD. 2e-3 should be fine.
+
+Let me go with this. One change: LR from 1e-3 to 2e-3.
+
+Wait, actually I want to think about whether there's a more impactful change. Let me look at the per-class APs again:
+- pore: 0.537
+- deposit: 0.635
+- discontinuity: 0.780
+- stain: 0.612
+
+The macro average is (0.537+0.635+0.780+0.612)/4 = 2.564/4 = 0.641. That matches.
+
+To improve the macro average, I need to improve the weakest classes. Pore at 0.537 is the weakest. If I could get pore to 0.60, the macro would go up by 0.063/4 = 0.016. That's above the noise floor.
+
+What specifically helps pore? Pore is a small dark hole. The key challenges:
+1. Small size → needs high resolution (224 helps, e016)
+2. Similar to stain → needs good feature discrimination
+3. Detector might miss some pores → lower recall
+
+For (2), the model needs to distinguish pore from stain. Both are small dark features. The difference is that pore is a hole (darker, more defined) while stain is a discoloration (less defined, more diffuse).
+
+What if I use **color augmentation** to help the model learn color-invariant features? If I randomly shift hue/saturation, the model would be forced to rely on shape/texture rather than color. This might help distinguish pore from stain based on shape rather than color.
+
+But this is a bigger change and might not help.
+
+Let me just go with the LR increase. It's simple, safe, and has a reasonable chance of helping.
+
+Actually, wait. Let me reconsider one more time. What about **using a different optimizer**? SGD with momentum is sometimes better than AdamW for fine-tuning. But this is a bigger change.
+
+Or what about **using a learning rate warmup with a different fraction**? Currently 5% warmup. What if I use 10% warmup? That would give a more gradual LR increase, potentially reducing instability.
+
+No, let me stick with the LR increase. It's the simplest change with a clear hypothesis.
+
+Final decision: **Increase LR from 1e-3 to 2e-3.**
+
+Hypothesis: With only ~660 training steps, the model needs a higher learning rate to make sufficient progress on the weak classes (pore, stain). Doubling the LR from 1e-3 to 2e-3 should accelerate convergence without causing instability (AdamW is forgiving, and 2.5 epochs is too few for overfitting).
+
+Let me write the change:
+
+SEARCH: `LR = 1e-3`
+REPLACE: `LR = 2e-3`
+
+That's it. Simple, focused, one idea.

@@ -1,0 +1,327 @@
+===== attempt 1 =====
+Let me analyze the situation:
+
+1. Current best (e000): 5-seed val mAP@0.5 = 0.6311
+2. The baseline one-step detector is 0.638 mAP@0.5
+3. The ceiling (stage-1 boxes with perfect classes) is 0.758 mAP@0.5
+4. Stage-1 boxes scored as single class 'defect': 0.755 mAP@0.5
+
+So the stage-2 classifier is actually HURTING performance compared to the one-step baseline (0.6311 vs 0.638). The ceiling is 0.758, so there's a lot of room for improvement.
+
+Key observations:
+- The classifier is trained on perfect boxes (true training boxes from crops.csv)
+- It has no notion of "not a defect" - it's trained only on true boxes
+- Per-class AP: pore 0.506, deposit 0.630, discontinuity 0.780, stain 0.608
+- Pore and deposit are the weak classes
+- Stain is often confused with deposit and background
+
+What's been tried:
+- e001: Training on detector boxes with background class - crashed (type bug)
+- e002: Fixed the crash but got 0.5172 (much worse) - rejected
+- e003: Including low-res crops - 0.6251 (slightly worse) - rejected
+- e004: Squaring class probability - 0.6161 (worse) - rejected
+
+Let me think about what to try next. The key insight is:
+
+The current system scores each eval box with `conf * p[class]`. The problem is:
+1. The classifier was trained only on true boxes, so it has no concept of background
+2. False alarms (background boxes) get scored based on whatever class the classifier assigns
+3. The detector's confidence might not correlate well with whether it's a true defect
+
+Ideas to consider:
+1. **Training on detector boxes with background class** - e002 tried this but got 0.5172, which is much worse. This might be because the implementation had issues or the approach needs refinement. But it's been tried and rejected.
+
+2. **Better scoring** - e004 tried p² which made things worse. Maybe the issue is that the classifier's probabilities aren't well-calibrated for background detection.
+
+3. **Architecture changes** - Try a different backbone. The current one is EfficientNet-B0. Maybe a larger model or different architecture could help.
+
+4. **Test-time augmentation** - Average predictions over multiple augmented versions.
+
+5. **Ensembling** - Train multiple models and average.
+
+6. **Better training data** - The current training uses only high-res crops. Maybe the issue is data quality.
+
+7. **Loss function changes** - Focal loss or label smoothing.
+
+8. **Inference changes** - Use only the tight crop or only the wide crop, or weight them differently.
+
+Let me think about what's most likely to help:
+
+The biggest issue is that the classifier has no background class. When it sees a false alarm, it still assigns a probability to each of the 4 classes. The score is `conf * p[class]`, so false alarms get scored based on the detector's confidence times the (wrong) class probability.
+
+But e002 tried adding a background class and got 0.5172, which is much worse. This is suspicious - maybe the implementation was flawed. Let me think about why it might have been bad:
+- If you train on detector boxes, many of them are false alarms (background). The class distribution would be heavily skewed toward background.
+- The overlap-based labeling might be noisy.
+- The model might learn to predict background too aggressively.
+
+Actually, wait. Let me reconsider. The fact that "stage-1 boxes scored as a single class 'defect': 0.755 mAP@0.5" is very telling. This means that if we just use the detector's confidence as the score for all boxes (treating them all as the same class), we get 0.755. The 4-class mAP with perfect labels is 0.758. So the detector's boxes are very good - the issue is purely classification.
+
+The current 0.6311 is below even the single-class 0.755. This means the classifier is actually making things worse by assigning wrong classes and wrong scores.
+
+Wait, that doesn't quite make sense. Let me re-read. "stage-1 boxes scored as a single class 'defect': 0.755 mAP@0.5" - this means if we label all boxes as one class and score them by detector conf, we get 0.755. But the 4-class mAP requires 4 separate classes. So this number isn't directly comparable.
+
+Actually, I think the 0.755 is computed as: all boxes are labeled as class "defect" (which doesn't exist in the 4-class system), so this is a different metric. Or maybe it's the mAP if you treat all 4 classes as one. Let me re-read the reference numbers.
+
+"stage-1 boxes with perfect classes (ceiling for stage 2): 0.758 mAP@0.5" - this is the 4-class mAP if you had perfect class labels on the stage-1 boxes.
+
+"stage-1 boxes scored as a single class 'defect': 0.755 mAP@0.5" - this might be a single-class mAP (all defects are one class). In that case, it's not directly comparable to the 4-class mAP.
+
+OK so the ceiling for our 4-class task is 0.758. We're at 0.6311. The gap is 0.127.
+
+Let me think about what would most likely help:
+
+1. **The classifier needs to be better at distinguishing pore and deposit** (the weak classes). 
+2. **The scoring needs to be better** - false alarms should get lower scores.
+
+Since e002 (background class) failed badly, and e004 (p²) failed, let me think about other approaches.
+
+**Idea: Use the detector confidence differently.** Currently score = conf * p[class]. What if we use conf more aggressively? Like conf^2 * p[class]? Or what if we threshold on conf?
+
+Actually, wait. Let me think about this differently. The issue might be that the classifier is not well-calibrated. When it's uncertain (which happens for background boxes), it still assigns ~0.25 to each class. So a background box with conf=0.5 gets scores of 0.125 for each class. These might compete with true detections.
+
+**Idea: Use max probability as a gate.** Score = conf * p[class] * max(p). This would suppress boxes where the classifier is uncertain (all probabilities are low, meaning it's probably background).
+
+Actually, that's similar to what p² does but applied differently. Let me think...
+
+If p = [0.25, 0.25, 0.25, 0.25] (uncertain), max(p) = 0.25.
+Score = conf * p[c] * max(p) = conf * 0.25 * 0.25 = conf * 0.0625
+
+If p = [0.7, 0.1, 0.1, 0.1] (confident), max(p) = 0.7.
+Score = conf * p[c] * max(p) = conf * 0.7 * 0.7 = conf * 0.49 for the top class.
+
+This is actually similar to p² for the top class but different for others. For the top class, it's p_top² * conf. For other classes, it's p_c * p_top * conf.
+
+Hmm, e004 tried p² and it was worse. So this might not help.
+
+**Idea: Train with focal loss.** The standard cross-entropy might not be optimal. Focal loss down-weights easy examples and focuses on hard ones. This might help the classifier be more discriminative.
+
+**Idea: Use a different backbone.** The current model is EfficientNet-B0 which is relatively small. Maybe a larger model would help. But we need to be careful about time budget.
+
+Looking at the time budget: 180 seconds total, 55 seconds reserved for prediction. So training gets about 125 seconds. The model does about 421 steps in that time. With a larger model, we'd get fewer steps but potentially better classification.
+
+Let me check: the eval has 41879 detections. With batch size 256, that's about 164 batches for evaluation. That should be fast.
+
+For training: 6052 boxes, batch size 64, that's about 94 steps per epoch. We get about 5 epochs in the time budget.
+
+If we use a larger model like efficientnet_b2, each step would be slower. Maybe 2-3x slower. So we'd get 1.5-2.5 epochs. That might not be enough.
+
+What about convnext_nano or resnet50? These might be comparable in speed.
+
+Actually, let me think about what's most impactful. The per-class APs are:
+- pore: 0.506 (very weak)
+- deposit: 0.630
+- discontinuity: 0.780 (decent)
+- stain: 0.608
+
+Pore is the weakest. The issue is that pore and deposit are confused, and stain is confused with deposit and background.
+
+**Idea: Class-specific augmentation or sampling.** Maybe oversample the weak classes (pore, stain) during training.
+
+Actually, let me reconsider the problem. The current approach:
+1. Crops are taken from true boxes (perfect boxes)
+2. Classifier is trained on these crops
+3. At inference, detector boxes (which include false alarms and misplaced boxes) are classified
+4. Score = conf * p[class]
+
+The main issues:
+1. Classifier doesn't know about background
+2. Classifier might not generalize well to detector boxes (which are slightly different from true boxes)
+3. Scoring doesn't account for the fact that some boxes are false alarms
+
+Since e002 (background class) failed, let me think about why. The problem might be:
+- Too many background examples (most detector boxes are false alarms)
+- The background class dominates and the model becomes too conservative
+- The overlap-based labeling is noisy
+
+What if instead of adding a background class, we use a different approach to handle false alarms?
+
+**Idea: Use the detector confidence as a proxy for background.** If the detector confidence is low, the box is more likely to be a false alarm. We could use this to adjust the score.
+
+But we're already using conf in the score. The issue is that conf might not be well-calibrated.
+
+**Idea: Train on detector boxes but WITHOUT a background class.** Instead, only use detector boxes that overlap with true boxes (IoU > 0.5). This way, the classifier sees the same kind of input it will see at test time (detector boxes), but only for true defects. This might improve generalization without the background problem.
+
+This is actually a good idea! The current classifier is trained on true boxes (perfect crops), but at test time it sees detector boxes (which are slightly misplaced). Training on detector boxes that are known to be true (by overlap) would make the classifier more robust to the detector's placement errors.
+
+Let me think about this more carefully:
+- Current: train on true boxes → test on detector boxes (mismatch)
+- Proposed: train on detector boxes with IoU>0.5 to true boxes → test on detector boxes (match)
+
+This should help with the "robustness to box misplacement" issue mentioned in the research brief.
+
+The implementation would be:
+1. For each train detection in dets.csv, check if it overlaps with any crop in crops.csv (IoU > 0.5)
+2. If it does, use the detection's box coordinates and the crop's class label
+3. Train the classifier on these detector boxes
+
+This is different from e001/e002 which added a background class. Here, we only use true detections (no background), but we use the detector's box coordinates instead of the true box coordinates.
+
+Let me estimate the data:
+- 6052 true boxes in crops.csv (high-res)
+- Some number of train detections in dets.csv
+- Of those, some will overlap with true boxes
+
+The number of training examples might be different from 6052. It could be more (if there are multiple detections per true box) or less (if some true boxes have no detection).
+
+This is a focused change: instead of using `crops` for training, use detector boxes that overlap with crops.
+
+Let me write the code:
+
+```python
+# Instead of:
+crops = [r for r in read_csv(os.path.join(args.data, "crops.csv")) if r["res"] in TRAIN_ON]
+
+# Use detector boxes that overlap with true crops:
+all_crops = read_csv(os.path.join(args.data, "crops.csv"))
+train_dets = [d for d in dets if d["split"] == "train"]
+train_rows = []
+for d in train_dets:
+    # Find overlapping crops
+    best_cls = -1
+    best_iou = 0
+    for c in all_crops:
+        if c["image"] != d["image"]:
+            continue
+        if c["res"] not in TRAIN_ON:
+            continue
+        # Compute IoU
+        ix1 = max(d["x1"], c["x1"])
+        iy1 = max(d["y1"], c["y1"])
+        ix2 = min(d["x2"], c["x2"])
+        iy2 = min(d["y2"], c["y2"])
+        iw = max(0, ix2 - ix1)
+        ih = max(0, iy2 - iy1)
+        inter = iw * ih
+        union = (d["x2"]-d["x1"])*(d["y2"]-d["y1"]) + (c["x2"]-c["x1"])*(c["y2"]-c["y1"]) - inter
+        iou = inter / max(union, 1e-6)
+        if iou > best_iou:
+            best_iou = iou
+            best_cls = c["cls"]
+    if best_iou > 0.5:
+        d["cls"] = best_cls
+        train_rows.append(d)
+```
+
+Wait, but this is O(n*m) where n is the number of train dets and m is the number of crops. With potentially thousands of each, this could be slow. Let me think about optimization.
+
+Actually, we can group crops by image and only check crops from the same image. That should make it fast enough.
+
+Let me also think about whether this will actually help. The hypothesis is:
+- Training on detector boxes (which have the same characteristics as test-time boxes) will make the classifier more robust to box placement errors
+- This should improve classification accuracy, especially for the weak classes (pore, deposit) where small placement errors might cause confusion
+
+This is a "data" category change - we're changing what data the model trains on.
+
+Let me also consider: should I keep the jitter? The current code has jitter for training. If we're already using detector boxes (which have their own placement errors), maybe we should reduce or remove the jitter. But let's keep it for now - it's a separate concern.
+
+Actually, I realize there might be an issue. The detector boxes might be at a different scale or position than the true boxes. The crop is taken from the box coordinates, so if the detector box is shifted, the crop will be shifted. This is exactly what we want to train on - the classifier should learn to classify defects even when the crop is slightly off.
+
+Let me also think about whether we should use both the detector box AND the true box for training. Like, for each true box, use both the true box crop and the detector box crop (if they overlap). This would give more training data and expose the model to both types of crops.
+
+Actually, let's keep it simple. Just use detector boxes that overlap with true boxes. This is a clean, focused change.
+
+Let me write the code more carefully:
+
+```python
+# Build training data from detector boxes that overlap with true crops
+all_crops = [r for r in read_csv(os.path.join(args.data, "crops.csv")) if r["res"] in TRAIN_ON]
+crops_by_image = {}
+for c in all_crops:
+    crops_by_image.setdefault(c["image"], []).append(c)
+
+train_dets = [d for d in dets if d["split"] == "train"]
+train_rows = []
+for d in train_dets:
+    cands = crops_by_image.get(d["image"], [])
+    best_cls, best_iou = -1, 0.0
+    for c in cands:
+        ix1, iy1 = max(d["x1"], c["x1"]), max(d["y1"], c["y1"])
+        ix2, iy2 = min(d["x2"], c["x2"]), min(d["y2"], c["y2"])
+        iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+        inter = iw * ih
+        union = (d["x2"]-d["x1"])*(d["y2"]-d["y1"]) + (c["x2"]-c["x1"])*(c["y2"]-c["y1"]) - inter
+        iou = inter / max(union, 1e-6)
+        if iou > best_iou:
+            best_iou, best_cls = iou, c["cls"]
+    if best_iou > 0.5:
+        d["cls"] = best_cls
+        train_rows.append(d)
+```
+
+This replaces the `crops` variable. The rest of the code should work the same since `train_rows` has the same format as `crops` (with x1, y1, x2, y2, image, cls fields).
+
+Wait, I need to check: does the dets.csv have the same fields as crops.csv? Let me look at the docstring:
+- crops.csv: id, res, image, x1, y1, x2, y2, img_w, img_h, cls
+- dets.csv: det_id, split, image, x1, y1, x2, y2, img_w, img_h, conf
+
+So dets.csv doesn't have "res" or "cls" fields. But the BoxDataset only uses "image", "x1", "y1", "x2", "y2", and "cls". So as long as I add "cls" to the det rows, it should work.
+
+The `needed` set for images should also include the train det images. Let me check:
+```python
+needed = {r["image"] for r in crops} | {d["image"] for d in ev}
+```
+If I replace `crops` with `train_rows`, I need to make sure the images from train_rows are included. Since train_rows are a subset of train dets, and the train dets are on training images (same as crops), the images should already be loaded. But to be safe, let me include them.
+
+Actually, the train dets are on training images, and the crops are also on training images. So the image sets should be the same or very similar. Let me just use train_rows in the needed set.
+
+Let me write the full change:
+
+Replace:
+```python
+    crops = [r for r in read_csv(os.path.join(args.data, "crops.csv")) if r["res"] in TRAIN_ON]
+    dets = read_csv(os.path.join(args.data, "dets.csv"))
+    ev = [d for d in dets if d["split"] == "eval"]
+    needed = {r["image"] for r in crops} | {d["image"] for d in ev}
+```
+
+With:
+```python
+    dets = read_csv(os.path.join(args.data, "dets.csv"))
+    ev = [d for d in dets if d["split"] == "eval"]
+    all_crops = [r for r in read_csv(os.path.join(args.data, "crops.csv")) if r["res"] in TRAIN_ON]
+    crops_by_img = {}
+    for c in all_crops:
+        crops_by_img.setdefault(c["image"], []).append(c)
+    train_rows = []
+    for d in [x for x in dets if x["split"] == "train"]:
+        best_cls, best_iou = -1, 0.0
+        for c in crops_by_img.get(d["image"], []):
+            ix1, iy1 = max(d["x1"], c["x1"]), max(d["y1"], c["y1"])
+            ix2, iy2 = min(d["x2"], c["x2"]), min(d["y2"], c["y2"])
+            inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+            union = (d["x2"]-d["x1"])*(d["y2"]-d["y1"]) + (c["x2"]-c["x1"])*(c["y2"]-c["y1"]) - inter
+            iou = inter / max(union, 1e-6)
+            if iou > best_iou:
+                best_iou, best_cls = iou, c["cls"]
+        if best_iou > 0.5:
+            d["cls"] = best_cls
+            train_rows.append(d)
+    crops = train_rows
+    needed = {r["image"] for r in crops} | {d["image"] for d in ev}
+```
+
+This is a clean, focused change. The hypothesis is that training on detector boxes (which match the test-time distribution) rather than true boxes will improve the classifier's robustness to box placement errors.
+
+Let me double-check the format. The `crops` variable is used in:
+1. `needed = {r["image"] for r in crops} | ...` - works with train_rows
+2. `BoxDataset(crops, images, True)` - works, BoxDataset uses r["image"], r["x1"], etc.
+3. `print(f"train {len(crops)} boxes, ...")` - works
+
+The det rows have: det_id, split, image, x1, y1, x2, y2, img_w, img_h, conf
+Plus we add: cls
+
+The BoxDataset's __getitem__ uses: r["image"], r["x1"], r["y1"], r["x2"], r["y2"], r.get("cls", -1)
+
+All of these are present in the det rows (after adding cls). Good.
+
+One concern: the number of training examples. If the detector misses some true boxes, we'll have fewer training examples than 6052. But if the detector finds multiple boxes per true box, we might have more. Either way, it should be in a reasonable range.
+
+Another concern: the IoU threshold of 0.5. This is the standard threshold for mAP@0.5. Using this means we only train on boxes that would be considered "true positives" by the mAP metric. This seems right.
+
+I think this is a good experiment. Let me finalize it.
+
+Actually, wait. I should also consider: the current code loads images for `needed` which includes crop images and eval images. If I change `crops` to `train_rows`, the images needed might be slightly different (train det images vs crop images). But since train dets are on training images (same as crops), this should be fine.
+
+Let me also make sure the print statement makes sense. It says "train {len(crops)} boxes" which will now show the number of detector boxes used for training. That's fine.
+
+I'm confident in this change. Let me write it up.

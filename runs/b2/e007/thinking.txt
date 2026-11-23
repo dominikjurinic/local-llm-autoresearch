@@ -1,0 +1,275 @@
+===== attempt 1 =====
+Let me carefully review the situation.
+
+Current best: e000, 5-seed validation mAP@0.5 is 0.6288. Baseline to beat (one-step 4-class detector): 0.638. So we're still below the baseline. Upper bound is 0.758.
+
+Per-class AP: pore 0.496, deposit 0.629, discontinuity 0.780, stain 0.609.
+
+Experiments so far:
+- e001 (data): adding low-res training boxes → 0.6246, rejected.
+- e002 (architecture): larger backbone → 0.6234, rejected.
+- e003 (data): IMG_SIZE 224 → 0.6197, rejected.
+- e004 (data): train on detector boxes (domain adaptation) → 0.6277, rejected (close but not confirmed).
+- e005 (scoring): some kind of score change → 0.6049, rejected.
+- e006 (scoring): sharpening probabilities → 0.5994, rejected.
+
+Lessons: the data category is flagged as EXHAUSTED (3 ideas, no new best). Architecture has 1 idea. Scoring has 2 ideas.
+
+Wait — but the data category has 3 ideas: e001 (low-res boxes), e003 (IMG_SIZE 224), e004 (training on detector boxes). All rejected. So "data" is exhausted.
+
+What hasn't been tried yet?
+- augmentation
+- loss
+- sampling
+- optimisation
+- inference (test-time augmentation)
+- other
+
+Let me think about where the error is.
+
+Key numbers:
+- One-step 4-class detector: 0.638 (the baseline to beat)
+- Stage-1 boxes with perfect classes: 0.758
+- Stage-1 boxes scored as a single class: 0.755
+- Current: 0.6288
+
+So the gap to the upper bound is ~0.13. The classifier's macro-F1 on perfect boxes is ~0.87. Pore and deposit are weak; stain is confused with deposit.
+
+Per-class AP: pore 0.496 (weakest), deposit 0.629, stain 0.609, discontinuity 0.780.
+
+Hmm. What's interesting: the class-agnostic ceiling (0.755) is nearly equal to the perfect-class ceiling (0.758). So the boxes are good; the issue is class assignment.
+
+Now, mAP@0.5 is computed per class. For each class, predictions are sorted by score; a hit is when it overlaps an unmatched true box of that class.
+
+Key insight from e006: emitting every box in all 4 classes hurts. Because a box the classifier assigns to class c still emits rows for the other 3 classes, which become false positives for those classes and hurt their AP. Wait, but actually the score of the wrong-class rows is conf * p_wrong, which is low, so they rank low. But they still count as false positives for those classes when they're reached. Actually, in mAP, false positives for a class hurt that class's AP. Since we emit all 4 classes for each box, every box is a potential FP for 3 classes.
+
+Hmm, but e006 tried to concentrate the score in the top class (sharpening), which should reduce the wrong-class rows' scores. That made it worse (0.5994). Why? Because sharpening also changed the ordering within the correct class? No wait — sharpening is monotone per box but not across boxes. Actually, sharpening changes relative ordering of boxes within a class. Hmm.
+
+Actually wait. Let me reconsider. The metric: "AP depends only on this ORDER. Any change that keeps the order of a class's predictions (for example multiplying all its scores by a constant, or a monotone function of the score) leaves its AP unchanged."
+
+So for a fixed class c, the order of predictions of class c is what matters. In the current scheme, the score for class c of box b is conf_b * p_c(b). The order of class-c predictions is by conf_b * p_c(b).
+
+If I apply a monotone function to the whole score vector, per class the order is preserved only if the function is applied... no. Sharpening: new score = conf_b * (p_c(b)^T / sum). This is NOT a monotone function of the old score conf_b * p_c(b), because the normalization sum depends on the box. So it changes the order within class c. That's why it could hurt.
+
+Actually, the key realization: for class c, what determines the order is conf_b * p_c(b). The p_c(b) is the classifier's probability for class c. If I only want to change which class a box is "assigned" to (to reduce cross-class FPs), I should not change the within-class ordering.
+
+Let me think about the fundamental issue differently.
+
+The problem: we emit 4 rows per box. For class c, the predictions are all boxes, scored by conf_b * p_c(b). A box b is a true positive for class c if the box overlaps a true defect of class c. 
+
+The AP for class c depends on the ranking of boxes by conf_b * p_c(b), and which of those boxes are TPs for class c.
+
+Now, the classifier assigns each box a "best" class argmax p. If the classifier is right, then for the correct class c*, p_c* is high, so the box ranks high for class c* (good, it's a TP there) and low for other classes (good, it's an FP there but ranks low). 
+
+The damage: when the classifier is wrong (assigns box to class c' but true class is c*), then:
+- For class c' (predicted): the box ranks high (p_c' high) but it's an FP for c' → hurts c'.
+- For class c* (true): the box ranks low (p_c* low) → it's a TP but ranks low, so it may not be counted before the AP is computed → hurts c*.
+
+So the class-confusion damage is symmetric: hurts both the predicted class (FP) and the true class (demoted TP).
+
+Now, the key question: how do we reduce this? The classifier F1 is 0.87, meaning 13% of boxes are misclassified (roughly). To improve, we need a better classifier, OR a smarter scoring that's robust to misclassification.
+
+Idea: what if we only emit the top-1 class per box (not all 4)? Then:
+- For the predicted class c', the box is emitted with score conf_b * p_c'(b) (or just conf_b).
+- For other classes, the box is not emitted → no FP for those classes.
+- But for the true class c*, if c' != c*, the box is not emitted at all → we lose the TP entirely for c*.
+
+Hmm, that's a tradeoff. Currently we emit all 4, so the TP for c* is present but ranked low. If we emit only top-1, the TP for c* is absent. Which is better?
+
+Actually, emitting all 4 classes means: every true defect box is present in its true class (ranked by conf * p_true). So we never "miss" a TP due to class assignment — it's always there, just possibly ranked low. The FPs come from boxes being present in wrong classes.
+
+If we emit only top-1: we eliminate the cross-class FPs, but we also eliminate the TPs for misclassified boxes in their true class. 
+
+Given the classifier is 87% accurate, top-1 emission would:
+- Keep 87% of TPs (the correctly classified ones), at full rank.
+- Lose 13% of TPs (misclassified ones).
+- Eliminate most cross-class FPs.
+
+Hmm, hard to say a priori. But e005 and e006 both tried scoring changes and both got worse. e005 was "score = conf * p_c is noisy, demotes true boxes" — I don't know exactly what it did but it got 0.6049. e006 sharpened and got 0.5994.
+
+Wait, the lessons say scoring has 2 ideas, both rejected. Is scoring exhausted? The rule says "A direction where three or more attempts gave no confirmed gain is exhausted." Scoring has only 2 attempts, so not formally exhausted, but 2 failures is a sign. The guidance: "after two failed follow-ups, switch to a different part of the problem."
+
+So maybe I should switch away from scoring. But wait — the two scoring attempts were both about the score function (sharpening, reweighting). A fundamentally different scoring idea is "emit only top-1 class per box" (or top-k). That changes WHICH rows exist, not just their scores. That's a different kind of change. Actually it's still "scoring" category but fundamentally different: it's about row selection, not score transformation.
+
+Hmm, but let me reconsider. Actually, let me reconsider the whole thing.
+
+Let me reconsider what's most likely to help. The per-class AP: pore 0.496 is the weakest. Pore is a fine-grained texture. e003 tried increasing IMG_SIZE to 224 and it got worse (0.6197). e001 adding low-res boxes worse. e004 training on detector boxes close (0.6277) but not confirmed.
+
+Let me think about augmentation. The current augmentation: geometric jitter (center shift ±10%, scale 0.85-1.2), horizontal/vertical flip, brightness 0.8-1.2. That's it. No color jitter, no crop jitter, no random erasing, etc.
+
+For pore detection (small holes), color/contrast augmentation might help. But e003 (higher res) hurt, suggesting the issue isn't purely resolution.
+
+Let me think about the loss. Current: CrossEntropyLoss, unweighted. The lesson says "Class-weighted loss hurt classification every time it was tried." So class weighting is out. But other loss changes? Label smoothing? Focal loss? 
+
+Actually, the lesson about class-weighted loss hurting — that was "in earlier experiments" (before this history, presumably). So loss category: class weighting tried and hurt. But focal loss or label smoothing are different.
+
+Hmm, but the guidance says "Tuning hyperparameters alone helped little in earlier experiments; changes of method helped more."
+
+Let me think about what's fundamentally different and likely to matter.
+
+Let me reconsider the error decomposition. We're at 0.6288. The one-step baseline is 0.638. The class-agnostic is 0.755. So if we had perfect class-agnostic boxes but our class assignment, we'd be at... well, we're at 0.6288 which is below even the one-step 0.638.
+
+Wait, that's important. Our two-stage system (0.6288) is BELOW the one-step detector (0.638). And the class-agnostic version of our stage-1 boxes is 0.755. So our stage-1 boxes are actually BETTER than the one-step detector's boxes (0.755 > 0.638 as class-agnostic). But our class assignment is so bad that we drop to 0.6288.
+
+So the class assignment is costing us 0.755 - 0.6288 = 0.126. That's a huge cost. The classifier F1 is 0.87 but the mAP cost is 0.126.
+
+So the #1 priority is clearly class assignment quality. Everything points to: improve the classifier, especially for pore and the stain/deposit confusion.
+
+Now, what improves classification? The classifier is a crop classifier. It gets a tight crop (1.5x) and wide crop (2.5x) of the box, averaged logits through EfficientNet-B0.
+
+Ideas to improve classification:
+1. Better backbone (e002 tried, rejected).
+2. Higher resolution (e003 tried, rejected).
+3. More training data (e001 tried, rejected).
+4. Train on detector boxes (e004, close but rejected).
+5. Better augmentation (not tried).
+6. Better loss (class weighting tried and hurt; focal/label-smoothing not tried).
+7. Better input representation — e.g., add a third view, or a different context scale, or the raw box crop at native resolution without resize, or multi-scale.
+8. Test-time augmentation (not tried).
+9. Ensembling (not tried).
+10. Training strategy: longer training, different LR schedule, etc. (optimisation).
+
+Let me think about which is most likely to gain ≥0.01.
+
+The classifier is trained for ~5 epochs, 435 steps. Loss goes 0.756 → 0.220. Is it undertrained? The budget is ~180s, reserve 55s, so ~125s for training = 5 epochs. Each epoch ~94 steps. The loss is still decreasing (0.2436 → 0.2204 from epoch 3 to 4). So maybe more training would help? But the budget is fixed at 180s. To train more, we'd need to speed up training (smaller batch? no, that's more steps... actually smaller batch = more steps but more overhead; larger batch = fewer steps). Or reduce the number of views, or reduce resolution.
+
+Hmm, actually the training is time-limited, not epoch-limited. It trains until deadline - RESERVE_S. So it already uses all available training time. The question is whether 435 steps is enough. The loss is still decreasing slowly. More steps might help but we're time-limited.
+
+Wait, but actually — is the model undertrained or overtrained? With 6052 boxes and 435 steps * 64 batch = 27840 samples seen = ~4.6 epochs. Loss 0.22. For a 4-class problem with 87% F1, 0.22 loss seems reasonable. Hard to say if more training helps.
+
+Let me think about test-time augmentation (TTA). At inference, we could average over flips (the model was trained with flips, so it should be flip-invariant-ish). TTA: predict on original, hflip, vflip, both, average the probabilities. This is a pure inference change, doesn't affect training. It should improve the probability estimates, especially for the weak classes. 
+
+Budget check: prediction currently takes... total 163s, training ends at ~125s (5 epochs, last at 125s), so prediction + writing ~38s. Wait, RESERVE_S is 55s but prediction only took ~38s? Let me recompute. t_start after loading (13s). deadline = T0 + 180. t_end = deadline - 55 = T0 + 125. So training runs until T0+125. Log shows epoch 4 done at 125s, then "done ... 163s total". So prediction took 163-125 = 38s. So we have ~17s of slack (55 reserve - 38 used). 
+
+If I do 4x TTA (original + 3 flips), prediction time roughly 4x = 152s, total = 125 + 152 = 277s > 180s. Way over budget! So 4x TTA doesn't fit.
+
+What about 2x TTA (original + hflip)? Prediction ~2x = 76s, total = 125 + 76 = 201s > 180. Still over.
+
+Hmm. So TTA is expensive because prediction is already 38s for a single pass over 41879 detections. Wait, 41879 detections, batch 256, that's ~164 batches, each 2 forward passes (tight + wide). Actually the model does 2 forward passes per sample (xt and xw). So it's like 2 * 41879 = 83758 forward passes. 38s for that.
+
+To fit TTA, I'd need to reduce training time or prediction cost. 
+
+Alternative: reduce the reserve and training to make room for TTA. But training is already using all time up to t_end. If I lower RESERVE_S, I get more training time but less prediction reserve. That's the wrong tradeoff for TTA.
+
+Actually, for TTA I want MORE prediction time, not less. So I'd reduce training (raise RESERVE_S) and add TTA. E.g., RESERVE_S = 100, training until T0+80 (~4 epochs?), prediction 4x TTA. Let me estimate. Training 80s: from log, 5 epochs = 125s including 13s load... wait no. Let me recompute. Load 13s. Then training from ~13s to 125s = 112s for 5 epochs ≈ 22.4s/epoch. If training budget is 80s (T0+80), that's (80-13)/22.4 ≈ 3 epochs. Then prediction with 4x TTA: 38s * 4 = 152s. Total = 80 + 152 = 232s > 180. Still over.
+
+Hmm, the prediction is just too expensive for 4x TTA. Even 2x TTA: training 80s + prediction 76s = 156s < 180. That fits! With margin. Let me double check: if RESERVE_S = 76 (reserve for 2x prediction), training until T0 + (180-76) = T0+104. Training from 13s to 104s = 91s ≈ 4 epochs. Prediction 2x = 76s. Total = 104 + 76 = 180s. Exactly at budget, no margin. Risky.
+
+Let me be more careful. Actually the reserve should account for prediction + writing + safety. Let me set RESERVE_S such that training ends earlier, leaving room for 2x TTA + margin.
+
+Actually, let me reconsider. Is 2x TTA (original + hflip) enough to matter? The model is trained with random hflip and vflip, so it should already be somewhat invariant. TTA averaging over hflip would help if the model isn't perfectly flip-invariant. The gain might be modest. And it costs training time (fewer epochs). Tradeoff unclear.
+
+Let me think about a cheaper, higher-impact idea.
+
+Alternative: reduce the number of forward passes at inference. Currently 2 views (tight + wide), each a forward pass. What if the wide view is not very useful? But that's a method change that could hurt.
+
+Let me step back and think about the augmentation angle, which is untried and cheap.
+
+Current training augmentation: center jitter ±10%, scale 0.85-1.2, hflip 50%, vflip 50%, brightness 0.8-1.2. 
+
+What's missing that could help pore/stain/deposit discrimination?
+- Color jitter (contrast, saturation, hue): weld images might have color variation. Pore vs stain might be separable by color/contrast.
+- Random erasing: robustness.
+- More aggressive crop/scale jitter: the detector boxes are misplaced, so training with more position/scale jitter would make the classifier robust to box misplacement. This directly addresses the train/test mismatch (e004 tried to address it by training on detector boxes, got close but not confirmed).
+
+Actually, e004 (train on detector boxes) got 0.6277, very close to best 0.6288 but not confirmed (within noise). So that direction (mismatch) is "close but not confirmed." More jitter is a related but different idea — instead of changing the training boxes, change the jitter to mimic detector box errors.
+
+Hmm, but is more jitter likely to gain ≥0.01? The classifier already has ±10% center jitter and 0.85-1.2 scale. Detector box misplacement might be larger than that. Let me think... Actually I don't know the magnitude of detector box error. 
+
+Let me reconsider. The strongest signal is: class assignment costs 0.126 mAP. The classifier F1 is 0.87. To gain 0.01 mAP, I need to meaningfully improve classification.
+
+Let me think about what a crop classifier for weld defects needs. Pore = small holes (texture). Deposit = extra material. Discontinuity = gap. Stain = discoloration. These are subtle. The classifier sees a 160x160 crop.
+
+One thing: the classifier uses the SAME backbone for both views and averages logits. What if instead we concatenate or use a better fusion? That's architecture-ish (e002 tried bigger backbone, rejected). 
+
+Let me think about the input more. The tight crop is 1.5x the box's long side, wide is 2.5x. For pore (small holes), the tight crop captures the hole detail. For context (is this a defect or background), the wide crop helps. 
+
+What about adding the box's own tight crop at higher effective resolution? e003 tried IMG_SIZE 224 (bigger resize) and it hurt. So resolution isn't the issue.
+
+Hmm, what about the fact that we resize the crop to a fixed 160x160? For a pore (small hole), the hole might be a few pixels. Resizing to 160 preserves relative detail. For a large deposit, resizing to 160 compresses it. This scale normalization is actually good for a classifier (scale-invariant). So that's fine.
+
+Let me reconsider TTA more carefully, because it's a clean method change that directly improves the probability estimates (the thing that's costing us 0.126).
+
+Actually, here's a cleaner TTA idea that's cheaper: instead of full TTA at inference, we could train with MORE augmentation and rely on that. But that's the augmentation category.
+
+Let me think about the cleanest high-impact untried experiment.
+
+Option A: Test-time augmentation with horizontal flip (2x). 
+- Targets: class assignment quality (the 0.126 cost).
+- Why it helps: averaging predictions over flips reduces variance and exploits the flip-invariance the model learned, giving better-calibrated probabilities, especially for weak classes.
+- Risk: costs ~30s training time (fewer epochs). Net effect unclear but TTA usually helps 0.005-0.02 for classifiers.
+- Budget: need to verify it fits.
+
+Option B: Stronger geometric jitter in training (mimic detector box misplacement).
+- Targets: train/test mismatch + class assignment.
+- Related to e004 (close but not confirmed). Different mechanism (jitter vs box source).
+- Risk: might not gain ≥0.01.
+
+Option C: Add color/contrast augmentation.
+- Targets: robustness, possibly pore/stain discrimination.
+- Unclear gain.
+
+Option D: Focal loss or label smoothing.
+- Class weighting hurt, but focal/label-smoothing are different.
+- Unclear, and "tuning hyperparameters helped little."
+
+Option E: Ensemble two models trained with different seeds/augmentations.
+- Would improve classification but doubles training time → doesn't fit budget.
+
+Let me reconsider the budget for TTA more precisely, because it's the most principled target (directly attacks the 0.126 class-assignment cost).
+
+Current timing:
+- Load: 13s
+- Training: 13s → 125s (112s), 5 epochs, 435 steps
+- Prediction + write: 125s → 163s (38s)
+- Total: 163s, budget 180s, slack 17s.
+
+For 2x TTA (original + hflip), prediction doubles to ~76s. To fit within 180s with margin, training must end by ~180 - 76 - 10(margin) = 94s. So RESERVE_S ≈ 86 (180 - 94). Let me set RESERVE_S = 90. Then training ends at T0 + 90. Training time = 90 - 13 = 77s ≈ 3.4 epochs. Prediction 2x = 76s. Total = 90 + 76 = 166s < 180. Margin 14s. OK.
+
+But wait, does reducing training from 5 to ~3.4 epochs hurt more than TTA helps? The loss at epoch 3 was 0.2436, epoch 4 was 0.2204. So going from 5 to 3.4 epochs means the model is a bit less trained. That could cost some mAP. The tradeoff is real.
+
+Hmm. This is the classic exploitation vs the cost. Let me think if there's a way to get TTA without losing training time.
+
+Idea: make prediction cheaper so TTA fits without cutting training. The prediction does 2 forward passes per sample (tight + wide). What if I reduce the eval batch overhead or... no.
+
+Alternative: Do TTA only via the training-time augmentation being stronger, so the model is more robust, and skip TTA at inference. That's the augmentation route.
+
+Actually, let me reconsider. Maybe the cleanest high-value experiment is to improve the classifier's robustness to box misplacement via stronger jitter, because:
+1. It's untried (augmentation category, 0 experiments).
+2. It directly addresses a known issue (train on GT boxes, test on detector boxes).
+3. e004 (the box-source version) was close (0.6277), suggesting this is a real axis but the specific fix didn't quite work; stronger jitter is a different, cheaper fix that doesn't require relabeling.
+4. It's cheap (no extra forward passes, no budget change).
+
+But will it gain ≥0.01? The current jitter is ±10% center, 0.85-1.2 scale. If detector boxes are off by, say, 15-20% in position and 20-30% in scale, then current jitter under-covers. Increasing to ±20% center and 0.7-1.4 scale would cover more. This is plausible to help the weak classes (pore especially, since a misplaced pore crop might show background).
+
+Hmm, but I'm not confident about the magnitude of detector box error. Let me think about what I can infer. The class-agnostic mAP of stage-1 boxes is 0.755, and with perfect classes 0.758. These are high, meaning the boxes mostly overlap true defects (IoU>0.5). So the boxes are reasonably placed — IoU>0.5 means decent overlap. So misplacement is moderate, not huge.
+
+Actually, if boxes have IoU>0.5 with true defects, the misplacement is bounded. A crop at 1.5x the box would still contain the defect mostly. So maybe box misplacement isn't the main issue.
+
+Let me reconsider. The main issue is class confusion: pore/deposit/stain. That's a texture/appearance discrimination problem, not a placement problem. So augmentation for placement (jitter) might not be the main lever. Augmentation for appearance (color, contrast, brightness) might be more relevant.
+
+Current brightness jitter is 0.8-1.2. Adding contrast and saturation jitter would expose the model to more appearance variation, potentially improving discrimination. But would it help pore vs stain? Pore is holes (dark spots), stain is discoloration. Contrast jitter might help separate them.
+
+Hmm, I'm going back and forth. Let me think about the single most defensible experiment.
+
+Actually, let me reconsider the TTA idea but make it fit the budget better. What if I do TTA with just the horizontal flip, AND reduce the number of training steps slightly, but the key is that TTA is a well-known reliable gain for classification. 
+
+Actually, wait. Let me reconsider whether the model benefits from TTA. The model is trained with random hflip and vflip at 50% each. So during training, the model sees both orientations. At inference, the model's prediction on the original image should already "know" the flip-invariant features. TTA averaging over flips would help only if the model's features aren't perfectly symmetric. In practice, TTA gives a small but reliable gain (0.003-0.01) for such models. Given seed noise is ±0.005, a 0.005 TTA gain might not be confirmable. Risky.
+
+Let me think bigger. What's the biggest lever?
+
+The class-assignment cost is 0.126. The classifier F1 is 0.87. If I could push F1 from 0.87 to 0.92, that might recover a good chunk. What pushes F1 up?
+
+Key: pore is weak (AP 0.496). Pore is a texture class. The classifier might be struggling with pore because pores are small and look like noise/stain. 
+
+Idea: What if the classifier should see the box at its NATIVE resolution for pore, i.e., not downscale large crops? But e003 (bigger IMG_SIZE) hurt. 
+
+Idea: What about giving the classifier the box crop AND a crop of the surrounding region at a fixed scale, to distinguish "is this a real defect or background"? The wide crop (2.5x) does some of this. 
+
+Idea: Multi-crop at multiple scales and let the model learn. That's more forward passes (budget issue).
+
+Let me reconsider the ensemble idea but make it fit. What if I train ONE model but with a larger effective dataset via stronger augmentation, effectively an "implicit ensemble"? That's the augmentation route again.
+
+OK here's another angle. Let me reconsider the loss. Current: plain CrossEntropy. The lesson says class-weighted loss hurt. But what about label smoothing? Label smoothing (e.g., 0.1) is known to improve generalization and calibration. It's a small, cheap change. But "tuning hyperparameters helped little." Label smoothing is borderline hyperparameter. Risk it's within noise.
+
+What about focal loss? Focal loss down-weights easy examples, focusing on hard ones (the confused pore/stain/deposit). This could help the weak classes. It's a method change to the loss, not a hyperparameter tweak per se. But it's also "loss" category which hasn't been tried in this history (only class-weighting in "earlier experiments"). FThinking budget reached. Stop thinking now and write the reply in the required format.

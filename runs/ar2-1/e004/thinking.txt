@@ -1,0 +1,180 @@
+===== attempt 1 =====
+Let me analyze the situation:
+
+1. Current best (e000): 0.6280 mAP@0.5, using EfficientNet-B0 with two-crop input
+2. e001 (background class): 0.5512 - rejected (worse)
+3. e002 (low-res crops): 0.6209 - rejected (slightly worse)
+4. e003 (ConvNeXt-Nano): 0.3721 - suspicious bug
+
+Looking at e003, the loss starts at 1.31 and only gets to 0.79 after 8 epochs, while EfficientNet-B0 starts at 0.76 and gets to 0.22 after 5 epochs. The loss is much higher and converges much slower. This suggests the model isn't training well - possibly the learning rate is too high for ConvNeXt, or the model needs more epochs, or there's some other issue.
+
+Actually, looking more carefully: ConvNeXt-Nano is a larger model than EfficientNet-B0. The loss of 1.31 vs 0.76 at start suggests the initial random weights are different, but the key issue is convergence. With the same LR of 1e-3 and AdamW, ConvNeXt might need a lower LR or more training. The fact that it only reaches 0.79 loss after 698 steps vs EfficientNet reaching 0.22 after 398 steps suggests the model is undertrained.
+
+But wait - the harness says this is "suspicious (likely bug)". Let me think about what could be wrong. The only change was MODEL = "convnext_nano". The model architecture is different but the interface should be the same (timm.create_model with num_classes=4). 
+
+Actually, I think the issue might be that ConvNeXt-Nano is simply slower per step (larger model) so it gets fewer steps in the same time budget, AND it needs more steps to converge. The loss is still decreasing (0.79 at the end), suggesting it's undertrained. This isn't really a "bug" per se, but the model just needs more training or a different LR schedule.
+
+Let me think about what would be a good next experiment. The instructions say "One idea per turn, with a short testable hypothesis."
+
+Options:
+1. Fix ConvNeXt-Nano by lowering LR (e.g., 3e-4) - but this is still architecture category and the model is just slower
+2. Try a different approach to scoring - e.g., use the detector confidence differently
+3. Try test-time augmentation (TTA) - flip both directions and average
+4. Try a different scoring formula - e.g., score = conf^a * prob^b for some exponents
+5. Try training on both high and low res (e002 was close but rejected)
+6. Try a different model that's faster per step but better than EfficientNet-B0
+
+Actually, let me reconsider. The per-class APs are: pore 0.494, deposit 0.629, discontinuity 0.780, stain 0.610. Pore and stain are the weak classes.
+
+Let me think about what could help most:
+- The scoring formula is `score = conf * prob[c]`. This is a simple product. Maybe we could use `conf^a * prob^b` with different exponents.
+- Test-time augmentation: flip horizontally and vertically, average predictions. This is free at inference time.
+- The model is trained on perfect boxes. Maybe adding jitter during training (which is already done) isn't enough.
+
+Actually, let me look at the scoring more carefully. The score is `d["conf"] * float(p[c])`. The detector confidence is the same for all 4 classes of a given box. So the ranking within a box is determined purely by the classifier probabilities. The ranking across boxes is determined by conf * prob.
+
+One idea: instead of `conf * prob`, use `conf^alpha * prob` where alpha < 1 to be less aggressive in suppressing low-confidence boxes, or alpha > 1 to be more aggressive. Or use `conf * prob^beta` where beta > 1 to sharpen the class probabilities.
+
+Actually, a more impactful change might be test-time augmentation. At inference time, we can:
+1. Predict on the original crop
+2. Predict on the horizontally flipped crop
+3. Predict on the vertically flipped crop
+4. Average the probabilities
+
+This effectively doubles the number of forward passes at inference but gives more robust predictions. Since we have 55s reserve and the model is fast, this should be feasible.
+
+Wait, let me check the time budget. The current run takes 165s out of 180s. The inference part is about 40s (165-125=40s for inference+writing). If I do 2x TTA (hflip + original), that would double inference time to ~80s, making total ~205s which exceeds 180s. So I need to be careful.
+
+Actually, let me recalculate. Training takes about 125s. Inference takes about 40s. Total 165s. With 2x TTA, inference would be ~80s, total ~205s. That's over budget.
+
+But wait, I could reduce the reserve or the training time. Or I could use a smaller/faster model. Or I could do TTA only on the tight crop (not the wide one), which would be 1.5x instead of 2x.
+
+Actually, let me think differently. What about a scoring change? The hypothesis would be: "Using a sharpened probability (prob^1.5) in the score will improve ranking by making the model more decisive about which class it is, reducing the impact of uncertain predictions on mAP."
+
+Or better: what about using `score = conf * max(0, prob[c] - prob_bg)` where prob_bg is the minimum probability? No, that doesn't make sense.
+
+Let me think about what's most likely to help given the constraints:
+
+1. The model is undertrained (loss still decreasing). But this is inherent to the time budget.
+2. Pore (0.494) and stain (0.610) are weak. 
+3. The scoring is simple: conf * prob.
+
+I think a good experiment would be test-time augmentation with just horizontal flip (2x inference). Let me check if it fits in the time budget.
+
+Current timing:
+- Loading: 14s
+- Training: ~111s (125-14)
+- Inference + writing: ~40s (165-125)
+- Total: 165s out of 180s
+
+With 2x TTA on inference:
+- Loading: 14s
+- Training: ~111s
+- Inference + writing: ~80s (doubled)
+- Total: ~205s - TOO MUCH
+
+So I need to either:
+- Reduce training time (fewer epochs, smaller batch, etc.)
+- Use a faster model
+- Only do TTA on one of the two crops
+
+Alternative: reduce RESERVE_S from 55 to 30, and use the saved time for TTA. But that's risky.
+
+Actually, wait. Let me re-read the timing. The log shows:
+- Loading: 14s
+- Training ends at 125s (epoch 4)
+- Done at 165s
+
+So training is 125-14 = 111s, inference is 165-125 = 40s.
+
+If I do 2x TTA, inference becomes ~80s, total = 14 + 111 + 80 = 205s. Over budget.
+
+What if I reduce RESERVE_S to 20 (from 55)? Then training gets more time but I need to make sure inference fits. Actually RESERVE_S is the time kept free for prediction. If I set it to 30, training would use until deadline-30, leaving 30s for inference. But inference currently takes 40s, so 30s isn't enough.
+
+Hmm, let me think of another approach. What about reducing the number of eval predictions? Currently it writes 53150 rows (41879 boxes * ~1.27 rows per box on average, since some are below MIN_SCORE). If I increase MIN_SCORE, fewer rows are written but that shouldn't affect timing much since the forward pass is the bottleneck.
+
+OK, let me think of a different experiment that doesn't require 2x inference time.
+
+What about a scoring change? Currently: `score = conf * prob[c]`. 
+
+Idea: Use `score = conf * prob[c] * (1 - mean_prob)` where mean_prob is the average probability across classes. This would suppress boxes where the model is uncertain (all probabilities are similar) and boost boxes where it's confident about one class. But this is equivalent to `conf * (prob[c] - 0.25)` which could go negative...
+
+Better idea: `score = conf * (prob[c] - 1/4)` clipped to 0. This rewards decisiveness.
+
+Or: `score = conf^0.5 * prob[c]` - this makes the detector confidence matter less (since it's the same for all classes of a box, it mainly affects cross-box ranking).
+
+Actually, the most impactful change might be to the training data. Let me reconsider e002 (low-res crops). It scored 0.6209 vs 0.6280. Very close. The issue might be that low-res crops are noisier and hurt more than they help.
+
+What about a different approach: use the detector's training boxes (dets.csv train) as ADDITIONAL training data, labeling them by IoU with crops.csv, but WITHOUT adding a background class (just ignore boxes that don't match any crop). This gives the model more examples of real defects at the positions the detector actually finds, without the confusion of background.
+
+Wait, e001 tried adding background and it was worse (0.5512). But that included a background class which might have confused the model. What if I just use the matched detector boxes (no background) as additional training data? This would give the model exposure to the actual box positions/sizes the detector produces, improving robustness to misplacement.
+
+Let me go with this: Use detector boxes from dets.csv (train split) that overlap with true crops as additional training examples. This teaches the model to classify defects at the positions and sizes the detector actually produces, improving robustness to box misplacement.
+
+Actually, let me reconsider. The current model already has jitter (10% center shift, 15% size variation). The detector boxes might be more misaligned than this jitter. Using actual detector boxes would teach the model to handle the real distribution of misalignments.
+
+But wait - how many detector boxes in the train split actually overlap with true crops? Let me think... The detector has 41879 eval boxes. The train split would have a similar number. Of those, maybe 60-70% overlap with true defects. That's a lot of additional training data.
+
+Let me design this experiment:
+1. Load dets.csv train split
+2. For each detector box, compute IoU with all crops in the same image
+3. If max IoU > 0.5 (or some threshold), label the detector box with that crop's class
+4. Add these labeled detector boxes to the training set
+5. Train as before (no background class)
+
+This should help because:
+- The model sees defects at the actual positions/sizes the detector finds
+- More training data (potentially 2-3x)
+- The model learns to be robust to the specific misalignment patterns of the detector
+
+Let me write this up. I'll use IoU > 0.3 as the matching threshold (slightly more lenient than 0.5 to include partially overlapping boxes).
+
+Actually, I need to be careful. The detector boxes in dets.csv train are on the same images as crops.csv. I need to match them by image and compute IoU.
+
+Let me write the code:
+
+```python
+def compute_iou(b1, b2):
+    x1 = max(b1["x1"], b2["x1"])
+    y1 = max(b1["y1"], b2["y1"])
+    x2 = min(b1["x2"], b2["x2"])
+    y2 = min(b1["y2"], b2["y2"])
+    inter = max(0, x2 - x1) * max(0, y2 - y1)
+    area1 = (b1["x2"] - b1["x1"]) * (b1["y2"] - b1["y1"])
+    area2 = (b2["x2"] - b2["x1"]) * (b2["y2"] - b2["y1"])
+    union = area1 + area2 - inter
+    return inter / max(union, 1e-6)
+```
+
+Then for each train det, find the best matching crop and use its class.
+
+Let me write the full experiment. I'll base it on e000 (the best).
+
+The key changes:
+1. Load dets.csv train split
+2. Match each det to a crop by IoU (threshold 0.3)
+3. Add matched dets to training set
+4. Train as before
+
+This is a "data" category change.
+
+Let me write the SEARCH/REPLACE blocks carefully.
+
+Looking at the current code, after loading crops and dets:
+```python
+    crops = [r for r in read_csv(os.path.join(args.data, "crops.csv")) if r["res"] in TRAIN_ON]
+    dets = read_csv(os.path.join(args.data, "dets.csv"))
+    ev = [d for d in dets if d["split"] == "eval"]
+```
+
+I need to add code to match train dets to crops and add them to the training set. Let me insert after the `ev = ...` line.
+
+Actually, I realize I should think about whether this will actually help or hurt. The concern is:
+- If the detector boxes are very different from the true boxes (different size, position), the crops will look different and the model might learn to classify "shifted" defects differently
+- But that's exactly what we want - robustness to the detector's specific errors
+
+The risk is that some detector boxes might match the wrong crop (if two defects are close). Using IoU > 0.3 should mitigate this.
+
+Let me also think about the time impact. More training data means more steps per epoch, but the total time is bounded by the deadline. The model will just see more data in the same time. This should be fine.
+
+Let me write the experiment.

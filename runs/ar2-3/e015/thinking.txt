@@ -1,0 +1,570 @@
+===== attempt 1 =====
+Let me analyze the situation carefully.
+
+Current best: e013 with 5-seed mean 0.6314 mAP@0.5
+- Per-class AP: pore 0.507, deposit 0.629, discontinuity 0.781, stain 0.609
+- The baseline to beat is 0.638 mAP@0.5 (one-step 4-class detector)
+- The ceiling (stage-1 boxes with perfect classes) is 0.758 mAP@0.5
+- Stage-1 boxes scored as single class 'defect': 0.755 mAP@0.5
+
+Key observations:
+1. The current score (0.6314) is close to but below the one-step baseline (0.638). We need to beat 0.638.
+2. The ceiling is 0.758, so there's significant room for improvement.
+3. Pore (0.507) and stain (0.609) are the weak classes.
+4. The brief mentions that "several rows per box (one per class) are allowed and often help" - and e014 (top-1 only) was rejected at 0.5916, confirming that multiple rows help.
+5. Training on detector boxes with background class (e002) was rejected at 0.5172.
+6. Training on detector boxes without background (e005) was rejected at 0.6248.
+7. e013 (TTA with h-flip) is the current best at 0.6314.
+
+Let me think about what ideas haven't been tried yet:
+
+From the "Ideas that are in scope":
+- train the classifier on detector boxes from the training images (dets.csv split "train"), labelled by overlap with the true boxes in crops.csv, including a "background" class for false alarms - tried in e002 (with background, failed at 0.5172) and e005 (without background, 0.6248)
+- combine detector conf and classifier probabilities differently (powers, background probability, ...) - tried e004 (p²), e008 (max(p) multiplier)
+- robustness to box misplacement (jitter matching the detector's errors) - tried e011 (larger jitter, 0.6356 seed-0 but not confirmed)
+- use of low-res training crops, test-time augmentation, ensembling within the time budget - e003 (low-res, 0.6251), e013 (TTA h-flip, current best)
+- architecture changes using the pretrained backbones listed below - e006 (ConvNeXt-Nano, crashed/bug)
+
+What hasn't been tried:
+1. Ensembling - using time budget to train multiple models and average predictions
+2. Different architectures that actually work (e006 was a bug)
+3. Combining TTA with other approaches
+4. Using the detector confidence more cleverly
+5. Training on a mix of GT boxes and detector boxes
+6. Different image sizes
+7. Different augmentation strategies
+8. Using both high and low res crops in a specific way
+
+Let me think about what's most promising:
+
+The key insight is that the ceiling is 0.758 and we're at 0.6314. The gap is 0.127. The one-step baseline is 0.638. We need to beat 0.638.
+
+Looking at the per-class scores:
+- pore 0.507 (weakest)
+- deposit 0.629
+- discontinuity 0.781 (strongest)
+- stain 0.609
+
+The main issues are pore and stain classification. The brief says "stain is often confused with deposit and background."
+
+Let me think about what could help most:
+
+1. **Ensembling**: We have ~157s total, ~13s loading, ~144s for training+prediction. Currently we train for ~100s (5 epochs). If we train 2 models with different seeds or different architectures and average, we might get a boost. But this halves training time per model.
+
+2. **Better architecture**: e006 (ConvNeXt-Nano) crashed due to a bug. Maybe trying a different architecture that's known to work well could help. But this is risky.
+
+3. **Training on detector boxes without background class but with the detector's actual box positions**: e005 tried this and got 0.6248 (worse than e013's 0.6314). But maybe combining GT boxes AND detector boxes could help.
+
+4. **Score calibration**: The scoring function is conf × p[c]. Maybe we can do better. For example, using a learned calibration or a different combination.
+
+5. **More TTA**: Currently we do h-flip. We could also do v-flip, or 90° rotation, or both flips.
+
+6. **Larger image size**: Currently 160. Maybe 224 or 256 would help with the weak classes.
+
+7. **Training longer / different schedule**: Currently 5 epochs in ~100s. Maybe a different schedule.
+
+8. **Using the detector confidence as a training signal**: Train the classifier to also predict whether a box is a true detection, using the detector confidence as a soft label.
+
+Let me think more carefully. The key constraint is time: ~144s for training + prediction.
+
+Actually, let me reconsider the problem. The mAP@0.5 score depends on:
+(a) correct class assignment for boxes that overlap true defects
+(b) good ranking: true detections should score higher than false ones
+
+The current approach: score = conf × p[c] for each class c.
+
+For a box that IS a true defect of class k:
+- The correct row (c=k) should have high score
+- The wrong rows (c≠k) are FPs for their respective classes
+
+For a box that is NOT a true defect (false alarm):
+- All 4 rows are FPs
+
+The ranking matters: true detections should score higher than false ones.
+
+One idea: **Use a sigmoid-based scoring instead of softmax**. Instead of softmax probabilities, use independent sigmoid outputs for each class. This way, a box can be "not a defect" (all sigmoids low) or "defect of type k" (sigmoid k high, others low). This naturally handles the background case.
+
+But wait, we're training with CrossEntropyLoss which assumes exactly one class. If we want to handle background, we'd need to add a background class or use multi-label.
+
+Actually, let me think about this differently. The brief says "several rows per box (one per class) are allowed and often help." This is because for mAP@0.5, having multiple rows per box means:
+- If the box is a true detection of class k, the row for class k is a TP, and the other 3 rows are FPs
+- But the FPs for wrong classes get ranked lower (lower score), so they don't hurt much
+- The key is that the TP row for class k gets ranked high
+
+The issue is that for false alarm boxes (no true defect), all 4 rows are FPs. We want these to have low scores.
+
+Current approach: score = conf × p[c]. For a false alarm, if the classifier is uncertain (p ≈ 0.25 for all classes), the scores are conf × 0.25. For a true detection, if the classifier is confident (p ≈ 0.9 for the right class), the score is conf × 0.9.
+
+So the ranking is: true detections (conf × 0.9) > false alarms (conf × 0.25), which is good.
+
+But what if we could make the classifier even better at distinguishing true defects from false alarms?
+
+Idea: **Train with a "background" class using detector boxes**. But e002 tried this and got 0.5172 (terrible). Why?
+
+Looking at e002: "Training the classifier on detector boxes (dets.csv train) labelled by IoU>0.5 overlap with GT crops, with an explicit background class for false alarms." The score was 0.5172, which is far below the baseline. The brief says "A score far below the current best usually means a bug."
+
+So e002 likely had a bug. Let me think about what the bug could have been...
+
+Actually, the experiment history says e002 was "rejected" with score 0.5172. And e001 (the first attempt) "crashed". So e002 fixed the crash but still had a bad score. The brief says "A score far below the current best usually means a bug (wrong class order, wrong box format, untrained model), not a bad idea."
+
+So the background class idea might actually be good, but e002 had a bug. Let me think about what the bug could have been...
+
+Possible bugs in e002:
+1. The background class might have been assigned incorrectly
+2. The IoU threshold might have been wrong
+3. The class mapping might have been off by one (background=0, pore=1, deposit=2, etc. but the output expected pore=0, deposit=1, etc.)
+4. The training data might have had issues
+
+Actually, I think the most likely bug is the class mapping. If we add a background class, we have 5 classes: 0=background, 1=pore, 2=deposit, 3=discontinuity, 4=stain. But the output format expects 0=pore, 1=deposit, 2=discontinuity, 3=stain. So when writing predictions, we need to skip class 0 (background) and map 1→0, 2→1, 3→2, 4→3. If this mapping was wrong in e002, it would explain the terrible score.
+
+But I can't be sure. Let me think of other ideas.
+
+Actually, let me reconsider. The brief says:
+- "train the classifier on detector boxes from the training images (dets.csv split 'train'), labelled by overlap with the true boxes in crops.csv, including a 'background' class for false alarms"
+
+This is listed as an in-scope idea. e002 tried it and got 0.5172 (likely a bug). e005 tried it without background and got 0.6248 (worse than e013's 0.6314 but not terrible).
+
+Let me think about what else to try.
+
+**Idea: Ensembling two models with different architectures**
+
+We have ~144s for training + prediction. Currently we use ~100s for training (5 epochs) and ~44s for prediction (41879 eval boxes × 4 TTA views).
+
+If we train 2 models (e.g., EfficientNet-B0 and ResNet50) each for ~70s, then predict with both and average, we might get a boost. But this is risky because:
+- Each model gets less training
+- Prediction time doubles
+- We need to make sure the total time fits
+
+Actually, prediction takes about 44s for one model with 4 TTA views. For 2 models, that's 88s. Plus training 2 models for ~70s each = 140s. Total = 228s, which exceeds the 180s budget. So ensembling 2 full models doesn't fit.
+
+What about ensembling 2 models but with fewer TTA views? Or ensembling within the same architecture but different seeds?
+
+Actually, let me reconsider the time budget. The total is 180s. Loading takes ~13s. So we have ~167s for training + prediction.
+
+Currently:
+- Training: ~100s (5 epochs, 381 steps)
+- Prediction: ~44s (41879 boxes × 4 views)
+- Total: ~144s + 13s loading = ~157s
+
+If we want to ensemble 2 models:
+- Training: 2 × 50s = 100s
+- Prediction: 2 × 44s = 88s (or 2 × 22s = 44s with 2 TTA views)
+- Total: 100 + 44 = 144s + 13s = 157s (fits!)
+
+But halving the training time per model might hurt. And halving the TTA views might also hurt.
+
+Alternatively, we could train 1 model for 100s and use the remaining 44s for prediction with 4 TTA views. That's what we're doing now.
+
+Hmm, ensembling is tight on time. Let me think of other ideas.
+
+**Idea: Larger image size (224 instead of 160)**
+
+The current image size is 160. EfficientNet-B0 is typically trained at 224. Using 224 might help the model see more detail, especially for the weak pore and stain classes.
+
+Trade-off: larger images = slower training and prediction. At 160, we do ~381 steps in 100s. At 224, we'd do fewer steps (maybe ~200 steps). But each step might be more informative.
+
+Actually, the crop is resized to IMG_SIZE × IMG_SIZE. At 160, a 2.5× context crop of a typical defect box might be ~160px in the original image. At 224, we'd have more pixels to work with.
+
+But wait, the image is resized to IMG_SIZE regardless. So at 224, we're just upscaling more. The question is whether the model benefits from seeing the crop at a higher resolution.
+
+Actually, I think the issue is that at 160, small defects (like pores) might be only a few pixels, and at 224, they'd be a bit more. But the resize is bilinear, so it's not a huge difference.
+
+Let me think about this differently. The model is EfficientNet-B0, which has a 240×240 input in its standard configuration. At 160, we're using a smaller input. At 224, we're closer to the standard size.
+
+I think trying IMG_SIZE=224 is a reasonable experiment. It's a focused change and could help with the weak classes.
+
+But wait, the prediction time would increase. At 160, prediction takes ~44s for 41879 boxes × 4 views. At 224, it might take ~80s (area increases by (224/160)² = 1.96×). That would push the total to 13 + 100 + 80 = 193s, which exceeds 180s.
+
+So we'd need to reduce training time. If we train for ~60s instead of 100s, total = 13 + 60 + 80 = 153s. That fits.
+
+But halving the training time might hurt more than the larger image helps.
+
+Hmm, let me think of another idea.
+
+**Idea: Use both high-res and low-res crops for training, but with a specific weighting**
+
+e003 tried including low-res crops and got 0.6251 (worse than e013's 0.6314). But maybe the issue was that low-res crops are noisier and dilute the high-res signal. What if we train on high-res crops first, then fine-tune on a mix?
+
+Actually, this is getting complicated. Let me think about simpler ideas.
+
+**Idea: Adjust the scoring function to better handle the ranking**
+
+The current score is conf × p[c]. What if we use conf^α × p[c]^β for some α, β? We tried p² (e004, 0.6161) and conf × p × max(p) (e008, 0.6265). Both were worse.
+
+What about conf × p[c] × (1 - p_bg) where p_bg is the probability of "background"? But we don't have a background class in the current model.
+
+What about using the margin: p[c] - mean(p)? Or p[c] - max(p[other classes])?
+
+Actually, let me think about what the scoring function should ideally do:
+- For a true detection of class k: high score for class k, low scores for other classes
+- For a false alarm: low scores for all classes
+
+The current score conf × p[c] does this reasonably well. The issue is that for false alarms, the classifier might still assign a non-trivial probability to some class.
+
+What if we use a "background probability" derived from the softmax? For example, p_bg = 1 - max(p). Then score = conf × p[c] × (1 - p_bg) = conf × p[c] × max(p). Wait, that's what e008 tried (conf × p[c] × max(p)), and it was rejected at 0.6265.
+
+Hmm. Let me think about other scoring functions.
+
+What about score = conf × p[c] / sum(p) = conf × p[c]? That's the same as the current one since softmax sums to 1.
+
+What about using log-odds? score = conf × log(p[c] / (1 - p[c]))? This would be more aggressive in suppressing low-probability classes.
+
+Actually, I think the scoring function is probably not the main bottleneck. The main issue is classification accuracy, especially for pore and stain.
+
+**Idea: Train on a mix of GT boxes and detector boxes**
+
+The current approach trains on GT boxes (crops.csv). The detector boxes (dets.csv train) are slightly misplaced relative to GT. Training on GT boxes means the model sees "perfect" boxes, but at test time it sees "imperfect" boxes.
+
+e005 tried training on detector boxes only and got 0.6248 (worse than e013's 0.6314). But what if we train on a mix: 50% GT boxes + 50% detector boxes? This would give the model exposure to both distributions.
+
+Actually, this is a reasonable idea. The GT boxes give clean labels, and the detector boxes give the "real" distribution. A mix might be better than either alone.
+
+But how to implement this? We'd need to:
+1. Load both crops.csv and dets.csv (train split)
+2. For dets.csv train, label each box by IoU>0.5 overlap with GT crops
+3. Combine the two datasets
+4. Train on the combined dataset
+
+The labeling step is the tricky part. For each detector box in the train split, we need to find the GT crop it overlaps with (IoU>0.5) and use that crop's class. If no GT crop overlaps, it's a background box (but we don't have a background class in the current model).
+
+Wait, but if we don't have a background class, what do we do with detector boxes that don't overlap any GT crop? We'd need to either:
+a) Exclude them (only use detector boxes that overlap GT)
+b) Add a background class
+c) Use them with the class of the nearest GT crop (incorrect)
+
+Option (a) is what e005 did, and it got 0.6248. Option (b) is what e002 did, and it got 0.5172 (likely a bug).
+
+Let me try option (a) but with a mix of GT and detector boxes. The hypothesis is that adding detector boxes (that overlap GT) to the GT training set will improve robustness to box misplacement without the risks of adding a background class.
+
+Actually, wait. Let me re-read the e005 result: "Training the classifier on detector boxes (from dets.csv train split) that overlap true crops (IoU>0.5) instead of the true box coordinates will close the train/test distribution gap." Score: 0.6248.
+
+So e005 replaced GT boxes with detector boxes. What if we ADD detector boxes to GT boxes (augmentation)? The GT boxes provide clean supervision, and the detector boxes provide robustness to misplacement.
+
+This seems like a good idea. Let me formulate it:
+
+**Hypothesis: Adding detector boxes (that overlap GT crops with IoU>0.5) to the GT training set will improve mAP by providing robustness to box misplacement while maintaining clean class supervision from the GT boxes.**
+
+Implementation:
+1. Load crops.csv (GT boxes) as before
+2. Load dets.csv train split
+3. For each detector box, compute IoU with all GT crops on the same image
+4. If max IoU > 0.5, label the detector box with the GT crop's class
+5. Combine GT boxes + matching detector boxes into the training set
+6. Train as before
+
+This is a focused change that builds on e013.
+
+Let me think about the implementation details:
+- We need to compute IoU between detector boxes and GT crops
+- Both are in the same image coordinate system
+- We need to match by image name
+- IoU > 0.5 threshold
+
+The code changes would be:
+1. After loading crops and dets, compute the labels for detector boxes
+2. Add the labeled detector boxes to the training set
+3. Train on the combined set
+
+Let me write the code.
+
+Actually, wait. I need to be careful about the data format. The crops.csv has columns: id, res, image, x1, y1, x2, y2, img_w, img_h, cls. The dets.csv has columns: det_id, split, image, x1, y1, x2, y2, img_w, img_h, conf.
+
+For the detector boxes to be used in training, they need the same format as crops.csv (at least the fields used by BoxDataset). Looking at BoxDataset.__getitem__, it uses r["image"], r["x1"], r["y1"], r["x2"], r["y2"], and r.get("cls", -1).
+
+So I need to create rows for detector boxes that have these fields. I can create a list of dicts with the same keys.
+
+Let me write the code:
+
+```python
+# After loading crops and dets:
+# Label detector boxes by IoU overlap with GT crops
+gt_by_image = {}
+for c in crops:
+    gt_by_image.setdefault(c["image"], []).append(c)
+
+det_train = [d for d in dets if d["split"] == "train"]
+det_labeled = []
+for d in det_train:
+    img = d["image"]
+    if img not in gt_by_image:
+        continue
+    dx1, dy1, dx2, dy2 = d["x1"], d["y1"], d["x2"], d["y2"]
+    best_iou = 0
+    best_cls = -1
+    for c in gt_by_image[img]:
+        cx1, cy1, cx2, cy2 = c["x1"], c["y1"], c["x2"], c["y2"]
+        ix1, iy1 = max(dx1, cx1), max(dy1, cy1)
+        ix2, iy2 = min(dx2, cx2), min(dy2, cy2)
+        iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+        inter = iw * ih
+        union = (dx2 - dx1) * (dy2 - dy1) + (cx2 - cx1) * (cy2 - cy1) - inter
+        iou = inter / max(union, 1e-6)
+        if iou > best_iou:
+            best_iou = iou
+            best_cls = c["cls"]
+    if best_iou > 0.5:
+        det_labeled.append({
+            "image": img,
+            "x1": d["x1"], "y1": d["y1"], "x2": d["x2"], "y2": d["y2"],
+            "cls": best_cls,
+        })
+
+# Combine GT + detector boxes
+train_rows = list(crops) + det_labeled
+```
+
+Wait, but the crops have a "res" field and the detector boxes don't. The BoxDataset doesn't use "res", so it should be fine. But I need to make sure the "image" field is accessible in the images dict.
+
+Actually, looking at the code more carefully:
+
+```python
+needed = {r["image"] for r in crops} | {d["image"] for d in ev}
+images = {p: np.asarray(Image.open(os.path.join(args.data, "images", p)).convert("RGB")) for p in needed}
+```
+
+The images dict is built from crops and eval dets. The train dets are on the same images as crops (since they're on training images), so the images should already be loaded. Good.
+
+But wait, I need to add the train det images to the "needed" set. Actually, the train dets are on the same images as the crops (training images), so they should already be in the "needed" set. Let me verify: the crops are from training images, and the train dets are also from training images. So yes, the images are already loaded.
+
+Let me also think about the size of the combined dataset. crops has 6052 boxes. The train dets might have a similar number of boxes. If about 50% overlap with GT, we'd add ~3000 boxes, making the total ~9000. This would increase training time.
+
+Actually, let me check: the eval dets have 41879 boxes. The train dets might have a similar number (maybe ~60000?). If 50% overlap, that's ~30000 additional boxes. That's a lot. Training time would increase significantly.
+
+Hmm, that might be too many. Let me think about whether to subsample.
+
+Actually, the train dets are on training images. The eval dets are on eval images. The number of train dets might be similar to the number of eval dets (41879). If 50% overlap with GT, that's ~20000 additional boxes. Combined with 6052 GT boxes, that's ~26000 boxes. At 64 per batch, that's ~400 steps per epoch. At ~0.26s per step (100s / 381 steps), that's ~104s per epoch. We currently do 5 epochs in 100s, so with 26000 boxes we'd do maybe 2-3 epochs in 100s.
+
+That's a significant reduction in training. The model might not train as well.
+
+Alternative: subsample the detector boxes. For example, only add up to 6000 detector boxes (matching the GT count). This would keep the total at ~12000 boxes, ~188 steps per epoch, ~3 epochs in 100s.
+
+Or: only add detector boxes that are "hard" examples (low confidence or near the IoU threshold). But this adds complexity.
+
+Let me just add all matching detector boxes and see what happens. The training loop already adapts to the data size (it trains until the time budget is used up).
+
+Actually, I realize there's another issue. The detector boxes might have different coordinates than the GT crops. The GT crops are the "true" defect locations, while the detector boxes are the "detected" locations. They might be slightly different in size and position. This is exactly the point: training on both gives the model exposure to both distributions.
+
+Let me also consider: should I use the detector box coordinates or the GT crop coordinates for the detector-labeled boxes? I think the detector box coordinates, since that's what the model will see at test time.
+
+OK let me write the actual code change. I need to:
+
+1. After loading crops and dets, compute labels for train dets
+2. Add labeled train dets to the training set
+3. Make sure the images for train dets are loaded (they should be, since they're on the same images as crops)
+
+Let me look at the current code structure:
+
+```python
+crops = [r for r in read_csv(os.path.join(args.data, "crops.csv")) if r["res"] in TRAIN_ON]
+dets = read_csv(os.path.join(args.data, "dets.csv"))
+ev = [d for d in dets if d["split"] == "eval"]
+needed = {r["image"] for r in crops} | {d["image"] for d in ev}
+images = {p: np.asarray(Image.open(os.path.join(args.data, "images", p)).convert("RGB")) for p in needed}
+```
+
+I need to add the train dets to the training set. Let me modify the code:
+
+```python
+crops = [r for r in read_csv(os.path.join(args.data, "crops.csv")) if r["res"] in TRAIN_ON]
+dets = read_csv(os.path.join(args.data, "dets.csv"))
+ev = [d for d in dets if d["split"] == "eval"]
+
+# Label train detector boxes by IoU overlap with GT crops
+gt_by_image = {}
+for c in crops:
+    gt_by_image.setdefault(c["image"], []).append(c)
+det_train = [d for d in dets if d["split"] == "train"]
+det_labeled = []
+for d in det_train:
+    img = d["image"]
+    if img not in gt_by_image:
+        continue
+    dx1, dy1, dx2, dy2 = d["x1"], d["y1"], d["x2"], d["y2"]
+    best_iou, best_cls = 0.0, -1
+    for c in gt_by_image[img]:
+        cx1, cy1, cx2, cy2 = c["x1"], c["y1"], c["x2"], c["y2"]
+        ix1, iy1 = max(dx1, cx1), max(dy1, cy1)
+        ix2, iy2 = min(dx2, cx2), min(dy2, cy2)
+        inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+        union = (dx2 - dx1) * (dy2 - dy1) + (cx2 - cx1) * (cy2 - cy1) - inter
+        iou = inter / max(union, 1e-6)
+        if iou > best_iou:
+            best_iou, best_cls = iou, c["cls"]
+    if best_iou > 0.5:
+        det_labeled.append({"image": img, "x1": d["x1"], "y1": d["y1"], "x2": d["x2"], "y2": d["y2"], "cls": best_cls})
+
+train_rows = list(crops) + det_labeled
+needed = {r["image"] for r in train_rows} | {d["image"] for d in ev}
+images = {p: np.asarray(Image.open(os.path.join(args.data, "images", p)).convert("RGB")) for p in needed}
+```
+
+Then change the DataLoader to use train_rows instead of crops:
+
+```python
+dl_tr = torch.utils.data.DataLoader(BoxDataset(train_rows, images, True), ...)
+```
+
+And update the print statement.
+
+Wait, I also need to make sure the "needed" set includes the images for train dets. Since train dets are on the same images as crops, they should already be included. But to be safe, I'll add them.
+
+Actually, looking at the code again:
+```python
+needed = {r["image"] for r in crops} | {d["image"] for d in ev}
+```
+
+The train dets are on the same images as crops (training images), so their images are already in the "needed" set via crops. So I don't need to add them. But to be safe, I'll include them.
+
+Let me also think about the print statement. Currently:
+```python
+print(f"train {len(crops)} boxes, eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
+```
+
+I'll change it to:
+```python
+print(f"train {len(train_rows)} boxes ({len(crops)} GT + {len(det_labeled)} det), eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
+```
+
+Now, one concern: the IoU computation might be slow if there are many GT crops per image. Let me think about the typical case. If an image has 10 GT crops and 100 detector boxes, that's 1000 IoU computations per image. With ~500 images, that's 500,000 IoU computations. Each is just a few floating-point operations, so it should be fast (< 1s).
+
+Actually, let me also consider: what if a detector box overlaps multiple GT crops? In that case, I use the one with the highest IoU. This is correct.
+
+What if a GT crop is overlapped by multiple detector boxes? Each detector box gets labeled independently. This is also correct.
+
+OK, I think this is a solid experiment. Let me write the final code.
+
+Actually, wait. Let me reconsider whether this is the best idea to try next. Let me look at the experiment history again:
+
+- e002: detector boxes + background class → 0.5172 (likely bug)
+- e005: detector boxes only (no background) → 0.6248
+- e013: TTA h-flip → 0.6314 (current best)
+
+The idea of adding detector boxes to GT boxes is different from both e002 and e005. It's a hybrid: GT boxes provide clean supervision, detector boxes provide robustness.
+
+I think this is a good next experiment. It's focused, testable, and builds on the current best.
+
+Let me also consider: should I use IoU > 0.5 or a different threshold? The brief mentions "IoU>0.5 overlap" as the standard. I'll stick with 0.5.
+
+One more thought: the detector boxes might have a different aspect ratio or size than the GT crops. This is fine - the make_crop function handles any box shape.
+
+Let me finalize the code change.
+
+Actually, I want to double-check one thing: the `read_csv` function converts "conf" to float. The dets.csv has a "conf" column. The crops.csv doesn't have a "conf" column. So when I create det_labeled rows, I don't need to include "conf" since BoxDataset doesn't use it.
+
+Also, the `read_csv` function converts "cls" to int. The det_labeled rows I create have "cls" as an int (from the GT crop's cls). Good.
+
+Let me write the final SEARCH/REPLACE blocks.
+
+Current code to find:
+```python
+    crops = [r for r in read_csv(os.path.join(args.data, "crops.csv")) if r["res"] in TRAIN_ON]
+    dets = read_csv(os.path.join(args.data, "dets.csv"))
+    ev = [d for d in dets if d["split"] == "eval"]
+    needed = {r["image"] for r in crops} | {d["image"] for d in ev}
+    images = {p: np.asarray(Image.open(os.path.join(args.data, "images", p)).convert("RGB")) for p in needed}
+    print(f"train {len(crops)} boxes, eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
+```
+
+New code:
+```python
+    crops = [r for r in read_csv(os.path.join(args.data, "crops.csv")) if r["res"] in TRAIN_ON]
+    dets = read_csv(os.path.join(args.data, "dets.csv"))
+    ev = [d for d in dets if d["split"] == "eval"]
+    # Label train detector boxes by IoU>0.5 overlap with GT crops, add to training set
+    gt_by_image = {}
+    for c in crops:
+        gt_by_image.setdefault(c["image"], []).append(c)
+    det_labeled = []
+    for d in [x for x in dets if x["split"] == "train"]:
+        img = d["image"]
+        if img not in gt_by_image:
+            continue
+        dx1, dy1, dx2, dy2 = d["x1"], d["y1"], d["x2"], d["y2"]
+        best_iou, best_cls = 0.0, -1
+        for c in gt_by_image[img]:
+            ix1, iy1 = max(dx1, c["x1"]), max(dy1, c["y1"])
+            ix2, iy2 = min(dx2, c["x2"]), min(dy2, c["y2"])
+            inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+            union = (dx2 - dx1) * (dy2 - dy1) + (c["x2"] - c["x1"]) * (c["y2"] - c["y1"]) - inter
+            iou = inter / max(union, 1e-6)
+            if iou > best_iou:
+                best_iou, best_cls = iou, c["cls"]
+        if best_iou > 0.5:
+            det_labeled.append({"image": img, "x1": dx1, "y1": dy1, "x2": dx2, "y2": dy2, "cls": best_cls})
+    train_rows = list(crops) + det_labeled
+    needed = {r["image"] for r in train_rows} | {d["image"] for d in ev}
+    images = {p: np.asarray(Image.open(os.path.join(args.data, "images", p)).convert("RGB")) for p in needed}
+    print(f"train {len(train_rows)} boxes ({len(crops)} GT + {len(det_labeled)} det), eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
+```
+
+And change the DataLoader:
+```python
+    dl_tr = torch.utils.data.DataLoader(BoxDataset(crops, images, True), batch_size=BATCH_SIZE, shuffle=True,
+```
+to:
+```python
+    dl_tr = torch.utils.data.DataLoader(BoxDataset(train_rows, images, True), batch_size=BATCH_SIZE, shuffle=True,
+```
+
+Let me verify the SEARCH strings are unique in the file.
+
+For the first block, the string:
+```
+    crops = [r for r in read_csv(os.path.join(args.data, "crops.csv")) if r["res"] in TRAIN_ON]
+    dets = read_csv(os.path.join(args.data, "dets.csv"))
+    ev = [d for d in dets if d["split"] == "eval"]
+    needed = {r["image"] for r in crops} | {d["image"] for d in ev}
+    images = {p: np.asarray(Image.open(os.path.join(args.data, "images", p)).convert("RGB")) for p in needed}
+    print(f"train {len(crops)} boxes, eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
+```
+
+This appears once in the file. Good.
+
+For the second block:
+```
+    dl_tr = torch.utils.data.DataLoader(BoxDataset(crops, images, True), batch_size=BATCH_SIZE, shuffle=True,
+```
+
+This appears once. Good.
+
+Let me finalize.
+
+Wait, I should also consider: the det_labeled boxes might include boxes that are very different in size from the GT crops. For example, a detector box might be much larger or smaller than the GT crop it overlaps with. This is actually the point - we want the model to handle this variation.
+
+But there's a potential issue: if a detector box is very large (e.g., covering most of the image), the crop might not be very informative. However, the make_crop function handles this by using the box's long side × context as the crop size. So a large box would give a large crop, which is fine.
+
+I think this is a good experiment. Let me write the final answer.
+
+Hmm, actually one more thought. The number of train detector boxes could be very large. If the eval split has 41879 boxes, the train split might have a similar or larger number. If 50% overlap with GT, that's ~20000+ additional boxes. This would significantly increase the training data size.
+
+The current training set is 6052 boxes. Adding 20000+ would make it ~26000+. At 64 per batch, that's ~400 steps per epoch. At the current speed (~0.26s per step), that's ~104s per epoch. We have ~100s for training, so we'd get about 1 epoch. That's a big reduction from 5 epochs.
+
+This might be too aggressive. Maybe I should subsample the detector boxes to keep the total training set size reasonable. For example, add at most 6000 detector boxes (matching the GT count), giving a total of ~12000 boxes.
+
+Or, I could use a different approach: instead of adding all matching detector boxes, I could randomly sample a subset. Let me add a cap.
+
+Actually, let me just add all matching detector boxes and let the training loop adapt. The training loop trains until the time budget is used up, so it will do fewer epochs but the same total training time. The question is whether 1 epoch on 26000 boxes is better than 5 epochs on 6052 boxes.
+
+In deep learning, it's generally better to see more diverse data, even if for fewer epochs. So I think adding all matching detector boxes is fine.
+
+But wait, there's another consideration: the data loader shuffles the data. If the training set is 26000 boxes, each epoch sees all 26000 boxes. If the training set is 6052 boxes, each epoch sees all 6052 boxes. In 100s, we'd see:
+- 26000 boxes: ~1 epoch (26000 boxes)
+- 6052 boxes: ~5 epochs (30260 boxes)
+
+So in both cases, we see a similar total number of box-examples (~26000-30000). The difference is in diversity: 26000 unique boxes vs 6052 unique boxes seen 5 times.
+
+I think 26000 unique boxes is better because of the diversity. The model sees more different crops, which should help generalization.
+
+OK, I'll go with adding all matching detector boxes. Let me finalize.
+
+One more thing: I should make sure the IoU computation is correct. Let me double-check:
+
+For two boxes (x1, y1, x2, y2) and (cx1, cy1, cx2, cy2):
+- Intersection: (max(x1,cx1), max(y1,cy1)) to (min(x2,cx2), min(y2,cy2))
+- Intersection area: max(0, min(x2,cx2) - max(x1,cx1)) * max(0, min(y2,cy2) - max(y1,cy1))
+- Union: area1 + area2 - intersection
+- IoU: intersection / union
+
+Yes, that's what I have. Good.
+
+Let me write the final answer now.

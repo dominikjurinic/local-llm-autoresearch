@@ -1,0 +1,297 @@
+===== attempt 1 =====
+Let me analyze the situation carefully.
+
+Current best: e000, 5-seed val mAP@0.5 = 0.6311
+- Per-class: pore 0.506, deposit 0.630, discontinuity 0.780, stain 0.608
+
+Key observations:
+1. The baseline one-step detector gets 0.638 mAP@0.5 on validation
+2. Stage-1 boxes with perfect classes get 0.758 mAP@0.5 (ceiling)
+3. Stage-1 boxes scored as single class get 0.755 mAP@0.5
+4. Our current best is 0.6311, which is actually BELOW the one-step baseline of 0.638
+
+The reference numbers tell us:
+- Stage-1 boxes with perfect classes: 0.758 mAP@0.5
+- Stage-1 boxes scored as single class 'defect': 0.755 mAP@0.5
+- Our current: 0.6311 mAP@0.5
+
+This is a huge gap! The ceiling is 0.758 and we're at 0.631. Even the single-class scoring gets 0.755. This means the issue is primarily about the scoring/ranking, not just classification.
+
+Wait, let me re-read. "stage-1 boxes scored as a single class 'defect': 0.755 mAP@0.5" - this means if we just output one class (say class 0) for all boxes with the detector confidence as the score, we get 0.755. That's because mAP@0.5 with 4 classes - if all predictions are class 0, then for class 0 we get all the true pore detections plus all false positives, and for classes 1,2,3 we get 0. But wait, that can't be right...
+
+Actually, I think "scored as a single class 'defect'" means they treat it as a 1-class problem where all defects are one class. In that case, mAP is computed over 1 class, not 4. So 0.755 is the mAP for a single "defect" class.
+
+And "stage-1 boxes with perfect classes (ceiling for stage 2): 0.758 mAP@0.5" - this means if we assign the correct class to each box, we get 0.758.
+
+So the gap from 0.6311 to 0.758 is due to:
+1. Wrong class assignments (classification errors)
+2. Poor ranking (false positives not suppressed well)
+
+The single-class score of 0.755 tells us that the detector boxes themselves are good (the ranking by conf is decent). The issue is that when we split into 4 classes, we lose a lot.
+
+Key insight: The current approach outputs 4 rows per box (one per class), each with score = conf * class_prob. This means for each box, the top class gets the highest score. But the problem is:
+- If a box is a false positive (background), all 4 class scores are conf * small_prob, which might still be above some true detection scores
+- The ranking within each class is determined by conf * class_prob, which may not be optimal
+
+Let me think about what would help most:
+
+1. **Background class / false positive suppression**: The e001/e002 experiments tried training on detector boxes with a background class, but e002 got 0.5172 (terrible). This suggests the background class approach as implemented didn't work well. But maybe the implementation was flawed.
+
+2. **Scoring strategy**: Currently score = conf * class_prob. Maybe we should use a different combination. For example:
+   - score = conf^a * class_prob^b for some a, b
+   - Or use the background probability to suppress: score = conf * class_prob / (1 + bg_prob)
+   - Or: score = conf * class_prob * (1 - bg_prob)
+
+3. **The key issue**: With 4 rows per box, the mAP computation works as follows:
+   - For each class, predictions are sorted by score
+   - A prediction is TP if it matches a GT box of that class with IoU > 0.5 and the GT hasn't been matched yet
+   - A prediction is FP otherwise
+   
+   The problem: if a box is a true pore but the classifier says it's 70% deposit, 20% pore, 10% stain, 0% discontinuity, then:
+   - The deposit row gets score = conf * 0.7
+   - The pore row gets score = conf * 0.2
+   - The deposit row will be checked first (higher score), and it'll be an FP (wrong class)
+   - The pore row will be checked later and will be a TP (if IoU > 0.5 with a pore GT)
+   
+   But the FP deposit row hurts the deposit class AP. And the pore TP is ranked lower than it should be.
+
+   Actually, in standard mAP, each prediction is independently evaluated. So the deposit FP hurts deposit AP, and the pore TP helps pore AP. The issue is that we're creating extra FPs for the wrong classes.
+
+   Alternative: Only output the top-1 class per box. This avoids creating FPs for wrong classes. But then we lose the ability to have a box match a GT of a different class.
+
+   Actually wait - in mAP@0.5, a prediction of class c for a box is a TP only if there's an unmatched GT of class c with IoU > 0.5. So if we output all 4 classes, a box that's truly a pore will:
+   - Be a TP for pore (if the pore row has high enough score and IoU matches)
+   - Be an FP for deposit, discontinuity, stain (unless there happens to be a GT of that class overlapping)
+   
+   So outputting all 4 classes creates 3 extra FPs per box (for the wrong classes). This is bad!
+
+   Better approach: Only output the top-1 class per box, or top-2 with a threshold.
+
+   Actually, let me reconsider. The reference says "Several rows per box (one per class) are allowed and often help." So maybe in some cases it helps. But the current score is 0.6311 which is below the single-class 0.755. 
+
+   Hmm, but the single-class 0.755 is computed differently - it's mAP over 1 class, not 4 classes. So it's not directly comparable.
+
+   Let me think about what the 0.758 ceiling means. If we have perfect classes, each box gets exactly one class. So there's no "extra FP" issue. The mAP is limited by:
+   - False positives (background boxes)
+   - Misplaced boxes (IoU < 0.5 with GT)
+   - The ranking (conf ordering)
+
+   With our current approach, we have 4x the predictions (4 per box instead of 1), and 3 of them are wrong class FPs. This significantly hurts the AP for each class.
+
+   **Key idea: Output only the top-1 class per box, with score = conf * class_prob (or some other scoring).**
+
+   Wait, but the brief says "Several rows per box (one per class) are allowed and often help." Let me re-read...
+
+   "Several rows per box (one per class) are allowed and often help."
+
+   Hmm, this is in the "What determines the score" section. Maybe it means that in some formulations, having multiple rows can help because if the top class is wrong but the second class is right, the second row can still be a TP. But the cost is the extra FPs.
+
+   Actually, I think the issue is more subtle. Let me think about it differently.
+
+   In mAP@0.5:
+   - For class c, we have a set of predictions (det_id, score) and a set of GTs
+   - We sort predictions by score descending
+   - For each prediction, check if it matches an unmatched GT of class c with IoU > 0.5
+   - If yes: TP, else FP
+   - Compute precision/recall at each point, then AP
+
+   If we output 4 rows per box:
+   - For a true pore box, the pore row can be a TP for pore
+   - The deposit row is an FP for deposit (unless it happens to overlap a deposit GT)
+   - Similarly for other classes
+   
+   If we output 1 row per box (top class):
+   - For a true pore box classified as pore: TP for pore
+   - For a true pore box classified as deposit: FP for deposit, and the pore GT is missed (no TP for pore)
+   
+   So the tradeoff is:
+   - 4 rows: More TPs (a box can match its true class even if the top prediction is wrong) but more FPs (wrong class predictions)
+   - 1 row: Fewer FPs but potentially miss TPs when the top class is wrong
+
+   The current score is 0.6311. Let me think about what would improve it most.
+
+   Actually, I think the biggest issue might be simpler: **the scoring**. Currently score = conf * class_prob. The detector conf is the same for all 4 rows of a box. So the ranking within a box is purely by class_prob. But across boxes, the ranking is by conf * class_prob.
+
+   The problem: a high-conf false positive (background) will have all 4 class scores = conf * small_prob. If conf is high (say 0.9) and the classifier gives 0.3 to the top class, the score is 0.27. A low-conf true detection (conf 0.3) with class_prob 0.9 gets score 0.27. They're tied! But the false positive should rank lower.
+
+   The classifier should be able to distinguish background from defects. But currently it's only trained on true defects (no background class). So for a background crop, the classifier will still assign probabilities summing to 1 across the 4 classes. The max probability might be 0.3-0.4 (not very confident), but it's still non-zero.
+
+   **The most impactful change might be to train on detector boxes with a background class**, but e002 tried this and got 0.5172 (terrible). Let me look at why e002 failed.
+
+   e002 was based on e001 which crashed. e002 fixed a type bug. But the score was 0.5172, which is way below even the baseline. This suggests the implementation was fundamentally broken, not just the idea.
+
+   Let me think about what could go wrong with the background class approach:
+   - If too many background examples dominate training, the model learns to predict background for everything
+   - If the IoU threshold for matching is wrong, labels are wrong
+   - If the background class probability is used incorrectly in scoring
+
+   Actually, let me reconsider the problem. The current approach:
+   - Trains on 6052 true training boxes (crops.csv, high-res only)
+   - No background class
+   - 4-class classification
+   - Score = conf * class_prob
+   - 4 rows per eval box
+
+   The score is 0.6311. The ceiling (perfect classes) is 0.758. The gap is 0.127.
+
+   What if I just try: **output only the top-1 class per box** instead of all 4? This would eliminate the 3x FP inflation. Let me estimate:
+
+   Currently, for each of 41879 eval boxes, we output 4 rows = 167,516 rows. If we output 1 row per box, we have 41,879 rows. The FPs for wrong classes disappear.
+
+   But we might lose some TPs: if a box's top class is wrong but the true class is the 2nd or 3rd, we'd miss that TP.
+
+   Given that the classifier has macro-F1 ~0.87 (from the brief), about 13% of boxes get the wrong class. For those, the 4-row approach saves the TP (the correct class row is still there) but adds 3 FPs. The 1-row approach loses the TP but has no extra FPs.
+
+   Hmm, it's not obvious which is better. Let me think about it from the mAP perspective.
+
+   Actually, I think the most impactful and simplest change to try is: **use a different scoring function that better separates true detections from false positives**.
+
+   Currently: score = conf * class_prob
+
+   The issue is that for background boxes, class_prob is still non-zero (since the model only knows 4 defect classes). The max class_prob for a background might be ~0.3-0.5. So score = conf * 0.4, which could be quite high.
+
+   What if we use: score = conf * (class_prob - 0.25) ? This subtracts the uniform prior (1/4 = 0.25). For a confident correct class (prob 0.9), score = conf * 0.65. For a background (prob ~0.3), score = conf * 0.05. This would dramatically reduce the scores of background boxes.
+
+   But this is a bit hacky. A cleaner approach:
+
+   What if we add a "confidence" term based on the entropy of the class distribution? If the model is uncertain (all 4 classes have similar probabilities), the box is more likely background. If it's confident (one class dominates), it's more likely a real defect.
+
+   score = conf * class_prob * (class_prob - 0.25) / (1 - 0.25)
+   
+   Or simpler: score = conf * max(0, class_prob - 0.25)
+
+   Actually, let me think about this differently. The key insight from the reference numbers:
+   - Single-class (all defects as one class): 0.755
+   - Perfect 4-class: 0.758
+   - Our current: 0.631
+
+   The gap between single-class (0.755) and perfect 4-class (0.758) is tiny (0.003). This means the detector boxes and their conf-based ranking are already very good. The only loss from perfect classes to single class is the class confusion.
+
+   Our 0.631 is 0.124 below the single-class 0.755. This gap must come from:
+   1. The 4-class scoring creating extra FPs (3 wrong-class rows per box)
+   2. The class_prob modifying the ranking (a high-conf box with low class_prob ranks below a low-conf box with high class_prob)
+
+   I think issue #1 is the biggest. Let me try: **output only the top-1 class per box, with score = conf * class_prob**.
+
+   Wait, but actually, let me reconsider. If I output only the top-1 class, then for a box where the top class is wrong, I get an FP for the wrong class and miss the TP for the right class. With 4 rows, I get the TP for the right class (good) but also FPs for the other 3 classes (bad).
+
+   Let me think about the net effect on mAP. For a given class c:
+   - With 4 rows: TPs come from boxes where c is any of the 4 classes (i.e., all boxes that overlap a GT of class c). FPs come from all boxes where c is one of the 4 classes but doesn't overlap a GT of class c. Since every box has a row for class c, every box is a candidate for class c.
+   
+   Wait, that's the key! With 4 rows per box, EVERY box has a prediction for EVERY class. So for class c, we have 41,879 predictions (one per box). A prediction is TP if the box overlaps a GT of class c. Otherwise it's FP.
+
+   So for class c, the number of TPs is the number of boxes that overlap GT of class c (and are matched), and FPs is the rest. The ranking is by conf * class_prob_c.
+
+   With 1 row per box (top class only): For class c, we only have predictions for boxes where c is the top class. So we have fewer predictions. TPs are boxes where c is the top class AND overlaps GT of class c. FPs are boxes where c is the top class but doesn't overlap GT of class c.
+
+   With 4 rows: More TPs (any box overlapping GT c is a TP, regardless of which class is "top") but also more FPs (all non-overlapping boxes are FPs).
+   With 1 row: Fewer TPs (only boxes where c is top AND overlapping) but fewer FPs too.
+
+   The AP depends on the precision-recall curve. With 4 rows, we have a denser set of predictions, which could help or hurt depending on the ranking.
+
+   Hmm, I think the 4-row approach is actually reasonable in principle. The issue might be more about the scoring.
+
+   Let me reconsider. With 4 rows per box, for class c:
+   - Every box has a score of conf * p_c
+   - TPs: boxes overlapping GT c, ranked by conf * p_c
+   - FPs: boxes not overlapping GT c, ranked by conf * p_c
+
+   The problem: a background box with conf=0.9 and p_c=0.3 gets score 0.27. A true detection with conf=0.5 and p_c=0.8 gets score 0.40. So the true detection ranks higher. Good.
+
+   But a background box with conf=0.9 and p_c=0.4 gets score 0.36. A true detection with conf=0.4 and p_c=0.7 gets score 0.28. Now the background ranks HIGHER than the true detection! Bad.
+
+   The issue is that conf * p_c doesn't properly separate background from true detections. The classifier's p_c for background is not low enough.
+
+   **Solution: Make the scoring more aggressive in suppressing low-confidence classifications.**
+
+   Option 1: score = conf * p_c^2 (square the probability)
+   - Background: 0.9 * 0.3^2 = 0.081
+   - True: 0.5 * 0.8^2 = 0.32
+   - Better separation!
+
+   Option 2: score = conf * p_c * (p_c - 0.25) / 0.75
+   - Background: 0.9 * 0.3 * 0.05/0.75 = 0.018
+   - True: 0.5 * 0.8 * 0.55/0.75 = 0.293
+   - Even better separation
+
+   Option 3: score = conf * (p_c - 0.25) (clip at 0)
+   - Background: 0.9 * max(0, 0.3-0.25) = 0.045
+   - True: 0.5 * (0.8-0.25) = 0.275
+
+   I think the simplest and most impactful change is to use **p_c^2** instead of p_c in the score. This is a one-line change and should improve the ranking significantly.
+
+   Actually, let me think about this more carefully. The p_c^2 approach effectively makes the classifier's confidence more discriminative. If p_c = 0.8 (confident), p_c^2 = 0.64. If p_c = 0.3 (uncertain/background), p_c^2 = 0.09. The ratio goes from 0.8/0.3 = 2.7 to 0.64/0.09 = 7.1. Much better separation.
+
+   But wait, there's a subtlety. The p_c values for true detections might also be affected. If a true pore has p_pore = 0.7, p_pore^2 = 0.49. The score becomes conf * 0.49 instead of conf * 0.7. This lowers the absolute scores but what matters is the relative ranking.
+
+   I think this is a good change to try. It's in the "scoring" category.
+
+   Let me also consider: should I change the number of rows per box? Currently 4 rows. If I use p_c^2 scoring, the wrong-class rows will have very low scores (since p_wrong is small, p_wrong^2 is very small). So they'll naturally be suppressed. I could keep 4 rows or reduce to top-2.
+
+   Let me go with: **change score from conf * p_c to conf * p_c^2**. This is a minimal, focused change.
+
+   Actually, wait. Let me reconsider the whole approach. The current score is 0.6311, which is below the one-step baseline of 0.638. The ceiling is 0.758. There's a lot of room for improvement.
+
+   Let me think about what the biggest lever is:
+
+   1. **Scoring**: Changing from p_c to p_c^2 should help with ranking. Estimated improvement: maybe 0.02-0.05?
+
+   2. **Training on detector boxes with background**: This could help the classifier actually learn to distinguish background. But e002 failed badly (0.5172), suggesting implementation issues.
+
+   3. **Reducing to top-1 class per box**: This eliminates wrong-class FPs. But might lose some TPs.
+
+   4. **Better augmentation / more training data**: e003 (adding low-res) didn't help.
+
+   I think the scoring change is the safest and most likely to help. Let me go with that.
+
+   Actually, let me reconsider. Let me look at the per-class APs:
+   - pore 0.506 (weak)
+   - deposit 0.630
+   - discontinuity 0.780 (strong)
+   - stain 0.608
+
+   Pore is the weakest. The brief says "Pore and deposit are the weak classes; stain is often confused with deposit and background."
+
+   With p_c^2 scoring, the effect would be:
+   - For pore: if the classifier gives p_pore = 0.6 for true pores, p_pore^2 = 0.36. For background, p_pore might be 0.2, p_pore^2 = 0.04. Better separation.
+   - For stain: if stain is confused with deposit, p_stain might be 0.4 and p_deposit = 0.4 for a stain box. With p^2, both become 0.16. The box would be ranked lower for both classes. This might hurt stain AP.
+
+   Hmm, so p^2 might help pore but hurt stain (since stain is already confused). But overall, I think it should help because the background suppression is the bigger effect.
+
+   Let me go with the scoring change. It's a clean, testable hypothesis.
+
+   Wait, actually I want to reconsider another option. What about using **conf * p_c * (1 - max_other_p)** where max_other_p is the max probability of the other 3 classes? This would penalize boxes where the model is uncertain between multiple classes.
+
+   No, that's more complex. Let me stick with p_c^2.
+
+   Actually, the simplest change: just change `s = d["conf"] * float(p[c])` to `s = d["conf"] * float(p[c])**2`.
+
+   Let me write the SEARCH/REPLACE block.
+
+   Current line:
+   ```
+                    s = d["conf"] * float(p[c])
+   ```
+
+   New line:
+   ```
+                    s = d["conf"] * float(p[c]) ** 2
+   ```
+
+   This is a one-character change (adding `** 2`). Clean and focused.
+
+   Hypothesis: Squaring the class probability in the score (conf * p_c^2 instead of conf * p_c) will improve mAP by more aggressively suppressing predictions where the classifier is uncertain (likely background), improving the ranking of true detections above false positives.
+
+   Let me verify the SEARCH text appears exactly once. Looking at the code:
+
+   ```python
+        for d, p in zip(ev, probs):
+            for c in range(4):
+                s = d["conf"] * float(p[c])
+                if s > MIN_SCORE:
+                    w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+   ```
+
+   Yes, `s = d["conf"] * float(p[c])` appears exactly once.
+
+   Let me finalize.

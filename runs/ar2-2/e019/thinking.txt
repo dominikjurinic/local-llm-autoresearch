@@ -1,0 +1,308 @@
+===== attempt 1 =====
+Let me analyze the current situation carefully.
+
+Current best: e016, 5-seed val mAP@0.5 0.6411
+- Per-class: pore 0.537, deposit 0.635, discontinuity 0.780, stain 0.612
+- Model: EfficientNet-B0, IMG_SIZE=224, single wide crop (2.5x), H-flip TTA
+- Training: ~660 steps, 2 epochs, AdamW LR=1e-3, cosine decay
+- Score: detector conf × class probability
+
+Let me think about what hasn't been tried yet and what might help:
+
+1. **Background class** - tried in e005 (rejected, 0.6039). But that was a different approach. Let me think about whether there's a better way.
+
+2. **Score calibration** - e004 (prob²), e014 (max prob multiplier) both rejected. What about using the detector confidence differently?
+
+3. **Architecture** - B2 rejected (e013), ConvNeXt-Nano rejected (e015). What about RegNet-Y-016 or ResNet50?
+
+4. **Data** - Training on detector boxes (e002, e003) helped. What about training on MORE detector boxes? Currently only IoU≥0.5 matched boxes are used. What about including boxes with lower IoU as "hard" examples?
+
+5. **Inference** - H-flip TTA helped (e009). Vertical flip rejected (e012). What about multi-scale TTA?
+
+6. **Optimization** - Batch size 32 rejected (e010), LR doubling rejected (e017), IMG_SIZE 192 rejected (e018).
+
+7. **Loss** - Focal loss rejected (e006), class-weighted loss hurt.
+
+8. **Sampling** - WeightedRandomSampler rejected (e011).
+
+Let me think about what's most promising:
+
+The key insight from the background: "stage-1 boxes with perfect classes (ceiling for stage 2): 0.758 mAP@0.5" and "stage-1 boxes scored as a single class 'defect': 0.755 mAP@0.5". Our current score is 0.6411. The gap between 0.6411 and 0.758 is significant - about 0.117.
+
+The per-class scores show pore (0.537) and stain (0.612) are the weakest. Deposit is 0.635.
+
+Let me think about what could help most:
+
+1. **Better score function**: The current score is `conf × prob[c]`. The problem is that for false alarms (background boxes), the classifier might assign high probability to some class, and if the detector conf is also high, the score could be high. We need to suppress these.
+
+   What if we use `conf × prob[c] × (prob[c] - max(other probs))`? Or `conf × (prob[c] - 0.25)` (subtracting the uniform baseline)? This would penalize uncertain predictions.
+
+   Actually, let me think more carefully. The mAP@0.5 scoring works like this: for each class, we rank all predictions by score, and a prediction is a TP if it matches a GT box of that class with IoU≥0.5. The key is ranking - true detections should score higher than false ones.
+
+   For a true detection of class c: conf is moderate-to-high, prob[c] should be high (say 0.6-0.9), other probs are low.
+   For a false alarm: conf could be anything, prob[c] could be anything (the model doesn't know it's background).
+
+   The issue is that the model was trained only on true defects (GT crops + matched detector boxes). It never saw background. So for a background box, it will still assign probabilities to the 4 classes, and one of them will be the "max". This max could be 0.3-0.5, which when multiplied by conf could give a reasonable score.
+
+   What if we add a background class but in a smarter way? e005 tried this and got 0.6039, which was bad. But maybe the issue was how it was implemented. Let me look at what e005 did...
+
+   Actually, I don't have the e005 code, just the hypothesis. It said "Adding a 5th 'background' class (from unmatched detector boxes, capped to 1.5× matched count) while keeping GT crops will let the classifier learn 'not a defect'; multiplying the score by (1 − prob_bg) will suppress false alarms."
+
+   The issue might have been that the background class was too dominant or the (1 - prob_bg) multiplier was too aggressive. Or maybe the architecture change (5 classes instead of 4) confused the model.
+
+   Alternative: instead of adding a 5th class, what if we use the softmax confidence differently? For example, score = conf × (prob[c] - 0.25) / (1 - 0.25)? This subtracts the "uniform" baseline. If the model is uncertain (all probs ≈ 0.25), the score would be near 0. If confident, the score would be higher.
+
+   Actually, let me think about this differently. The score function `conf × prob[c]` has a problem: for a background box where the model outputs [0.3, 0.3, 0.2, 0.2], the scores would be [0.3×conf, 0.3×conf, 0.2×conf, 0.2×conf]. These could rank above some true detections that have lower prob (e.g., a true pore with prob [0.4, 0.2, 0.2, 0.2] gives score 0.4×conf).
+
+   What about using a temperature-scaled softmax? Or using the log of the probability? Or using prob[c] - max(prob[other])?
+
+   Let me think about `conf × (prob[c] - 0.25)`:
+   - True detection, prob[c]=0.8: score = conf × 0.55
+   - True detection, prob[c]=0.4: score = conf × 0.15
+   - Background, prob[c]=0.3: score = conf × 0.05
+   - Background, prob[c]=0.2: score = conf × -0.05 (would be filtered by MIN_SCORE)
+
+   This seems reasonable. It penalizes uncertainty. But e004 tried prob² and it was rejected. Let me think about why...
+
+   prob²: true detection prob[c]=0.8 → 0.64, background prob[c]=0.3 → 0.09. Ratio: 7.1x
+   prob - 0.25: true detection prob[c]=0.8 → 0.55, background prob[c]=0.3 → 0.05. Ratio: 11x
+   
+   So (prob - 0.25) gives better separation. But it could also hurt if true detections have moderate confidence (prob=0.4 → 0.15) while background has high confidence (prob=0.5 → 0.25). Hmm.
+
+   Actually, let me think about a different approach. What about using the margin: prob[c] - max(prob[j] for j≠c)? This directly measures how much class c is preferred over the alternatives.
+
+   - True detection, prob=[0.7, 0.1, 0.1, 0.1]: margin = 0.6
+   - True detection, prob=[0.4, 0.3, 0.2, 0.1]: margin = 0.1
+   - Background, prob=[0.3, 0.3, 0.2, 0.2]: margin = 0.0
+   - Background, prob=[0.4, 0.2, 0.2, 0.2]: margin = 0.2
+
+   This seems very clean. The margin directly measures "how much does the model prefer this class over the others?" For background, where the model is uncertain, the margin is small. For true detections, the margin is large.
+
+   Score = conf × max(0, prob[c] - max(prob[j] for j≠c))
+
+   This is a scoring change that doesn't require retraining. Let me check if this has been tried... Looking at the history:
+   - e004: prob² (rejected)
+   - e014: max prob multiplier (rejected)
+   
+   Neither is the margin approach. This seems like a good next experiment.
+
+   Actually wait, let me reconsider. The margin approach has a potential issue: if the model is very confident about the wrong class for a true detection, the margin for the correct class could be negative. E.g., true pore but model says prob=[0.2, 0.6, 0.1, 0.1]. Then margin for pore = 0.2 - 0.6 = -0.4, which would be clipped to 0. This means the detection would get score 0 and be effectively dropped. This could hurt recall.
+
+   But in practice, the model is trained to classify correctly, so for true detections, the correct class should usually have the highest probability. The margin would be positive. For background, the margin would be small. So this should work.
+
+   Let me also consider: what about `conf × prob[c] × (prob[c] - max_other)`? This combines the probability with the margin. But this might be too aggressive.
+
+   I think the cleanest approach is: `score = conf × max(0, prob[c] - max(prob[j] for j≠c))`. This is a pure scoring change, no retraining needed.
+
+   Actually, let me reconsider the whole picture. The current score is 0.6411. The ceiling is 0.758. The gap is 0.117. 
+
+   Let me think about what's limiting the score:
+   1. Classification errors (wrong class) - this is the main issue since "many errors are wrong types, not missed defects"
+   2. Ranking issues (false alarms scoring too high)
+   3. Missed defects (detector didn't find them) - but this is fixed by stage 1
+
+   For (1), we need better classification. The model is undertrained (only ~660 steps). But increasing training time has been tried (e010 batch size, e017 LR, e018 IMG_SIZE) and all rejected.
+
+   For (2), the scoring function matters. The margin approach could help here.
+
+   For (3), nothing we can do in stage 2.
+
+   Let me go with the margin scoring approach. It's a focused, testable change in the scoring category.
+
+   Wait, actually I want to think about whether there's a better data/augmentation approach that might have bigger impact.
+
+   Looking at the training data: 26347 boxes (14128 GT + 12219 det). The model trains for ~660 steps with batch size 64, so it sees ~42240 samples (with some overlap due to shuffling). That's about 1.6 passes through the data.
+
+   What if we train for more epochs? The issue is time. With IMG_SIZE=224, each step takes about 0.12s (660 steps in ~80s of training time). To get 3x more steps, we'd need to reduce per-step cost.
+
+   Actually, let me look at the timing more carefully:
+   - Loading: 17s
+   - Epoch 0: 411 steps, 94s total (so ~77s for epoch 0, ~0.187s/step)
+   - Epoch 1: 660 steps, 125s total (so ~31s for epoch 1, ~0.047s/step)
+   
+   Wait, that doesn't make sense. Let me re-read:
+   - "epoch 0: loss 0.5211, 411 steps, 94s" - 94s from T0
+   - "epoch 1: loss 0.2859, 660 steps, 125s" - 125s from T0
+   
+   So epoch 0 took 94-17=77s for 411 steps = 0.187s/step
+   Epoch 1 took 125-94=31s for 249 steps (660-411) = 0.124s/step
+   
+   The first epoch is slower probably due to data loading/caching. Total training time: 125-17=108s for 660 steps.
+   
+   Reserve is 55s, total budget is 180s. So training can use up to 125s. It used 108s. There's about 17s of slack.
+   
+   Actually wait, the deadline is T0 + 180 - 55 = T0 + 125. And the training ended at 125s. So it used the full budget.
+
+   To get more steps, we'd need to reduce per-step cost. Options:
+   - Smaller batch (tried, rejected)
+   - Smaller image (tried, rejected)
+   - Faster model (tried B2 which is slower, rejected)
+   - Fewer workers / no pin_memory (unlikely to help much)
+
+   What about using a smaller but different architecture? Like ResNet18 or RegNetY-016? These might be faster per step than EfficientNet-B0 at 224.
+
+   Actually, let me check: EfficientNet-B0 at 224 has about 4M params. ResNet18 has 11M params but is generally faster per FLOP. RegNetY-016 has about 8M params.
+
+   Hmm, but the architecture changes have all been rejected. Let me not go down that path.
+
+   Let me focus on the scoring change. The margin approach is clean and testable.
+
+   Actually, let me think about another angle. What about using the detector confidence more cleverly? Currently, score = conf × prob[c]. The detector confidence is from YOLOv7-tiny, which is class-agnostic. So conf reflects "how much does this look like a defect" rather than "how much does this look like class c".
+
+   What if the detector confidence is noisy? For true defects, conf might be 0.5-0.9. For false alarms, conf might be 0.2-0.7. The overlap in conf ranges means conf alone can't distinguish them well.
+
+   What if we use conf^0.5 × prob[c]? This would reduce the impact of conf and rely more on prob. Or conf × prob[c]^1.5?
+
+   Hmm, but e004 tried prob² and it was rejected. So increasing the power of prob didn't help.
+
+   Let me go with the margin approach. Here's my plan:
+
+   Change the scoring from:
+   ```python
+   s = d["conf"] * float(p[c])
+   ```
+   to:
+   ```python
+   margin = float(p[c]) - max(float(p[j]) for j in range(4) if j != c)
+   s = d["conf"] * max(0.0, margin)
+   ```
+
+   This should:
+   - Boost true detections where the model is confident about the correct class (large margin)
+   - Suppress false alarms where the model is uncertain (small margin)
+   - Suppress cross-class rows where the model prefers a different class (negative margin → 0)
+
+   Let me write the code change.
+
+   Actually, I realize I should double-check: in the current code, `p` is a numpy array of shape (4,) for each detection. So `p[c]` is the probability for class c.
+
+   The change would be:
+   ```python
+   for d, p in zip(ev, probs):
+       max_other = max(float(p[j]) for j in range(4) if j != c)
+       margin = float(p[c]) - max_other
+       s = d["conf"] * max(0.0, margin)
+   ```
+
+   Wait, I need to be careful with the loop structure. Let me look at the current code:
+
+   ```python
+   for d, p in zip(ev, probs):
+       for c in range(4):
+           s = d["conf"] * float(p[c])
+           if s > MIN_SCORE:
+               w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+   ```
+
+   The new code would be:
+   ```python
+   for d, p in zip(ev, probs):
+       p_list = [float(p[j]) for j in range(4)]
+       for c in range(4):
+           max_other = max(p_list[j] for j in range(4) if j != c)
+           margin = p_list[c] - max_other
+           s = d["conf"] * max(0.0, margin)
+           if s > MIN_SCORE:
+               w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+   ```
+
+   This is a clean, focused change. Let me write it up.
+
+   Actually, I want to also consider: should I use `max(0, margin)` or just `margin` (allowing negative scores)? If I allow negative scores, those rows would be filtered by MIN_SCORE (0.001) since they'd be negative. So it's equivalent to `max(0, margin)` in terms of output, but `max(0, margin)` is cleaner.
+
+   Wait, actually MIN_SCORE is 0.001, so negative scores would be filtered. But conf is always positive (it's a detector confidence), and margin could be negative. So conf × margin could be negative, which would be < MIN_SCORE and filtered. So I don't strictly need max(0, margin), but it's cleaner.
+
+   Let me also think about whether this could hurt. If a true detection has prob=[0.35, 0.3, 0.2, 0.15] (correct class is 0), the margin is 0.35-0.3=0.05. The score would be conf × 0.05. Previously it was conf × 0.35. So the score drops by 7x. This could hurt if the detection was previously ranked high enough to be a TP.
+
+   But the key insight is: if the model is this uncertain (max prob only 0.35), it's more likely to be a false alarm or a hard case. The margin approach correctly identifies this as low-confidence.
+
+   On the other hand, if a true detection has prob=[0.7, 0.1, 0.1, 0.1], the margin is 0.6. Score = conf × 0.6. Previously conf × 0.7. Only 14% drop. And for a false alarm with prob=[0.3, 0.3, 0.2, 0.2], margin = 0.0, score = 0. Previously conf × 0.3.
+
+   So the margin approach disproportionately suppresses uncertain predictions, which is exactly what we want for ranking.
+
+   I'm fairly confident this is a good experiment. Let me write it up.
+
+   One more thought: should I also try a temperature on the softmax? Like using `softmax(logits / T)` with T < 1 to sharpen the distribution? This would make the margins larger for confident predictions and smaller for uncertain ones. But this is a separate change and would violate the "one idea per turn" rule.
+
+   Let me stick with just the margin scoring change.
+
+   Let me write the SEARCH/REPLACE block:
+
+   SEARCH:
+   ```
+       for d, p in zip(ev, probs):
+           for c in range(4):
+               s = d["conf"] * float(p[c])
+               if s > MIN_SCORE:
+                   w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+   ```
+
+   REPLACE:
+   ```
+       for d, p in zip(ev, probs):
+           p_list = [float(p[j]) for j in range(4)]
+           for c in range(4):
+               max_other = max(p_list[j] for j in range(4) if j != c)
+               s = d["conf"] * max(0.0, p_list[c] - max_other)
+               if s > MIN_SCORE:
+                   w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+   ```
+
+   This is a clean, focused change. Let me finalize.
+===== attempt 2 =====
+The user says the SEARCH text wasn't found. Let me look at the current file more carefully. The issue is that my SEARCH block started with `    for d, p in zip(ev, probs):` but the actual file has different indentation or the line is different.
+
+Let me re-read the current best train.py file carefully:
+
+```python
+    for d, p in zip(ev, probs):
+            for c in range(4):
+                s = d["conf"] * float(p[c])
+                if s > MIN_SCORE:
+                    w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+
+Wait, let me look at the exact indentation in the file. The file shows:
+
+```python
+    n = 0
+    with open(os.path.join(args.out, "preds.csv"), "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["det_id", "cls", "score"])
+        for d, p in zip(ev, probs):
+            for c in range(4):
+                s = d["conf"] * float(p[c])
+                if s > MIN_SCORE:
+                    w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+
+So the indentation is:
+- `    n = 0` (4 spaces)
+- `    with open(...)` (4 spaces)
+- `        w = csv.writer(f)` (8 spaces)
+- `        w.writerow(...)` (8 spaces)
+- `        for d, p in zip(ev, probs):` (8 spaces)
+- `            for c in range(4):` (12 spaces)
+- `                s = d["conf"] * float(p[c])` (16 spaces)
+- `                if s > MIN_SCORE:` (16 spaces)
+- `                    w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1` (20 spaces)
+
+So my SEARCH block had wrong indentation. I had:
+```
+    for d, p in zip(ev, probs):
+        for c in range(4):
+            s = d["conf"] * float(p[c])
+            if s > MIN_SCORE:
+                w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+
+But the actual file has:
+```
+        for d, p in zip(ev, probs):
+            for c in range(4):
+                s = d["conf"] * float(p[c])
+                if s > MIN_SCORE:
+                    w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+
+I need to fix the indentation. Let me copy it exactly from the file.

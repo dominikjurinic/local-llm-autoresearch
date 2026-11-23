@@ -1,0 +1,365 @@
+===== attempt 1 =====
+Let me analyze the current state and think about what to try next.
+
+Current best: e016, 5-seed val mAP@0.5 0.6411
+- EfficientNet-B0, IMG_SIZE=224, single wide crop (2.5x), H-flip TTA
+- Trained on GT crops + matched detector boxes (IoU≥0.5)
+- Score = conf × prob[c]
+- ~660 steps, 2 epochs
+
+Per-class AP: pore 0.537, deposit 0.635, discontinuity 0.780, stain 0.612
+
+Let me review what's been tried and what's left:
+
+**Data:**
+- e001: Training on detector boxes with background class → rejected (0.5691)
+- e002: Adding matched detector boxes → new best (0.6293)
+- e003: Adding low-res GT crops → new best (0.6317)
+- e005: 5th background class → rejected (0.6039)
+- e024: Upweighting matched detector boxes 2× → rejected (0.6397)
+
+**Scoring:**
+- e004: conf × prob² → rejected
+- e014: × max_prob → rejected
+- e019: margin scoring → rejected (0.5805)
+- e026: Histogram-calibrated conf → rejected (0.6278)
+
+**Architecture:**
+- e008: Single wide crop (2.5x) → new best (0.6386)
+- e013: EfficientNet-B2 → rejected (0.6340)
+- e015: ConvNeXt-Nano → rejected (0.5833)
+- e016: IMG_SIZE 160→224 → new best (0.6411)
+- e018: IMG_SIZE 224→192 → rejected (0.6387)
+- e021: tf_efficientnetv2_b0 → not confirmed (0.6447 seed-0, 0.6352 5-seed)
+- e022: MobileNetV3-Large → rejected (0.6380)
+- e027: INF_SIZE 256 → rejected (0.6326)
+
+**Inference:**
+- e009: H-flip TTA → new best (0.6387)
+- e012: V-flip + 180° rotation TTA → rejected (0.6370)
+
+**Optimization:**
+- e010: Batch 32 → rejected (0.6229)
+- e017: LR 2e-3 → rejected (0.6364)
+- e020: Min LR multiplier raised → rejected (0.6363)
+- e025: SGD → suspicious/bug (0.4765)
+
+**Loss:**
+- e006: Focal loss → rejected (0.6123)
+- e023: Label smoothing → rejected (0.6340)
+
+**Sampling:**
+- e011: WeightedRandomSampler for pore/stain → rejected (0.6305)
+
+So what's left to try? Let me think about what could actually help:
+
+1. **The two-crop input was removed in e008** (single wide crop). The original two-crop (1.5x + 2.5x) gave 0.6387 with H-flip TTA. The single wide crop at 160 gave 0.6386. Then 224 gave 0.6411. But what about going back to two-crop at 224? The two-crop approach was the starting point and the brief says "A crop classifier given perfect boxes reaches macro-F1 ~0.87 with the starting recipe (two-crop input)." The two-crop approach was dropped in e008 to get more training steps. But now with IMG_SIZE=224, the cost per step is higher. Let me think...
+
+Actually wait, e008 changed from two-crop to single wide crop. The two-crop was 1.5x + 2.5x through the same model, logits averaged. This was the starting recipe. At 224, each forward pass is more expensive, so two-crop would cost ~2x per step. With 660 steps at single-crop 224, two-crop would give ~330 steps. That's a significant reduction.
+
+But the two-crop approach was the "starting recipe" that reached macro-F1 ~0.87. The question is whether the extra context from the tight crop helps enough to compensate for fewer training steps.
+
+2. **Ensembling**: The brief mentions "ensembling within the time budget." Could we train two models and average their predictions? With 660 steps, we could train two smaller models or one model for half the time twice with different seeds/augmentations. But this is complex.
+
+3. **Training on detector boxes with background**: e001 tried this and got 0.5691, but that was on the base e000 (which had two-crop, 160px, no H-flip TTA, no matched dets). The idea might work better on the current architecture. But e005 also tried background class and got 0.6039. So background class seems harmful.
+
+4. **Score calibration**: We've tried prob², max_prob, margin, histogram calibration. What about a simpler approach? The score is currently conf × prob[c]. What if we use a temperature-scaled probability? Or what about using the raw logit difference?
+
+5. **Data augmentation**: We have H-flip, V-flip, brightness. What about:
+   - Color jitter (more aggressive)
+   - Random erasure (CutOut)
+   - Elastic deformation
+   - Random scaling (beyond the current 0.85-1.2)
+   
+   Actually, the current augmentation is: H-flip (50%), V-flip (50%), brightness (0.8-1.2x), and geometric jitter in make_crop (±10% center shift, 0.85-1.2x side). This is already fairly aggressive.
+
+6. **More training data**: We're using both high and low res crops. The matched detector boxes add 12219 boxes. What about using ALL detector boxes (including unmatched ones) but with a soft label or lower weight? e001 and e005 tried background and it hurt. But what about using unmatched boxes as a "mixture" of classes with low confidence?
+
+7. **The key insight from the brief**: "When all types are merged into one class, the same detector reaches 0.77, so many errors are wrong types, not missed defects." And "stage-1 boxes scored as a single class 'defect': 0.755 mAP@0.5". The ceiling is 0.758. We're at 0.6411.
+
+The gap between 0.6411 and 0.758 is large. The main errors are:
+- Wrong class assignments (pore/deposit/stain confusion)
+- False alarms being scored too high
+- Some missed detections
+
+8. **What about the scoring function more carefully?** The current score is conf × prob[c]. For a true detection, conf is moderate and prob[correct_class] is high. For a false alarm, conf might be moderate but prob[all_classes] are low (or spread out). The issue is that conf doesn't distinguish well.
+
+What if we use: score = conf × (prob[c] - mean(prob)) or score = conf × prob[c] / sum(prob)? Wait, prob already sums to 1.
+
+Actually, what about: score = (conf × prob[c]) × (1 - prob_bg_estimate)? Where prob_bg_estimate is the probability that the box is background, estimated as 1 - max(prob). This is similar to e014 (× max_prob) which was rejected. Hmm.
+
+9. **What about using the detector confidence differently?** The detector conf ranges from 0 to 1. For true detections, conf tends to be higher. For false alarms, conf can still be moderate. What if we use conf^0.5 or conf^2 to adjust the ranking?
+
+Actually, let me think about what scoring changes haven't been tried:
+- conf × prob → current
+- conf × prob² → tried, rejected
+- conf × prob × max_prob → tried, rejected
+- conf × (prob - max_other) → tried, rejected
+- calibrated conf → tried, rejected
+- What about: (conf × prob)^α for some α? Or conf^α × prob?
+
+10. **What about training the model to directly predict the score?** Instead of predicting class probabilities and combining with conf, what if we add a regression head that predicts the "detection confidence"? This is a bigger change.
+
+11. **What about the number of predictions per box?** Currently we output all 4 classes per box. The brief says "Several rows per box (one per class) are allowed and often help." We're already doing this. What about outputting only the top-2 classes? Or adjusting the scores so that lower-probability classes are suppressed more?
+
+12. **Let me think about what's most promising.** The per-class APs are: pore 0.537, deposit 0.635, discontinuity 0.780, stain 0.612. Pore is the weakest. The brief says "Pore and deposit are the weak classes; stain is often confused with deposit and background."
+
+What could specifically help pore?
+- Pores are small, dark circular spots. They need fine detail.
+- The 224px input helps (e016 was a big gain).
+- Maybe a higher resolution would help even more? e027 tried 256px inference and it was rejected. But what about training at 256?
+- Actually, e018 tried 192 and it was rejected. e027 tried 256 inference and rejected. So 224 seems to be the sweet spot.
+
+13. **What about a different approach to the two-crop idea?** Instead of two separate crops through the same model (which doubles compute), what about concatenating the tight and wide crops into a single 224×448 or 448×224 input? This would require a different model input. Or what about using the tight crop as an additional channel?
+
+Actually, the simplest two-crop approach at 224 would be: make two crops (1.5x and 2.5x), resize both to 224×224, run through the model twice, average logits. This costs 2x per forward pass. With 660 steps currently, we'd get ~330 steps. That's a significant reduction.
+
+But wait - the original two-crop at 160px with the starting recipe reached macro-F1 ~0.87 on perfect boxes. The single wide crop at 224 is our current best. The question is whether two-crop at 224 would be better.
+
+Let me estimate: at 224px, each forward pass takes ~0.25s (660 steps in ~110s of training time, so ~0.17s per step including data loading and backward). Two crops would be ~0.34s per step, giving ~330 steps in the same time. That's half the training.
+
+Hmm, but the two-crop approach was the "starting recipe" that worked well. Let me think about whether it's worth trying.
+
+Actually, I realize I should think about what's most likely to give a meaningful improvement. Let me reconsider the problem.
+
+The key metrics:
+- Current: 0.6411
+- Single class "defect": 0.755
+- Perfect classes on stage-1 boxes: 0.758
+- One-step 4-class: 0.638 (baseline to beat, we're at 0.6411)
+
+So we're barely beating the one-step baseline. The gap to the ceiling (0.758) is 0.117. Most of this gap is from wrong class assignments.
+
+The classifier's job is to:
+1. Assign the right class to true detections
+2. Suppress false alarms (give them low scores)
+3. Rank true detections above false ones
+
+For (1), we need better classification accuracy, especially for pore/stain/deposit.
+For (2) and (3), we need better score calibration.
+
+Let me think about what hasn't been tried that could help with classification:
+
+**Idea: Use the tight crop (1.5x) as the primary input instead of wide (2.5x).**
+
+The current setup uses a 2.5x wide crop. But for small defects like pores, the tight crop (1.5x) might show more detail of the defect itself, while the wide crop shows more context. The two-crop approach averaged both. What if the tight crop alone is better for classification?
+
+Actually, e008 changed from two-crop to single wide crop and it was a new best (0.6386 vs 0.6317). So the wide crop alone was better than the two-crop average at 160px. But that was before the 224px change.
+
+**Idea: Train at 224 but use a different CONTEXT value.**
+
+Currently CONTEXT=2.5. What if 2.0 or 3.0 is better? A smaller context shows more detail of the defect, a larger context shows more surrounding area. For pores (small dark spots), a tighter crop might show the pore more clearly. For stains (larger areas), a wider crop might help.
+
+This is a cheap experiment - just change CONTEXT from 2.5 to 2.0 or 3.0.
+
+**Idea: Use a different image size for the tight vs wide crop.**
+
+Actually, let me think about what's most likely to work given the history. Many things have been tried and rejected. The remaining untried ideas are:
+
+1. Different CONTEXT values (2.0, 3.0)
+2. Two-crop at 224 (but expensive)
+3. More aggressive augmentation (elastic deformation, color jitter)
+4. Different score functions (haven't exhausted all options)
+5. Training with a different loss (e.g., KL divergence with soft targets)
+6. Using the detector confidence as an input feature to the classifier
+7. Multi-scale training (train at multiple resolutions)
+
+Let me think about #6: using detector confidence as an input. The classifier currently doesn't see the detector's confidence score. If we add it as an extra input (e.g., as a 4th channel or as a bias), the model could learn to weight its prediction based on how confident the detector is. High-conf detections are more likely to be true, so the model could be more decisive. Low-conf detections are more likely to be false alarms, so the model could be more uncertain.
+
+But this is a bigger architectural change. Let me think of something simpler.
+
+**Idea: Add a 4th channel to the input that encodes the detector confidence.**
+
+For training: for GT crops, we don't have a detector confidence. We could use a fixed value (e.g., 1.0) or the mean confidence of matched dets. For matched detector boxes, we use their actual confidence.
+
+For eval: we use the actual confidence.
+
+This adds information that the model can use. But it changes the input format and the pretrained weights expect 3 channels. We'd need to modify the first conv layer.
+
+Actually, this is getting complex. Let me think of something simpler.
+
+**Idea: Change CONTEXT from 2.5 to 2.0.**
+
+Hypothesis: A tighter crop (2.0x instead of 2.5x) shows more detail of the defect itself, which is especially helpful for the weak classes (pore, stain) where the defect's appearance is the key discriminator. The wider crop (2.5x) includes more background which can be confusing.
+
+This is a one-line change and easy to test.
+
+Actually, let me reconsider. The starting recipe used CONTEXT=2.5 and TIGHT_CONTEXT=1.5. The two-crop approach averaged both. When e008 dropped the tight crop and kept only 2.5, it was a new best. But that was at 160px. At 224px, the effective field of view is different.
+
+At 224px with CONTEXT=2.5, the crop shows 2.5x the defect size. At CONTEXT=2.0, it shows 2.0x. The tighter crop would show more detail per pixel.
+
+Let me go with CONTEXT=2.0 as a quick test.
+
+Wait, actually, I should think more carefully. What's the most impactful change I can make?
+
+Let me look at the per-class APs again:
+- pore: 0.537 (weakest)
+- deposit: 0.635
+- discontinuity: 0.780 (strongest)
+- stain: 0.612
+
+Pore is by far the weakest. What makes pores hard?
+- They're small, dark, circular spots
+- They can be confused with other small dark features
+- They need fine detail to distinguish from background noise
+
+The 224px input was a big help (e016). What else could help?
+
+**Idea: Add random erasure (CutOut) augmentation.**
+
+Random erasure randomly masks out rectangular regions of the input, forcing the model to rely on other parts of the image. This can improve robustness and generalization. For pores, which are small features, the model needs to learn to identify them even when parts of the image are occluded.
+
+But actually, random erasure might hurt for small defects because it could erase the defect itself.
+
+**Idea: Use a different backbone - regnety_016 or resnet34.**
+
+We've tried EfficientNet-B0, B2, ConvNeXt-Nano, MobileNetV3-Large, tf_efficientnetv2_b0. We haven't tried:
+- convnext_atto (very small)
+- convnext_pico (very small)
+- regnety_016 (16M params, ResNet-like)
+- resnet18, resnet26d, resnet34, resnet50
+
+ResNet architectures are different from EfficientNet. They use skip connections and might capture different features. But they're also more FLOPs-heavy at 224px.
+
+Actually, regnety_016 is 16M params - that's 4x EfficientNet-B0. It would be slower per step.
+
+resnet34 is 21M params. Also slower.
+
+resnet18 is 11M params. Moderate.
+
+Let me think about what's most likely to give a meaningful improvement...
+
+**Idea: Use a mix of CONTEXT values during training (multi-scale training).**
+
+Instead of always using CONTEXT=2.5, randomly vary it between 2.0 and 3.0 during training. This gives the model exposure to different scales, similar to multi-scale training in object detection. At inference, use the fixed CONTEXT=2.5.
+
+This is a simple change: in make_crop, when train=True, multiply the context by a random factor.
+
+Actually, the current code already has `side *= random.uniform(0.85, 1.2)` which varies the crop size by ±15%. This is already a form of multi-scale. Making it 0.7 to 1.4 would be more aggressive.
+
+**Idea: Increase the geometric jitter during training.**
+
+Currently: center shift ±10%, side scale 0.85-1.2. What about center shift ±15%, side scale 0.75-1.3? This would make the model more robust to box misplacement, which is a known issue (the detector's boxes are slightly misplaced).
+
+The brief mentions "robustness to box misplacement (jitter matching the detector's errors)" as an in-scope idea.
+
+Let me check: the current jitter is ±10% of the side length for center, and 0.85-1.2 for side. The detector's boxes are "slightly misplaced" - what's the typical misplacement? If the detector's IoU with GT is ~0.5-0.7, the misplacement could be 20-40% of the box size.
+
+Increasing the jitter to ±20% center and 0.7-1.4 side would better match the detector's error distribution. This is a simple change.
+
+Let me go with this: increase the training jitter to better match the detector's box misplacement.
+
+Current:
+```python
+cx += random.uniform(-0.1, 0.1) * side
+cy += random.uniform(-0.1, 0.1) * side
+side *= random.uniform(0.85, 1.2)
+```
+
+New:
+```python
+cx += random.uniform(-0.2, 0.2) * side
+cy += random.uniform(-0.2, 0.2) * side
+side *= random.uniform(0.7, 1.4)
+```
+
+Hypothesis: The detector's boxes are misaligned with ground truth by up to ~20-30% of the box size. The current training jitter (±10% center, 0.85-1.2x side) doesn't fully cover this distribution, so the classifier is less robust to the actual box misplacement at inference. Increasing the jitter to ±20% center and 0.7-1.4x side better matches the detector's error distribution, improving robustness especially for small defects (pore) where relative misplacement matters more.
+
+This is a focused, testable change. Let me write it up.
+
+Wait, but I should also consider: does the jitter already cover the range? The matched detector boxes are already in the training set (e002). These boxes have the actual detector misplacement. So the model already sees some misplacement through the matched dets. But the GT crops have no misplacement. The jitter on GT crops adds some, but maybe not enough.
+
+The ratio of GT crops to matched dets is 14128:12219, so about 53% GT and 47% dets. The dets have natural misplacement. The GT crops have jitter of ±10%. If the detector's typical misplacement is ±20%, then the GT crops are under-jittered.
+
+I think increasing the jitter is a reasonable next step. Let me go with it.
+
+Actually, let me reconsider one more time. What about the CONTEXT value? The brief says the starting recipe was two-crop (1.5x + 2.5x). The single wide crop at 2.5x was chosen in e008. But what if 2.0x is actually better at 224px?
+
+At 224px with CONTEXT=2.5, the crop is 2.5x the defect. At CONTEXT=2.0, it's 2.0x. The tighter crop shows the defect more prominently. For pore detection, this might be better.
+
+But I've already decided to try the jitter change. Let me stick with that.
+
+Actually, let me think about this differently. What's the single most impactful change I can make?
+
+Looking at the experiment history, the biggest gains were:
+- e008: two-crop → single wide crop (0.6317 → 0.6386, +0.007)
+- e009: + H-flip TTA (0.6386 → 0.6387, +0.0001)
+- e016: 160 → 224 (0.6387 → 0.6411, +0.0024)
+
+The gains are getting smaller. We're in diminishing returns territory.
+
+Let me think about what could give a bigger jump:
+
+1. **A fundamentally different approach to scoring.** Instead of conf × prob, what if we use a learned scoring function? E.g., train a small MLP that takes (conf, prob[0], prob[1], prob[2], prob[3]) and outputs a score for each class. This MLP could be trained on the training detector boxes where we know the true class.
+
+But this is complex and might overfit.
+
+2. **Using the detector confidence as a training signal.** During training, for matched detector boxes, we know both the class and the detector confidence. We could add a loss term that encourages the model to be more confident when the detector is confident, and less confident when the detector is uncertain. This is a form of meta-learning.
+
+But this is also complex.
+
+3. **A simpler idea: use the detector confidence to weight the training loss.** For matched detector boxes with high conf, use a higher loss weight. For low conf, use a lower weight. This makes the model focus on the examples where the detector is most confident, which are more likely to be true detections.
+
+Actually, this is interesting but might not help much.
+
+4. **What about using a different number of predictions per box?** Currently we output all 4 classes. What if we only output the top-1 or top-2 classes? The brief says "Several rows per box (one per class) are allowed and often help." So all 4 is probably fine.
+
+5. **What about a two-pass approach?** First pass: classify all boxes. Second pass: for boxes where the top-2 classes are close (e.g., prob diff < 0.1), re-examine with a different crop or model. This is complex and might not fit in the time budget.
+
+Let me go back to the jitter idea. It's simple, testable, and addresses a known issue (box misplacement).
+
+Actually, I just realized something. The current jitter is applied in make_crop, which is called for both training and eval (but only the jitter part is conditional on train). Let me re-read the code:
+
+```python
+def make_crop(img, r, context, train):
+    h, w = img.shape[:2]
+    cx, cy = (r["x1"] + r["x2"]) / 2, (r["y1"] + r["y2"]) / 2
+    side = max(max(r["x2"] - r["x1"], r["y2"] - r["y1"]) * context, MIN_CROP)
+    if train:  # light geometric jitter
+        cx += random.uniform(-0.1, 0.1) * side
+        cy += random.uniform(-0.1, 0.1) * side
+        side *= random.uniform(0.85, 1.2)
+    s = max(2, int(round(side)))
+    ...
+```
+
+Yes, the jitter is only during training. Good.
+
+Let me also consider: should I increase the jitter AND change the CONTEXT? No, one idea per turn. Let me just do the jitter.
+
+Let me write the change:
+
+```python
+    if train:  # light geometric jitter
+        cx += random.uniform(-0.1, 0.1) * side
+        cy += random.uniform(-0.1, 0.1) * side
+        side *= random.uniform(0.85, 1.2)
+```
+
+Change to:
+
+```python
+    if train:  # geometric jitter matching detector box misplacement
+        cx += random.uniform(-0.2, 0.2) * side
+        cy += random.uniform(-0.2, 0.2) * side
+        side *= random.uniform(0.7, 1.4)
+```
+
+This doubles the center jitter and widens the side scale range.
+
+Hypothesis: The detector's boxes are misaligned with ground truth by up to ~20-30% of the box size (IoU 0.5-0.7 range). The current training jitter (±10% center, 0.85-1.2x side) underestimates this misplacement, making the classifier less robust to the actual box positions at inference. Doubling the jitter to ±20% center and 0.7-1.4x side better matches the detector's error distribution, improving robustness especially for small defects (pore) where relative misplacement has a larger effect on the visible content.
+
+This is a focused change. Let me finalize it.
+
+Wait, I want to double-check: the SEARCH text must appear exactly once in the file. Let me look at the current best train.py (e016):
+
+```python
+    if train:  # light geometric jitter
+        cx += random.uniform(-0.1, 0.1) * side
+        cy += random.uniform(-0.1, 0.1) * side
+        side *= random.uniform(0.85, 1.2)
+```
+
+Yes, this appears exactly once. Good.
+
+Let me finalize the response.

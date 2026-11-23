@@ -1,0 +1,341 @@
+===== attempt 1 =====
+Let me carefully analyze the situation.
+
+**Current state:**
+- Best: e000, 5-seed mean 0.6297
+- Baseline to beat: 0.638 (one-step 4-class detector)
+- Ceiling: 0.758
+- Class-agnostic: 0.755
+- Per-class: pore 0.504, deposit 0.626, discontinuity 0.780, stain 0.609
+
+**Key insight from the reference numbers:**
+- Stage-1 boxes with perfect classes: 0.758
+- Stage-1 boxes as single class: 0.755
+- Our two-stage: 0.630
+
+So the gap from 0.630 to 0.758 is almost entirely a *class decision* problem. The boxes are fine (0.755 single-class), so the issue is purely in assigning the right class.
+
+**What has been tried:**
+1. e001: crashed (NameError)
+2. e002: fixing e001, rejected (0.5541)
+3. e003: 4 views averaging (inference), not confirmed (0.6301)
+4. e004: scoring - only emit best class, rejected (0.5689)
+5. e005: architecture swap (regnety_016?), rejected (0.6240)
+6. e006: data - include low-res crops, rejected (0.6225)
+7. e007: scoring - cross-class contamination, rejected (0.6192)
+8. e008: mixup augmentation, not confirmed (0.6327)
+9. e009: sampling - train on detector boxes, rejected (0.6268)
+10. e010: scoring - ranking, rejected (0.6289)
+11. e011: inference - probability averaging, rejected (0.6253)
+12. e012: data - size/aspect channels, crashed
+13. e013: fixing e012, crashed
+14. e014: data - size/aspect channels (fixed), not confirmed (0.6273)
+
+**Lessons:**
+- data: EXHAUSTED (3+ ideas, no new best)
+- scoring: EXHAUSTED (3+ ideas, no new best)
+- inference: 2 ideas, 0 new best, 1 close
+- architecture: 1 idea, 0 new best
+- augmentation: 1 idea, 0 new best, 1 close
+- sampling: 1 idea, 0 new best
+
+**What's the core problem?**
+The gap is 0.630 vs 0.758 ceiling. This is a class decision problem. The per-class scores show:
+- pore: 0.504 (weakest)
+- deposit: 0.626
+- discontinuity: 0.780 (strongest)
+- stain: 0.609
+
+The "known" section says:
+- Crop classifier with perfect boxes reaches macro-F1 ~0.87
+- Pore and deposit are weak classes; stain confused with deposit
+- Tuning hyperparameters alone helped little
+- Class-weighted loss hurt every time
+
+**What hasn't been tried that could matter?**
+
+Let me think about what fundamentally different approaches remain:
+
+1. **The scoring/ranking problem**: We emit 4 rows per box. The metric says "AP depends only on the ORDER." So if we emit all 4 classes per box, each class's list has ~41k entries. The key is the *relative ordering* within each class's list.
+
+Wait, but e004, e007, e010 all tried scoring changes and were rejected. Let me think about what they did:
+- e004: only emit best class (dropped 3 rows per box) → 0.5689, much worse
+- e007: cross-class contamination fix → 0.6192
+- e010: ranking fix → 0.6289
+
+So emitting all 4 rows is actually important (e004 dropped to 0.5689). The scoring category seems exhausted.
+
+2. **The class decision quality**: The model's per-class probabilities are what drive the scores. If we can make the classifier better at distinguishing pore vs deposit vs stain, that helps.
+
+What makes pore hard? Pores are small. The crop is 1.5x and 2.5x the box. For small boxes, the crop might be very small (MIN_CROP=16) and then upscaled to 160. This could lose information.
+
+Actually, wait. Let me reconsider the problem structure.
+
+The key realization: **mAP@0.5 depends only on the ORDER of predictions within each class.** So for class c, we have a list of (box, score) pairs sorted by score. A prediction is a hit if it overlaps an unmatched true box of class c by IoU > 0.5.
+
+Since we emit one row per class per box, the set of boxes in each class's list is the SAME (all eval boxes). The only thing that varies is the score (ordering). So the AP for class c depends entirely on how we rank the boxes by their "probability of being class c."
+
+Now, the ceiling (0.758) is achieved when boxes that overlap true defects get the correct class. In that case, for class c, the boxes that overlap true c-defects are ranked highest (they get the correct class label, so they're in class c's list with high score), and false alarms are ranked lowest.
+
+Wait, actually the ceiling is: "Every detector box that overlaps a true defect (IoU > 0.5) gets the correct class; every other box (false alarms) is KEPT, as class 0, with its detector conf." So in the ceiling, each box gets exactly ONE class (the correct one if it's a true detection, else class 0). And the score is the detector conf.
+
+So in the ceiling, for class c (c≠0), the list contains only boxes that overlap true c-defects, sorted by detector conf. For class 0, the list contains true pore boxes (sorted by conf) PLUS all false alarms (sorted by conf).
+
+In our current approach, we emit 4 rows per box. So for class c, the list contains ALL boxes, each with score = det_conf * p_c. The ordering is by det_conf * p_c.
+
+The difference: in the ceiling, class c's list has only true c boxes (plus for class 0, false alarms). In our approach, class c's list has all boxes.
+
+So the question is: can our scoring (det_conf * p_c) rank true c boxes above non-c boxes well enough?
+
+The problem is that p_c is the classifier's probability. If the classifier is good, p_c should be high for true c boxes and low for others. But if the classifier confuses pore and deposit, then a true pore box might get high p_deposit, and it would rank high in the deposit list (as a false positive) and also high in the pore list.
+
+Hmm, but the metric is per-class. Let me think about what actually hurts.
+
+For class c, AP is computed by sorting all predictions of class c by score, then greedily matching. A prediction is a TP if it matches an unmatched true c box. Otherwise it's a FP.
+
+The issue: if a true pore box gets a high score in the deposit list (because p_deposit is high for it), then it becomes a false positive in the deposit list, which hurts deposit's AP.
+
+Conversely, if a false alarm gets a high p_c, it becomes a false positive in class c's list.
+
+So the classifier's confusion matrix directly affects AP.
+
+**What could help the classifier?**
+
+Ideas not yet tried:
+1. **Larger image / higher resolution**: Currently IMG_SIZE=160. Pores are small; a 160px image might not capture enough detail. But this would slow down training and prediction. Let me check the budget.
+
+Current: 432 steps in ~150s (13s load + 137s train + prediction). Each step ~0.3s. If I increase resolution, step time increases.
+
+Actually, the prediction is 41879 boxes × 2 views = 83758 forward passes. At batch 256, that's ~327 batches. The prediction time is 162-137 = 25s. So ~0.076s per batch of 256, or ~0.0003s per view.
+
+If I double the resolution (160→320), the compute per view goes up by 4x (roughly, for conv nets). So prediction would be ~100s. That's too much given the 55s reserve.
+
+Actually, let me reconsider. The total budget is 180s. Load is 13s. Reserve is 55s. So training gets 180-13-55 = 112s. Currently training takes 137-13 = 124s... wait, that doesn't add up. Let me re-read.
+
+"epoch 4: loss 0.2180, 432 steps, 125s" — so at 125s we're at 432 steps. "done: 5 epochs, 432 steps, 53378 prediction rows, 162s total". So training ended at ~125s (or a bit more), prediction took 162-125 = 37s. Total 162s, within 180s.
+
+Wait, the log says "125s" at epoch 4, and total is 162s. So prediction + writing took 37s. The reserve is 55s, so training should stop at 180-55 = 125s. Yes, that matches.
+
+So if I increase resolution, training steps get slower (fewer steps in 112s) AND prediction gets slower. Both hurt.
+
+2. **Better crop strategy**: Currently tight 1.5x + wide 2.5x. What if we use a different context? Or what if the crop is the issue for small boxes?
+
+Actually, for very small boxes (pores), the crop side = max(long_side * 1.5, 16). If the box is 5px, the crop is 16px, then upscaled to 160. That's a 10x upscale, which is bad. The pore detail is lost.
+
+What if for small boxes, we use a larger context to include more surrounding texture? Or what if we don't upscale so aggressively?
+
+Hmm, but this is a "data" category change, and data is marked EXHAUSTED. But the rule says "do not propose another variant of it unless you can say what is fundamentally different." The crop context is somewhat different from the size/aspect channel idea. But it's still "data" in the sense of what the model sees.
+
+Actually, let me reconsider what "data" category means here. The data experiments were:
+- e001: (crashed, about ranking)
+- e006: include low-res crops
+- e012: size/aspect channels (crashed)
+- e013: fixing e012 (crashed)
+- e014: size/aspect channels (not confirmed)
+
+So data = changing what input the model sees or what training data is used. The crop context (1.5x, 2.5x) is part of "what the model sees." Changing it would be a data experiment. But data is exhausted.
+
+Hmm. Let me think about other categories.
+
+3. **Architecture**: Only 1 tried (e005, regnety_016, rejected). What about a different architecture that's better at fine-grained classification? Or what about using the model differently?
+
+Actually, what about **multi-scale input** or **feature pyramid**? The model sees two crops (tight + wide) and averages logits. What if instead of averaging logits, we concatenate features or use a different fusion?
+
+e003 tried 4 views (tight+wide, each with... something) and got 0.6301 (not confirmed). e011 tried probability averaging vs logit averaging and got 0.6253 (rejected).
+
+4. **Loss**: Class-weighted loss hurt every time. What about focal loss? Or label smoothing? Or a different loss that addresses the confusion between specific pairs?
+
+Actually, the known issue is stain confused with deposit, and pore/deposit weak. What about a **contrastive loss** or **triplet loss** that specifically pushes apart the confused classes? Or what about **mixup** (already tried, e008, not confirmed)?
+
+Wait, e008 was mixup and got 0.6327 (not confirmed, close). So augmentation is "1 idea, 0 new best, 1 close." Not exhausted.
+
+5. **Optimization**: Not tried at all! The category list doesn't show "optimisation" in the lessons. Let me check... The categories are: data, augmentation, architecture, loss, sampling, optimisation, inference, scoring, other.
+
+Looking at the lessons table: data, inference, scoring, architecture, augmentation, sampling. No "loss" and no "optimisation" rows. So loss and optimisation haven't been tried (except class-weighted loss which is mentioned as "hurt every time it was tried" in the known section, but that might have been in a different context).
+
+Wait, the known section says "Class-weighted loss hurt classification every time it was tried." So loss has been tried (class weighting) and hurt. But other loss changes (focal loss, label smoothing) haven't been tried.
+
+**Optimisation** hasn't been tried at all. What could help?
+- Different optimizer (SGD with momentum vs AdamW)?
+- Different learning rate schedule?
+- Longer training (but budget-limited)?
+- Learning rate warmup is already there.
+
+Actually, the current setup trains for ~112s with 432 steps. That's a lot of steps. The loss goes from 0.73 to 0.22 over 5 epochs. Is the model underfitting or overfitting?
+
+With 6052 training boxes and 432 steps × 64 batch = 27648 samples seen, that's ~4.6 epochs worth of data (6052/64 = 94.5 steps per epoch, 432/94.5 = 4.56 epochs). So we see each sample ~4.6 times.
+
+The loss is still decreasing at the end (0.218 at epoch 4). So the model might benefit from more training. But we're budget-limited.
+
+What if we use a smaller model to train faster and get more steps? e005 tried regnety_016 (smaller) and got 0.6240 (rejected). So smaller model didn't help.
+
+What about **training efficiency**: using a smaller batch size to get more steps? Or using gradient accumulation?
+
+Actually, let me think about the most impactful change.
+
+**The core problem is class confusion: pore vs deposit, stain vs deposit.**
+
+The classifier sees two crops (tight 1.5x, wide 2.5x). For pore (small, round, dark spots), the tight crop might be mostly the pore. For deposit (larger, irregular), the tight crop shows the deposit shape.
+
+What if the issue is that the model needs to see the box in context of the weld bead? The wide crop (2.5x) provides some context. But maybe not enough.
+
+Alternatively, what if we provide the model with the **box coordinates relative to the image** or **the box size as a feature**? e014 tried size/aspect channels and got 0.6273 (not confirmed, slightly below 0.6297). So that didn't help.
+
+Let me think differently. What's the biggest lever?
+
+The gap is 0.630 vs 0.758. That's 0.128. The per-class breakdown:
+- pore: 0.504
+- deposit: 0.626
+- discontinuity: 0.780
+- stain: 0.609
+
+If we could get pore to 0.70 (matching discontinuity roughly), that would add (0.70-0.504)/4 = 0.049 to the mean. If stain to 0.75, that's (0.75-0.609)/4 = 0.035. Combined, ~0.084. That would get us to ~0.714.
+
+So the biggest lever is improving pore and stain classification.
+
+**What makes pore hard?**
+Pores are small. In the image, they're small dark spots. The crop is 1.5x the box, so for a 5px box, the crop is 7.5px → clamped to 16px → upscaled to 160px. The pore is a tiny dark spot in a sea of weld texture. The model has to identify "this is a pore" vs "this is a deposit" (which might also be small and dark).
+
+**What makes stain hard?**
+Stain is confused with deposit. Stain might be a discoloration without a clear shape, while deposit is a raised irregular shape.
+
+**Idea: What if we train the classifier to be more discriminative by using a different loss function?**
+
+Focal loss reduces the weight of easy examples, focusing on hard ones. This could help with the confused classes. But loss category... let me check if it's been tried. The lessons table doesn't show a "loss" row, so it hasn't been formally tried (except class-weighted which is mentioned in the known section).
+
+Actually, wait. Let me re-read: "Class-weighted loss hurt classification every time it was tried." This is in the "What is already known" section, suggesting it was tried in some earlier context (maybe not in this experiment series). So loss is a fresh category in this series.
+
+**Focal loss hypothesis**: The classifier is already good at easy examples (discontinuity, which is distinct). The hard examples (pore vs deposit, stain vs deposit) are where it loses. Focal loss down-weights easy examples and focuses on hard ones, which could sharpen the decision boundaries between confused classes. Expected gain: 0.01-0.03, targeting pore and stain.
+
+But wait, is focal loss likely to help? In practice, focal loss is more for detection (handling FP/TN imbalance). For classification with 4 roughly balanced classes, it might not help much. And the known section says "Tuning hyperparameters alone helped little in earlier experiments; changes of method helped more." Focal loss is somewhat of a hyperparameter change.
+
+Let me think about something more methodological.
+
+**Idea: What if we use the detector confidence differently in the final score?**
+
+Currently: score = det_conf * p_c. The det_conf is the stage-1 detector's confidence. This is a proxy for "is this a real defect?" The p_c is the stage-2 classifier's probability.
+
+For the ranking within class c, we want true c boxes to rank high and non-c boxes to rank low. The det_conf helps separate real defects from false alarms (across all classes). The p_c helps separate class c from other classes.
+
+But what if the det_conf is noisy or miscalibrated? What if we could learn a better combination?
+
+Actually, e010 tried scoring changes and got 0.6289 (rejected). e007 tried 0.6192. e004 tried 0.5689. So scoring is exhausted.
+
+**Idea: What about training the classifier on the detector boxes (train split) instead of ground-truth crops?**
+
+e009 tried this (sampling category) and got 0.6268 (rejected). So that didn't help.
+
+**Idea: What about using a stronger data augmentation specifically for the weak classes?**
+
+The known section says pore and deposit are weak. What if we apply stronger augmentation to pore and deposit samples? Or what if we use class-specific augmentation?
+
+This is an augmentation change. e008 tried mixup (0.6327, not confirmed). So augmentation has 1 close result. Not exhausted.
+
+But class-specific augmentation is a bit of a stretch. Let me think more.
+
+**Idea: What about the crop for small boxes?**
+
+For small boxes (pores), the crop is upscaled a lot, losing detail. What if we use a **higher resolution** specifically for small boxes? Or what if we use a **larger context** for small boxes to include more texture?
+
+Actually, here's a concrete idea: **For small boxes, the 1.5x tight crop is very small and gets upscaled, blurring the pore. What if we use a larger tight context (e.g., 2.0x) for all boxes, or adaptively for small boxes?**
+
+But this is a data/crop change, and data is exhausted.
+
+Hmm, let me reconsider. The rule says "A direction where three or more attempts gave no confirmed gain is exhausted: do not propose another variant of it unless you can say what is fundamentally different."
+
+Data has 6 ideas, 3 ran, 0 new best, 3 crashed. The 3 that ran were e006 (low-res), e014 (size channels), and... e001 crashed. So actually only 2 data experiments completed (e006, e014), both rejected/not confirmed. Plus 3 crashed (e001, e012, e013).
+
+Wait, the table says "data | 6 | 3 | 0 | 1 | 3". So 6 ideas, 3 ran, 0 new best, 1 close, 3 crashed. The 3 that ran: e006 (0.6225, rejected), e014 (0.6273, not confirmed), and one more? Let me check. e001 crashed, e002 was based on e001 (data category? no, e002's base is e001 but category is... let me re-read).
+
+Actually, the history table:
+- e001: data, crashed
+- e002: data (base e001), 0.5541, rejected
+- e006: data, 0.6225, rejected
+- e012: data, crashed
+- e013: data (base e012), crashed
+- e014: data, 0.6273, not confirmed
+
+So data has 6 entries: e001, e002, e006, e012, e013, e014. Ran: e002, e006, e014 (3). Crashed: e001, e012, e013 (3). Close: e014 (0.6273, close to 0.6297). New best: 0.
+
+So data is marked EXHAUSTED. I should avoid data unless fundamentally different.
+
+**Let me focus on untried categories: loss and optimisation.**
+
+**Loss ideas:**
+1. Focal loss (γ=2): focus on hard examples
+2. Label smoothing (e.g., 0.1): regularize, prevent overconfidence
+3. Contrastive / triplet loss between confused pairs
+4. Knowledge distillation (but no teacher)
+
+**Optimisation ideas:**
+1. SGD with momentum instead of AdamW
+2. Different LR (higher or lower)
+3. More aggressive LR schedule
+4. Gradient clipping
+5. Training for more steps (but budget-limited)
+6. Smaller batch for more steps
+
+Actually, let me reconsider the training dynamics. The model trains for 432 steps, loss 0.73 → 0.22. The validation mAP is 0.630. Is the model undertrained?
+
+With EfficientNet-B0 pretrained, fine-tuning for 4.5 epochs on 6052 samples... that's actually a decent amount of training. The loss is still decreasing, so maybe more training would help. But we're budget-limited.
+
+What if we use a **smaller, faster model** to get more training steps? e005 tried regnety_016 and got 0.6240 (rejected). So that specific smaller model didn't help. But what about convnext_pico or convnext_atto (even smaller)?
+
+Actually, the issue with smaller models is they might not be accurate enough. The bottleneck is class confusion, which needs a good feature extractor.
+
+Let me think about **what change could plausibly gain 0.01+**.
+
+The per-class scores: pore 0.504, stain 0.609. These are the weak ones. The classifier macro-F1 is ~0.87, meaning ~13% of classifications are wrong. The confusion is pore↔deposit and stain↔deposit.
+
+**Key idea: What if we add a "deposit" vs "non-deposit" auxiliary task, or use a hierarchical classification?**
+
+No, that's too complex and might not fit the contract.
+
+**Simpler idea: What about using a larger image size for the classifier?**
+
+Currently 160px. Pores are small; at 160px, a 5px pore becomes ~40px in the crop (if the crop is 1.5x = 7.5px, clamped to 16, then 16/160*5 = 0.5px... wait, that's not right).
+
+Let me recompute. Box long side = 5px. Tight context = 1.5, so crop side = max(5*1.5, 16) = max(7.5, 16) = 16px. The 5px pore occupies 5/16 = 31% of the crop width. Then the 16px crop is resized to 160px. So the pore is 5/16*160 = 50px in the final image. That's actually not that small.
+
+For a 2px pore: crop side = max(3, 16) = 16px. Pore is 2/16*160 = 20px. Still visible.
+
+So the resolution might not be the issue. The pore is visible in the crop.
+
+Hmm. Let me think about what else could help.
+
+**What about the wide crop (2.5x)?** For a 5px box, wide crop = max(12.5, 16) = 16px. Same as tight! So for small boxes, tight and wide crops are identical (both clamped to 16px). The two views provide no additional information for small boxes!
+
+This is a key insight. For small boxes (pores), the tight and wide crops are the same because both are clamped to MIN_CROP=16. The "two-crop" design only helps for larger boxes where 1.5x and 2.5x give different contexts.
+
+So for pores (small boxes), the model sees the same image twice and averages the logits, which is the same as seeing it once. The two-crop design provides no benefit for the hardest class!
+
+**What if we use a larger MIN_CROP or a different context for small boxes?**
+
+If we increase the wide context to, say, 4x or 5x, then for a 5px box, wide crop = max(20-25, 16) = 20-25px. This gives a different view that includes more surrounding texture. The pore would be smaller in the wide crop (5/25 = 20% vs 5/16 = 31%), but it would include more weld bead context.
+
+This could help the model distinguish pore (small isolated spot) from deposit (larger irregular shape) by seeing the surrounding texture.
+
+But this is a data/crop change. Data is exhausted. However, I can argue it's fundamentally different: previous data changes were about what features to add (size channels) or what data to include (low-res). This is about the *crop geometry* for small boxes, which directly addresses the fact that tight and wide crops are identical for small boxes.
+
+Actually, let me reconsider. The rule says I shouldn't propose another data variant unless fundamentally different. The crop context IS the data (what the model sees). But the specific issue (tight=wide for small boxes) is a bug-like issue in the current design that hasn't been addressed.
+
+Alternatively, I could frame this as an **architecture** change: instead of two fixed-context crops, use an adaptive context or a different fusion. But that's a stretch.
+
+Let me think about whether changing the wide context from 2.5 to something larger would help.
+
+If CONTEXT = 4.0:
+- For a 5px box: wide crop = max(20, 16) = 20px. Tight = max(7.5, 16) = 16px. Now they're different!
+- For a 10px box: wide = max(40, 16) = 40px. Tight = max(15, 16) = 16px. Different.
+- For a 20px box: wide = max(80, 16) = 80px. Tight = max(30, 16) = 30px. Different.
+
+So increasing CONTEXT to 4.0 would make the wide crop meaningfully different from the tight crop for small and medium boxes. This gives the model more context to work with.
+
+But would this help? The wide crop would show the pore in more context. For pore vs deposit, the context might help (pores are isolated spots, deposits are irregular shapes that might have different surrounding texture).
+
+The risk: a larger crop includes more background, which might dilute the signal. And the pore becomes smaller in the crop (5/20 = 25% vs 5/16 = 31%).
+
+This is a reasonable experiment. Expected gain: 0.01-0.02, targeting pore (and possibly stain).
+
+But it's a data category change, and data is exhausted. Let me see if I can frame it differently.
+
+Actually, you know what, let me reconsider the categories. The "data" category in the lessons refers to: e001 (ranking idea, crashed), e002 (fixing e001), e006 (low-res crops), e012/e013 (size channels,Thinking budget reached. Stop thinking now and write the reply in the required format.

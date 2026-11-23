@@ -1,0 +1,243 @@
+Let me analyze the situation carefully.
+
+**Current state:**
+- Best: e009 (4-scale crop pyramid with feature-pyramid head, EfficientNet-B0, 160px) = 0.6359 val mAP@0.5 (5-seed)
+- Current best is far from the ceiling: perfect classes on stage-1 boxes gives 0.758; your scores cost ~0.12 mAP compared with 0.7366 (if every box had correct class but kept your scores).
+- Diagnostics show: on boxes overlapping real defects, pore is only 63% right, deposit 77% right, discontinuity 95% right, stain 90% right. The biggest confusion is pore→stain and deposit→stain.
+
+**Key observation:** "mAP@0.5 if every box had its correct class but kept your scores: 0.7366 (yours: 0.6359)". So even with perfect classification on overlapping boxes, you'd get 0.7366, still below the 0.758 perfect-class ceiling. The gap 0.758-0.7366 = 0.021 is from scores (detector conf ranking). The gap 0.7366 - 0.6359 = 0.1007 is from wrong class assignments on overlapping boxes.
+
+So the dominant remaining error IS the class decision on true defects: pore→stain, deposit→stain, and some stain→deposit.
+
+**Why are pore and deposit misclassified as stain?**
+From the background: "Pore and deposit are the weak classes; stain is often confused with deposit." Pores are small voids, deposits are larger blobs, discontinuities are cracks/lines, stains are discolorations. The confusion between pore→stain, deposit→stain suggests the classifier isn't distinguishing texture/type well enough at 160px crops with efficientnet_b0.
+
+**What's been tried (e009 is current best):**
+- e001: training on actual detector boxes (mismatch idea) — rejected
+- e002: single tighter crop 3x — rejected
+- e003: TTA — rejected
+- e004: per-class logit biases — rejected
+- e005, e006, e007, e008: architecture variants (cross-attention, etc.) — crashed or not confirmed
+- e009: 4-scale pyramid with feature-pyramid head — NEW BEST
+- e010: add spatial structure to the head — rejected
+- e011: dedicated high-resolution stream — rejected
+- e012: detector boxes as training data again — rejected
+- e013: same idea as e001, data — rejected
+- e014: ensemble — rejected (score 0.5771? That's a crash/bug)
+- e015: box area ratio as model input — crashed
+- e016: geometric prior as scoring multiplier — rejected
+
+**Lessons so far:**
+- data: EXHAUSTED? (3 ideas, no new best)
+- inference: 2 ideas, no gain
+- scoring: 2 ideas, no gain
+- architecture: 9 ideas, 6 ran, 1 new best, 2 not confirmed, 3 crashed
+
+The key insight from the diagnostics:
+- Pore and deposit misclassified as stain. 
+- Share of boxes with right class by defect size: small 82%, medium 90%, large 92%. So actually size doesn't help much... wait, that says "small 82%" meaning for small boxes, 82% are right? But the confusion is pore→stain. Hmm, but pore boxes tend to be small. Actually wait — those are all true defects with a detector box overlapping; 82% for small seems better than 63% for pores overall. So maybe pores that are detected well (larger) are harder.
+
+Actually, let me reconsider: the diagnostic says "small 82%, medium 90%, large 92%" — meaning boxes with true defect in the smallest size third have 82% accuracy. This means smaller boxes are actually harder? But pore is misclassified as stain more often... So maybe pores are in small boxes and those are the ones being confused.
+
+Hmm wait, if small boxes are 82% right vs. overall pore 63% right, then maybe the size distribution of pores overlapping detector boxes skews. This isn't very informative.
+
+**What's left to try?**
+The current best uses a 4-scale pyramid (1.25x, 1.75x, 2.5x, 3.5x) with EfficientNet-B0 at 160px, trained on GT boxes, and score = conf × p(c).
+
+What remains:
+1. **Training data mismatch**: e009 is still trained on ground-truth boxes (centered, correct size), but test-time classifies detector boxes which are offset/sized differently. This was tried in e001/e012 (retrained on detector boxes) and rejected — but those used different architectures. Actually e012 was on e009 with a similar idea... no, e012 says "Training on the actual detector boxes" and got 0.6142, rejected. But that's still worth noting as attempted.
+
+2. **Resolution**: The model runs at 160px. Maybe higher resolution would help texture discrimination between pore/stain/deposit. But e011 tried a high-res stream and was rejected (and it crashed/timeout?). e011 got 0.5990, which is bad — probably a bug or the extra stream hurt. Actually, e011's result was "rejected" not crashed. Hmm.
+
+Wait, but there's an important consideration: **the budget**. The run takes 168s for 2 epochs with 4 crops. We have ~180s total. So we can't easily add more compute.
+
+3. **What about the score function?** Currently score = conf × p(c). The reference numbers say "stage-1 boxes scored as a single class 'defect': 0.755" vs "stage-1 boxes with perfect classes: 0.758". So the ranking by detector conf alone is almost as good as the ceiling; the class decision matters for the remaining gap.
+
+Let me reconsider the problem. The per-class val AP@0.5 (mean of 5 seeds): pore 0.531, deposit 0.625, discontinuity 0.778, stain 0.610.
+
+Wait — these per-class scores are quite low overall. Even discontinuity at 0.778. Hmm, but the reference says stage-1 boxes with perfect classes reach 0.758 mAP@0.5... And one-step 4-class detector gets 0.638. So the baseline is ~0.64 and we're at 0.636, and the ceiling is 0.758.
+
+Actually, I realize the per-class scores of 0.531 (pore), 0.625 (deposit), 0.610 (stain) are the actual achieved APs for these classes. And the overall mean is 0.6359. Interesting that discontinuity is at 0.778 but pore and stain are low.
+
+The biggest confusion: pore→stain (19 of 75 pores misclassified as stain), deposit→stain (55 of 271 deposits misclassified as stain). And stain→deposit (43 of 610 true stains misclassified as deposit). So the stain class is absorbing both pore and deposit.
+
+**Hypothesis for next experiment:**
+The confusion is at the texture level: pores are small dark voids, deposits are raised rough material, stains are discolorations on the surface. The key difference might be in finer texture details that get lost at 160px with efficientnet_b0's pooling.
+
+What if I **increase resolution** — but carefully, because of budget constraints? A 4-crop pyramid at 160px takes ~2s for prediction (from the log: total 168s, training took ~155s for 2 epochs... actually epoch 0: 94 steps in 72s-13s=59s? Wait let me re-read. "train 6052 boxes, eval 41879 detections, 1022 images (13s)" then epoch 0 ends at 72s. So first epoch: 94 steps in ~59s = 0.63 s/step. Second epoch: 63 steps in ~23s? That's odd — the loop breaks when time.time() >= t_end. Actually epoch 1 ended at 95s and "done: 2 epochs, 157 steps". So the budget was exhausted mid-epoch... wait, no. Let me re-read the log:
+
+```
+train 6052 boxes, eval 41879 detections, 1022 images (13s)
+epoch 0: loss 0.4703, 94 steps, 72s
+epoch 1: loss 0.2745, 157 steps, 95s
+done: 2 epochs, 157 steps, 55620 prediction rows, 168s total
+```
+
+Hmm, "157 steps" after epoch 1, but that should be cumulative (94 + 63 = 157). Then the training loop ended at 95s. But then the prediction took until 168s (73s for prediction on 41879 detections with 4 views each?). That's the heavy part — predicting 41879 boxes × 4 crops each = ~167k images through the model.
+
+Actually wait, that prediction time is suspicious: 168 - 95 = 73s for 41879 detections × 4 views... Let me think about what matters. The total is 168s with 180s budget. So there's only 12s buffer.
+
+For the next experiment, I need to think about what will actually gain mAP and fit in budget.
+
+**Key insight**: The gap from wrong classes is 0.10 mAP. That's large. What could fix it?
+
+The reference says the "ceiling for stage 2" (perfect classes, keep your scores) is 0.758; the current system reaches 0.636; and if every box had its correct class but kept the detector's conf ranking, it'd be 0.737. So:
+- Wrong class decisions cost ~0.10 mAP
+- Ranking by your scores costs ~0.021 mAP vs perfect classes with conf ranking (0.758 - 0.7366)
+
+Hmm wait, that's not quite right either. Let me think again: "mAP@0.5 if every box had its correct class but kept your scores: 0.7366". So the ordering of rows is what you have (conf × p(c)), and only the class labels are changed to perfect. The gap 0.758 - 0.7366 = 0.0214 is from score ordering. And 0.7366 - 0.6359 = 0.1007 is from wrong class decisions on overlapping boxes.
+
+So the biggest fixable part is class decision.
+
+**What's the actual error?**
+pore→stain: 19 errors (25% of pores), deposit→stain: 55 errors (20% of deposits). 
+
+Hmm, one thing I notice: the score function uses conf × p(c). If a pore box's detector conf is high and the model assigns it to stain, we get a false positive in "stain" that displaces true pores. But actually since mAP is per-class, the main issue is that within the "pore" class, we have fewer true positives because their rows are classified as stain.
+
+What would help? A model that can actually distinguish pore from stain at texture level. The 4-scale pyramid helps by giving multiple contexts. 
+
+**A new idea**: The problem might be that the model is trained on perfectly-centered GT boxes but tested on detector boxes with different offsets/sizes. e001/e012 tried training on detector boxes and got no gain... but wait, e001 was from e000 (the two-crop baseline) and e012 was from e009. Both rejected. Hmm.
+
+Actually, I want to look at this differently. The reference numbers tell us:
+- d2_boxes_perfect_classes_val_map50: 0.758 — the ceiling
+- d2_class_agnostic_val_map50: 0.755 — detector alone, no classes needed
+- d1_val_map50: 0.638 — baseline
+
+So stage-1 box quality is excellent (0.755 as single class). The entire loss is in the classification (wrong type) — about 0.12 mAP. And we can't fix stage-1 here.
+
+So my focus must be: **how to classify each detector box correctly**, given it's already found.
+
+The current architecture: multi-scale pyramid, 4 scales (1.25x, 1.75x, 2.5x, 3.5x), EfficientNet-B0 backbone, 160px each, feature-pyramid fusion with proj_dim=256 and MLP head 512 hidden.
+
+What's missing compared to a strong solution?
+
+**Idea: higher resolution + the strongest available pretrained model.** The models available include resnet50, efficientnet_b2, tf_efficientnetv2_b0 — all stronger than efficientnet_b0. And higher resolution like 288 or 384 would help texture.
+
+But budget: at 160px with 4 crops and batch size 64, we got 94 steps/epoch (59s). With batch 64 and 4 views... each step processes 64 × 4 = 256 images through EfficientNet-B0.
+
+Wait, actually the bottleneck in prediction is the eval pass: 73s for ~167k forward passes ≈ 0.00044 s per view. That's fast. So prediction isn't the issue; training is.
+
+Actually, let me reconsider. The log shows epoch 0: 94 steps at 59s (0.63 s/step) and epoch 1: 63 steps at 23s (~0.36 s/step). Why faster? Because the learning rate schedule decays... no, that shouldn't change speed much. Oh — perhaps the second epoch's batches were partially processed... Actually "epoch 1: loss 0.2745, 157 steps" means cumulative 157 steps after epoch 1 = 94 + 63 = 157. And it ended at 95s, so epoch 1 took 23s for 63 steps = 0.36 s/step. Hmm, the difference might be from dropout/mixup? No... Maybe the first epoch includes warm-up steps that are slower? No.
+
+Actually, maybe the DataLoader workers' caching effects or just measurement noise. Whatever.
+
+So ~0.5s per step (256 images × 4 views through EfficientNet-B0 at 160px with channels_last). We have ~75s of training budget (180 - 13s load - 73s pred = 94s... roughly). So ~150-180 steps.
+
+**What about the ensemble idea?** e014 tried ensembles and crashed (score 0.5771, probably a bug where the model wasn't trained enough or some issue). The brief says "Averaging predictions of several independently trained models" is reliable. But e014 from e009 crashed? Actually "e014 | e009 | inference | ... 0.5771 | - | rejected". So it ran but got a worse score — maybe the ensemble implementation had an issue, or maybe training multiple models in one run isn't feasible within budget (each model gets fewer steps).
+
+Hmm, actually if I train 4 models each with 4x the budget... no, the budget is fixed. Each model would get 1/4 the steps, and ensembles need well-trained members.
+
+**What about the "training on detector boxes" idea?** e001/e012 tried it — both rejected. But those were from different bases. e012 was from e009. The result: 0.6142 vs 0.6359 current best. So that's worse! Training on detector boxes made it WORSE. That's interesting — maybe because the detector boxes are lower quality (offset, wrong size) and the classifier learns those errors... or maybe the IoU>0.5 matching labeled wrong classes.
+
+Wait, actually the e012 idea was "Training on the actual detector boxes" with IoU > 0.5 overlap labeling. But this is a classic "proposal-based training" approach. It got worse. Hmm.
+
+**Let me think about what's really different about pores vs stains.**
+Pore: small, dark, circular void in the weld bead.
+Deposit: excess material, rough texture.
+Stain: discoloration (darker or lighter) on the surface without texture change.
+
+The confusion pore↔stain and deposit↔stain at 160px crops... The current model uses 4 scales but pools spatially (global average pooling per scale then concat). This discards where in the crop the defect is. A center-pooled feature might confuse a stain that covers most of the crop with a pore/deposit centered in a tight crop.
+
+Hmm, actually — what if I use **center-weighted cropping** or pay attention to the region? No...
+
+**Wait. Let me reconsider the architecture.** The current e009 has:
+- backbone features (C channels) at each scale → 1x1 conv proj to 256 dims → GAP → concat → MLP head (512 hidden, GELU, 4 classes).
+
+The heads are per-scale shared MLP. A stronger fusion might help. But e010 tried spatial structure and got worse.
+
+**What about a much simpler, stronger approach: use the strongest available backbone at higher resolution?**
+
+Let me think about budget more concretely. With efficientnet_b0 at 160px:
+- Load+train+pred ≈ 168s for 157 steps (2 epochs of ~78 steps)
+- Training time per step ~0.5s → 75s of training.
+- Prediction: 73s for 41879 boxes × 4 crops.
+
+If I switch to a bigger backbone (e.g., efficientnet_b2 or resnet50), the model is slower but the number of steps is what matters. Actually, if I keep batch size 64 and go to 2x resolution, forward pass becomes ~4x slower per image... that's too slow.
+
+What about keeping the same architecture but increasing resolution to 224? That might gain texture detail without huge cost. With efficientnet_b0 at 160px, it works well. But e011 tried a high-res stream and got worse (0.599) — that's concerning, but it was an extra stream added on top, not replacing the low-res one.
+
+Hmm. Let me think about what's the **fundamental gap** in the current system.
+
+Actually, wait. I should consider: the model uses 4 scales including very wide views (3.5x). At 160px final size with 3.5x context, the defect itself becomes small in the crop. A pore at 3.5x scale would be tiny. The multi-scale approach might help but could also dilute texture at wider scales.
+
+**A different idea**: What about using **context-aware cropping where the wider crops keep the defect at a fixed size**? I.e., instead of fixing the final resolution at 160px, crop tighter for larger contexts so the defect occupies more pixels? Hmm, but that's just another way of setting scale.
+
+**Actually, let me reconsider the problem from scratch.** 
+
+The detector finds boxes with conf. The classifier decides class. What distinguishes pore from stain from deposit at the pixel level?
+- Pore: small (< 5px?) dark circle/void. 
+- Deposit: larger region of rough, bright-ish material.
+- Stain: large region of slightly different color/intensity, smooth.
+
+The key visual difference between pore and stain: size! A pore is small; a stain covers more area. The current system uses a 4-scale pyramid but the head pools globally.
+
+Wait — actually, from e015/e016 history: "box area ratio" was tried as a geometric prior (in scoring) and as model input, and crashed/no gain. So size IS known to be a cue but implementing it in scoring didn't help enough (e016 got 0.5765, way worse — that's probably because the geo-score multiplication broke the ranking).
+
+Hmm, e016's geo prior was applied as score multiplier: s = conf × p(c) × geo(c). This multiplies per-class scores by a per-class constant-ish factor, which RE-ORDERS classes within a box. It got 0.5765 — much worse. Why? Because the geometric prior from training boxes doesn't transfer well to detector boxes (different distribution), and it re-orders the rows badly, displacing true positives with false ones.
+
+**So here's a thought**: The model should learn to use size info internally. The current head pools all spatial information into 512 hidden dims — it can't easily use "the defect fills most of the crop" as a cue because the pooled features lose position and scale information... wait no, the crops are at fixed scales relative to the box, so the defector's size within the crop varies with the actual box. Hmm, but actually the box defines the crop, so a pore (small object) in a 1.5x crop would be quite small, whereas a stain covering the whole bead would fill more of the crop.
+
+Hmm, wait — that's the key! The stage-1 detector boxes are around the defect. For pores, the box is tight around a small void; for stains, the box might encompass a large region of discoloration. If the classifier could know "how much of the crop is occupied by the defect," it would help distinguish pore from stain.
+
+But e016/e015 tried using box area as a cue and it failed. Hmm.
+
+**Actually, let me look at this from the "what's different about the current best" angle.**
+e009 introduced: 4-scale pyramid (1.25x to 3.5x) + feature pyramid head with per-scale projections. This gained +0.005 (unconfirmed) / ~+0.006 over the baseline 0.63.
+
+What remains unexplored that could matter?
+1. **Higher resolution**: The current model at 160px. Textures distinguishing pore/stain/deposit might need more pixels. A 2-scale pyramid (tight + wide) at 256 or 320px might be better than 4 scales at 160px.
+2. **Better backbone**: resnet50 or efficientnet_b2/tf_efficientnetv2_b0 at the same resolution.
+3. **Different training approach**: e.g., train with the same scale jitter as test (not just GT boxes), or use a two-branch architecture.
+
+Actually — I realize there's a simpler, stronger idea that hasn't been tried: **use the strongest backbone at the highest feasible resolution with fewer scales.** E.g., efficientnet_b2 or tf_efficientnetv2_b0 at 256px with only 2-3 scales (1.5x and 2.5x). The "texture" problem might be fundamentally a resolution/backbone problem: at 160px, efficientnet_b0 can't resolve the fine texture differences between pore and stain/deposit.
+
+But budget... Let me estimate:
+- efficientnet_b0 at 160px, 4 crops, batch 64: ~0.5 s/step → 75s training + 73s pred = 168s total (within 180s, tight).
+- If I use efficientnet_b2 (bigger) at 192px with 4 crops... the forward pass would be maybe 2-3x slower. So ~150 steps/epoch → we'd fit fewer epochs. And prediction of 41879 boxes × 4 views with a bigger model: 73s × 3 = 219s — too slow!
+
+Hmm, prediction time is the issue. Let me recompute the prediction cost. At current config: 73s for 41879 boxes × 4 views = 167k views. That's 0.44 ms/view... on a GPU? With channels_last and AMP, ~0.44ms per view is plausible on a decent GPU.
+
+Actually wait — I should check: the log says "train 6052 boxes, eval 41879 detections". So 41879 eval boxes each with 4 views = 167k crop forward passes in 73s. That's actually pretty fast. Hmm, but this is likely on a small GPU (maybe T4?). Let me not worry about exact numbers; the key constraint is 180s total.
+
+If I go to a bigger backbone: prediction time doubles → 146s + training > 180s. Risky.
+If I reduce scales from 4 to 3: prediction saves 25% → 55s, more training budget.
+
+**Let me think about what the actual error is once more.**
+The confusion matrix shows pore→stain (25%), deposit→stain (20%). And true stain is 90% right but with 43 errors as deposit and 7 as pore. So "stain" is over-predicted: both pores and deposits are absorbed into stain, and some stains become deposits.
+
+This smells like the model sees "some dark-ish region in a weld bead" and defaults to "stain" (the most common visual pattern of discoloration) rather than distinguishing texture. The fix might be:
+1. More resolution/better backbone to see fine texture.
+2. Better training data (the model trained on GT boxes at specific crops but tested on detector boxes with different scale/offset).
+
+Wait — the e009 idea was "4-scale pyramid" and it helped a bit (+0.005). But what about **making the scales closer to the test-time reality**? The stage-1 detector boxes are not perfectly centered or sized. Maybe adding **random scale/center jitter** during training (i.e., simulate detector box offsets) would help.
+
+Hmm, but that's basically e001/e012 (train on detector boxes) — which was rejected. But e001/e012 were "train on the actual detector boxes from train split" (using their GT labels matched by IoU). That's different from adding jitter to existing GT boxes! 
+
+Hmm wait, actually it IS similar: training on GT boxes with noise vs. training on actual detector boxes. e001 and e012 both failed. So the distribution mismatch isn't the main issue — the classifier generalizes fine from GT boxes to detector boxes for the most part (that's why 95% of discontinuities are right). The failure is specific to pore/stain/deposit discrimination.
+
+**Let me reconsider: what if the problem is in the head, not the backbone?**
+The current head: concat of 4 scale features (each 256 dim) → 1024 dims → linear 512 → GELU → linear 4. That's decent. The per-scale projections are 1x1 convs with GAP — this means each scale's spatial info is discarded.
+
+What if I keep the spatial structure? e010 tried "spatial structure in the head" and got worse (0.6282). Hmm. But maybe the implementation was wrong? e010 says "Global average pooling in e009's fusion head discards spatial structure within each crop" — the fix was to keep spatial features... but it got worse. Interesting.
+
+OK here's another thought — **what if we use per-scale softmax and combine at probability level**? Or use a different combination? Actually, let me think about what would give a real gain:
+
+**The most promising direction I haven't fully explored: higher resolution + stronger backbone.**
+The e011 attempt (high-res stream) got 0.599 — probably due to a bug or because adding a high-res stream on top of the existing 4-scale pyramid was too costly/complex. But a clean redesign might work.
+
+Actually, wait. Let me reconsider the **time budget** more carefully:
+- Total: 180s. Load: ~13s. Prediction: ~73s (at current config). Training available: ~94s.
+- We run 2 epochs of ~78 steps = 157 steps total.
+
+What if I use **resnet50 at 160px with 3 scales**? The prediction time would be similar-ish (resnet50 is faster than efficientnet_b0 per image? no, resnet50 is slower... efficientnet_b0 is quite fast).
+
+Let me think about what's the actual bottleneck: the model has to process 4 crops per box. Each crop is 160×160 RGB. With batch 64, that's 256 images per forward pass. If I reduce to 3 crops (1.5x, 2.5x, maybe 3.5x), prediction saves 25%.
+
+**Hmm, actually here's a cleaner idea.** The multi-scale pyramid is good but the head uses GAP on each scale and then concatenates. What if instead of pooling at all, I use **a proper feature pyramid + detection head** approach where spatial resolution is maintained? No wait, that's for detecting.
+
+Let me refocus. The goal: highest mAP@0.5 on hidden test images. We know the current best (e009) scores 0.6359 vs a ceiling of 0.758. The main error is class confusion (pore↔stain, deposit↔stain).
+
+**What if I increase the input resolution to 224px and use efficientnet_b2?**
+Wait, but e011 tried high-res and failed. Let me think about why: "Give the classifier a dedicated high-resolution stream" — this adds a second branch for high-res, which doubles compute. It crashed... no, it got 0.599 (rejected). The rejection means it ran but got worse. Probably because the two streams weren't properly fused, or the model was under-trained.
+
+OK, let me think about what's actually different andThinking budget reached. Stop thinking now and write the reply in the required format.

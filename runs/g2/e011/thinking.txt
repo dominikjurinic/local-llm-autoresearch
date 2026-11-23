@@ -1,0 +1,258 @@
+===== attempt 2 =====
+Let me carefully analyze the situation.
+
+**Current state:**
+- Best: e000, 5-seed 0.6288
+- 10 experiments so far, nothing confirmed
+- e010 (precomputed crops) timed out: precomputation itself took 129s (14s→143s), leaving only ~34s of training. The crop precomputation is the bottleneck — 6052 + 41879 boxes × 2 views of PIL resize is slow. Precomputing eval crops (41879 boxes) is a waste of time since we only need them once. Precomputing only training crops (6052 boxes) would take ~129s × 6052/47931 ≈ 16s. That's feasible!
+
+Wait, let me estimate: total boxes precomputed = 6052 + 41879 = 47931 boxes, 2 views each = 95862 crops, took 129s. So ~1.35ms per crop. Training only: 6052 × 2 = 12104 crops ≈ 16s. That's worth it: per-step crop work is removed from the data loader.
+
+But wait — how much time does the data loader actually cost per step? Log: epoch 0 (94 steps) from 13s to 59s = 46s → ~0.49s/step. Epoch 1: 94 steps in 18s → 0.19s/step. So after warmup, ~0.19s/step. If the data loader is the bottleneck, precomputing training crops could speed it up. Let me think: the per-step work includes crop computation (2 PIL resizes + flips etc.) in the workers. With 8 workers and batch 64, each worker handles 8 samples × 2 views. If crop computation is ~1.35ms/crop → ~2.7ms per sample → 8 samples = ~21ms per worker batch, GPU step time is? EfficientNet-B0 at 160px, batch 64, 2 forward passes + backward, on GPU probably ~50-100ms. So the data loader is probably not the bottleneck... but the first epoch was 0.49s/step (warmup, workers spinning up, page cache cold).
+
+Actually, the timeout in e010 was purely due to the 129s of precomputation. If I only precompute training crops (~16s), I gain ~16s of training time (reserve 55s, so training budget = 180-55 = 125s; precompute 16s → 109s for training vs the current 125s... no wait, that's a loss! The current e000 does crop computation inside the data loader in parallel with GPU training. So precomputing training crops up front takes 16s of wall time that would otherwise be overlapped with GPU compute. Unless the data loader is the bottleneck, this is a net loss.
+
+Hmm, but e010 precomputed both training and eval. The 129s included eval (41879 boxes). Training only would be ~16-20s. If the data loader is the bottleneck, we gain steps; if not, we lose ~16s of training.
+
+From the logs: epoch 1-4 each have ~94 steps (epoch 4 is 57 steps, cut off). Steps per epoch: 6052/64 = 94.5 → 94 steps with drop_last. Epoch 1: 94 steps in 18s = 191ms/step. Epoch 2: 94 steps in 18s. Epoch 3: 94 steps in 19s. Epoch 4: 57 steps in 11s. So steady-state is ~190-200ms/step.
+
+What's the GPU time per step? EfficientNet-B0, batch 64, 160px, 2 forward passes (tight + wide) + backward. On a decent GPU, a single forward + backward for B0 at 160px, batch 64 might be ~40-60ms. With 2 views: ~80-120ms. Plus H2D transfer. So the GPU step is probably 100-150ms. Data loader: 8 workers, each producing 8 samples (batch 64/8 workers). Per sample: 2 crops × (PIL resize ~0.7ms + numpy ops ~0.5ms) ≈ 2.5ms → per worker batch 20ms. So the data loader should keep up... but there's also the overhead of creating tensors, collation, etc.
+
+Actually, the first epoch being 46s for 94 steps (490ms/step) suggests the data loader was the bottleneck initially (cold page cache, worker startup). After that, 190ms/step — probably mixed.
+
+Let me think about what would actually help. The guide says: "buy training steps (whenever the log shows the GPU is waiting or the loss is still dropping at the cutoff)." The loss is still dropping at the cutoff (0.219 at step 433). So more steps should help. How to get more steps?
+
+Options:
+1. Precompute only training crops (~16s overhead). If the data loader is the bottleneck, we gain; if not, we lose 16s. Risky.
+2. Reduce reserve: e006 tried reserve 45 and was rejected (0.6253). Hmm, that's odd — reserve 45 should give more training time. Wait, e006: "Lowering reserve to 45 (measured 37s + ~8s safety margin)" got 0.6253, rejected. That's strange. More training time → worse? Maybe prediction is slower than measured, or... hmm. Actually, wait — if the reserve is too low, the run might be killed at 180s. Prediction took 37s in the seed-0 run (125→162). If prediction is 37s and the training budget is 135s, total = 135 + 37 + 13 (load) = 185s > 180s → killed! That's probably why e006 failed — it was killed, or... no, it got a score of 0.6253, so it finished. Hmm, but it was rejected. Maybe prediction was slower on that run and it barely squeaked through with fewer... no wait, the reserve determines when training stops, not prediction time. If reserve=45, training stops at t=135, prediction takes 37s → done at 172s. That should be fine. So why 0.6253?
+
+Hmm, wait. Actually, e006's measurement: prediction 37s is from 125s→162s in the seed-0 log. But that includes writing out 53606 rows. Maybe on other seeds it's slower. Or maybe 10 more steps of training (125s→135s budget = +10s = ~50 steps) doesn't actually help and the difference is just noise. 0.6253 vs 0.6288 is within noise (std 0.0049). So e006 was just noise — more steps didn't clearly help, or the difference wasn't detectable.
+
+Hmm, that's a useful data point: +10s of training (about 50 more steps) didn't produce a detectable gain. So the model isn't starved for steps in a simple way? Or the gain from 50 more steps is < 0.005.
+
+Let me reconsider. The loss is dropping: 0.72 → 0.37 → 0.29 → 0.25 → 0.22. Still dropping. But mAP gain from more steps might be small.
+
+Let me think about the bigger picture. Diagnostics:
+- mAP with correct class but own scores: 0.7461 vs own 0.6288. So wrong class costs 0.117! That's huge.
+- Perfect class ceiling: 0.758. So scores cost 0.012 against the ceiling.
+
+So the dominant error is class misassignment. Confusion matrix:
+- Pore: 63% correct. Pore→stain 20, pore→deposit 6, pore→discontinuity 1. Total pore boxes: 75.
+- Deposit: 78% correct. Deposit→stain 55! Deposit→pore 2. Total deposit: 270.
+- Discontinuity: 96% correct.
+- Stain: 88% correct. Stain→deposit 46, stain→pore 15. Total stain: 614.
+
+Biggest confusions: deposit→stain (55), stain→deposit (46), pore→stain (20). Stain and deposit are confused in both directions. Pore is confused with stain.
+
+Guide: "Fine-grained classes (only after 2 and 3). Look for one change that helps the whole pore/deposit/stain confusion."
+
+But wait — the guide's plan:
+1. Consolidate: detector boxes from training split (e001 crashed, e002 rejected). Guide says "if it fails twice, drop it." It failed twice (crash + reject). Hmm, "if it's accepted, build on it; if it fails twice, drop it and move on." e001 crashed, e002 was rejected at seed 0 (0.6282). So by the guide's own rule, drop it.
+
+2. Close the box quality gap:
+   - Simulate detector error on true boxes: e003 tried (shift up to 0.45× long side, scale) — rejected 0.6259. e005 tried (match the actual measured distribution) — rejected 0.6275. So 2 attempts, both failed. By the rule of thumb: "2 failed variants in a direction: move to the next direction."
+   - Weight/sample training boxes by box quality: not tried.
+   - Combine the 2 views better: e004 (shared backbone concat) 0.6345 seed 0, 5-seed 0.6329 not confirmed. e007 (MLP + addition) crashed. So 1 attempt not confirmed, 1 crash.
+
+3. Buy training steps: e006 (reserve) rejected (noise), e010 (precompute) timeout.
+
+4. Fine-grained classes.
+
+Hmm. So what's left that's promising and untried?
+
+Let me think about what the actual bottleneck is. The classifier gets 63% on pore. Pore is the weakest class (AP 0.502). The paper says pore and deposit are the weak classes.
+
+Key insight from the brief: "A crop classifier given perfect boxes reaches macro-F1 ~0.87 with the starting recipe (two-crop input)." So on clean boxes, macro-F1 is 0.87. On detector boxes, the "share of boxes with the correct class" is: pore 63%, deposit 78%, discont 96%, stain 88% → macro ≈ 81%. So the drop from clean boxes to detector boxes is significant for pore.
+
+The guide says: "Treat this first as a train/test distribution mismatch problem." But the 2 attempts at box error simulation failed. Hmm.
+
+Wait, let me reconsider what "box quality" means here. The detector boxes overlap true boxes with IoU > 0.5. The crops are centered on the box with context 1.5× and 2.5× of the long side. If the box is shifted, the crop is also shifted. The current jitter is ±10% of side and scale 0.85-1.2. e003 made it much bigger (shift up to 0.45× side). Both the small and big versions failed. Interesting — so jittering the box position doesn't help.
+
+Why? Maybe because the classifier is robust enough to small shifts, and the real problem is something else. Or maybe the jitter hurts more than it helps (the training distribution moves away from the clean distribution that's also in the test set — the test set includes both well-placed and poorly-placed boxes).
+
+Let me think about the problem from a different angle. What information does the classifier have?
+- Tight crop (1.5× box) and wide crop (2.5× box).
+- No size/aspect ratio info (e008 tried adding it, not confirmed: 0.6251 seed 0, 0.6279 5-seed).
+
+Hmm, wait, e008: "Feed each box's absolute size (log of long side) and aspect ratio as 2 additional inputs, added to the classifier logits via a small zero-initialized head." 5-seed 0.6279, not confirmed. So size info didn't help.
+
+What about resolution? IMG_SIZE = 160. The brief says "pretrained backbones are typically trained at a fixed resolution and often work best near it" (160 is... EfficientNet-B0 is trained at 224). The "resolution and small-box handling" family (224px, larger MIN_CROP, enlarged tight crops) — 9 attempts, no gain, best 0.634 not confirmed. So resolution is exhausted.
+
+Backbone: exhausted (8 attempts).
+TTA: exhausted (8 attempts).
+Score rows: exhausted (16 attempts).
+Background class: exhausted (9 attempts).
+Class-balanced sampling/loss: exhausted (4 attempts).
+Training augmentation: exhausted (5 attempts).
+Focal loss: exhausted (2 attempts).
+Longer training: exhausted (6 attempts).
+Detector boxes as training data: 6 attempts in old runs, +2 tonight (crash, reject). Guide says drop after 2 failures.
+
+Hmm, what's not tried? Let me enumerate the families in the old runs:
+1. Score rows — exhausted
+2. Background class — exhausted
+3. Detector boxes as training data — guide says drop after 2 failures
+4. Third wide view (4×) — "accepted twice (5-seed 0.6342, +0.005), gain almost entirely from the pore class; rejected once (0.633). Adds ~20s per run, close to the time limit." Interesting! This was accepted twice in the old runs but under the looser rule. Tonight's rule is stricter (also counts validation image noise). Gain was +0.005, "almost entirely from pore." Under tonight's rule, "gains from a handful of images or one small class usually don't hold and the harness won't accept them." So probably not worth retrying.
+5. Low-res crops — exhausted
+6. Bigger backbone — exhausted
+7. Resolution — exhausted
+8. TTA — exhausted
+9. Longer training — exhausted
+10. Class-balanced — exhausted
+11. Training augmentation — exhausted
+12. Focal loss — exhausted
+13. Box size/aspect input — 4 attempts "never properly tested" (2 crashes, 1 edit failure, 1 run at 0.629). Tonight e008: 0.6251 seed 0, 0.6279 5-seed not confirmed.
+
+Hmm, so basically everything the old runs tried is exhausted, plus a few more of tonight's attempts. What's really left?
+
+Let me re-read the guide's plan:
+1. Consolidate: detector boxes — failed twice tonight, drop.
+2. Close box quality gap:
+   - Simulate detector error: e003, e005 failed. 2 failed variants → move to next direction.
+   - Weight/sample training boxes by box quality: not tried.
+   - Combine the 2 views better: e004 not confirmed (0.6329 5-seed vs 0.6288 best, +0.0041, "not confirmed"), e007 crashed. So 1 proper attempt, not confirmed.
+3. Buy training steps: e006 (reserve) rejected, e010 (precompute) timeout.
+4. Fine-grained classes: after 2 and 3.
+
+Hmm wait, e004: seed 0 0.6345, 5-seed 0.6329. Best is 0.6288 (5-seed). So e004's 5-seed 0.6329 is +0.0041 over best. "Not confirmed" — the margin required was probably around +0.005 or so. So e004 was close. The shared-backbone concat architecture is a direction that's close but not confirmed.
+
+Let me think about what's fundamentally different and could give a ≥0.01 gain.
+
+Actually, let me step back and think about the problem more carefully.
+
+The dominant error is class misassignment (0.117 mAP). The confusion is mostly deposit↔stain and pore→stain.
+
+What distinguishes these classes?
+- Pore: small holes in the weld bead.
+- Deposit: extra material.
+- Discontinuity: gap/crack.
+- Stain: discoloration.
+
+The classifier sees a 160px crop. The tight crop is 1.5× the box, the wide crop is 2.5× the box.
+
+Key question: why does the classifier get pore wrong 37% of the time? Pore is small. When the box is small, the 1.5× crop is also small, and after resizing to 160px, the pore might be a few pixels. The wide crop (2.5×) gives context.
+
+Hmm, but the "resolution and small-box handling" family (9 attempts) was exhausted, including "enlarged tight crops for small boxes." So resolution isn't the answer.
+
+Let me think about the deposit↔stain confusion. These are visually similar (both can be discolored/extra material). What separates them? Context, texture, size.
+
+Actually, let me reconsider the whole approach. The guide says the binding constraint is 180s and "every second of training you gain is a free improvement." And "aim for changes that should move all classes."
+
+Let me reconsider "buying training steps." The loss is still dropping at the cutoff. e006 (reserve 45) was rejected but that was within noise (0.6253 vs 0.6288, diff 0.0035 < noise 0.005). So we can't tell if more steps help. But e010 (precompute) timed out because it precomputed eval crops too.
+
+What if I precompute only training crops? ~16s overhead. That gives... wait, no. Let me recompute. The current e000 does crop computation in the data loader, in parallel with GPU. If I precompute training crops up front (16s), then the data loader only does flip/brightness/normalize (cheap). But I've spent 16s of wall time. If the data loader was the bottleneck, I gain steps; if not, I lose 16s of training.
+
+From the logs, steady-state is ~190ms/step. Let me estimate the GPU time. Actually, I can't easily tell if the data loader is the bottleneck. The first epoch was slow (490ms/step) due to warmup.
+
+Hmm, this is risky. Let me think about a cleaner way to buy steps.
+
+Actually, wait. Let me reconsider. The real question is: is the model undertrained? The loss is dropping at the cutoff. If I could get 50% more steps, would mAP go up by ≥0.01? e006 suggests +50 steps (10s) gives < 0.005. So +50% steps (100s→150s... no). Let me not over-index on this.
+
+Let me think about the "combine the 2 views better" direction, which was close (e004: 0.6329 5-seed, +0.0041). What's fundamentally different that could push it over?
+
+e004: shared backbone, concat 1280+1280 = 2560 → 2-layer head. This was +0.0041, not confirmed.
+
+What if the issue is that averaging/concating logits/features from the same backbone doesn't capture the cross-view interaction? Or what if I need to train the head differently?
+
+Actually, let me reconsider. The 2 views are tight (1.5×) and wide (2.5×). They're very correlated (same center, different scale). Concatenating features from the same backbone might be redundant.
+
+Alternative: what if the wide crop is mostly useful for context to separate deposit/stain, and the tight crop is for the defect itself? A cross-attention or difference feature might help.
+
+Hmm, but this is getting speculative. Let me think about what's most likely to give a broad gain.
+
+Let me reconsider the problem from the "what does the model see" angle. The model sees a 160px crop. For the deposit↔stain confusion, maybe the model needs higher resolution to see the texture difference. But resolution is exhausted (9 attempts).
+
+Wait, "resolution and small-box handling (224px, larger MIN_CROP, enlarged tight crops for small boxes) — 9 attempts, no gain, best 0.634 not confirmed." So 224px was tried and didn't help. OK.
+
+Let me think about the training data. Currently training on 6052 true boxes (high-res only). The detector boxes from the training split were tried (e001/e002) and failed. But wait — the old runs "accepted twice (5-seed 0.6337 and 0.6342, ~+0.004)" for detector boxes as training data. So it did help a little in the old runs (under the looser rule). Tonight e002 was rejected at seed 0 (0.6282). So it's marginal.
+
+Hmm, let me reconsider. The guide explicitly says "if it fails twice, drop it and move on." e001 crashed, e002 rejected. So drop it.
+
+Let me think about what's really untried and could give a broad gain.
+
+Actually, let me reconsider the "buy training steps" direction more carefully, because the guide lists it as a main direction and e010 (the most recent) was a timeout in this direction. The natural next step is to fix e010 by precomputing only training crops (not eval).
+
+But I'm worried about the 16s overhead. Let me estimate more carefully whether the data loader is the bottleneck.
+
+Actually, here's a cleaner idea: instead of precomputing crops (which has overhead), what if I reduce the per-step cost in a way that's clearly a win?
+
+Wait, let me reconsider. Let me look at the timing again:
+- Load: 13s
+- Epoch 0: 94 steps, 13s→59s = 46s (490ms/step) — warmup
+- Epoch 1: 94 steps, 59s→77s = 18s (191ms/step)
+- Epoch 2: 94 steps, 77s→95s = 18s
+- Epoch 3: 94 steps, 95s→114s = 19s
+- Epoch 4: 57 steps, 114s→125s = 11s
+- Prediction: 125s→162s = 37s
+- Total: 162s
+
+So steady-state is ~190ms/step. Training budget = 180 - 55 = 125s. Training runs from ~13s to 125s = 112s of actual training → 433 steps.
+
+If I could halve the step time to ~95ms, I'd get ~2× the steps in the same time. That would be a big win. What makes a step 190ms?
+
+Two forward passes (tight + wide) + one backward. If each forward is ~50ms and backward ~80ms, total ~180ms. Plus data loading overhead.
+
+To halve: I'd need a faster model or fewer views. But the model is fixed at B0 (bigger is exhausted, and smaller might hurt). Fewer views = 1 view, but the 2-view design is core.
+
+Hmm. What about batch size? BATCH_SIZE=64. If the GPU isn't saturated, a bigger batch might be more efficient per sample but fewer steps. Actually, for a fixed time budget, what matters is total samples seen (steps × batch). Bigger batch = same samples in fewer steps but less efficient per step... actually no. Let me think.
+
+Actually, the number of optimization steps matters for convergence. With a fixed time budget, I want to maximize steps. Bigger batch = fewer steps for the same data, but each step processes more data. The total data processed = steps × batch. If I increase batch, I process more data per step but have fewer steps. For a fixed time, total data processed is roughly the same (time-limited), but fewer steps = less gradient updates = potentially worse convergence. So bigger batch is probably worse for a fixed time budget. Smaller batch = more steps but less efficient per step (GPU underutilization).
+
+Hmm, this is getting complicated. Let me step back.
+
+Let me reconsider the "combine the 2 views better" direction since it was the closest to a win (e004: +0.0041). And think about what's fundamentally different.
+
+Actually, wait. Let me reconsider e004. It was "not confirmed" at 0.6329 5-seed. The best is 0.6288. So +0.0041. The margin needed is probably around +0.005 to +0.007 (seed noise 0.005 + validation noise). So e004 was close. If I could make the shared-backbone approach a bit better, it might confirm.
+
+But the rule says "2 failed variants in a direction: move to the next direction." e004 (not confirmed) and e007 (crash). Is "not confirmed" a failure? It's close. And e007 crashed (a bug, not a failed idea). So really only 1 proper attempt (e004) that was close. I think it's reasonable to try one more variant of the view combination, since e007's crash was a bug not a failed idea.
+
+But what variant? Let me think.
+
+e004: concat features → 2-layer head.
+e007: MLP each → add + learned gate. Crashed.
+
+What's a fundamentally different combination? 
+
+Idea: Instead of running the backbone twice (once per view) and combining, what if I stack the 2 views as a 4-channel input? No, that doesn't make sense for RGB.
+
+Idea: What if the 2 views are processed by the backbone, and I use the GAP feature from the tight crop as the main signal and the wide crop feature as a context/modulation? Like FiLM conditioning: the wide crop produces scale and shift that modulate the tight crop features.
+
+Hmm, that's speculative.
+
+Actually, let me reconsider. Maybe the issue with e004 is that the head (2-layer MLP on 2560-dim) is undertrained or the combination is too simple. What if I use a deeper or wider head? Or what if the problem is that concat loses the "which view is which" structure?
+
+Alternatively — and this might be the key insight — maybe the 2 views are so correlated that the second view adds little, and the real gain should come from a different second view. But the 3rd wide view (4×) was tried (old runs) and gave +0.005 mostly from pore.
+
+Let me reconsider the whole thing. I think I'm overcomplicating this.
+
+Let me re-read the guide's plan and the rules of thumb:
+- "Before each experiment, write down which diagnostic number should move, and in which direction."
+- "2 failed variants in a direction: move to the next direction."
+- "Recheck the time arithmetic for every change that adds work per box."
+- "Don't spend experiments on families listed as 'no gain'."
+
+Given the history, let me map out what's left:
+- Box quality simulation: e003, e005 failed → move on.
+- Box quality weighting/sampling: not tried. This is a sub-direction of "close the box quality gap" that hasn't been tried.
+- View combination: e004 close (not confirmed), e007 crash. 1 proper attempt.
+- Buy steps: e006 rejected (noise), e010 timeout.
+
+Hmm, "weight or sample training boxes by box quality, so the model sees enough poorly placed boxes" — this is untried. But how would I compute "box quality"? The training boxes are the true boxes (perfect). There's no "quality" for them. Unless I mean: weight boxes by size (small boxes are harder)? Or by class (pore/deposit are weak)?
+
+Wait, "class-balanced sampling or class-weighted loss — 4 attempts, no gain." So class weighting is exhausted. Size-based weighting? That's adjacent to "resolution and small-box handling" which is exhausted.
+
+Hmm. Let me reconsider.
+
+Actually, I realize I should think harder about what the single biggest lever is. The diagnostic says wrong class costs 0.117 mAP. That's the target. The confusion is deposit↔stain and pore→stain.
+
+What's the most likely reason the model confuses deposit and stain? They're visually similar. The model needs a feature that separates them. What feature?
+
+- Texture: deposit might be rougher/more material-like; stain might be smoother/discolored.
+- Context: deposit might be on the bead; stain might be on the surrounding area.
+- Size: they might have different typical sizes.
+
+The model already sees texture (in the crop) and context (wide crop). So what's missing?
+
+Maybe the model isn't seeing enough texture detail because of the 160px resolution. But resolution is exhausted.
+
+Maybe the model needs to compare the tight and wide crops (e.g., is the defect consistent across scales?). The current design averages/concatenates but doesnThinking budget reached. Stop thinking now and write the reply in the required format.

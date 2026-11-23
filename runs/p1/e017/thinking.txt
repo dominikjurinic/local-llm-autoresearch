@@ -1,0 +1,113 @@
+===== attempt 1 =====
+Let me carefully analyze the current state and the proposed experiment.
+
+The lead wants to change:
+1. MODEL: "efficientnet_b0" → "efficientnet_b2"
+2. IMG_SIZE: 160 → 224
+3. SCALES: (1.25, 1.75, 2.5, 3.5) → (1.5, 2.5)
+4. BATCH_SIZE: 64 → 32
+
+The head architecture stays the same (MultiScaleClassifier with num_scales=2, proj_dim=256, hidden=512).
+
+Let me check the budget:
+- Current: 4 views, 160px, efficientnet_b0 → 168s total (13s load, ~59s train, ~96s pred... wait let me re-read the log)
+- Log: "epoch 0: loss 0.4703, 94 steps, 72s" and "epoch 1: loss 0.2745, 157 steps, 95s" and "done: 2 epochs, 157 steps, 55620 prediction rows, 168s total"
+- So load = 13s, training = 95-13 = 82s (2 epochs, 157 steps), prediction = 168-95 = 73s
+
+With 2 views instead of 4:
+- Prediction time: roughly halved → ~37s
+- Training: efficientnet_b2 at 224px is slower per step. Let me estimate:
+  - efficientnet_b0 at 160px: 157 steps in 82s → ~0.52s/step
+  - efficientnet_b2 at 224px: roughly 2-3x slower per step (bigger model + higher res). Let's say ~1.0-1.5s/step
+  - With 2 views instead of 4, each step does 2 forward passes instead of 4, so ~2x faster per step than 4-view b0
+  - Net: b2@224 with 2 views vs b0@160 with 4 views: per-step cost is roughly (2x model compute × 1.9x res compute) / 2 (fewer views) ≈ 1.9x slower per step
+  - So ~1.0-1.5s/step → in 82s we'd get ~55-80 steps
+  - That's fewer steps but each step is on a stronger model
+
+Actually wait, let me reconsider. The current 4-view setup does 4 forward passes through the backbone per sample. With 2 views, it's 2 forward passes. The backbone is the expensive part.
+
+- b0@160: 4 views × forward = 4 units of backbone compute per sample
+- b2@224: 2 views × forward = 2 units, but each unit is ~2-3x more expensive (b2 vs b0, 224 vs 160)
+
+So per-sample compute: 2 × 2.5 = 5 units vs 4 × 1 = 4 units. Roughly similar, maybe slightly slower.
+
+With BATCH_SIZE 32 instead of 64, the batch size is halved, so each step processes half the samples. This means more steps needed per epoch, but each step is faster.
+
+Actually, the key constraint is total wall time. Let me estimate:
+- Load: ~13s (same)
+- Training: The training loop runs until deadline - RESERVE_S. RESERVE_S = 85s. So training gets 180 - 85 - 13 = 82s.
+- With b2@224, 2 views, batch 32: each step is maybe 1.0-1.5s (vs 0.52s for b0@160, 4 views, batch 64)
+- So ~55-80 steps in 82s
+- Prediction: 41879 boxes / 256 per batch = 164 batches, 2 views each. With b2@224, each batch is ~2x slower than b0@160 (bigger model, higher res) but half the views. So roughly similar per-batch time, maybe 1.5x slower. Current pred is 73s for 4 views. With 2 views at b2@224: maybe 73 × (2/4) × 1.5 ≈ 55s.
+- Total: 13 + 82 + 55 = 150s < 180s. OK, fits.
+
+Wait, but RESERVE_S = 85. The training stops at deadline - RESERVE_S = T0 + 180 - 85 = T0 + 95. So training gets from T0+13 to T0+95 = 82s. Then prediction runs from T0+95 to T0+180, giving 85s for prediction. If prediction takes 55s, we're fine with 30s margin.
+
+Actually, let me reconsider RESERVE_S. It's 85s reserved for prediction. Current prediction takes 73s. With 2 views but bigger model, it might be similar or slightly more. Let's say 60s. 85s reserve should be enough.
+
+Let me now write the SEARCH/REPLACE blocks. I need to change:
+1. MODEL = "efficientnet_b0" → "efficientnet_b2"
+2. IMG_SIZE = 160 → 224
+3. SCALES = (1.25, 1.75, 2.5, 3.5) → (1.5, 2.5)
+4. BATCH_SIZE = 64 → 32
+
+Let me check the exact lines in the file:
+
+```python
+MODEL = "efficientnet_b0"
+PRETRAINED = True
+IMG_SIZE = 160
+SCALES = (1.25, 1.75, 2.5, 3.5)  # multi-scale crop pyramid
+MIN_CROP = 16
+TRAIN_ON = ("high",)    # resolutions of crops.csv used for training
+BATCH_SIZE = 64
+```
+
+I'll do one block to change all four settings. Let me make sure the SEARCH text is exact.
+
+Actually, I should be careful. Let me re-read the file to get exact spacing.
+
+```
+MODEL = "efficientnet_b0"
+PRETRAINED = True
+IMG_SIZE = 160
+SCALES = (1.25, 1.75, 2.5, 3.5)  # multi-scale crop pyramid
+MIN_CROP = 16
+TRAIN_ON = ("high",)    # resolutions of crops.csv used for training
+BATCH_SIZE = 64
+```
+
+I'll do a single SEARCH/REPLACE for the settings block. That's clean and safe.
+
+Let me verify: the MultiScaleClassifier takes num_scales=4 by default, but in main() it's called with `num_scales=len(SCALES)`. So when SCALES has 2 elements, it'll create 2 scale_projs. The head will have `num_scales * proj_dim = 2 * 256 = 512` input features, then hidden=512, then 4 classes. That's fine.
+
+The BoxDataset iterates over SCALES, so it'll create 2 views. The forward pass loops over views. All consistent.
+
+One thing to check: with BATCH_SIZE=32 and 6052 training boxes, that's 6052/32 ≈ 189 steps per epoch. With drop_last=True, it's 189 steps per epoch. In 82s at ~1.0-1.5s/step, that's ~55-80 steps, so less than one epoch. That's fine - the training loop runs until time budget is exhausted.
+
+Actually wait, I should double-check: is the training loop structured to do full epochs or just run until time runs out? Looking at the code:
+
+```python
+while not done:
+    tot, nb = 0.0, 0
+    for views, y in dl_tr:
+        frac = min(1.0, (time.time() - t_start) / budget)
+        ...
+        if time.time() >= t_end:
+            done = True
+            break
+    print(...)
+    epoch += 1
+```
+
+So it does full epochs but breaks early if time runs out. With 189 steps per epoch and maybe 60-80 steps fitting in the budget, it'll do less than one epoch. That's fine - the cosine schedule is based on fraction of budget used, not epoch count.
+
+Everything looks consistent. Let me write the edit.
+
+Actually, I want to reconsider one thing. The lead's plan says "simplify scale_projs to proj_dim=256 each; reduce hidden head to 512." But the current code already has proj_dim=256 and hidden=512. So no change needed there. The head will naturally adapt to 2 scales.
+
+Let me also think about whether RESERVE_S needs adjustment. Currently 85s. With 2 views at b2@224, prediction might take ~55-65s. 85s should be fine. I'll leave it.
+
+One more thought: should I worry about the learning rate? The lead didn't mention changing LR. With a bigger model (b2 vs b0), the optimal LR might be different. But the lead said "implement exactly this experiment, nothing more." So I'll keep LR=1e-3.
+
+Let me write the final edit. Single SEARCH/REPLACE block for the settings.

@@ -1,0 +1,461 @@
+===== attempt 1 =====
+Let me analyze the situation carefully.
+
+Current best: e000 with 5-seed mean 0.6311
+- pore 0.506, deposit 0.630, discontinuity 0.780, stain 0.608
+
+Key observations from the research brief:
+- One-step 4-class detector baseline: 0.638 mAP@0.5
+- Stage-1 boxes with perfect classes (ceiling): 0.758 mAP@0.5
+- Stage-1 boxes scored as single class 'defect': 0.755 mAP@0.5
+- Crop classifier with perfect boxes reaches macro-F1 ~0.87
+- Pore and deposit are weak classes; stain confused with deposit and background
+- Class-weighted loss hurt every time
+- Tuning hyperparameters alone helped little; changes of method helped more
+
+Experiment history:
+- e001: crashed (type bug)
+- e002: fixed crash, 0.5172 - rejected (training on detector boxes with background class)
+- e003: low-res crops, 0.6251 - rejected
+- e004: p² scoring, 0.6161 - rejected
+- e005: training on detector boxes (overlap), 0.6248 - rejected
+- e006: ConvNeXt-Nano, 0.2901 - suspicious (likely bug)
+- e007: MixUp, 0.6326 seed-0, 0.6292 5-seed - not confirmed
+
+So far, nothing has beaten the baseline. The key insight from the brief is:
+- "mAP@0.5 rewards, per class: (a) the right class on boxes that overlap a true defect, and (b) good ranking: true detections should score higher than false ones."
+- "Detector boxes include false alarms (background) and slightly misplaced boxes; the starting classifier was trained only on perfect boxes and has no notion of 'not a defect'."
+- "Several rows per box (one per class) are allowed and often help."
+
+The current approach outputs 4 rows per box (one per class), scored as conf * p[c]. The problem is that the classifier has no notion of background - it always assigns some probability to a defect class.
+
+Key idea that hasn't been fully explored: The scoring mechanism. Currently score = conf * p[c]. But the detector's conf already provides some signal about whether something is a defect. The classifier's probabilities should modulate this.
+
+Let me think about what could actually help here:
+
+1. **Background-aware scoring**: The classifier doesn't know about background. But we could use the detector conf more cleverly. If conf is low, the box is likely background. If conf is high, it's likely a defect. The classifier should only be used to pick the class, not to determine if it's a defect.
+
+2. **Score calibration**: Instead of conf * p[c], maybe we should use something like conf * p[c] / sum(p) or conf * (p[c] - p_bg) where p_bg is estimated somehow.
+
+3. **The key insight**: The stage-1 boxes scored as a single class get 0.755. The 4-class detector gets 0.638. The gap is entirely in class assignment. But the current two-stage system gets 0.6311, which is actually WORSE than the one-step detector. This means the classifier is making bad class assignments that hurt more than they help.
+
+Wait, let me re-read. The "stage-1 boxes scored as a single class 'defect'" gets 0.755. This means if we just assign every box to one class (say class 0), we get 0.755. But that's because mAP@0.5 with a single class... wait, no. Let me re-read.
+
+"stage-1 boxes scored as a single class 'defect': 0.755 mAP@0.5"
+
+I think this means: all boxes are scored with the same class (e.g., all as "defect" which maps to one of the 4 classes), and the mAP is computed. Actually, I think it means all boxes get the same score regardless of class, so the ranking is purely by detector conf. With 4 classes, if all boxes are assigned to one class, then for that class you get all the detections (including false positives), and for the other 3 classes you get nothing.
+
+Actually wait, re-reading: "When all types are merged into one class, the same detector reaches 0.77". So if you merge all 4 classes into 1, mAP goes from 0.69 to 0.77. The "stage-1 boxes scored as a single class 'defect': 0.755" probably means: take the stage-1 detector boxes, assign them all to a single class (say class 0), and compute mAP@0.5. This gives 0.755 because the detector is good at finding defects (high recall) but the class assignment is wrong.
+
+Hmm, actually I think it means: all boxes are given the same score (based on detector conf), and they're all assigned to one class. In that case, for that one class, you'd get high precision and recall (since the detector is good), but for the other 3 classes, AP would be 0. So mAP would be (AP_class0 + 0 + 0 + 0) / 4. That doesn't make sense for 0.755.
+
+Let me re-think. Maybe "scored as a single class" means: the boxes are scored with a single confidence value (detector conf), and then for mAP computation, each box is considered as potentially being any class. Or maybe it means: the boxes are all labeled as the same class, and mAP is computed as if there's only one class.
+
+Actually, I think the most sensible interpretation is: "stage-1 boxes scored as a single class 'defect'" means all boxes are assigned to a single class (let's say class 0), and mAP@0.5 is computed with 4 classes. In this case:
+- For class 0: all boxes are candidates. The true positives are the actual class-0 defects. The false positives are all other boxes. AP would be moderate.
+- For classes 1, 2, 3: no candidates. AP = 0.
+- mAP = (AP_0 + 0 + 0 + 0) / 4
+
+That would give a low number, not 0.755.
+
+Another interpretation: maybe "scored as a single class" means the mAP is computed as if there's only one class (all defects merged). In that case, 0.755 makes sense - the detector is good at finding defects regardless of type.
+
+I think that's the right interpretation. The "ceiling" of 0.758 means: if we had perfect class labels on the stage-1 boxes, mAP@0.5 would be 0.758. The "single class" of 0.755 means: if we merge all classes into one, mAP is 0.755. These are close, suggesting the detector boxes are good but the class assignment is the bottleneck.
+
+So the key challenge is: the classifier needs to correctly assign classes to the detector boxes. The current classifier gets 0.6311, which is worse than the one-step detector (0.638). This means the classifier is actually HURTING performance compared to just using the one-step detector's class predictions.
+
+Wait, but the one-step detector's 0.638 is on high-res images. The two-stage system's 0.6311 is also on the same validation images. So the two-stage system is slightly worse than the one-step detector.
+
+The key issue: the classifier is trained on perfect GT boxes but evaluated on detector boxes that may be slightly misplaced. Also, the classifier has no background concept - it always assigns a class.
+
+Let me think about what could actually help:
+
+1. **Better scoring function**: The current score is conf * p[c]. But if the classifier is uncertain (all p[c] are similar), the scores will be similar, and the ranking will be dominated by conf. If the classifier is confident about a specific class, that class gets a boost. This seems reasonable, but maybe the interaction is wrong.
+
+2. **Using the detector conf more cleverly**: The detector conf indicates how likely the box is a defect. If conf is very low, the box is likely background, and we should suppress all class predictions. If conf is high, we should trust the classifier more.
+
+3. **Score = conf * p[c] / max(p)** or **score = conf * (p[c] - mean(p))**: These would make the classifier's relative confidence matter more.
+
+4. **Two-stage scoring**: First, use conf to determine if it's a defect. Then, use the classifier to determine the class. The score could be conf * p[c] where p[c] is the softmax probability, but with a threshold on conf.
+
+Actually, let me think about this differently. The mAP@0.5 metric rewards:
+- For each class, true detections should be ranked above false detections
+- A detection is "true" if it overlaps (IoU > 0.5) with a GT box of the same class
+
+The current approach outputs 4 rows per box. For a given box, the 4 rows have scores conf * p[0], conf * p[1], conf * p[2], conf * p[3]. Since sum(p) = 1, the sum of the 4 scores is conf. The box with the highest p[c] gets the highest score for that class.
+
+The problem: if a box is background (no GT overlap), it still gets 4 rows with non-zero scores. These are false positives for all 4 classes. The detector conf should help suppress these, but if conf is not well calibrated, it won't.
+
+Key insight: **The classifier should learn to output a "background" probability**. But we can't add a 5th class without retraining. However, we can use the classifier's uncertainty as a proxy for background. If max(p) is low (say < 0.5), the classifier is uncertain, and the box might be background.
+
+Actually, let me think about a different approach. What if we use the classifier's probability to modulate the detector conf differently?
+
+Current: score[c] = conf * p[c]
+Alternative: score[c] = conf * p[c] * (p[c] - 0.25)  # 0.25 is the uniform distribution
+Or: score[c] = conf * max(0, p[c] - 0.25)  # suppress if classifier is uncertain
+
+This would suppress all classes when the classifier is uncertain (all p[c] ≈ 0.25), and boost the most likely class when the classifier is confident.
+
+Actually, a simpler and more principled approach: **score[c] = conf * p[c] / (4 * max(p))** or something that normalizes.
+
+Wait, let me think about what actually matters for mAP. For a given class c, the AP depends on the ranking of all boxes that are predicted as class c. A box is a TP for class c if it overlaps a GT box of class c. It's a FP otherwise.
+
+The score for box i, class c is: s(i,c) = conf_i * p_i[c]
+
+For class c, we sort all boxes by s(i,c) descending. A box is TP if it overlaps GT class c. The precision-recall curve depends on how well s(i,c) separates TPs from FPs.
+
+The issue: for a background box (no GT overlap), s(i,c) = conf_i * p_i[c] > 0 for all c. These are FPs for all classes. If conf_i is high (detector is confident it's a defect) but it's actually background, the scores will be high, hurting precision.
+
+The classifier's p_i[c] should be low for background boxes if the classifier has learned to recognize background. But the classifier was trained only on GT boxes (all defects), so it has no concept of background. It will always assign some probability to a defect class.
+
+So the key issue is: **the classifier cannot distinguish background from defects**. The detector conf is the only signal for this.
+
+Given this, the scoring should be:
+- If conf is low → likely background → suppress all scores
+- If conf is high → likely defect → trust the classifier for class assignment
+
+The current scoring (conf * p[c]) already does this to some extent. But maybe the interaction is wrong. For example, if conf is very low (0.01) and p[c] is high (0.9), the score is 0.009, which is very low. But if conf is moderate (0.5) and p[c] is moderate (0.3), the score is 0.15, which is higher. This seems reasonable.
+
+Let me think about what else could help...
+
+Actually, re-reading the brief: "Several rows per box (one per class) are allowed and often help." This suggests that outputting multiple rows per box is beneficial. The current approach outputs 4 rows per box. Maybe we should output fewer rows? For example, only output the top-2 classes? Or only output the top-1 class?
+
+If we output only the top-1 class per box, we reduce the number of false positives. But we might miss some true positives if the classifier's top-1 is wrong.
+
+If we output top-2 classes, we get a balance.
+
+Let me think about the numbers:
+- 41879 eval detections
+- 4 rows per box → 167516 rows
+- But MIN_SCORE = 0.001, so some rows are filtered
+- Actual output: 53543 rows
+
+So about 1.28 rows per box on average. This means many boxes have low scores for most classes.
+
+Hmm, what if we try a different approach: **only output the top-1 class per box, with score = conf * p[top1]**? This would reduce false positives significantly.
+
+Or: **output top-2 classes per box**.
+
+Actually, let me think about this from a different angle. The one-step detector gets 0.638. The two-stage system gets 0.6311. The difference is small. The ceiling is 0.758. So there's a lot of room for improvement.
+
+The key question: what's the main source of error?
+1. Wrong class assignment (classifier picks wrong class)
+2. False positives (background boxes get high scores)
+3. Missed detections (defect boxes get low scores)
+
+From the brief: "many errors are wrong types, not missed defects" (from the one-step detector analysis). So the main issue is class assignment.
+
+The classifier's macro-F1 is ~0.87 with perfect boxes. With detector boxes (slightly misplaced), it's probably lower. The weak classes are pore and stain.
+
+Let me think about what method change could help:
+
+1. **Score calibration with background**: Use the classifier's uncertainty to suppress background. For example, score[c] = conf * p[c] * (p[c] - 0.25) / (1 - 0.25). This normalizes so that uniform distribution gives 0, and perfect confidence gives 1.
+
+2. **Top-k output**: Only output the top-k classes per box, reducing false positives.
+
+3. **Score = conf^a * p[c]^b**: Tune the exponents.
+
+4. **Use the detector conf as a gate**: If conf < threshold, output nothing. If conf >= threshold, output the top class.
+
+Let me think about option 1 more carefully. If p = [0.25, 0.25, 0.25, 0.25] (uniform), then p[c] - 0.25 = 0 for all c, so all scores are 0. This means the box is suppressed. If p = [0.9, 0.03, 0.03, 0.04], then p[0] - 0.25 = 0.65, so score[0] = conf * 0.65 / 0.75 ≈ conf * 0.87. This is reasonable.
+
+But wait, this might be too aggressive. If p = [0.5, 0.2, 0.2, 0.1], then p[0] - 0.25 = 0.25, score[0] = conf * 0.25 / 0.75 ≈ conf * 0.33. This is a significant reduction. But the classifier is somewhat confident about class 0, so we might want to keep this detection.
+
+Actually, the formula score[c] = conf * (p[c] - 0.25) / 0.75 is equivalent to conf * (4*p[c] - 1) / 3. When p[c] = 0.25, score = 0. When p[c] = 1, score = conf. This is a linear mapping from [0.25, 1] to [0, conf].
+
+This seems like a reasonable approach. It suppresses uncertain predictions while keeping confident ones.
+
+But wait, there's a subtlety. For mAP, what matters is the relative ranking. If we apply this transformation to all scores, the relative ordering within a class might change. Let's think...
+
+For class c, the score is conf * (p[c] - 0.25) / 0.75. Two boxes i and j are both predicted as class c. Box i has conf_i = 0.8, p_i[c] = 0.6. Box j has conf_j = 0.6, p_j[c] = 0.8.
+
+Original scores: s_i = 0.8 * 0.6 = 0.48, s_j = 0.6 * 0.8 = 0.48. Tied.
+New scores: s_i = 0.8 * (0.6 - 0.25) / 0.75 = 0.8 * 0.467 = 0.373, s_j = 0.6 * (0.8 - 0.25) / 0.75 = 0.6 * 0.733 = 0.44. Now j > i.
+
+The new scoring favors boxes where the classifier is more confident, even if the detector conf is lower. This might be good or bad depending on which signal is more reliable.
+
+Actually, I think the key insight is: **the detector conf is a measure of "is this a defect?" and the classifier probability is a measure of "which class is this?"**. These are different signals. The current scoring multiplies them, which is reasonable. But the classifier's probability is not a measure of "is this a defect?" - it's a measure of "given that this is a defect, which class?" (approximately, since it was trained only on defects).
+
+So the issue is: for a background box, the classifier will still output some class probabilities (since it was trained only on defects). The detector conf should be the primary signal for "is this a defect?" and the classifier should be the primary signal for "which class?"
+
+Given this, the scoring conf * p[c] is actually reasonable. The detector conf gates the "is it a defect?" question, and the classifier probability determines the class.
+
+But the problem is: the detector conf might not be well calibrated. If the detector conf is high for background boxes (false alarms), the scores will be high, hurting precision.
+
+Let me think about a different approach. What if we use the classifier's maximum probability as an additional gate?
+
+score[c] = conf * p[c] * max(p)
+
+This would further suppress boxes where the classifier is uncertain. If max(p) = 0.25 (uniform), score = conf * p[c] * 0.25, which is 4x lower than the original. If max(p) = 0.9, score = conf * p[c] * 0.9, which is slightly lower.
+
+Hmm, this might be too aggressive. Let me think...
+
+Actually, I think the most promising direction is to **train the classifier on detector boxes with a background class**. This was tried in e002 and got 0.5172, which was rejected. But e002 had a bug (type issue with img_w/img_h). Let me re-read...
+
+e002: "The e001 crash was a trivial type bug (img_w/img_h left as strings by read_csv); fixing it lets us test the core idea—training on detector boxes with an explicit background class"
+
+So e002 fixed the crash and got 0.5172. This is much worse than the baseline 0.6311. So training on detector boxes with a background class actually HURTS. Why?
+
+Possible reasons:
+1. The detector boxes are noisy (misplaced), so training on them introduces noise.
+2. The background class is too dominant (most detector boxes are background), so the model learns to predict background.
+3. The overlap-based labeling is noisy (IoU > 0.5 threshold might mislabel some boxes).
+
+So the background class approach doesn't work well. Let me think of other approaches.
+
+What about **test-time augmentation (TTA)**? At inference time, we could:
+- Flip the image horizontally and vertically
+- Use different crop sizes
+- Average the predictions
+
+This could improve the classifier's accuracy without changing the training.
+
+But TTA would increase inference time. With 41879 eval boxes and 4 crops (original + 3 augmented), we'd need 4x more forward passes. The current inference takes about 37 seconds (162 - 125). With 4x, it would be about 150 seconds, which might exceed the budget.
+
+Actually, let me check the timing:
+- Loading: 13s
+- Training: 125s (5 epochs)
+- Inference + writing: 37s
+- Total: 162s
+
+The budget is 180s with 55s reserve, so training can use up to 125s. Inference + writing takes 37s. If we do 2x TTA (horizontal flip), inference would be about 74s, total about 199s. That's over budget.
+
+With 1x TTA (just the original), it's fine. With 2x TTA (original + horizontal flip), it might be tight.
+
+Actually, the current code already does two views (tight crop + wide crop) and averages the logits. So it's already a form of TTA. Adding a horizontal flip would make it 4 views (tight+wide, each with and without flip).
+
+Let me think about other approaches...
+
+**Score calibration using the classifier's entropy**: The entropy of the probability distribution indicates uncertainty. High entropy → uncertain → likely background. Low entropy → confident → likely defect.
+
+score[c] = conf * p[c] * (1 - H(p)) where H(p) is the normalized entropy.
+
+Or: score[c] = conf * p[c] * (1 - H(p)/log(4))
+
+When p is uniform, H(p) = log(4), so 1 - H/log(4) = 0. All scores are 0.
+When p is a delta (one class = 1), H(p) = 0, so 1 - 0 = 1. Score = conf * p[c].
+
+This is similar to the (p[c] - 0.25) approach but smoother.
+
+Actually, I think the simplest and most impactful change would be to **only output the top-1 class per box** instead of all 4. This would:
+- Reduce false positives (fewer rows per box)
+- Keep the most confident prediction
+- Reduce the number of rows written (faster)
+
+But this might miss some true positives where the top-1 is wrong but the top-2 is correct.
+
+Alternatively, **output top-2 classes per box**.
+
+Let me think about the expected impact. Currently, 53543 rows are written for 41879 boxes (1.28 rows/box). If we output top-1, we'd have at most 41879 rows. If we output top-2, at most 83758 rows.
+
+For mAP, reducing false positives is important. Each box that's a false positive for class c contributes to the FP count for class c. If we output 4 classes per box, a background box is a FP for all 4 classes. If we output top-1, it's a FP for only 1 class.
+
+This could significantly improve precision for all classes.
+
+But it could also hurt recall if the top-1 is often wrong. The classifier's top-1 accuracy is probably around 80-85% (macro-F1 ~0.87 with perfect boxes). So about 15-20% of true detections would have the wrong top-1 class. These would be missed.
+
+The trade-off: reducing FPs by ~75% (from 4 to 1 per box) vs. losing ~15-20% of TPs.
+
+For mAP, this is likely a net positive, especially for the weak classes (pore, stain) where the classifier is less confident.
+
+Let me go with this: **output only the top-1 class per box, with score = conf * p[top1]**.
+
+Wait, but the brief says "Several rows per box (one per class) are allowed and often help." This suggests that multiple rows per box are beneficial. Maybe top-2 is better than top-1.
+
+Let me think about this more carefully. The mAP@0.5 metric: for each class, we compute AP. A detection is a TP if it overlaps (IoU > 0.5) with a GT box of the same class. If a box overlaps a GT box of class 0 but is predicted as class 1, it's a FP for class 1 and a miss for class 0.
+
+If we output top-1 only, and the top-1 is wrong, we lose the TP for the correct class and gain a FP for the wrong class. If we output top-2, and the correct class is in the top-2, we keep the TP (with a lower score) and gain a FP for the other class.
+
+The score matters for ranking. If the correct class has a lower score than the wrong class, it might be ranked lower, hurting precision at that recall level.
+
+I think top-2 is a reasonable compromise. Let's try **top-2 classes per box**.
+
+Actually, wait. Let me reconsider. The current approach outputs all 4 classes with score = conf * p[c]. The MIN_SCORE = 0.001 filters out very low scores. So in practice, most boxes have 1-2 rows with significant scores.
+
+Let me check: 53543 rows / 41879 boxes = 1.28 rows/box. So on average, 1.28 classes per box have score > 0.001. This means the classifier is often confident about 1-2 classes.
+
+If we output top-2, we'd have at most 2 rows per box, which is close to the current average. The difference is that we'd explicitly pick the top-2 rather than filtering by score threshold.
+
+Hmm, this might not make a big difference. Let me think of something else.
+
+**What about using the detector conf more aggressively?** The detector conf is the only signal for "is this a defect?" If we use it more aggressively, we can suppress background boxes.
+
+For example: score[c] = conf^2 * p[c]. This squares the conf, making low-conf boxes much lower. But e004 tried p^2 and it didn't help. What about conf^2?
+
+Or: score[c] = conf * p[c] * conf = conf^2 * p[c]. This is the same as conf^2 * p[c].
+
+Actually, let me think about this differently. The detector conf is in [0, 1]. If conf = 0.5, conf^2 = 0.25. If conf = 0.1, conf^2 = 0.01. So squaring the conf makes low-conf boxes much lower, which is good for suppressing background.
+
+But this also makes moderate-conf boxes lower, which might hurt recall.
+
+Let me try a different approach: **score[c] = conf * p[c] * (conf + p[c]) / 2**. This is the arithmetic mean of conf and p[c], multiplied by... no, that's not right.
+
+Actually, let me try the simplest thing: **score[c] = conf * p[c] * max(p)**. This uses the classifier's confidence as an additional gate.
+
+When the classifier is confident (max(p) = 0.9), score ≈ conf * p[c] * 0.9 ≈ conf * p[c] (slightly reduced).
+When the classifier is uncertain (max(p) = 0.25), score = conf * p[c] * 0.25 = conf * 0.25 * 0.25 = conf * 0.0625 (significantly reduced).
+
+This effectively suppresses boxes where the classifier is uncertain, which are more likely to be background.
+
+Let me go with this: **score[c] = conf * p[c] * max(p)**.
+
+Wait, but this changes the relative ranking. For a given class c, two boxes i and j:
+- Box i: conf_i = 0.8, p_i[c] = 0.7, max(p_i) = 0.7 → score_i = 0.8 * 0.7 * 0.7 = 0.392
+- Box j: conf_j = 0.6, p_j[c] = 0.5, max(p_j) = 0.5 → score_j = 0.6 * 0.5 * 0.5 = 0.15
+
+Original: score_i = 0.56, score_j = 0.30. Ratio: 1.87.
+New: score_i = 0.392, score_j = 0.15. Ratio: 2.61.
+
+The new scoring increases the ratio, meaning the more confident box is ranked even higher. This could help with precision.
+
+But it also reduces the absolute scores, which might cause more boxes to fall below MIN_SCORE. Let me check: MIN_SCORE = 0.001. With the new scoring, a box with conf = 0.1, p[c] = 0.25, max(p) = 0.25 would have score = 0.1 * 0.25 * 0.25 = 0.00625 > 0.001. So it would still be written. A box with conf = 0.05, p[c] = 0.25, max(p) = 0.25 would have score = 0.05 * 0.25 * 0.25 = 0.003125 > 0.001. Still written.
+
+OK, let me think about what's the most impactful change I can make.
+
+Actually, I just realized something important. Let me re-read the brief:
+
+"mAP@0.5 rewards, per class: (a) the right class on boxes that overlap a true defect, and (b) good ranking: true detections should score higher than false ones."
+
+The key is (b): good ranking. True detections should score higher than false ones. The current scoring (conf * p[c]) might not achieve this well because:
+1. Background boxes with high conf get high scores (bad)
+2. Defect boxes with low conf get low scores (bad)
+3. The classifier's probability doesn't distinguish background from defects (bad)
+
+The most impactful change would be to **better separate true detections from false ones in the score**.
+
+One approach: **use the classifier's probability as a "defect-ness" score**. If the classifier was trained only on defects, then a high probability for any class indicates a defect. A low probability for all classes (uniform) indicates background.
+
+But the classifier always outputs probabilities that sum to 1, so the "defect-ness" is not directly available. We need to use the uncertainty (entropy) as a proxy.
+
+score[c] = conf * p[c] * (1 - H(p)/log(4))
+
+Where H(p) = -sum(p[c] * log(p[c])) and log(4) is the max entropy for 4 classes.
+
+When p is uniform, H/log(4) = 1, so score = 0.
+When p is a delta, H = 0, so score = conf * p[c] = conf.
+
+This is a smooth version of the (p[c] - 0.25) approach.
+
+Let me implement this. Actually, the simpler version is:
+
+score[c] = conf * p[c] * (max(p) - 0.25) / 0.75
+
+When max(p) = 0.25 (uniform), score = 0.
+When max(p) = 1 (delta), score = conf * p[c] = conf.
+
+This is equivalent to the (p[c] - 0.25) approach when p[c] = max(p).
+
+Actually, let me just try the simplest version: **score[c] = conf * p[c] * max(p)**.
+
+This is easy to implement and has a clear interpretation: the classifier's confidence (max probability) acts as an additional gate.
+
+Let me write the code change.
+
+Current code:
+```python
+    for d, p in zip(ev, probs):
+        for c in range(4):
+            s = d["conf"] * float(p[c])
+            if s > MIN_SCORE:
+                w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+
+New code:
+```python
+    for d, p in zip(ev, probs):
+        max_p = float(np.max(p))
+        for c in range(4):
+            s = d["conf"] * float(p[c]) * max_p
+            if s > MIN_SCORE:
+                w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+
+Wait, but this might be too aggressive. Let me think about the expected impact.
+
+For a true defect box with conf = 0.7 and classifier probabilities [0.5, 0.2, 0.2, 0.1]:
+- Original: scores = [0.35, 0.14, 0.14, 0.07]
+- New: max_p = 0.5, scores = [0.175, 0.07, 0.07, 0.035]
+
+The scores are halved. This means the box is ranked lower relative to other boxes. If other boxes are also halved, the relative ranking is the same. But if some boxes are more affected (those with lower max_p), the relative ranking changes.
+
+For a background box with conf = 0.5 and classifier probabilities [0.3, 0.3, 0.2, 0.2]:
+- Original: scores = [0.15, 0.15, 0.10, 0.10]
+- New: max_p = 0.3, scores = [0.045, 0.045, 0.03, 0.03]
+
+The background box's scores are reduced by a factor of 0.3/0.5 = 0.6 (since original max score was 0.15 and new max is 0.045). The true defect box's scores are reduced by a factor of 0.5/0.7 = 0.71 (since original max was 0.35 and new max is 0.175).
+
+So the background box is suppressed more (factor 0.6) than the true defect box (factor 0.71). This is the desired effect!
+
+The ratio of true defect score to background score:
+- Original: 0.35 / 0.15 = 2.33
+- New: 0.175 / 0.045 = 3.89
+
+The separation is improved. This should help with mAP.
+
+OK, I'm going to go with this change. Let me write the SEARCH/REPLACE block.
+
+Actually wait, I want to reconsider. The brief says "Tuning hyperparameters alone helped little in earlier experiments; changes of method helped more." The scoring change is a method change, not a hyperparameter tuning. So it should be in the right direction.
+
+Also, the brief says "Class-weighted loss hurt classification every time it was tried." So we should avoid class weighting.
+
+Let me also consider: should I change MIN_SCORE? With the new scoring, scores are lower, so more rows might fall below MIN_SCORE. This could be good (fewer false positives) or bad (missing some true detections).
+
+I'll keep MIN_SCORE = 0.001 for now and see how it goes.
+
+Let me finalize the change:
+
+```python
+    for d, p in zip(ev, probs):
+        max_p = float(np.max(p))
+        for c in range(4):
+            s = d["conf"] * float(p[c]) * max_p
+            if s > MIN_SCORE:
+                w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+
+This is a focused change that tests the hypothesis: "Using the classifier's maximum probability as an additional gate in the score will improve mAP by better separating true detections from false ones, since background boxes tend to have lower classifier confidence (more uniform probability distributions)."
+
+Let me write the SEARCH/REPLACE block.
+
+The current code in the file:
+```python
+    for d, p in zip(ev, probs):
+        for c in range(4):
+            s = d["conf"] * float(p[c])
+            if s > MIN_SCORE:
+                w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+
+The new code:
+```python
+    for d, p in zip(ev, probs):
+        max_p = float(np.max(p))
+        for c in range(4):
+            s = d["conf"] * float(p[c]) * max_p
+            if s > MIN_SCORE:
+                w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+
+This is a clean, focused change. Let me verify the SEARCH text matches exactly.
+
+Looking at the current best train.py (e000), the relevant section is:
+
+```python
+    n = 0
+    with open(os.path.join(args.out, "preds.csv"), "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["det_id", "cls", "score"])
+        for d, p in zip(ev, probs):
+            for c in range(4):
+                s = d["conf"] * float(p[c])
+                if s > MIN_SCORE:
+                    w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+
+I need to match this exactly. Let me copy it character for character.
+
+Actually, I realize I should double-check: is the current best e000 or e007? The problem says "Current best train.py (e000, 5-seed val mAP@0.5 0.6311, seed std 0.0025)". And e007 was "not confirmed" (5-seed mean 0.6292 < 0.6311). So the current best is e000.
+
+I should use BASE: best, which is e000.
+
+Let me write the final answer.

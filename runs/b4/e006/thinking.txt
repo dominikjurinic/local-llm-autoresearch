@@ -1,0 +1,360 @@
+===== attempt 1 =====
+Let me think carefully about this problem.
+
+**Current state:**
+- Best: e000, 5-seed mean 0.6297 (baseline two-crop EfficientNet-B0)
+- Per-class AP: pore 0.504, deposit 0.626, discontinuity 0.780, stain 0.609
+- Ceiling (perfect classes on stage-1 boxes): 0.758
+- Class-agnostic single class: 0.755
+- One-step 4-class baseline to beat: 0.638
+
+**Key insight from the problem setup:**
+Since the code emits one row per class for every box (4 rows per box), the set of boxes that can be a "hit" for each class is fixed by stage 1. The ranking within a class is what matters. The score is `conf * p_c`. So for class c, the ranking is determined by `conf * p_c`, and since conf is fixed per box, the ranking is determined by `p_c` weighted by conf.
+
+Wait, actually the ranking within class c is by score = conf * p_c. Both conf and p_c vary per box. So the ranking is a combination of detector confidence and classifier probability.
+
+The gap between 0.630 and 0.758 (ceiling) is the ranking problem. The ceiling uses detector conf as the score for all boxes (with perfect classes). So the ceiling's per-class ranking is by conf alone. Our current system ranks by conf * p_c.
+
+Hmm, interesting. The ceiling (0.758) ranks each class's boxes by conf. Our system (0.630) ranks by conf * p_c. So the classifier probability is actually HURTING the ranking relative to conf alone? That's a big insight.
+
+Wait, let me reconsider. In the ceiling, every box that overlaps a true defect gets the correct class; every other box (false alarm) is kept as class 0 with detector conf. So the ceiling has: for each class, the boxes are those overlapping a true defect of that class (correctly labeled) PLUS all false alarms as class 0. And the score is detector conf.
+
+So in the ceiling, for class 0 (pore), the ranking is by conf, and the boxes include all true pores (correct) plus all false alarms. For classes 1,2,3, only the correctly-overlapping boxes.
+
+In our system, every box gets 4 rows (one per class). So for class c, the boxes are ALL boxes (not just overlapping ones), each scored by conf * p_c.
+
+So the difference: in the ceiling, class c has only the boxes that truly are class c (plus false alarms for class 0). In our system, class c has ALL boxes. This means our system has many more false-positive rows per class, and the ranking must separate true c boxes from non-c boxes using p_c.
+
+So the key question: does the classifier probability p_c help or hurt the ranking?
+
+The ceiling ranks by conf. If p_c were perfectly correlated with "is this box a true c", then ranking by conf * p_c would be better than conf alone (it would push true c boxes up). But the classifier is only ~0.87 macro-F1, so p_c is noisy.
+
+Actually, the important realization: the ceiling's score for a box in class c is just conf. Our score is conf * p_c. If p_c were a perfect indicator, we'd do better than the ceiling. But p_c is noisy, and multiplying by a noisy p_c might HURT the ranking relative to conf alone.
+
+Wait, but there's a subtlety. In the ceiling, the false alarms are all class 0. So for class 0, the ceiling ranks true pores + all false alarms by conf. For our system, class 0 ranks all boxes by conf * p_0. The false alarms get some p_0 value (probably low-ish but not zero). 
+
+Hmm, this is getting complex. Let me think about what experiments have been tried:
+
+- e001: crashed (data)
+- e002: rejected (0.5541) - restored writer
+- e003: inference - 4 views averaging, 0.6355 seed-0, 0.6301 5-seed - NOT confirmed (basically same as baseline)
+- e004: scoring - 0.5689 - rejected (emitting fewer rows?)
+- e005: architecture - efficientnet_b2, 0.6240 - rejected
+
+So the architecture change (b2) didn't help. The inference (4 views) didn't help. The scoring change didn't help.
+
+Let me think about what the actual bottleneck is.
+
+The per-class AP: pore 0.504, deposit 0.626, discontinuity 0.780, stain 0.609.
+
+Pore is the weakest. Stain is second weakest.
+
+The known info says: "Pore and deposit are the weak classes; stain is often confused with deposit."
+
+So the classifier confuses stain with deposit. And pore is weak.
+
+Let me think about the ranking problem more carefully.
+
+Actually, here's a key idea I haven't tried: **the score should perhaps not be conf * p_c but something that better separates true detections from false alarms.**
+
+Wait, but the metric is mAP@0.5. For a given class c, all predictions of class c are sorted by score. A prediction is a hit if it overlaps an unmatched true box of class c by IoU > 0.5.
+
+The boxes are fixed (stage 1). So the set of boxes that CAN be hits for class c is fixed: those boxes that overlap a true c box. The ranking determines the precision/recall curve.
+
+Now, the score = conf * p_c. The ranking is by this.
+
+Key insight: **The detector conf already encodes "how much does this box look like a defect at all" (class-agnostic).** The classifier p_c encodes "which class." 
+
+For the ranking within class c, we want true c boxes at the top and non-c boxes at the bottom. The conf helps separate true defects from false alarms (since false alarms have lower conf on average). The p_c helps separate c from other classes.
+
+But here's the thing: the ceiling uses conf ALONE and gets 0.758. So conf alone, with perfect class assignment, gives 0.758. Our system with conf * p_c gives 0.630. 
+
+The difference must come from:
+1. Misassignment: boxes that are true c but assigned low p_c (because classifier is wrong), and boxes that are NOT c but assigned high p_c.
+2. The false alarms: in the ceiling, false alarms are class 0 only. In our system, false alarms get p_c for all c, so they pollute all classes.
+
+Hmm wait, but actually the false alarms in the ceiling are class 0. So for class 0 in the ceiling, the ranking includes false alarms. For classes 1,2,3 in the ceiling, no false alarms (only true boxes). 
+
+In our system, for ALL classes, false alarms are present (with p_c scores). So for classes 1,2,3, our system has extra false-alarm rows that the ceiling doesn't have. These extra rows, if ranked high, hurt precision.
+
+So one big source of error: false alarms getting high p_c for non-zero classes.
+
+But we can't remove false alarms (they're stage 1). We can only rank them. If p_c for false alarms is low, they rank low and don't hurt much.
+
+Let me reconsider. The real lever we have is the score. The score determines ranking. 
+
+Idea: **What if the score should be more like a "is this a true defect AND class c" probability, rather than conf * p_c?**
+
+Actually, conf is already a "is this a defect" score. p_c is "which class." So conf * p_c is "is this a defect of class c." That seems right.
+
+Hmm, but the issue is the ranking. Let me think about whether we should use a different combination.
+
+Actually, wait. Let me reconsider the ceiling more carefully. The ceiling gets 0.758 with score = conf. That means: if we had perfect classes and ranked by conf, we'd get 0.758. 
+
+Our system gets 0.630 with score = conf * p_c and imperfect classes (4 rows per box).
+
+Now, what if we could get the class assignment closer to perfect? The crop classifier reaches ~0.87 macro-F1. If we improved it, the ranking would improve.
+
+But the architecture change (b2) didn't help. The 4-view inference didn't help.
+
+Let me think about what would actually help.
+
+**Idea: train the classifier better / longer / differently.**
+
+The current training: 5 epochs, 432 steps, loss went 0.73 -> 0.22. That's decent. But maybe more training would help? The budget is 180s, reserve 55s, so ~125s for training. 432 steps in ~125s = ~0.29s/step. 
+
+Actually, the model might be undertrained. Let me think. Loss 0.22 at the end. For a 4-class problem, that's not super low. More training might help the classifier, which would help the ranking.
+
+But wait, the "Lessons" say tuning hyperparameters alone helped little in earlier experiments; changes of method helped more. And class-weighted loss hurt.
+
+Hmm. Let me think about the ranking problem from a different angle.
+
+**Key realization about the metric:** The AP depends only on the ORDER of a class's predictions. So what matters is, for each class c, the relative ordering of all boxes by score_c = conf * p_c.
+
+Now, the boxes that are true c should be ranked above boxes that are not c. The score conf * p_c does this if p_c is high for true c and low for non-c, and conf is high for true defects and low for false alarms.
+
+But there's a subtle issue: **the conf factor.** For a true c box, conf might be high or low. For a non-c box (a true box of another class), conf is also high (it's a real defect). So conf doesn't help separate c from other classes — it's high for both. Only p_c separates them.
+
+For a false alarm, conf is low-ish, and p_c is whatever. So conf helps push false alarms down.
+
+So the ranking within class c is:
+- True c boxes: score = conf_c * p_c (conf_c is their detector conf, p_c should be high)
+- True non-c boxes: score = conf_nc * p_c (conf_nc high, p_c should be low)
+- False alarms: score = conf_fa * p_c (conf_fa low, p_c whatever)
+
+For the ranking to be good, we need p_c to be high for true c and low for true non-c. The conf factor mostly affects false alarms.
+
+So the classifier quality (p_c) is the main lever for separating classes. And the conf is mostly for false alarms.
+
+Now, the ceiling uses conf alone. In the ceiling, for class c (c≠0), only true c boxes are present (no false alarms, no true non-c boxes — because perfect class assignment means each box gets exactly one class). Wait, no. Let me re-read.
+
+"stage-1 boxes with perfect classes (ceiling for stage 2): 0.758 mAP@0.5. Every detector box that overlaps a true defect (IoU > 0.5) gets the correct class; every other box (false alarms) is KEPT, as class 0, with its detector conf."
+
+So in the ceiling:
+- Boxes overlapping a true defect: get the correct class (the class of the true defect they overlap).
+- Boxes NOT overlapping any true defect (false alarms): class 0, score = conf.
+
+So for class c (c≠0): only boxes overlapping a true c defect. No false alarms, no other-class boxes.
+For class 0: boxes overlapping a true 0 defect + all false alarms.
+
+And all scored by conf.
+
+So the ceiling's class c (c≠0) ranking is purely among true c boxes, by conf. That's a "clean" ranking. The AP for class c in the ceiling is determined by how well conf ranks true c boxes against the true c boxes (which are all hits, since they overlap true c). Wait, if all boxes in class c are true c boxes (all hits), then AP = 1 for that class? No...
+
+Hmm, wait. If every box in class c is a true c box (overlaps a true c defect), then every prediction is a hit (assuming IoU > 0.5 with an unmatched true box). But there might be more boxes than true boxes (multiple boxes overlapping the same true box). So some boxes would be false positives (overlapping an already-matched true box).
+
+Actually, mAP@0.5: a prediction is a hit if it overlaps an UNMATCHED true box by IoU > 0.5. So if two boxes overlap the same true box, one is a hit, the other is a false positive (the true box is already matched).
+
+So even in the ceiling, there are false positives (duplicate boxes on the same true defect). The ranking by conf determines which duplicate is the hit.
+
+OK this is getting complicated. Let me step back and think about what practical experiment to run.
+
+**The gap: 0.630 (ours) vs 0.758 (ceiling).**
+
+The ceiling has perfect classes. We have imperfect classes (4 rows per box, noisy p_c).
+
+The main difference: in the ceiling, each box is assigned to at most one class (the correct one, or class 0 for false alarms). In our system, each box is assigned to all 4 classes with scores conf * p_c.
+
+So our system has 4x the rows, and the ranking must separate classes using p_c.
+
+**What if we could make the class assignment more like the ceiling?** I.e., assign each box to its best class only (argmax), not all 4?
+
+Wait, that was e004 (scoring), which got 0.5689 and was rejected. Let me think about what e004 did. The hypothesis said "every box injects 3 false-positive rows into the other classes' ranked lists." So e004 probably emitted only the argmax class per box. That got 0.5689, worse.
+
+Hmm, why would emitting only argmax be worse? Because if the classifier is wrong (argmax is wrong class), then the box is in the wrong class's list entirely, and it's a false positive there AND a miss in the correct class. Whereas with 4 rows, the box is in the correct class's list too (with some score), so it can still be a hit.
+
+Wait, but with 4 rows, the box is in ALL classes' lists. So it's a hit in the correct class (if ranked well) and a false positive in the other 3 classes. With argmax-only, it's a hit in the correct class (if argmax is right and ranked well) and not present in the other classes.
+
+The difference: with 4 rows, if argmax is wrong, the box is still in the correct class's list (as a non-argmax row). With argmax-only, if argmax is wrong, the box is NOT in the correct class's list (it's in the wrong class's list instead).
+
+So 4 rows is more robust to class misassignment. That's why argmax-only was worse.
+
+OK so 4 rows per box is good. The ranking within each class is the lever.
+
+**Let me think about the score more carefully.**
+
+Currently: score_c = conf * p_c.
+
+For class c, the ranking is by conf * p_c. 
+
+The issue: for true c boxes, we want them ranked high. For true non-c boxes and false alarms, ranked low.
+
+The conf factor: true c boxes have conf in [0,1], true non-c boxes have conf in [0,1], false alarms have conf in [0,1] (lower on average).
+
+Hmm, actually, maybe the problem is that conf is NOT a good ranking signal within class c. Because conf is class-agnostic, it doesn't distinguish c from non-c. So for true c vs true non-c boxes, conf is similar (both are real defects). The only thing that distinguishes them is p_c.
+
+So within class c, the ranking is essentially by p_c (with conf as a tiebreaker / false-alarm suppressor).
+
+Now, the ceiling ranks by conf. But in the ceiling, class c has only true c boxes (plus false alarms for c=0). So conf ranks true c boxes against each other (for the duplicate-box problem) and against false alarms (for c=0).
+
+In our system, class c has true c + true non-c + false alarms, ranked by conf * p_c.
+
+So the question is: does conf * p_c rank true c boxes above true non-c boxes and false alarms better than the ceiling's conf-alone does for its cleaner set?
+
+I think the key issue is the NOISE in p_c. The classifier is ~0.87 F1, so ~13% of boxes are misclassified. For a misclassified true c box, p_c is low, so it's ranked low → miss. For a misclassified true non-c box (assigned high p_c), it's ranked high → false positive.
+
+So improving the classifier would help. But architecture change didn't help.
+
+**Let me think about what else could help.**
+
+Idea 1: **Better training of the classifier.** Maybe the current training is undertrained or the augmentation is off. Let me look at the training recipe.
+
+Current: EfficientNet-B0, IMG_SIZE=160, two crops (1.5x tight, 2.5x wide), logits averaged. Augmentation: light geometric jitter (center ±10%, side 0.85-1.2x), random flips (h,v), brightness 0.8-1.2. LR=1e-3 AdamW, weight decay 0.05, batch 64. 5 epochs.
+
+The augmentation is quite light. Maybe more augmentation would help generalization? But the "Lessons" say tuning hyperparameters helped little.
+
+Idea 2: **The score combination.** Maybe conf * p_c is not optimal. What if we use a different combination, like p_c only (drop conf), or conf^a * p_c^b?
+
+Wait, but the metric says "Any change that keeps the order of a class's predictions leaves its AP unchanged." So we need to change the ORDER.
+
+If we drop conf and use p_c only, the order changes (conf is no longer a factor). Would that help? For true c vs true non-c boxes, p_c alone might rank better (no conf noise). But for false alarms, p_c alone might not push them down as well (a false alarm could have high p_c by chance).
+
+Hmm. Actually, conf is important for false alarms. Let me think.
+
+Actually, here's a cleaner way to think about it. The score should be proportional to P(true defect of class c | box). We have:
+- conf ≈ P(defect | box) [class-agnostic, from stage 1]
+- p_c ≈ P(class c | box, defect) [from our classifier]
+
+So P(c | box) ≈ conf * p_c (roughly). That's what we have. Seems right.
+
+But maybe the classifier's p_c is not well-calibrated. Maybe we should use a different temperature or calibration.
+
+Idea 3: **Test-time augmentation (TTA) for the eval boxes.** Average over multiple crops/views to get more robust p_c. e003 tried 4 views and got 0.6301 (not confirmed, basically same). So TTA with more views didn't help much.
+
+Idea 4: **Use the detector conf differently.** Maybe the conf is noisy and we should rely more on p_c.
+
+Let me reconsider the numbers. The class-agnostic single-class score is 0.755. The ceiling (perfect classes) is 0.758. These are very close! That means: if we just score all boxes as a single class "defect" (ignoring class), we get 0.755. And if we have perfect classes, we get 0.758. So the class assignment adds almost nothing to the "defect detection" score — because the class-agnostic detection is already near-perfect, and the class assignment just splits the boxes into 4 classes.
+
+Wait, that's a crucial insight. The class-agnostic score (0.755) is computed as a single class "defect." So all boxes are one class, ranked by conf. That gives 0.755. 
+
+The ceiling (0.758) has perfect classes, ranked by conf. That gives 0.758.
+
+So going from class-agnostic (0.755) to perfect-classes (0.758) gains only 0.003. That means the class assignment, when perfect, barely changes the mAP. Because mAP@0.5 per class averaged — if the classes are perfectly assigned, each class's AP is determined by how well conf ranks that class's boxes. And the average is 0.758, close to the single-class 0.755.
+
+Now, our system (0.630) has imperfect classes. The gap 0.758 - 0.630 = 0.128 is the cost of imperfect class assignment + the 4-rows-per-box ranking.
+
+So the whole game is: get the class assignment/ranking closer to perfect.
+
+Now, here's the thing: the class-agnostic score (0.755) ranks all boxes by conf. If we could assign each box to its correct class and keep the conf ranking, we'd get 0.758. The loss comes from:
+1. Misassignment (box assigned to wrong class → false positive in wrong class, miss in right class).
+2. The 4-rows structure: each box is in all 4 classes, so the ranking within each class must separate true-c from true-non-c using p_c, which is noisy.
+
+Wait, but if we had perfect assignment and 4 rows... no, the ceiling has 1 row per box (the correct class, or class 0 for false alarms). So the ceiling doesn't have the 4-rows problem.
+
+Hmm, so there are two separate issues:
+(a) The 4-rows-per-box structure (each box in all 4 classes) vs 1-row-per-box (correct class only).
+(b) The noisy p_c ranking.
+
+For (a): if we could assign each box to exactly one class (the correct one), we'd be at the ceiling. But we don't know the correct class. We have to estimate it.
+
+For (b): even with 4 rows, if p_c perfectly separated classes, we'd do well.
+
+The current system does 4 rows with noisy p_c. e004 tried 1 row (argmax) and did worse (0.5689). So 4 rows is better than 1 row, because 4 rows is robust to misassignment.
+
+So the lever is: improve p_c (the classifier), OR change the score to better exploit p_c.
+
+Let me think about the score again. score_c = conf * p_c.
+
+For class c, ranking by conf * p_c. 
+
+Consider a true c box with conf=0.8, p_c=0.7 (classifier somewhat confident). Score = 0.56.
+Consider a true non-c box with conf=0.8, p_c=0.2 (classifier says it's not c). Score = 0.16.
+Consider a false alarm with conf=0.3, p_c=0.5. Score = 0.15.
+
+So the true c box (0.56) ranks above the true non-c (0.16) and false alarm (0.15). Good.
+
+But if the classifier is wrong: true c box with p_c=0.3 (misclassified). Score = 0.24. True non-c box with p_c=0.6. Score = 0.48. Now the non-c box ranks above the c box. Bad.
+
+So the classifier's errors directly cause ranking errors. Improving the classifier is key.
+
+But architecture change (b2) didn't help. Maybe the classifier is already near its limit for this data, or maybe the b2 change was offset by the reduced training time (reserve 75 vs 55).
+
+Wait, e005 (b2) had RESERVE_S=75, so less training time. And it got 0.6240, slightly worse than 0.6297. Maybe b2 is better but undertrained? Or maybe b2 is just not better.
+
+Let me think about a different angle.
+
+**Idea: The score should weight p_c more strongly, or use a power of p_c to sharpen the ranking.**
+
+Currently score_c = conf * p_c. The p_c is in [0,1] (soft, since softmax). If we use p_c^k for k>1, we sharpen the ranking (true c boxes with high p_c stay high, low p_c boxes drop). But this only changes the order if p_c varies. Actually, p_c^k is monotone in p_c, so the order within a fixed conf is the same. But conf varies per box, so conf * p_c^k has a different order than conf * p_c.
+
+Hmm, but is this likely to help? It's a re-weighting of the score. The "Lessons" warn against "anything that only re-orders scores in a way the metric ignores" — but this does change the order, so it's not ignored. But it's a subtle change.
+
+Actually, I realize the more important question: is the conf factor HELPING or HURTING the ranking?
+
+Let me think. In the ceiling, conf alone gives 0.758 (with perfect classes). In our system, conf * p_c gives 0.630. 
+
+If p_c were perfect (p_c=1 for true c, 0 otherwise), then score_c = conf * 1 = conf for true c boxes, and 0 for others. So the ranking would be by conf for true c boxes (same as ceiling), and non-c boxes would be at the bottom. That would give ~0.758.
+
+So the loss is entirely due to p_c being imperfect. The conf factor is "correct" (it matches the ceiling's ranking for true c boxes). The problem is p_c's noise.
+
+So we need better p_c. Architecture change didn't help. What else?
+
+**Idea: Train the classifier on more data / better data.**
+
+The training uses crops.csv with res="high". Maybe there are "low" res crops too? The TRAIN_ON = ("high",). What if we include "low" res crops for more training data?
+
+Wait, the docstring says crops.csv has res ("high"/"low"). The current code trains only on "high". Maybe including "low" would give more training examples, improving the classifier.
+
+But "low" res might be lower quality. Hmm. But more data often helps.
+
+Actually, let me reconsider. The eval boxes — what resolution are the eval images? The dets.csv has image, and the images are in images/. The crops.csv has res. If the eval images are high-res, then training on high is right. If low, then...
+
+Actually, I don't know the eval resolution. Let me think. The "high-res images" in the paper get 0.69 mAP. The eval is probably high-res. So training on high is right.
+
+But maybe including low-res crops (downsampled?) would add data. Unclear.
+
+Let me think about the augmentation. The current augmentation is light. For a classifier, more augmentation (color jitter, etc.) might help generalization. But the "Lessons" say hyperparameter tuning helped little.
+
+**Idea: The two-crop averaging might be suboptimal.** The model takes two crops (1.5x and 2.5x) and averages logits. Maybe the tight crop (1.5x) is more informative for classification, or maybe we should weight them differently.
+
+Actually, let me reconsider the whole approach. The classifier is given a crop of the box. The box is from stage 1 (class-agnostic detector). The crop shows the defect. The classifier decides the type.
+
+The two crops: tight (1.5x the box) and wide (2.5x the box). The tight crop focuses on the defect; the wide crop gives context. Averaging them.
+
+Maybe the context (wide crop) is important for some classes (e.g., stain vs deposit might depend on surrounding area). 
+
+Hmm, but e003 (4 views) didn't help.
+
+Let me think about a fundamentally different idea.
+
+**Idea: Use the detector's conf as a training signal / loss.**
+
+No, that's complicated.
+
+**Idea: Train the classifier to directly predict the mAP-relevant ranking.**
+
+The metric is mAP, which depends on ranking. Maybe we can train a model that directly optimizes ranking (listwise loss). But that's a big change and might not fit the budget.
+
+**Idea: The score should incorporate the "is this a real defect" more carefully.**
+
+Actually, wait. Let me reconsider the false alarm problem. In our system, false alarms get 4 rows (one per class) with scores conf * p_c. If a false alarm has high p_c for some class (by chance), it gets a high score and becomes a false positive in that class.
+
+The conf factor helps: false alarms have lower conf, so conf * p_c is lower. But if p_c is high (say 0.8) and conf is moderate (0.4), score = 0.32, which might rank above some true c boxes with low conf.
+
+Hmm.
+
+Let me think about the actual distribution. I don't have the data, so I'm guessing.
+
+**Let me focus on the most promising idea: improve the classifier's p_c.**
+
+Options:
+1. Better backbone (b2 tried, didn't help — but was undertrained).
+2. More training (longer, but budget-limited).
+3. Better data (include low-res crops).
+4. Better augmentation.
+5. Better input (different crops).
+6. Ensembling (but budget).
+
+Wait, the "Lessons" say: "Tuning hyperparameters alone helped little in earlier experiments; changes of method helped more." And "Class-weighted loss hurt classification every time."
+
+So method changes are preferred. Let me think about a method change.
+
+**Method change idea: The classifier should see the box in a way that's more discriminative for the weak classes.**
+
+Pore is the weakest (0.504). What does a pore look like? Small holes in the weld. Deposit is extra material. Discontinuity is a break. Stain is discoloration.
+
+Pore vs the others: pores are small, dark spots. Maybe the tight crop is important for pores (they're small features). 
+
+Stain is confused with deposit. Stain is discoloration (color change), deposit is extra material (shape change). So color might be important for stain.
+
+Hmm, this suggests theThinking budget reached. Stop thinking now and write the reply in the required format.

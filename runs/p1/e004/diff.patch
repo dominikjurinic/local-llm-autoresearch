@@ -1,0 +1,70 @@
+--- e000/train.py
++++ e004/train.py
+@@ -52,5 +52,6 @@
+ LR = 1e-3
+ WEIGHT_DECAY = 0.05
+-RESERVE_S = 55          # seconds kept free for prediction and writing
++RESERVE_S = 40          # seconds kept free for prediction and writing
++BIAS_EPOCHS = 2         # epochs of fine-tuning with the bias-corrected loss
+ MIN_SCORE = 0.001       # rows below this score are not written
+ MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+@@ -148,8 +149,42 @@
+     model = model.to(device).to(memory_format=torch.channels_last)
+     crit = nn.CrossEntropyLoss()
++    amp = dict(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda")
++
++    # Fit per-class logit biases on held-out data (3-fold cross-validation): for each fold,
++    # bias[c] = log(true count of c) - log(sum of predicted prob of c) on the other two folds.
++    idx = np.arange(len(crops))
++    np.random.shuffle(idx)
++    folds = [set(i.tolist()) for i in np.array_split(idx, 3)]
++    fold_of = np.full(len(crops), -1, dtype=int)
++    for k, f in enumerate(folds):
++        fold_of[list(f)] = k
++    ev_rows = []
++    for k in range(3):
++        sel = [i for i in range(len(crops)) if fold_of[i] != k]
++        ev_rows += [crops[i] for i in sel]
++    dl_bias = torch.utils.data.DataLoader(BoxDataset(ev_rows, images, False), batch_size=256, shuffle=False,
++                                           num_workers=workers, pin_memory=True)
++    model.eval()
++    bias_vecs = []
++    with torch.no_grad(), torch.autocast(**amp):
++        for k in range(3):
++            sel = [i for i in range(len(crops)) if fold_of[i] != k]
++            ys = np.array([crops[i]["cls"] for i in sel])
++            prob_sum = np.zeros(4, dtype=np.float64)
++            for xt, xw, _ in dl_bias:
++                xt = xt.to(device).to(memory_format=torch.channels_last)
++                xw = xw.to(device).to(memory_format=torch.channels_last)
++                p = torch.softmax(((model(xt) + model(xw)) / 2).float(), 1).cpu().numpy()
++                i0 = len(ev_rows) - len(sel)
++                prob_sum += p[i0:i0 + len(sel)].sum(axis=0)
++            true_cnt = np.bincount(ys, minlength=4).astype(np.float64)
++            bias_vecs.append(np.log(np.maximum(true_cnt, 1.0)) - np.log(np.maximum(prob_sum, 1e-9)))
++    bias = torch.tensor(np.mean(bias_vecs, axis=0), dtype=torch.float32, device=device)
++    print("class bias correction (logits):", bias.tolist(), flush=True)
+     opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+-    amp = dict(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda")
+ 
+     # Train until the budget minus the reserve is used up: 5% warm-up, then cosine decay.
++    # For the last BIAS_EPOCHS the bias correction is added to the loss:
++    # loss = CE - sum_c bias[c] * p[c]  (pushes the decision away from over-predicted classes).
+     t_start = time.time()
+     t_end = deadline - RESERVE_S
+@@ -159,4 +194,5 @@
+     while not done:
+         tot, nb = 0.0, 0
++        use_bias = epoch >= BIAS_EPOCHS
+         for xt, xw, y in dl_tr:
+             frac = min(1.0, (time.time() - t_start) / budget)
+@@ -168,5 +204,8 @@
+             y = y.to(device, non_blocking=True)
+             with torch.autocast(**amp):
+-                loss = crit((model(xt) + model(xw)) / 2, y)
++                lg = (model(xt) + model(xw)) / 2
++                loss = crit(lg, y)
++                if use_bias:
++                    loss = loss - (torch.softmax(lg.float(), 1) * bias).sum(1).mean()
+             opt.zero_grad(set_to_none=True)
+             loss.backward()

@@ -1,0 +1,387 @@
+### system
+# Research brief: two-stage weld defect detection (LoHi-WELD)
+
+## Background
+LoHi-WELD contains images of real robotic weld beads with four defect types:
+0 pore, 1 deposit, 2 discontinuity, 3 stain. The original paper uses a one-step detector
+(YOLOv7-tiny) that finds and names defects at once: 0.69 mAP@0.5 on high-res images. When all
+types are merged into one class, the same detector reaches 0.77, so many errors are wrong types,
+not missed defects.
+
+We test a two-stage system: a class-agnostic detector (stage 1, fixed, already run) finds defect
+boxes; your code (stage 2) decides the type of each box and how confident each prediction is.
+
+## Reference numbers on validation (same images your score is computed on)
+- one-step 4-class detector (the baseline to beat): 0.638 mAP@0.5
+- stage-1 boxes with perfect classes (ceiling for stage 2): 0.758 mAP@0.5
+- stage-1 boxes scored as a single class 'defect': 0.755 mAP@0.5
+
+## What is already known
+- A crop classifier given perfect boxes reaches macro-F1 ~0.87 with the starting recipe (two-crop
+  input). Pore and deposit are the weak classes; stain is often confused with deposit and background.
+- Tuning hyperparameters alone helped little in earlier experiments; changes of method helped more.
+- Class-weighted loss hurt classification every time it was tried.
+
+## What determines the score
+mAP@0.5 rewards, per class: (a) the right class on boxes that overlap a true defect, and (b) good
+ranking: true detections should score higher than false ones. Detector boxes include false alarms
+(background) and slightly misplaced boxes; the starting classifier was trained only on perfect boxes
+and has no notion of "not a defect". Several rows per box (one per class) are allowed and often help.
+
+Ideas that are in scope (not a to-do list):
+- train the classifier on detector boxes from the training images (dets.csv split "train"), labelled
+  by overlap with the true boxes in crops.csv, including a "background" class for false alarms
+- combine detector conf and classifier probabilities differently (powers, background probability, ...)
+- robustness to box misplacement (jitter matching the detector's errors)
+- use of low-res training crops, test-time augmentation, ensembling within the time budget
+- architecture changes using the pretrained backbones listed below
+
+## How your code is run
+- `python train.py --data /work/data --out /work/out --seed S --seconds T`, offline, in a sandbox.
+- `T` is the total wall-clock budget (loading, training, prediction). At the limit the run is killed
+  and counts as failed. Keep a safety margin.
+- Inputs and output format: see the docstring at the top of train.py.
+- The harness scores the eval boxes on validation images and shows you the score. The rest are hidden
+  test images, scored only after the research is finished. You cannot tell them apart.
+- No internet. Packages: the standard library, numpy, torch, torchvision, timm, PIL.
+- Pretrained weights are available only for these timm models: convnext_atto, convnext_nano, convnext_pico, efficientnet_b0, efficientnet_b2, mobilenetv3_large_100, regnety_016, resnet18, resnet26d, resnet34, resnet50, tf_efficientnetv2_b0
+
+## How results are judged
+- Each new version runs with seed 0. If it beats the current best mean, it is re-run with more seeds;
+  only if the multi-seed mean still beats the best does it become the new best.
+- Seed-to-seed noise is about +-0.005 to 0.01 mAP. A single-seed gain smaller than that is probably noise.
+- A score far below the current best usually means a bug (wrong class order, wrong box format,
+  untrained model), not a bad idea; the harness will say so.
+- Every change is applied on top of the current best `train.py` (or the most recent version with BASE: last).
+
+## Rules
+1. One idea per turn, with a short testable hypothesis. Keep the edit focused on that idea.
+2. Keep the contract. Use the seed. Respect the time budget.
+3. Do not try to find the labels of eval images by any route; only training labels may be used.
+4. If a run crashed or timed out, read the log and fix the cause.
+
+## Reply format (exactly this; no other text outside these fields)
+BASE: best            (or: last   -- to edit the most recent version instead of the best)
+CATEGORY: one of data, augmentation, architecture, loss, sampling, optimisation, inference, scoring, other
+HYPOTHESIS: one or two sentences
+<<<<<<< SEARCH
+lines copied exactly from the current file
+=======
+the new lines
+>>>>>>> REPLACE
+
+You may give several SEARCH/REPLACE blocks. Each SEARCH text must appear exactly once in the
+file (copy it character for character, including indentation). To insert code, put a nearby
+line in SEARCH and repeat it in REPLACE together with the new lines.
+
+
+### user
+## Current best train.py (e016, 5-seed val mAP@0.5 0.6411, seed std 0.0019)
+```python
+#!/usr/bin/env python3
+"""
+Two-stage weld defect detection, stage 2: the file the research agent edits.
+
+Stage 1 (fixed, already done): a class-agnostic detector (YOLOv7-tiny) found candidate defect boxes,
+each with a confidence ("conf"). Stage 2 (this file): decide the defect type of each box and give
+each prediction a score: 0 pore, 1 deposit, 2 discontinuity, 3 stain.
+The result is scored like a normal detector: mAP at IoU 0.5 over the 4 classes.
+
+Contract with the harness (do not break it):
+  - inputs in <data>:
+      crops.csv  labelled training boxes: id, res ("high"/"low"), image, x1, y1, x2, y2, img_w, img_h, cls
+      dets.csv   detector boxes: det_id, split ("train" or "eval"), image, x1, y1, x2, y2, img_w, img_h, conf
+                 "train" boxes are on training images (their true class can be found by overlap with crops.csv);
+                 "eval" boxes are on hidden evaluation images: make predictions for these
+      images/    the images
+  - write <out>/preds.csv with columns det_id, cls, score: one or more rows per eval box
+    (several rows with different classes for the same box are allowed; leaving a box out drops it).
+    Higher score = more confident. Per image at most the 300 highest-scoring rows count.
+  - use --seed for all randomness
+  - finish within --seconds of wall time (loading, training, prediction); the harness kills it at the limit.
+
+Starting point: the "two-crop" classifier (tight crop 1.5x + wide crop 2.5x of the box through the same
+EfficientNet-B0, logits averaged), trained on the true training boxes; each eval box becomes one
+prediction per class with score = detector conf x class probability.
+"""
+import time
+
+T0 = time.time()  # the time budget counts from here
+
+import argparse
+import csv
+import math
+import os
+import random
+from collections import defaultdict
+
+import numpy as np
+import timm
+import torch
+import torch.nn as nn
+from PIL import Image
+
+# ---------------------------------------------------------------- settings
+MODEL = "efficientnet_b0"
+PRETRAINED = True
+IMG_SIZE = 224
+CONTEXT = 2.5           # wide crop: side = CONTEXT * long side of the box
+TIGHT_CONTEXT = 1.5     # tight crop
+MIN_CROP = 16
+TRAIN_ON = ("high", "low")    # resolutions of crops.csv used for training
+BATCH_SIZE = 64
+LR = 1e-3
+WEIGHT_DECAY = 0.05
+RESERVE_S = 55          # seconds kept free for prediction and writing
+MIN_SCORE = 0.001       # rows below this score are not written
+MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+
+def read_csv(path):
+    rows = list(csv.DictReader(open(path)))
+    for r in rows:
+        for k in ("x1", "y1", "x2", "y2", "conf"):
+            if k in r:
+                r[k] = float(r[k])
+        if "cls" in r:
+            r["cls"] = int(r["cls"])
+    return rows
+
+
+def make_crop(img, r, context, train):
+    h, w = img.shape[:2]
+    cx, cy = (r["x1"] + r["x2"]) / 2, (r["y1"] + r["y2"]) / 2
+    side = max(max(r["x2"] - r["x1"], r["y2"] - r["y1"]) * context, MIN_CROP)
+    if train:  # light geometric jitter
+        cx += random.uniform(-0.1, 0.1) * side
+        cy += random.uniform(-0.1, 0.1) * side
+        side *= random.uniform(0.85, 1.2)
+    s = max(2, int(round(side)))
+    x0, y0 = int(round(cx - s / 2)), int(round(cy - s / 2))
+    canvas = np.full((s, s, 3), 114, dtype=np.uint8)  # gray padding outside the image
+    sx0, sy0, sx1, sy1 = max(0, x0), max(0, y0), min(w, x0 + s), min(h, y0 + s)
+    if sx1 > sx0 and sy1 > sy0:
+        canvas[sy0 - y0:sy1 - y0, sx0 - x0:sx1 - x0] = img[sy0:sy1, sx0:sx1]
+    return np.asarray(Image.fromarray(canvas).resize((IMG_SIZE, IMG_SIZE), Image.BILINEAR), dtype=np.float32) / 255.0
+
+
+class BoxDataset(torch.utils.data.Dataset):
+    def __init__(self, rows, images, train):
+        self.rows, self.images, self.train = rows, images, train
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __getitem__(self, i):
+        r = self.rows[i]
+        img = self.images[r["image"]]
+        fh = fv = False
+        bright = 1.0
+        if self.train:
+            fh, fv, bright = random.random() < 0.5, random.random() < 0.5, random.uniform(0.8, 1.2)
+        x = make_crop(img, r, CONTEXT, self.train)
+        if fh:
+            x = x[:, ::-1]
+        if fv:
+            x = x[::-1, :]
+        if self.train:
+            x = np.clip(x * bright, 0, 1)
+        x = (x - MEAN) / STD
+        return torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))), r.get("cls", -1)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data", default="/work/data")
+    ap.add_argument("--out", default="/work/out")
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--seconds", type=float, default=180)
+    args = ap.parse_args()
+    deadline = T0 + args.seconds
+    random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    all_crops = read_csv(os.path.join(args.data, "crops.csv"))
+    crops = [r for r in all_crops if r["res"] in TRAIN_ON]
+    dets = read_csv(os.path.join(args.data, "dets.csv"))
+    train_dets = [d for d in dets if d["split"] == "train"]
+    ev = [d for d in dets if d["split"] == "eval"]
+    crops_by_img = defaultdict(list)
+    for r in all_crops:
+        crops_by_img[r["image"]].append(r)
+    matched_dets = []
+    for d in train_dets:
+        best_iou, best_cls = 0.0, -1
+        for c in crops_by_img.get(d["image"], []):
+            x1, y1 = max(d["x1"], c["x1"]), max(d["y1"], c["y1"])
+            x2, y2 = min(d["x2"], c["x2"]), min(d["y2"], c["y2"])
+            inter = max(0, x2 - x1) * max(0, y2 - y1)
+            union = (d["x2"]-d["x1"])*(d["y2"]-d["y1"]) + (c["x2"]-c["x1"])*(c["y2"]-c["y1"]) - inter
+            iou = inter / union if union > 0 else 0.0
+            if iou > best_iou:
+                best_iou, best_cls = iou, c["cls"]
+        if best_iou >= 0.5:
+            d["cls"] = best_cls
+            matched_dets.append(d)
+    train_rows = crops + matched_dets
+    needed = {r["image"] for r in train_rows} | {d["image"] for d in ev}
+    images = {p: np.asarray(Image.open(os.path.join(args.data, "images", p)).convert("RGB")) for p in needed}
+    print(f"train {len(train_rows)} boxes ({len(crops)} gt + {len(matched_dets)} det), eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
+
+    workers = min(8, os.cpu_count() or 2)
+
+    def worker_init(_):
+        s = torch.initial_seed() % 2**32
+        random.seed(s); np.random.seed(s)
+
+    g = torch.Generator().manual_seed(args.seed)
+    dl_tr = torch.utils.data.DataLoader(BoxDataset(train_rows, images, True), batch_size=BATCH_SIZE, shuffle=True,
+                                        num_workers=workers, pin_memory=True, drop_last=True,
+                                        persistent_workers=True, generator=g, worker_init_fn=worker_init)
+    dl_ev = torch.utils.data.DataLoader(BoxDataset(ev, images, False), batch_size=256, shuffle=False,
+                                        num_workers=workers, pin_memory=True)
+
+    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
+    model = model.to(device).to(memory_format=torch.channels_last)
+    crit = nn.CrossEntropyLoss()
+    opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    amp = dict(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda")
+
+    # Train until the budget minus the reserve is used up: 5% warm-up, then cosine decay.
+    t_start = time.time()
+    t_end = deadline - RESERVE_S
+    budget = max(1.0, t_end - t_start)
+    steps, epoch, done = 0, 0, False
+    model.train()
+    while not done:
+        tot, nb = 0.0, 0
+        for x, y in dl_tr:
+            frac = min(1.0, (time.time() - t_start) / budget)
+            f = frac / 0.05 if frac < 0.05 else 0.5 * (1 + math.cos(math.pi * (frac - 0.05) / 0.95))
+            for pg in opt.param_groups:
+                pg["lr"] = LR * max(f, 1e-3)
+            x = x.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            y = y.to(device, non_blocking=True)
+            with torch.autocast(**amp):
+                loss = crit(model(x), y)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+            tot += loss.item(); nb += 1; steps += 1
+            if time.time() >= t_end:
+                done = True
+                break
+        print(f"epoch {epoch}: loss {tot / max(nb, 1):.4f}, {steps} steps, {time.time() - T0:.0f}s", flush=True)
+        epoch += 1
+
+    # Classify every eval detection; one prediction per class with score = detector conf x class probability.
+    # TTA: average predictions from original and horizontal-flip views.
+    model.eval()
+    probs = []
+    with torch.no_grad(), torch.autocast(**amp):
+        for x, _ in dl_ev:
+            x = x.to(device).to(memory_format=torch.channels_last)
+            p1 = torch.softmax(model(x).float(), 1)
+            p2 = torch.softmax(model(x.flip(-1)).float(), 1)
+            probs.append(((p1 + p2) / 2).cpu())
+    probs = torch.cat(probs).numpy()
+    os.makedirs(args.out, exist_ok=True)
+    n = 0
+    with open(os.path.join(args.out, "preds.csv"), "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["det_id", "cls", "score"])
+        for d, p in zip(ev, probs):
+            for c in range(4):
+                s = d["conf"] * float(p[c])
+                if s > MIN_SCORE:
+                    w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+    print(f"done: {epoch} epochs, {steps} steps, {n} prediction rows, {time.time() - T0:.0f}s total", flush=True)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+Per-class val AP@0.5 (mean of 5 seeds): pore 0.537, deposit 0.635, discontinuity 0.780, stain 0.612
+
+Log of its seed-0 run (last lines):
+train 26347 boxes (14128 gt + 12219 det), eval 41879 detections, 2255 images (17s)
+epoch 0: loss 0.5211, 411 steps, 94s
+epoch 1: loss 0.2859, 660 steps, 125s
+done: 2 epochs, 660 steps, 55547 prediction rows, 164s total
+
+## Experiment history (38 experiments so far)
+id | base | category | hypothesis | seed-0 score | 5-seed mean | outcome
+e001 | e000 | data | Training on detector boxes (labelled by IoU≥0.5 overlap with ground truth, plus a 5th "background" class for false alarms) instead of perfect crops will improve mAP because the classifier becomes robust to the detector's | 0.5691 | - | rejected
+e002 | e000 | data | Adding detector boxes that match ground truth (IoU ≥ 0.5) to the training set alongside perfect crops will improve mAP because the classifier becomes robust to the detector's box misplacement while retaining clean class  | 0.6368 | 0.6293 | new best
+e003 | e002 | data | Adding low-resolution ground-truth crops to training will improve mAP because the classifier sees more diverse examples at the resolution the detector actually operates on, improving robustness for the weak pore and stai | 0.6296 | 0.6317 | new best
+e004 | e003 | scoring | Squaring the class probability in the score (conf × prob²) will improve mAP by better separating true detections (high prob for correct class) from false alarms and cross-class rows (lower prob), improving the ranking th | 0.6211 | - | rejected
+e005 | e003 | data | Adding a 5th "background" class (from unmatched detector boxes, capped to 1.5× matched count) while keeping GT crops will let the classifier learn "not a defect"; multiplying the score by (1 − prob_bg) will suppress fals | 0.6039 | - | rejected
+e006 | e003 | loss | Focal loss (γ=2, no class weights) will improve mAP by upweighting hard-to-classify examples—especially pore and stain, the two weakest classes—during training, without the negative effects seen when class-weighted loss  | 0.6123 | - | rejected
+e007 | e003 | augmentation | Mixup augmentation (blending two training samples with a Beta-distributed weight and soft-label cross-entropy) will improve mAP by creating virtual examples that smooth the decision boundary between the confusing pore/st | 0.6233 | - | rejected
+e008 | e003 | architecture | Switching from two-crop (tight 1.5× + wide 2.5×) to single wide-crop (2.5×) halves the forward-pass cost per sample, allowing ~2.3× more training epochs (from ~1 to ~2.3) within the same time budget. Since the model is c | 0.6409 | 0.6386 | new best
+e009 | e008 | inference | Test-time augmentation with horizontal flip at inference (averaging predictions from original and H-flipped crops) will improve classification accuracy—especially for pore and stain, the weakest classes—by reducing sensi | 0.6396 | 0.6387 | new best
+e010 | e009 | optimisation | Reducing batch size from 64 to 32 (with proportionally scaled LR) doubles the number of optimizer updates within the same wall-clock budget, improving convergence and classification accuracy—especially for the weak pore  | 0.6229 | - | rejected
+e011 | e009 | sampling | Oversampling pore (AP 0.528) and stain (AP 0.611) by 1.5× via WeightedRandomSampler will improve their classification accuracy by giving the model more exposure to these weak classes during training, addressing the class | 0.6305 | - | rejected
+e012 | e009 | inference | Adding vertical flip (and 180° rotation) to the existing horizontal-flip TTA will improve classification accuracy by giving the model four symmetric views of each crop, helping disambiguate pore from stain/deposit where  | 0.6370 | - | rejected
+e013 | e009 | architecture | EfficientNet-B2 (6.6M params vs B0's 4M) has greater capacity to learn the fine-grained visual distinctions between pore, stain, and deposit, and even with ~1.3 epochs instead of 2 (due to ~1.5× per-step cost), the impro | 0.6340 | - | rejected
+e014 | e009 | scoring | Multiplying the per-class score by the classifier's max probability (max over 4 classes) will improve mAP by boosting confident true detections and suppressing uncertain false alarms, improving the ranking component of m | 0.6320 | - | rejected
+e015 | e009 | architecture | ConvNeXt-Nano (5M params, sequential depthwise conv + LayerNorm blocks) captures fine-grained texture differences between pore/stain/deposit better than EfficientNet-B0's compound-scaling architecture at similar compute  | 0.5833 | - | rejected
+e016 | e009 | architecture | Increasing IMG_SIZE from 160 to 224 aligns the input resolution with the pretrained EfficientNet-B0 weights (trained at 224×224) and gives ~40% more pixel detail for small defects like pores (the weakest class at AP 0.52 | 0.6423 | 0.6411 | new best
+e017 | e016 | optimisation | With only ~660 training steps (≈2.5 epochs), the model is undertrained and the cosine schedule decays the LR to near-zero before meaningful convergence on weak classes (pore 0.537, stain 0.612). Doubling the peak LR from | 0.6364 | - | rejected
+e018 | e016 | architecture | Reducing IMG_SIZE from 224 to 192 cuts per-step cost by ~26% (fewer pixels in both data pipeline and model), yielding ~35% more training steps (≈880 vs 660). Since the model is clearly undertrained (loss still dropping 0 | 0.6387 | - | rejected
+e019 | e016 | scoring | Replacing the score `conf × prob[c]` with `conf × (prob[c] − max_other_prob)` (the class margin) will improve mAP because it directly measures how much the model prefers the predicted class over alternatives: true detect | 0.5805 | - | rejected
+e020 | e016 | optimisation | The cosine LR schedule decays to near-zero in the last ~20% of training (~125 of 660 steps), wasting that time at negligible LR while the loss is still dropping fast (0.52→0.29). Raising the minimum LR multiplier from 1e | 0.6363 | - | rejected
+e021 | e016 | architecture | tf_efficientnetv2_b0 has a more modern architecture (squeeze-and-excitation blocks, improved scaling strategy) than efficientnet_b0, which should produce better discriminative features for the fine-grained pore/stain/dep | 0.6447 | 0.6352 | not confirmed
+e022 | e016 | architecture | MobileNetV3-Large has ~44% fewer FLOPs than EfficientNet-B0 at 224×224, enabling ~45% more training steps (≈950 vs 660) within the same wall-clock budget. The extra training epochs (≈3.6 vs 2.5) should improve convergenc | 0.6380 | - | rejected
+e023 | e016 | loss | Label smoothing (0.1) will improve mAP by preventing the model from becoming overconfident on training examples, yielding better-calibrated class probabilities that improve the ranking component of mAP—true defects get h | 0.6340 | - | rejected
+e024 | e016 | sampling | The classifier only ever sees detector boxes at inference, so upweighting the matched detector boxes (IoU≥0.5) 2× relative to GT crops during training will reduce the train/inference distribution gap and improve mAP, esp | 0.6397 | - | rejected
+e025 | e016 | optimisation | Replacing AdamW (LR=1e-3, wd=0.05) with SGD+momentum (LR=0.1, momentum=0.9, wd=1e-4) will improve mAP because SGD with momentum is the standard and often superior optimizer for fine-tuning pretrained CNNs: larger effecti | 0.4765 | - | suspicious (likely bug)
+e026 | e016 | scoring | The raw YOLOv7-tiny confidence is likely miscalibrated (overconfident on false alarms), so replacing it with a histogram-calibrated "P(defect | conf)" estimated from the ~12k training detector boxes should improve the ra | 0.6278 | - | rejected
+e027 | e016 | inference | The weak classes (pore 0.537, stain 0.612) are small/textural defects, so input detail is likely the bottleneck: the 160→224 jump (e016) was the biggest recent gain. Classifying eval crops at 256×256 while training stays | 0.6326 | - | rejected
+e028 | e016 | augmentation | The detector's boxes are misaligned with ground truth by up to ~20-30% of the box size (IoU 0.5-0.7 range), but the current training jitter (±10% center, 0.85-1.2× side) underestimates this misplacement. Doubling the jit | 0.6369 | - | rejected
+e029 | e016 | scoring | The undertrained model (2 epochs, loss still dropping 0.52→0.29) produces overly uniform softmax probabilities, compressing the score gap between true and false detections. Dividing logits by T=0.7 before softmax sharpen | 0.6277 | - | rejected
+e030 | e016 | inference | Removing the H-flip TTA (which gave no measurable gain, e009: 0.6386→0.6387) and reducing the prediction reserve from 55s to 40s frees ~15s for additional training steps (~14% more, 660→~750), improving convergence of th | 0.6374 | - | rejected
+e031 | e016 | sampling | Curriculum training—first learning on clean GT crops (60% of budget) to establish class boundaries, then fine-tuning on detector boxes (40%) to adapt to the inference distribution—will improve mAP because the model won't | 0.6309 | - | rejected
+e032 | e016 | architecture | RegNetY-016 (0.9M params) is ~3x faster per forward/backward step than EfficientNet-B0 (4M params), enabling ~2000 training steps (vs 660) within the same wall-clock budget. The 3x more optimizer updates should significa | - | - | timeout
+e033 | e016 | architecture | Training at 160×160 (≈2× fewer pixels per step) while keeping inference at 224×224 will roughly double training steps (≈1300 vs 660), improving convergence for the weak pore/stain classes, while the higher-res inference  | 0.6052 | - | rejected
+e034 | e016 | loss | mAP@0.5 decomposes into independent per-class rankings, but the softmax couples all four class scores (they must sum to 1), distorting each class's ranking. Replacing CE with 4 independent BCE sigmoid heads lets each cla | 0.6447 | 0.6401 | not confirmed
+e035 | e016 | optimisation | The cosine schedule decays LR to near-zero over ~630 of 660 steps, but the model is clearly undertrained (loss still dropping 0.52→0.29). Replacing cosine decay with constant LR after the 5% warmup keeps the full learnin | 0.6256 | - | rejected
+e036 | e016 | augmentation | Random erasing (Cutout-style) during training will improve mAP by forcing the model to rely on multiple spatial regions rather than a single texture patch, improving robustness to the detector's box misplacement and help | 0.6426 | 0.6400 | not confirmed
+e037 | e016 | augmentation | Reducing the crop context from 2.5× to 2.0× gives the model a tighter view of the defect, reducing the diluting effect of surrounding weld bead and improving discrimination between pore (small circular holes) and stain ( | 0.6350 | - | rejected
+e038 | e016 | data | The weld images almost certainly have a very different intensity distribution from ImageNet (likely narrow dynamic range, near-grayscale), so the hardcoded ImageNet mean/std suboptimally scales inputs to the pretrained s | 0.6360 | - | rejected
+
+## Most recent experiment: e038 (rejected)
+Its change, relative to its base e016:
+--- e016/train.py
++++ e038/train.py
+@@ -55,6 +55,6 @@
+ RESERVE_S = 55          # seconds kept free for prediction and writing
+ MIN_SCORE = 0.001       # rows below this score are not written
+-MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+-STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
++MEAN = None  # computed from data in main()
++STD = None   # computed from data in main()
+ 
+ 
+@@ -148,5 +148,14 @@
+     needed = {r["image"] for r in train_rows} | {d["image"] for d in ev}
+     images = {p: np.asarray(Image.open(os.path.join(args.data, "images", p)).convert("RGB")) for p in needed}
+-    print(f"train {len(train_rows)} boxes ({len(crops)} gt + {len(matched_dets)} det), eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
++    _sample = list(needed)[:500]
++    _means, _stds = [], []
++    for _p in _sample:
++        _img = images[_p].astype(np.float32) / 255.0
++        _means.append(_img.mean(axis=(0, 1)))
++        _stds.append(_img.std(axis=(0, 1)))
++    global MEAN, STD
++    MEAN = np.mean(_means, axis=0).astype(np.float32)
++    STD = (np.mean(_stds, axis=0) + 1e-6).astype(np.float32)
++    print(f"train {len(train_rows)} boxes ({len(crops)} gt + {len(matched_dets)} det), eval {len(ev)} detections, {len(images)} images, norm mean={MEAN.round(3)} std={STD.round(3)} ({time.time() - T0:.0f}s)", flush=True)
+ 
+     workers = min(8, os.cpu_count() or 2)
+
+If you want to build on (or fix) this most recent version instead of the best, write BASE: last. Its full train.py differs from the best only by the change above.
+
+Propose the next experiment, in the reply format.

@@ -1,0 +1,210 @@
+===== attempt 1 =====
+Let me analyze the situation:
+
+1. Current best is e008 with 5-seed mean 0.6314
+2. The 224px experiments (e010, e011) didn't confirm - e011 got 0.6272 (below best)
+3. The per-class AP shows pore (0.505) and stain (0.609) are weak
+4. Training on detector boxes with background class (e001, e004) was rejected
+5. Focal loss, label smoothing were rejected
+6. TTA helped (e005)
+7. More training time helped (e008)
+8. Max-probability scoring (e009) was not confirmed (0.6298 vs 0.6314)
+
+Let me think about what to try next. Key observations:
+- Pore is the weakest class (0.505 AP)
+- Stain is also weak (0.609)
+- The model is trained on perfect boxes only
+- The classifier doesn't know about "background" - it always assigns 4 classes
+- The scoring is `det_conf * class_prob` - this means even background boxes get non-zero scores for all classes
+
+Ideas to consider:
+1. **Training on detector boxes (dets.csv train)** - tried in e001 and e004, both rejected. But maybe a different approach to how they're used?
+2. **Different scoring** - e009 tried max-prob suppression, not confirmed. What about using a power on the probability? Like `conf * p^2` to sharpen the distribution?
+3. **Architecture** - ConvNeXt-Nano was buggy (e003). What about trying a different backbone that's known to work?
+4. **Data augmentation** - More aggressive augmentation? Color jitter?
+5. **Training duration** - e008 showed more training helps. But we're already at the limit.
+6. **Learning rate schedule** - Maybe a different schedule?
+7. **Batch size** - Smaller batch might help generalization?
+8. **Ensembling** - Train multiple models and average?
+9. **Two-view architecture change** - Instead of averaging two views, concatenate them? Or use a different fusion?
+
+Let me think about what's most promising:
+
+The scoring formula is `conf * p[c]`. The issue is that for background boxes, all 4 probabilities sum to 1, so the best class always gets a non-trivial score. The max-prob suppression (e009) tried `conf * p[c] * max(p)` which should help but didn't confirm.
+
+What about `conf * p[c] / sum(p^2)` or `conf * p[c] * (max(p) - 0.25)`? These would suppress more when the distribution is flat.
+
+Actually, let me think about this differently. The key insight from the background:
+- "stage-1 boxes with perfect classes (ceiling for stage 2): 0.758 mAP@0.5"
+- "stage-1 boxes scored as a single class 'defect': 0.755 mAP@0.5"
+- Our score: 0.6314
+
+So the gap between "perfect classes" and our score is 0.758 - 0.631 = 0.127. This is mostly classification errors.
+
+The gap between "single class" and "perfect classes" is only 0.003, meaning the boxes themselves are good - it's purely a classification problem.
+
+Given that:
+- Pore is weakest (0.505)
+- Stain is second weakest (0.609)
+- The model sees two crops (tight 1.5x and wide 2.5x)
+
+What about trying a different approach to the two-view fusion? Instead of averaging logits, what about:
+- Concatenating the features before the classifier head?
+- Using the tight crop for fine detail and wide crop for context, with different weights?
+
+Actually, let me think about something simpler. The current model uses `efficientnet_b0`. What about trying `convnext_pico` or `regnety_016`? The ConvNeXt-Nano was buggy (e003), but maybe it was a configuration issue.
+
+Wait, let me re-read e003: "ConvNeXt-Nano's modern inductive biases... should improve discrimination" - score 0.3721, "suspicious (likely bug)". So it probably had a bug.
+
+Let me think about what's most likely to help given the constraints:
+
+1. The model is limited by classification accuracy, not detection
+2. Pore and stain are the weak classes
+3. More training time helped (e008)
+4. TTA helped (e005)
+5. The model is trained on perfect boxes only
+
+A promising direction: **Use a different, potentially better backbone**. The `convnext_pico` or `regnety_016` might work better. But architecture changes have been risky (e003 was buggy).
+
+Another direction: **Improve the scoring function**. The current scoring is `conf * p[c]`. What if we use `conf * p[c] / (1 + background_estimate)` where background_estimate is based on how diffuse the probability distribution is? Or what about `conf * (p[c] - 0.25)^+` (zero out probabilities near uniform)?
+
+Actually, let me think about a simpler but potentially effective idea: **power the probability to sharpen the distribution**. Instead of `conf * p[c]`, use `conf * p[c]^2`. This makes the top class relatively stronger and the others weaker. For a correct prediction where p[top] = 0.6, this gives 0.36 vs 0.6 (relative to the sum). For a background box where p = [0.25, 0.25, 0.25, 0.25], this gives 0.0625 vs 0.25. The ratio of top to others goes from 1:1 (uniform) to 1:1 (still uniform for background) but for a somewhat correct prediction it sharpens.
+
+Wait, that doesn't help with background suppression. Let me think again...
+
+For a correct box: p = [0.7, 0.1, 0.1, 0.1] → p^2 = [0.49, 0.01, 0.01, 0.01]. The top class score is 0.49*conf.
+For a background box: p = [0.3, 0.3, 0.2, 0.2] → p^2 = [0.09, 0.09, 0.04, 0.04]. The top class score is 0.09*conf.
+
+The ratio of correct/background goes from 0.7/0.3 = 2.33 to 0.49/0.09 = 5.44. That's a significant improvement in ranking!
+
+But wait, this also reduces the absolute scores, which might not matter since mAP is about ranking.
+
+Actually, for mAP@0.5, what matters is the ranking of true detections vs false ones. If we can make the scores of true detections higher relative to false ones, we improve AP. The power transformation does exactly this when the model is somewhat confident about the correct class.
+
+Let me try `score = conf * p[c]^2` as a simple scoring change. This is a "scoring" category change.
+
+Actually wait - let me reconsider. The e009 experiment tried `conf * p[c] * max(p)` which is similar in spirit (suppress when distribution is flat). It got 0.6298 (not confirmed, below 0.6314). So this direction might not be as effective as hoped.
+
+Let me think of something else...
+
+What about **training with a background class but using it only for scoring, not as a 5th output class**? I.e., train normally with 4 classes, but at inference, use the entropy of the distribution as a "background likelihood" to suppress scores.
+
+Or better: what about **using the detector confidence differently**? Currently it's `conf * p[c]`. What if the detector confidence is already a good background signal? What if we use `conf^2 * p[c]` or `conf * p[c] * conf` (same thing)?
+
+Hmm, let me think about what else could help...
+
+**Idea: Train on both high and low resolution crops, but with different weights.** The e002 experiment added low-res crops and got 0.6209 (rejected). But maybe the issue was that low-res crops were noisy. What if we use low-res crops only for the wide view (context), not the tight view?
+
+Actually, let me look at this from a different angle. The per-class scores are:
+- pore: 0.505 (very weak)
+- deposit: 0.630
+- discontinuity: 0.782 (strong)
+- stain: 0.609
+
+Pore is the weakest. Pores are small circular holes. They might be hard to distinguish from background or from stain (dark spots). 
+
+What if I try a **different input size specifically for the tight crop**? Pores are small, so a tighter crop with higher resolution might help. But this complicates the architecture.
+
+Let me think about something more practical. What about **changing the batch size**? Currently 64. A smaller batch (32) gives more gradient updates per epoch, and the noise in gradients can act as regularization. Or a larger batch (128) for more stable gradients.
+
+Actually, I think the most promising untried idea is: **train on detector boxes from dets.csv (train split) as additional training data, but WITHOUT a background class**. Instead, for each detector box, find the best-matching true crop by IoU, and if IoU > 0.5, use that label; if no match, skip it. This gives the model examples at the actual positions the detector produces, without the complexity of a background class (which hurt in e001).
+
+Wait, but e004 tried exactly this: "Training on detector boxes (dets.csv train) matched to true crops by IoU will improve robustness to the detector's actual box misalignment" and got 0.6234 (rejected).
+
+Hmm. So training on detector boxes has been tried twice and rejected both times.
+
+Let me think about what hasn't been tried:
+- Different backbone (other than the buggy ConvNeXt-Nano)
+- Different scoring (power, etc.) - partially tried with e009
+- Different augmentation (color jitter, random erasing)
+- Different learning rate / schedule
+- Different batch size
+- Ensemble of two models
+- Different fusion of the two views (concat instead of average)
+- Using only one view (tight or wide)
+- Different IMG_SIZE (tried 224, didn't confirm)
+
+I think a good next experiment would be to try a **different backbone** that's known to work well. Let me try `convnext_pico` or `regnety_016`. The ConvNeXt family might be better for this task. But e003 with convnext_nano was buggy...
+
+Actually, let me look at what's available: convnext_atto, convnext_nano, convnext_pico, efficientnet_b0, efficientnet_b2, mobilenetv3_large_100, regnety_016, resnet18, resnet26d, resnet34, resnet50, tf_efficientnetv2_b0
+
+What about `tf_efficientnetv2_b0`? It's similar to efficientnet_b0 but with the v2 improvements (better normalization, etc.). Or `efficientnet_b2` which is larger.
+
+Actually, I think the most impactful change I can make is to **try a different scoring formula**. Let me think about what would help:
+
+The current formula: `score = conf * p[c]`
+
+The issue: for background boxes, the classifier still outputs 4 probabilities that sum to 1. The best class gets ~0.3-0.4 probability. With conf ~0.5-0.9, the score is ~0.15-0.36. For true boxes, the correct class gets ~0.6-0.8 probability, score ~0.3-0.72.
+
+The ratio is only about 2:1. If I could make it 4:1 or 5:1, ranking would improve significantly.
+
+What about: `score = conf * p[c] * (p[c] - 1/4)`? For a correct box with p[c]=0.7: score = conf * 0.7 * 0.45 = conf * 0.315. For background with p[c]=0.3: score = conf * 0.3 * 0.05 = conf * 0.015. Ratio: 21:1! But this might be too aggressive.
+
+Or: `score = conf * (p[c] - 0.25)`? For correct: conf * 0.45. For background: conf * 0.05. Ratio: 9:1.
+
+Or simply: `score = conf * p[c]^3`? For correct (p=0.7): conf * 0.343. For background (p=0.3): conf * 0.027. Ratio: 12.7:1.
+
+I think `p[c]^2` is a reasonable middle ground. Let me try that.
+
+Actually, wait. Let me reconsider. The e009 experiment used `conf * p[c] * max(p)` and got 0.6298. Let me compute what that does:
+- Correct box (p=[0.7, 0.1, 0.1, 0.1]): score for class 0 = conf * 0.7 * 0.7 = conf * 0.49
+- Background (p=[0.3, 0.3, 0.2, 0.2]): score for best = conf * 0.3 * 0.3 = conf * 0.09
+
+That's actually a 5.4:1 ratio, similar to p^2. And it didn't help (0.6298 < 0.6314). So maybe the scoring isn't the bottleneck.
+
+Let me think differently. What if the issue is that the model simply isn't classifying well enough? The per-class AP for pore is 0.505, meaning it's getting the class wrong about half the time for pore boxes. No amount of scoring tricks will fix that.
+
+So maybe I should focus on **improving classification accuracy**. Options:
+1. Better backbone
+2. Better training (more data, better augmentation)
+3. Better architecture (different fusion of views)
+
+Let me try **changing the fusion of the two views**. Currently it's `(model(xt) + model(xw)) / 2` - averaging logits. What if instead I:
+- Concatenate the features (before the classifier head)?
+- Use a weighted average (more weight on tight crop for fine detail)?
+- Use only the tight crop (simpler, less context noise)?
+
+Actually, the simplest change that might help: **use a weighted average that favors the tight crop**. Pores are small, so the tight crop (1.5x) shows them at higher resolution. The wide crop (2.5x) dilutes them. For pore detection, the tight crop should be more informative.
+
+Let me try: `logits = 0.6 * model(xt) + 0.4 * model(xw)` instead of `(model(xt) + model(xw)) / 2`.
+
+This is a small, focused change that could help the weak pore class without risking a timeout or bug.
+
+Actually, let me think about this more carefully. The tight crop is 1.5x the box size, the wide is 2.5x. Both are resized to 160x160. So the tight crop shows the defect at 160/(1.5*box_size) pixels per box unit, while the wide shows it at 160/(2.5*box_size). The tight crop gives the defect more pixels - better for small features like pores.
+
+But the wide crop gives context - helpful for distinguishing stain (which looks like a smudge) from deposit (which is a raised area) based on surrounding texture.
+
+A 60/40 split favoring the tight crop seems reasonable. Let me try that.
+
+Wait, but this is a very small change. Will it make a measurable difference? The seed-to-seed noise is ±0.005-0.01. I need a change that's likely to give >0.01 improvement.
+
+Let me think bigger. What about **removing the wide crop entirely and using only the tight crop, but at a larger input size**? No, that changes too many things.
+
+What about **adding color augmentation** during training? Currently we have:
+- Random crop jitter (position ±10%, size 0.85-1.2x)
+- Random horizontal/vertical flip
+- Random brightness (0.8-1.2x)
+
+What's missing:
+- Random contrast
+- Random hue/saturation
+- Random erasing (to simulate occlusion)
+- Color jitter (combined)
+
+Let me add random contrast and saturation jitter. This could help the model be more robust to lighting variations in the weld images, which might be confusing pore (dark spot) with stain (dark smudge).
+
+Actually, I realize I should think about what's most likely to give a measurable improvement. Let me rank my ideas:
+
+1. **Different backbone** (e.g., tf_efficientnetv2_b0 or convnext_pico) - moderate risk, moderate reward
+2. **Weighted view fusion** (favor tight crop) - low risk, small reward
+3. **More aggressive augmentation** (color jitter) - low risk, small-medium reward
+4. **Smaller batch size** (32 instead of 64) - low risk, small reward (more updates)
+5. **Different LR schedule** - low risk, small reward
+
+I think the safest bet with a reasonable chance of improvement is to try a **slightly better backbone**. `tf_efficientnetv2_b0` is the natural upgrade from `efficientnet_b0` - same size, better architecture (better normalization, SE blocks). It should be a drop-in replacement.
+
+Let me go with `tf_efficientnetv2_b0`. It's in the allowed list, it's the same size as efficientnet_b0 (so no timeout risk), and the v2 improvements (better normalization, SE attention) should help with fine-grained classification.
+
+Hypothesis: tf_efficientnetv2_b0's improved normalization and SE attention blocks will improve fine-grained discrimination between visually similar defect types (especially pore vs stain) compared to the original efficientnet_b0, without increasing compute cost.
+
+This is a clean, focused change: just swap the model name.

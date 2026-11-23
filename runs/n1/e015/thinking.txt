@@ -1,0 +1,329 @@
+===== attempt 1 =====
+Let me analyze the current situation carefully.
+
+## Current State
+- Best model (e000): 5-seed val mAP@0.5 = 0.6318
+- Per-class AP: pore 0.478, deposit 0.649, discontinuity 0.789, stain 0.610
+- The pore class is the main weakness (AP 0.478)
+
+## History Analysis
+Looking at the experiment history, several patterns emerge:
+
+1. **Architecture ideas** (9 attempts): Multiple attempts with third view (4x context), box metadata features, different context sizes. Some showed promise at seed-0 (0.640-0.644) but didn't confirm at 5-seed (0.634-0.636). The harness says "EXHAUSTED? (3+ ideas, no new best)".
+
+2. **Data ideas** (3 attempts): Adding detector boxes from train split as training data. e002 and e009 showed seed-0 improvements (0.633-0.638) but 5-seed didn't confirm (0.639, 0.640). "EXHAUSTED? (3+ ideas, no new best)".
+
+3. **Inference**: Only 1 attempt (e013) which crashed.
+
+4. **Optimisation**: e014 (EMA) crashed/bugged with score 0.4027.
+
+## Key Insights from Diagnostics
+- mAP@0.5 with perfect classes but current scores: 0.7530 (vs current 0.6318) - huge gap from wrong classes
+- Perfect classes ceiling: 0.758
+- Class-agnostic detector alone: 0.755
+- Pore is the main problem: 60% accuracy, confused with stain (12) and deposit (4)
+- Stain confused with deposit (31) and pore (9)
+- Small defects: 77% accuracy vs 94% for large
+
+## What hasn't been tried properly:
+1. **Test-time augmentation (TTA)** - The history says "Test-time augmentation (flips, extra views at inference): 8 attempts, no gain: best 5-seed 0.631; 8 views timed out". But this was in earlier 5-hour runs, not in this current run. The current run hasn't tried TTA yet.
+
+2. **Ensemble / snapshot ensemble / SWA** - Not tried in this run.
+
+3. **Different loss functions** - Focal loss tried twice in earlier runs (no gain), but label smoothing, mixup/cutmix not tried in this run.
+
+4. **Training on detector boxes + perfect boxes combined** - e012 tried combining detector boxes with third view but didn't confirm.
+
+5. **Better scoring/inference** - The current scoring is `detector_conf * class_prob`. Could we do better?
+
+6. **Class-specific handling** - Pore is the weak class. Could use different context for pore vs others.
+
+7. **Longer training** - The log shows 433 steps in ~125s training time (out of 180s total - 55s reserve = 125s budget). Could we train more efficiently?
+
+Wait, the RESERVE_S is 55 seconds. Training takes ~125s, prediction takes ~37s (162-125). Total 180s. That's tight.
+
+Let me think about what could give a meaningful gain (>0.01):
+
+The biggest gap is pore classification (0.478 vs 0.649+ for others). The confusion matrix shows pore->stain (12) and pore->deposit (4). 
+
+Looking at the "third wide view" experiments: they helped pore but didn't confirm at 5-seed. The issue might be that the fixed third view adds noise for larger defects.
+
+What about **adaptive context**: use wider context only for small boxes (pores tend to be small)? e013 tried this but crashed.
+
+What about **test-time augmentation with flips**? The earlier runs said "8 views timed out" but maybe just horizontal flip (2 views) would fit in budget and help.
+
+Actually, let me check the time budget more carefully. Current run: 162s total. Budget is 180s. So ~18s margin. Adding TTA (2x forward pass) would add ~37s more, exceeding budget. But we could reduce training time slightly.
+
+Wait, the RESERVE_S is 55s but prediction only takes ~37s. So we have ~18s extra. Not enough for 2x TTA.
+
+What about **SWA (Stochastic Weight Averaging)** or **EMA** properly implemented? e014 had a bug. The EMA idea is sound - it's a standard technique that often helps.
+
+But the harness says "Likely-bug results so far (do not repeat these without fixing the cause): e014". So I should fix the EMA bug if I want to try it.
+
+Let me look at the EMA bug: The EMA params are stored on CPU (`p.detach().cpu().clone()`), but the model is on GPU. During update, they do `ema_p.mul_(ema_decay).add_(p.detach().cpu(), alpha=1 - ema_decay)`. This should work. But then at inference they do `p.copy_(ema_p.to(device))`. 
+
+Wait, the issue might be that `ema_params` are on CPU and the model parameters are on GPU. The copy_ should handle this. But maybe the EMA update is wrong? Let me check: `ema_p.mul_(ema_decay).add_(p.detach().cpu(), alpha=1 - ema_decay)` - this updates the CPU tensor. Then `p.copy_(ema_p.to(device))` copies back to GPU. This seems correct.
+
+But the score dropped to 0.4027. That's a massive drop. The training loss looks normal (0.714 -> 0.249). The number of prediction rows doubled (71126 vs 53606). That suggests the scores are different - maybe the EMA model produces higher probabilities, so more rows pass MIN_SCORE=0.001.
+
+Actually, wait. The EMA model should be better calibrated, not worse. A drop from 0.63 to 0.40 is huge. Maybe the EMA wasn't actually used for inference correctly? Or the model parameters were corrupted?
+
+Actually, looking at the code: `ema_params = [p.detach().cpu().clone() for p in model.parameters()]` - this creates a list of CPU tensors. Then in the update: `for p, ema_p in zip(model.parameters(), ema_params): ema_p.mul_(ema_decay).add_(p.detach().cpu(), alpha=1 - ema_decay)`. This updates the CPU tensors. Then at inference: `for p, ema_p in zip(model.parameters(), ema_params): p.copy_(ema_p.to(device))`. This copies CPU->GPU. Seems correct.
+
+But wait - `model.parameters()` returns an iterator. If you iterate it twice, you get different iterators but same parameters in same order. That should be fine.
+
+Hmm, maybe the issue is that `ema_params` are not registered as buffers, so they don't get moved to GPU with the model? But they're on CPU intentionally.
+
+Actually, I think the bug might be subtle. Let me think... The training loss is normal. The model trains normally. Then at the end, it copies EMA weights. But what if the EMA update is happening incorrectly? 
+
+Oh wait! The EMA update uses `p.detach().cpu()` which creates a new tensor each time. `ema_p.mul_(ema_decay).add_(p.detach().cpu(), alpha=1 - ema_decay)` - this is in-place on `ema_p` (which is on CPU). The `add_` with `alpha` should work. But `p.detach().cpu()` creates a new tensor each iteration. That's fine.
+
+Maybe the issue is that the model was in `train()` mode during EMA copy? No, they do `model.eval()` after.
+
+Actually, I notice: the EMA update happens `if frac > ema_start_frac:` where `frac = min(1.0, (time.time() - t_start) / budget)`. So EMA starts after 10% of training time. That seems reasonable.
+
+The prediction rows doubled (71126 vs 53606). With 41879 detections * 4 classes = 167516 max rows. 53606 means ~32% of rows kept. 71126 means ~42% kept. So EMA model gives higher confidence scores on average. But mAP dropped.
+
+This is strange. Let me not dwell on debugging e014 - the harness says it's a likely bug and I shouldn't repeat without fixing.
+
+## What to try next?
+
+Given the constraints:
+- Architecture ideas: EXHAUSTED (6 ran, 0 new best, 3 crashed)
+- Data ideas: EXHAUSTED (3 ran, 0 new best)
+- Inference: 1 crashed
+- Optimisation: 1 bugged
+
+The most promising unexplored direction in THIS run is **inference-time augmentation** (TTA) - but budget is tight.
+
+Or **optimisation** - properly implemented EMA or SWA.
+
+Or **scoring** - the current scoring is `detector_conf * class_prob`. Could we calibrate or combine differently?
+
+Actually, looking at the reference numbers:
+- d2_class_agnostic_val_map50 (detector alone, class doesn't matter): 0.755
+- d2_boxes_perfect_classes_val_map50 (perfect classes, detector conf as score): 0.758
+- Our best: 0.6318
+- One-step 4-class detector: 0.638
+
+The gap between 0.758 (perfect classes) and 0.6318 is entirely from wrong class assignments. The classifier is the bottleneck.
+
+The pore class is the main issue. Per-class AP: pore 0.478, deposit 0.649, discontinuity 0.789, stain 0.610.
+
+What if we use **different context scales for different classes**? Or **class-specific models**? Too complex.
+
+What about **ensemble of models trained with different seeds**? The budget is 180s. Training takes ~125s. We could train 2 models with half the steps each? But 5-seed mean of current best is 0.6318 with std 0.0059. An ensemble of 2 might gain ~0.01-0.02 but each model would be undertrained.
+
+Wait, the current training uses cosine decay over the budget. If we train 2 models sequentially, each gets ~62s training (half steps). That might hurt more than ensemble helps.
+
+What about **snapshot ensemble** - save checkpoints during training and average? That's free at training time, just extra inference time. But inference time is tight.
+
+Actually, let me reconsider the time budget. Current: 13s load, 125s train, 37s predict = 175s (log says 162s total, hmm). 180s budget. Reserve 55s but only 37s used. So we have ~18s slack.
+
+If we do TTA with horizontal flip (2x forward pass), prediction becomes ~74s. Total ~175+37 = 212s > 180s. Too much.
+
+But we could reduce training by 18s (to ~107s) and use that for TTA. 107s training vs 125s - about 15% fewer steps. Might be worth it if TTA gives >0.01 gain.
+
+But earlier runs said TTA gave no gain (best 5-seed 0.631). However, those were different runs with different baselines.
+
+Another idea: **The scoring function**. Currently `score = detector_conf * class_prob`. The detector_conf is the same for all 4 classes of a box. So within a class, the ranking is purely by class_prob. The detector_conf only affects cross-class ranking (which doesn't matter for per-class AP). So the scoring is equivalent to just using class_prob for ranking within each class.
+
+But wait - the detector_conf varies across boxes. For a given class, boxes with higher detector_conf get higher scores. Since detector_conf correlates with localization quality (higher conf = better box), this helps ranking. But the class_prob already contains some of this info.
+
+What if we use `score = class_prob` only (ignore detector_conf)? Or `score = detector_conf^alpha * class_prob`? The detector_conf might be miscalibrated.
+
+Actually, the reference says: "stage-1 boxes scored as a single class 'defect': 0.755 mAP@0.5". This uses detector_conf as score for a single class. Our classifier adds class_prob on top.
+
+The perfect-classes ceiling with our scores is 0.7530. The perfect-classes ceiling with detector conf is 0.758. So our scores are slightly worse than detector conf for ranking (0.753 vs 0.758). This means `detector_conf * class_prob` ranks true boxes slightly worse than `detector_conf` alone! Because class_prob adds noise.
+
+So a simple fix: **use detector_conf as the score, not detector_conf * class_prob**. The class_prob only chooses the class, the score comes from detector_conf. This would give 0.7530 mAP (perfect classes with our scores) vs 0.758 (perfect classes with detector conf). Wait, the 0.7530 is "mAP@0.5 if every box had its correct class but kept your scores". So if we fix the class assignment but keep our scoring, we get 0.7530. If we fix class assignment AND use detector_conf as score, we get 0.758.
+
+But we can't fix class assignment perfectly. However, this suggests that **for the boxes we classify correctly, using detector_conf as score would rank them better**.
+
+Actually, the scoring works as: for each box, we output 4 rows (one per class) with score = detector_conf * p(class). For a given class, the predictions are ranked by detector_conf * p(class). If we used just detector_conf, all boxes of that class would be ranked by detector_conf regardless of p(class). But p(class) should be high for correct class, low for wrong classes. So for the correct class, detector_conf * p(class) ≈ detector_conf (if p≈1). For wrong classes, detector_conf * p(class) is small. So the current scoring naturally down-weights wrong-class predictions.
+
+But if the classifier is uncertain (p(class) < 1), it down-weights even correct predictions. Whereas detector_conf alone doesn't.
+
+What if we use `score = detector_conf` for the predicted class (argmax), and don't output other classes? That's the "only argmax class" idea which was tried 16 times with no gain.
+
+What if we use `score = detector_conf * p(class)^T` with temperature T < 1 to sharpen? Or T > 1 to soften?
+
+Actually, the key insight: **AP depends only on ranking within each class**. For class c, we have predictions with scores s_i = detector_conf_i * p_i(c). The ranking by s_i is the same as ranking by p_i(c) if detector_conf_i is constant, but it's not. detector_conf_i correlates with box quality.
+
+The perfect-classes ceiling with our scores is 0.7530. With detector_conf it's 0.758. So our scores lose 0.005 mAP just from scoring. That's small compared to the 0.12 loss from wrong classes.
+
+So the main problem remains classification accuracy, especially pore.
+
+## New idea: **Adaptive context based on box size at test time**
+
+The pore class is small (60% accuracy on small boxes vs 94% on large). The third wide view (4x) helped pore in earlier runs but hurt larger classes. e013 tried adaptive context (wide view only for small boxes) but crashed.
+
+Let me try a simpler version: **at test time, for small boxes, use an extra wide crop; for large boxes, don't**. But we need to train the model to handle this. 
+
+Simpler: **train with three views (1.5x, 2.5x, 4x) but at test time, only use the wide view for small boxes**. But the model expects 3 views.
+
+Even simpler: **train a model that takes 3 views always, but at test time, for large boxes, replace the wide view with a duplicate of the medium view** (so no extra computation). But this is weird.
+
+Best: **Train with 3 views (1.5x, 2.5x, 4x) using 2-of-3 random sampling (as e010 did, which got 0.6493 5-seed but not confirmed)**. e010 got seed-0 0.6435, 5-seed 0.6493. That's +0.0175 over base! But "not confirmed" means the gain wasn't statistically significant above the noise.
+
+Wait, the table says e010: "not confirmed" with 5-seed 0.6493. Base is 0.6318. Gain = 0.0175. The seed std is 0.0059. So gain is ~3 sigma. Why not confirmed? Maybe the harness has a stricter threshold.
+
+Actually, the harness says: "only if the multi-seed mean beats the best by more than its uncertainty does it become the new best." And "After each confirmation run the harness tells you the gain and the margin that was needed."
+
+So 0.6493 vs 0.6318 with std 0.0059: the uncertainty of the mean is 0.0059/sqrt(5) ≈ 0.0026. The gain is 0.0175, which is >> 0.0026. So it should be confirmed. Unless the 5-seed std for e010 was higher.
+
+The table says "5-seed mean" for e010 is 0.6493. It doesn't give the std. Maybe the std was larger.
+
+Regardless, e010's idea (3 views with 2-of-3 sampling) is promising. It crashed in e005/e006 but worked in e010.
+
+But the harness says architecture is "EXHAUSTED? (3+ ideas, no new best)". And e010 is in architecture.
+
+Wait, e010 is listed as "not confirmed". The harness might consider it not a confirmed gain. But it's the best seed-0 and 5-seed so far.
+
+Let me look at e010's hypothesis: "The pore class (AP 0.478) is confused with stain/deposit due to insufficient context at small scales. Earlier runs confirmed a fixed 4× wide view twice (+0.005 mAP, pore-driven) but it increased training compute. Using 2-of-3 random sampling during training keeps compute similar while still exposing the model to the wide view."
+
+And e012 combined detector boxes + third view: seed-0 0.6441, 5-seed 0.6454.
+
+The best 5-seed so far is e010 at 0.6493 (not confirmed). Base is 0.6318.
+
+What about **combining the two best ideas**: detector boxes training data (e002/e009) + 3-view with 2-of-3 sampling (e010)? e012 tried this but with adaptive wide view (which crashed in e013). e012 got 0.6454 5-seed.
+
+Actually e012 hypothesis: "Two previously confirmed ideas address complementary problems: (1) training on detector boxes from train split matches test distribution, (2) extra-wide view helps small defects. Combine both: train on detector boxes (IoU>0.5) plus ground truth, with three views (1.5×, 2.5×, 3.5×) and 2-of-3 sampling."
+
+But e012 used 3.5x not 4x, and got 0.6454.
+
+What if I do: **detector boxes training data + 3 views (1.5x, 2.5x, 4x) with 2-of-3 sampling**? This combines the two best ideas.
+
+But the harness says data and architecture are both "EXHAUSTED". However, the combination hasn't been tried properly (e012 used adaptive wide view which crashed).
+
+Actually, looking at the history table: "Detector boxes from the train split as extra training data" was tried 6 times, "accepted twice (5-seed 0.6337 and 0.6342, about +0.004)". So it gives a small confirmed gain.
+
+"Third, very wide view (4x the box) next to the 1.5x and 2.5x crops, logits averaged" was tried 3 times, "accepted twice (5-seed 0.6342 both, +0.005)".
+
+e010 did 2-of-3 sampling with 3 views and got 0.6493 (not confirmed).
+
+The combination of both (detector boxes + 3-view 2-of-3) hasn't been cleanly tried. e012 tried but with adaptive wide view (crashed in e013).
+
+Let me propose: **Train on both ground-truth boxes AND detector boxes (IoU>0.5), using three views (1.5x, 2.5x, 4x) with 2-of-3 random view sampling during training, logits averaged.**
+
+This combines the two ideas that each gave ~+0.005 confirmed gain. Together they might give +0.01.
+
+But I need to check time budget. 3 views with 2-of-3 sampling means 2 forward passes per batch (same as current 2 views). So training time similar. But we have more training data (detector boxes + crops). That increases steps per epoch. Current: 6052 crops, 94 steps/epoch (batch 64). Detector boxes on train split: how many? dets.csv has train and eval. Need to check.
+
+In the code: `dets = read_csv(...); ev = [d for d in dets if d["split"] == "eval"]`. So train detector boxes are `tr_dets = [d for d in dets if d["split"] == "train"]`. How many? Not shown. But likely similar or more than crops.
+
+If we add detector boxes, dataset size increases, so steps per epoch increases, so fewer epochs in same time. But 2-of-3 sampling keeps forward passes same.
+
+Actually, the current dataset is `crops` (6052 boxes). If we add detector boxes that overlap GT (IoU>0.5), we might add several thousand more. But we'd need to compute IoU for each detector box with GT boxes.
+
+This adds preprocessing time but not training time per step.
+
+Let me check the time: current total 162s. Load 13s, train 125s, predict 37s. Adding IoU computation at load time: negligible. More training data: more steps per epoch, but same total training time (time-bounded). So same number of steps total? No, time-bounded training: `while not done: ... if time.time() >= t_end: done=True`. So total training time fixed at ~125s. More data per epoch means fewer epochs, but same total steps (since step time constant). Actually step time might increase slightly if data loading becomes bottleneck, but unlikely.
+
+So this should fit in budget.
+
+But the harness says data and architecture are EXHAUSTED. However, the combination is new. And e010 (3-view 2-of-3) got 0.6493 which is the highest 5-seed so far.
+
+Wait, I should check: is e010's 0.6493 actually the 5-seed mean? The table says "5-seed mean" column. For e010 it says 0.6493. For base e000 it says 0.6318. That's a big jump. But "outcome: not confirmed". Maybe the confirmation run failed or the gain wasn't significant in the confirmation.
+
+Given the instructions: "A direction where three or more attempts gave no confirmed gain is exhausted: do not propose another variant of it unless you can say what is fundamentally different."
+
+For architecture: 9 ideas, 6 ran, 0 new best, 6 close but not confirmed, 3 crashed. The "third wide view" idea was tried 3 times (accepted twice at 0.6342), and e010 tried 2-of-3 sampling (0.6493 not confirmed). So the core idea (wide view helps pore) has shown promise but not confirmed.
+
+For data: detector boxes tried 6 times, accepted twice at +0.004. Small but confirmed.
+
+The combination hasn't been tried cleanly. e012 tried but with adaptive wide view (which is a different idea).
+
+I think the most promising is to **properly combine detector-box training data with the 3-view 2-of-3 architecture**, without the adaptive part that caused crashes.
+
+But the harness might reject it as "exhausted category". Let me think of something in a non-exhausted category.
+
+Inference: only 1 attempt (crashed). Optimisation: 1 attempt (bugged).
+
+What about **test-time augmentation with horizontal flip only, and reduce training slightly to fit**? 
+
+Current prediction: 37s for 41879 detections * 2 views = 83758 forward passes. Batch size 256. 83758/256 ≈ 327 batches. 37s / 327 ≈ 0.113s per batch.
+
+With TTA (flip): 2x forward passes = 74s. Total 13+125+74=212s > 180s.
+
+Reduce training reserve: RESERVE_S from 55 to 37 (actual prediction time) + 74 (TTA) = 111s? No, RESERVE_S is time kept free for prediction. If prediction takes 74s, need RESERVE_S >= 74. Then training budget = 180 - 74 = 106s (vs 125s). 15% less training.
+
+Could work. But earlier runs said TTA no gain.
+
+What about **SWA (Stochastic Weight Averaging)**? Average model weights over last N epochs. Free at training time, just need to store checkpoints. At inference, use averaged weights. This often improves generalization.
+
+Or **EMA properly fixed**. The e014 bug needs to be understood. But the harness says "do not repeat these without fixing the cause."
+
+Let me try to fix EMA. The bug in e014: score dropped to 0.4027. Training loss normal. Prediction rows doubled. 
+
+Possible bug: The EMA parameters are updated on CPU, but the model is on GPU. When copying back: `p.copy_(ema_p.to(device))`. This should work. But maybe the model parameters are not contiguous? Or the EMA update is wrong.
+
+Wait: `ema_params = [p.detach().cpu().clone() for p in model.parameters()]` - this creates a list of tensors. Then in the loop: `for p, ema_p in zip(model.parameters(), ema_params):`. But `model.parameters()` returns a generator. Each time you call it, you get a new generator. The order should be the same. But `ema_params` is a list. So `zip(model.parameters(), ema_params)` pairs the i-th parameter with the i-th EMA tensor. This should be fine.
+
+But what if the model has parameters that don't require grad? `model.parameters()` returns all parameters. `opt = torch.optim.AdamW(model.parameters(), ...)` also uses all. So consistent.
+
+Another possibility: The EMA update uses `p.detach().cpu()` which creates a new tensor. `ema_p.mul_(ema_decay).add_(p.detach().cpu(), alpha=1 - ema_decay)`. This is in-place on `ema_p`. But `ema_p` is a CPU tensor. `p.detach().cpu()` is also CPU. This should work.
+
+At the end: `for p, ema_p in zip(model.parameters(), ema_params): p.copy_(ema_p.to(device))`. This copies EMA weights to model.
+
+But the model was in `train()` mode during training. After training, they don't call `model.eval()` before copying? They do: the inference section starts with `model.eval()`. But the EMA copy is before that.
+
+Wait, the code structure in e014:
+```python
+# ... training loop ...
+    # Load EMA weights for inference
+    with torch.no_grad():
+        for p, ema_p in zip(model.parameters(), ema_params):
+            p.copy_(ema_p.to(device))
+
+    # Classify every eval detection; one prediction per class with score = detector conf x class probability.
+    model.eval()
+```
+
+This looks correct.
+
+Why did it fail? The prediction rows doubled (71126 vs 53606). This means more scores > 0.001. The EMA model might produce more confident predictions (higher max prob). But mAP dropped.
+
+Maybe the EMA model is overconfident? Or the class probabilities are miscalibrated?
+
+Actually, if EMA helps, it should improve calibration and ranking. A drop to 0.40 is catastrophic.
+
+Let me look at the training steps: 354 steps vs 433 steps. Fewer steps because EMA update takes time? The log shows epoch times: 63s, 85s, 107s, 125s (4 epochs). Base: 59s, 77s, 95s, 114s, 125s (5 epochs). So EMA version ran 4 epochs in ~125s vs 5 epochs in ~125s. 20% slower per epoch. So fewer total steps (354 vs 433). That could hurt.
+
+The EMA update loop: `for p, ema_p in zip(model.parameters(), ema_params): ema_p.mul_(ema_decay).add_(p.detach().cpu(), alpha=1 - ema_decay)`. This runs every step after warmup. For EfficientNet-B0, ~5M parameters. Copying to CPU every step is slow! That's why it's 20% slower.
+
+The fix: **Keep EMA parameters on GPU**. Update on GPU. No CPU-GPU transfer.
+
+Let me propose: **Fix EMA by keeping EMA params on GPU, update in-place on GPU**. This should be fast and might actually work.
+
+This is an "optimisation" category idea. Only 1 attempt so far (bugged). Not exhausted.
+
+Hypothesis: EMA is a proven technique that improves generalization. The e014 implementation had a performance bug (CPU-GPU transfer every step) causing fewer training steps, and possibly a correctness bug. A proper GPU-only EMA implementation should run at same speed as baseline and improve mAP by ~0.01-0.02.
+
+This is fundamentally different from e014 because it fixes the performance bug (CPU transfer) and potential correctness issues.
+
+Let me write this experiment.
+
+But wait - the current best is e000. e014 is based on e000. I should base on e000 (best) and add proper EMA.
+
+Actually, the reply format says: "BASE: best (or: last -- to edit the most recent version instead of the best)". The most recent version is e014 (last). But e014 has the buggy EMA. I should base on best (e000) and add correct EMA.
+
+Let me check the current best train.py (e000) and add EMA properly.
+
+Key changes:
+1. Initialize EMA params on same device as model (GPU)
+2. Update EMA on GPU (no CPU transfer)
+3. Start EMA after warmup
+4. At inference, swap model params with EMA params (or just use EMA params for forward)
+
+Actually, simpler: keep a shadow copy of params on GPU. Update with `ema_p.mul_(decay).add_(p, alpha=1-decay)`. At end, swap.
+
+Let me write the SEARCH/REPLACE blocks.
+
+First, I need to add EMA initialization after optimizer creation.
+
+Then in training loop, after `opt.step()`, update EMA.
+
+Then after training, before inference, load EMA weights.
+
+Let me be careful with the exact lines from the current best train.py.

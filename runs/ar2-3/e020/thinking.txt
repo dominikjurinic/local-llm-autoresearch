@@ -1,0 +1,960 @@
+===== attempt 1 =====
+Let's analyze the situation:
+
+Current best (e016): 5-seed average 0.6337. Baseline one-step detector: 0.638 mAP@0.5. So we're still slightly below the baseline. Ceiling is 0.758.
+
+Per-class AP: pore 0.524, deposit 0.626, discontinuity 0.779, stain 0.606.
+
+What's been tried:
+- e001/e002: background class training — 0.5172, bad
+- e003: low-res crops — 0.6251, bad
+- e004: p² scoring — 0.6161, bad
+- e005: training on detector boxes — 0.6248, bad
+- e006: ConvNeXt-Nano — 0.2901, suspected bug
+- e007: MixUp — 0.6292, not confirmed
+- e008: conf × p × max(p) — 0.6265, bad
+- e009: context 3.5 — 0.6309, not confirmed
+- e010: label smoothing — 0.6254, not confirmed
+- e011: larger jitter — 0.6294, not confirmed
+- e012: focal loss — 0.6209, bad
+- e013: TTA horizontal flip — 0.6314, new best
+- e014: top-1 only — 0.5916, bad
+- e015: adding detector boxes to GT — 0.6285, bad
+- e016: 2x oversampling of pore/stain — 0.6337, new best
+- e017: 224x224 — timeout
+- e018: 3x oversampling — 0.6200, bad
+- e019: reducing reserve to 50s — 0.6291, bad
+
+Interesting patterns:
+- Scoring changes mostly hurt (p², ×maxp, top-1).
+- Data changes mostly hurt.
+- TTA flip helped.
+- 2x oversampling of weak classes helped.
+- More training time didn't help (e019). So the model seems to be plateauing — loss decreased 0.62→0.31→0.24 but the extra time didn't help. Actually e019 got 0.6291 with more training steps, which is slightly worse than 0.6333 on seed 0. Hmm, this suggests that training longer might actually be slightly harmful (overfitting), or it might just be noise.
+
+Wait — e016 seed 0 was 0.6333, and e019 (more training) was 0.6291. That's a 0.004 drop, within noise range (±0.005-0.01). So more training is neutral to slightly negative.
+
+So the model is probably well-trained. The bottleneck is elsewhere.
+
+Ideas not yet tried:
+1. TTA: horizontal flip was tried. Vertical flip? Both? Scale augmentation at test time? 5-crop TTA?
+2. Ensemble of 2 different models (e.g., EfficientNet-B0 + RegNetY or ResNet) — the time budget might allow it. We're using about 157s out of 180s. Training takes about 144s. Two models would need about 70s each. Might be tight but possible. Actually the budget T is given by the harness; in the log the default is 180s. e017 (224x224) timed out at 180s. So the budget is 180s.
+
+Hmm wait, what does the harness actually pass for --seconds? The log says 157s total and the default is 180. e017 timed out. So budget = 180s.
+
+Ensemble: train two smaller/faster models. For example, EfficientNet-B0 at 160 + ResNet18 at 160, each for about 60s, then average probabilities. This might help with diversity. But each model gets less training. Uncertain.
+
+3. Score calibration: the score is conf × p[c]. Detector conf is a class-agnostic score. Maybe we should use a different combination: conf^a × p[c]^b. p² was tried (b=2) and was bad. ×maxp was also bad. What about dividing by (1 - p_bg)? No background class.
+
+Actually, the key insight from the brief: "stage-1 boxes scored as a single class 'defect': 0.755". So the detector's ranking is good for finding defects (0.755 as single class). The problem is purely class assignment. If we could classify perfectly, we'd get 0.758.
+
+Current: 0.6337. So classification is costing about 0.12 mAP.
+
+The crop classifier on perfect boxes gets macro-F1 about 0.87. On detector boxes it's probably lower.
+
+4. What about using detector conf in training? Not currently used.
+
+5. Architecture: ConvNeXt-Nano was suspected to be a bug (0.2901). Maybe retry with a fix? What was the bug? Probably the model didn't train enough, or a bug in the code. Unclear. We could retry ConvNeXt-Nano carefully, but the "suspected bug" result means the harness flagged it. The cause of the bug is unknown. Risky.
+
+6. Inference: currently doing 4 forward passes per box (tight, tight-flip, wide, wide-flip). What about adding a 3rd context level? Or vertical flip (8 passes)? TTA flip helped (e013). Vertical flip might add a bit more. Cheap test: add vertical flip to inference. Actually wait — the crop is a square centered on the box. Horizontal flip is a meaningful transformation for weld beads (beads are usually horizontal lines). Vertical flip is also plausible.
+
+Actually, let me think about what has the most upside:
+
+The biggest lever: classification accuracy on the weak classes (pore 0.524, stain 0.606). The classifier is trained on GT boxes. The crop classifier on perfect boxes gets F1 0.87.
+
+Hmm, what about input resolution? e017 (224) timed out. What about 192? Intermediate. 160→192 increases compute by (192/160)² = 1.44x. Training was about 144s → about 207s. Too much. No good.
+
+What about training a smaller model faster to allow more epochs? The loss is still decreasing. But e019 showed that more training didn't help. So capacity/epochs isn't the limit.
+
+What about the two-crop averaging? Currently averaging logits of tight and wide crops. What about weighting? Or training two separate heads? Minor.
+
+Let me think about scoring more carefully. mAP@0.5 per class: for each class, TP requires IoU>0.5 with a GT of that class and correct class assignment. FP = predicted box that doesn't match any GT of that class (including boxes that overlap a GT of a different class).
+
+If we output 4 rows per box, each box contributes up to 4 predictions. A box overlapping a pore GT, if scored as pore, is TP for pore; if also scored as deposit, it's FP for deposit (assuming it doesn't overlap a deposit GT). So wrong-class rows are pure FPs that hurt the ranking of that class.
+
+e014 (top-1 only) was 0.5916 — much worse. So multiple rows help. Interesting — why? Because the IoU matching: a box overlapping a GT might not match at IoU 0.5 if it's shifted… actually the detector boxes are "slightly shifted". If a box overlaps a GT at IoU 0.4, it's not a TP for any class. Hmm, but with 4 rows, at least… no, each row needs IoU>0.5 with a GT of that class.
+
+Why does top-1 hurt? Probably because the top-1 class is often wrong (e.g., predicts deposit when it's actually stain), so we lose the TP, whereas with 4 rows, the correct class row still exists with a decent score and can match. So the ranking within a class matters: for the stain class, a box that is actually stain but where the model's top-1 is deposit — with 4 rows the stain row has a reasonable score and can rank above FPs; with top-1 it's completely missing.
+
+So the scoring function should boost the probability of the correct class relative to others. The classifier's p[c] does that.
+
+What about using a temperature on the softmax? Lower temperature sharpens probabilities (more confident), higher smooths. p² is equivalent to temperature… actually p² = softmax(2*logits), i.e., temperature 0.5 (sharper). That hurt. Smoothing (label smoothing) also hurt. So the current calibration seems good.
+
+What about the conf multiplier? conf × p. What about conf^0.5 × p? Or (conf×p) with a different exponent on conf? The detector's conf ranking is good (0.755 single class). Within a class, ranking by conf×p is a combination of the detector's "is this a defect" signal and the classifier's "which class" signal.
+
+Hmm, what about score = conf * p[c] * (p[c] / max(p))? That's p²-ish. No good.
+
+Let me think about the problem differently. The ceiling with perfect classes is 0.758. Single-class is 0.755. So the detector's box quality is great. The only loss is class assignment errors. Current 0.6337 → 0.124 gap.
+
+Classifier macro-F1 on perfect boxes is 0.87. On detector boxes probably about 0.75? Each misclassification turns a potential TP into a FP for the predicted class and a missed TP for the true class.
+
+To improve: better classifier. What hasn't been tried that could substantially improve classification?
+
+- Larger context for stain (e009: 3.5x, not confirmed 0.6309 vs 0.6314 — basically noise).
+- Low-res data (e003, bad).
+- Detector boxes in training (e005, e015, bad).
+- Background class (e002, bad).
+- MixUp (e007, 0.6292, not confirmed — close to best but below).
+- Focal loss (bad), label smoothing (bad), class weighting (bad per brief).
+- Jitter (e011, not confirmed).
+- TTA flip (helped).
+- Oversampling (2x helped, 3x bad).
+
+Untested:
+- Vertical flip TTA.
+- Both flips + original (3 views) — e013 was original + horizontal flip (2 views per crop). Could add vertical.
+- 5-crop TTA (original, hflip, vflip, h+v, plus a scale variant).
+- Ensemble of two architectures.
+- Different backbone (retry convnext_nano with a fix, or try resnet50/regnety).
+- Learning rate / optimizer changes (SGD vs AdamW?).
+- Training on both high+low res — e003 was bad.
+- Using detector conf as a training feature?
+- Per-class score adjustment: e.g., multiply stain scores by a constant? That's a kind of calibration. Hmm, risky, but per-class APs are known: pore 0.524, stain 0.606. But wait — those APs come from the full pipeline. Adjusting per-class score multipliers changes the ranking within a class (a per-class constant doesn't change within-class ranking!). A per-class constant multiplier doesn't change per-class AP at all, since mAP is computed per class independently and a monotonic transformation of scores within a class doesn't change the ranking. So no effect. Right — per-class constants are useless.
+
+What changes within-class ranking: the p[c] values and the conf.
+
+Hmm, what about score = conf^a * p[c]? a=1 is current. a=0.5 gives more weight to p. a=2 gives more weight to conf. Let's think: for the stain class, ranking should prioritize boxes that are truly stain. The detector's conf is class-agnostic — it indicates "defect-ness". For stain GT boxes, conf is probably similar to other defects. p[c] is the class signal. So p should dominate. But p² hurt… that's sharpening, which changes the relative ordering of p values (amplifies differences). Hmm, p² amplifies the top class; for the stain class, boxes where stain is top-1 with p=0.9 get 0.81, boxes where stain is 2nd with p=0.4 get 0.16. Sharpening pushes 2nd-place stain predictions down. If those 2nd-place predictions are often actually stain (when the model is confused between stain and deposit), sharpening hurts stain AP. That's consistent with stain being confused with deposit.
+
+So what about softening? p^0.5? That lifts 2nd-place predictions. Hmm, but it also lifts FPs. Unclear. Actually wait — e004 was p² (sharpening) and hurt. Softening (p^0.5) is the opposite direction. Worth trying? Category: scoring.
+
+Actually, let me reconsider. What about score = conf * p[c] * (1 - p_top1/2)? No, let's keep it simple.
+
+Let me think about the ensemble idea more concretely, since "changes in method helped more than tuning" and ensembles are a method change. Time budget: 180s total. Loading about 13s. Prediction about 42s (from e019 analysis: prediction consumes about 42s of the 65s reserve; total 157s, reserve 65 → training about 13+144… let me compute: total 157s, reserve 65s, so t_end = T0+115. Training ran from about 13s to about 115s = 102s, 387 steps. Prediction + writing about 42s).
+
+For an ensemble of 2 models: each model gets about 50s of training, then prediction for both is about 84s. Total: 13 + 50 + 50 + 84 = 197s > 180. Too much. Unless we reduce prediction cost.
+
+Reduce prediction: currently 4 forward passes per box (tight, tight-hflip, wide, wide-hflip), batch 256, 41879 boxes → 164 batches × 4 passes. On GPU probably fast. About 42s for everything including loading eval crops (crop generation is the CPU bottleneck — 41879 boxes × 2 crops of resize). Actually crop generation: 41879 boxes, 2 crops each, PIL resize to 160 — that's probably most of the 42s.
+
+For an ensemble we could drop TTA (2 passes per model instead of 4) → prediction about 21s × 2 models = 42s. Training: 2 models × 50s = 100s. Total: 13 + 100 + 42 = 155s. Feasible! But each model is trained for only about 50s (about 1.5 epochs vs 3). e019 showed that more training beyond 3 epochs doesn't help, but less training (1.5 epochs) might hurt.
+
+Alternatively, ensemble 2 models where one is small (resnet18 or convnext_nano) and trains faster, allowing the other to train longer. E.g., EfficientNet-B0 for 70s + ResNet18 for 30s. Hmm.
+
+Actually, is an ensemble likely to help? The two models are trained on the same data with the same recipe; diversity comes from architecture/init. Typical ensemble gain on classification: 1-3% F1. On mAP maybe +0.005-0.01. Plausible but uncertain, and the time pressure is real.
+
+Let me think about other method changes with higher expected value:
+
+**Idea: train the classifier on crops from detector boxes with soft labels from IoU, but that was tried (e005, e015) and was bad.**
+
+**Idea: use the detector's conf in the training data** — e.g., weight training samples by conf? GT crops don't have conf. Skip.
+
+**Idea: vertical flip TTA.** Cheap, in the same direction as e013 (which helped). Hypothesis: weld beads are roughly horizontal; vertical flip is a less natural symmetry but still adds diversity. Risk: if the stain texture is vertically asymmetric (e.g., spatter below the bead), vertical flip averaging could hurt. Hmm. e013's horizontal flip helped. Vertical flip is a coin flip (pun intended).
+
+**Idea: add a 3rd context level (e.g., 1.0x tight + 2.5x wide + 4x ultra-wide).** Stain needs context. e009 tried increasing wide to 3.5 and it was neutral. Adding a 3rd view at test time = 6 passes (3 crops × 2 flips) → prediction cost +50% (about 63s). Training cost +50% per step (3 forward passes). Training budget 102s → about 68s, about 2 epochs. Hmm, fewer epochs. Trade-off.
+
+**Idea: change optimizer to SGD with momentum.** AdamW vs SGD — for fine-tuning ImageNet backbones, SGD often works better. LR schedule: 5% warmup + cosine. SGD with LR 0.1, momentum 0.9, wd 1e-4. This is a real method change with a good chance of improving final accuracy. Category: optimisation. e019 was optimisation (reserve) and was bad, but that's a different thing.
+
+Hmm wait, but the loss curve with AdamW: 0.62 → 0.31 → 0.24. Looks healthy. SGD might converge differently.
+
+**Idea: retry ConvNeXt-Nano (e006 was suspected bug 0.2901).** What was the bug? Unknown to us. 0.2901 is "far below best → probably a bug". Maybe the convnext_nano pretrained weights load fine but something about the model (e.g., default input size, or the model needs `num_classes` and the head is randomly initialized — that's fine). Actually, a common bug: timm's convnext models have different default settings… hmm. Or maybe the model was just too slow at 160px and barely trained (a few steps) → untrained model → low score. convnext_nano is about 50x slower than efficientnet_b0? No, nano is a bit bigger than b0 but comparable. Actually, convnext_nano has about 50M params vs b0's 4M! convnext_nano is 50.3M params. That's 12x b0. At 160px with batch 64, probably 3-4x slower per step → only about 100 steps in 102s, about 0.7 epochs. Undertrained → 0.29. So the "bug" was really just size mismatch. Retry with a smaller convnext: convnext_pico (0.25M? no — convnext_pico is 0.25M? Let me recall: convnext_pico 0.25M? Actually: convnext_pico 0.25M? No. timm's convnext sizes: pico 0.25M? I think convnext_pico is about 0.25M, atto about 0.1M? Hmm, no: convnext_femto 0.07M, convnext_pico 0.25M, convnext_atto 0.1M? I don't remember exactly. convnext_nano 50.3M, convnext_tiny 28.6M, convnext_femto 0.07M, convnext_pico 0.25M, convnext_atto 0.1M? Something like that. And efficientnet_b0 is 4.1M.
+
+So retrying convnext_nano is a bad idea (too big). A different backbone of similar size to b0: resnet18 (11.7M), resnet34 (21.8M), regnety_016 (9.9M), efficientnet_b2 (7.7M), mobilenetv3_large_100 (5.4M), tf_efficientnetv2_b0 (7.8M), resnet26d (15.8M), resnet50 (25.6M).
+
+tf_efficientnetv2_b0 is a good modern choice, 7.8M params, comparable speed to b0. Hypothesis: a better backbone improves classification, especially on weak classes. But e006 suggested backbone change… it was suspected bug, inconclusive.
+
+**Idea: 2-model ensemble with a small second model.** E.g., EfficientNet-B0 (main, 60s) + RegNetY-016 (small, 25s), average probabilities. Diversity from architecture.
+
+Let me weigh expected value:
+1. Vertical flip TTA: cheap, low risk, small expected gain (+0.002-0.005).
+2. SGD optimizer: medium risk, medium expected gain.
+3. Backbone swap (tf_efficientnetv2_b0): medium risk, medium expected gain.
+4. Ensemble: time-risky, medium expected gain.
+5. p^0.5 scoring: cheap, low risk, small expected gain.
+
+The brief says "changes in method helped more than tuning". TTA flip (method) helped. 2x oversampling (sampling) helped.
+
+Hmm, actually, let me reconsider the problem. What's the biggest error source? Let's think about what mAP@0.5 measures here:
+
+For each class c: predictions for class c ranked by score. TP = matches a GT of class c at IoU≥0.5. Note: each GT can only be matched once. Detector boxes include false alarms (background) and shifted boxes.
+
+Two failure modes:
+(a) A box overlapping a GT of class c is predicted with low p[c] (misclassified) → low score → ranks below FPs → AP loss.
+(b) A background box gets a high p[c] → FP.
+
+The score conf × p[c] handles both.
+
+Given that single-class mAP is 0.755 and the ceiling is 0.758, the detector's conf ranking is nearly optimal for defect detection. The class assignment is the whole game.
+
+Classifier F1 on perfect boxes is 0.87. On detector boxes, probably about 0.75-0.80. To move mAP from 0.634 to 0.75, we need near-perfect class assignment. That requires a substantially better classifier.
+
+What method changes could substantially improve the classifier?
+
+- **Data: use all training images' detector boxes as a "background + shifted" mixture** — tried, bad.
+- **Better features: multi-scale context** — partially tried.
+- **Pretraining on domain data?** No internet, but we have 1022 images. Self-supervised pretraining? Too complex / too time-consuming.
+- **Finetune with a better recipe: longer training with a smaller model + ensemble.**
+
+Hmm wait, actually — what about using low-res images at test time? No, eval images are what they are.
+
+What about **training with mixed high+low res crops** — e003 was bad (0.6251). OK.
+
+**What about input size 192 with fewer steps?** e017 (224) timed out at 180s. 192: compute ×1.44. Training 102s → 147s, plus loading (crop resize to 192 is slower) and prediction (1.44x → 60s). Total: about 13×1.44 + 147 + 60 ≈ 188s. Probably timeout. 176: ×1.21 → 13×1.21+123+51 = 174s. Risky but maybe OK? Hmm, but does 160→176 help? Marginal.
+
+Let me look at the numbers again. e016 seed 0: 0.6333, 5-seed average 0.6337, std 0.0026. To become the new best, a new version needs to beat 0.6337 on 5-seed average (after beating on seed 0). Seed noise ±0.005-0.01. So we need a real gain of at least about 0.005 to have a good chance.
+
+Vertical flip TTA: expected gain probably +0.002-0.004. Might not clear the bar.
+
+Let me think about ensembles more. Actually, a **temporal ensemble** might be better: train one model and average predictions from checkpoints at different times (e.g., epoch 2 and epoch 3 states)? Checkpoint averaging is cheap: save model state at some point, keep training, at prediction time use both states (2x prediction cost, no extra training). Temporal ensembles usually give a small but real gain (0.5-1.5% on classification).
+
+Prediction cost: currently 42s with 4 passes. With 2 model states: 84s. Total: 13 + 102 + 84 = 199 > 180. Too much. Reduce to 2 passes per state (drop TTA): 21s × 2 = 42s. But then we lose the TTA gain. Trade-off.
+
+Or save one intermediate checkpoint and average logits — same cost.
+
+Hmm, what about **reducing prediction cost** to free up time? Crop generation is the bottleneck. 41879 boxes × 2 crops. Can we precompute crops once and reuse them across models/passes? Yes! For an ensemble, crops are identical across models — generate once, then run multiple models on the same tensors. That's the key efficiency trick.
+
+Plan:
+1. Load images (13s).
+2. Precompute all eval crops as tensors (tight + wide) — about 20s.
+3. Train model A (EfficientNet-B0) for about 55s.
+4. Train model B (tf_efficientnetv2_b0 or resnet18) for about 40s.
+5. Predict with both models, 2 passes each (no TTA, or 1 flip): about 2×21s = 42s…
+
+Total: 13 + 20 + 55 + 40 + 42 + writing about 5 = 175s. Tight but OK. But each model gets fewer training steps (A: about 55s ≈ 2 epochs, B: about 40s ≈ 1.5 epochs). Undertrained models hurt.
+
+Alternatively, keep TTA for model A (the better-trained one) and no TTA for B:
+13 + 20 + 55 + 40 + (42 + 21) + 5 = 176s. Still tight.
+
+Hmm, risky. And is the ensemble gain worth the undertraining? Uncertain.
+
+Let me reconsider: **what about a simpler, higher-EV change?**
+
+Looking at per-class APs: pore 0.524 is the weakest. Pore = small holes in the weld. The tight crop (1.5x) should be good for pore. Stain needs context.
+
+**Idea: per-class crop context.** Train with class-dependent context? Complicated.
+
+**Idea: separate the two crops into two heads / two models and combine at the class level.** E.g., tight crop model → pore/deposit scores, wide crop model → stain/deposit scores? Too speculative.
+
+**Idea: train on detector boxes with soft labels (IoU-based)** — tried, bad.
+
+**Idea: use both high and low res crops but only for the weak classes?** e003 (all low-res) was bad. Maybe low-res only for pore/stain? Hmm, that's a refinement of a rejected idea; the brief says each change builds on the current best, and rejected ideas shouldn't be retried in the same direction.
+
+**Idea: change the score to use the geometric mean of conf and p: sqrt(conf * p)?** = conf^0.5 * p^0.5. This reduces the dominance of conf. Hmm.
+
+Actually, wait. Let me reconsider the role of conf. conf × p[c]: the detector's conf is a "defect-ness" score. For a true defect box, conf is probably high (the detector found it). For a background false alarm, conf is lower but not zero. So conf already separates background from defect reasonably well (single-class mAP 0.755).
+
+Within a class, say stain: the ranking is by conf × p_stain. A true stain box with p_stain=0.5 (confused with deposit) scores 0.5×conf. A background box with p_stain=0.3 scores 0.3×conf_bg. If conf_bg is much lower, fine. The ranking is a product of two signals.
+
+What if we used conf^0.5 × p instead? It would boost low-conf boxes. Low-conf true boxes are probably hard cases… unclear.
+
+I keep going back and forth. Let me look at the history for a pattern of what worked:
+- e013 TTA flip: +0.005 (0.6314 vs base 0.6265? wait, e013's base is e000. e000's score isn't listed, but e013 seed 0 0.6392 was "new best").
+- e016 2x oversampling: 0.6333 seed 0 (base e013 seed 0 was 0.6392?? that's odd — e016's seed 0 0.6333 < e013's seed 0 0.6392, yet e016 became the new best on 5-seed average: 0.6337 vs e013's 0.6314). OK, so multi-seed average is what matters.
+
+So the current best's 5-seed average is 0.6337.
+
+Given the noise (std 0.0026), a new version needs a 5-seed average > 0.6337.
+
+Let me think about **SGD vs AdamW** more. For fine-tuning CNNs on a small dataset, SGD+momentum with a higher LR is a standard recipe that often beats AdamW, especially with weight decay. AdamW with wd=0.05 at LR 1e-3 is fairly aggressive decay. Hmm.
+
+Actually, yes, let me reconsider the **backbone** angle with a concrete plan: **tf_efficientnetv2_b0** (7.8M, similar speed to b0, better architecture, pretrained). If it's a drop-in swap (timm.create_model with num_classes=4), there's no bug risk like e006 (which was probably convnext_nano's size). Hypothesis: a stronger backbone improves per-class accuracy, especially pore/stain.
+
+But wait — e006 convnext_nano at 0.2901: if it was simply undertrained due to size, then a 7.8M model should train fine. The risk is that the backbone swap doesn't help (the recipe is tuned for b0). But the brief says method changes help more than tuning, and a backbone is a method change.
+
+Alternatively, **resnet18** (11.7M) — ResNets are robust and fast.
+
+Hmm, let me also consider **the two-crop design itself**: logits averaged. What if we train two separate models (one per crop) and combine? No — that's the ensemble idea again.
+
+Let me estimate the ensemble EV more carefully. Two models, same data, different architectures. On a 6k-sample classification task, ensemble gain is probably +0.5-1.5% top-1 accuracy. mAP is sensitive to ranking, so maybe +0.003-0.008 mAP. But undertraining (2 epochs instead of 3) costs about -0.002-0.005 (e019: 3.87 epochs vs 3 epochs gave -0.004 on seed 0, though that's noise). Net: probably +0.001-0.005. Marginal. And time risk.
+
+Versus backbone swap: if the new backbone is better, +0.005-0.015; if not, -0.005-0.02. EV probably +0.002. Risk of wasting a turn.
+
+Versus vertical flip TTA: +0.001-0.004, low risk, no time risk. EV +0.002.
+
+Versus SGD: +0.002-0.008 if it works, -0.005 if not.
+
+Hmm. Actually, wait. Let me reconsider the prediction pipeline. Currently: logits = (model(xt) + model(xt.flip(3)) + model(xw) + model(xw.flip(3))) / 4.
+
+What about adding **a 3rd context (e.g., 4x ultra-wide) at inference only** (no retraining — the model has seen 1.5x and 2.5x; a 4x crop is out of distribution but the network might still give a reasonable signal)? Risky, probably weak.
+
+What about **test-time crop jitter ensemble**: average over 2-3 random jittered crops (like training jitter)? The model was trained with jitter, so jittered crops are in-distribution. Averaging over K jittered crops reduces variance. E.g., K=2 jittered tight crops + K=2 jittered wide crops + original = more passes. Cost: each extra pass is about 10s (42s/4 passes ≈ 10.5s per pass). We have about 23s of slack (157 used, 180 limit, but we should keep a margin of about 10s → about 13s slack ≈ 1 extra pass). Hmm, tight.
+
+Actually, let me recompute the time budget from the log: total 157s at 180s budget. Reserve 65s → training stops at T0+115. Loading 13s. So training 102s, prediction + writing 42s.
+
+If we add 2 extra TTA passes (e.g., vertical flip of tight and wide): prediction 42 → about 63s. Total 178s. Too close to 180. Kill risk. We'd need to reduce RESERVE to about 50 (e019 showed that doesn't hurt training quality… wait, e019 reduced reserve to 50 and got 0.6291 on seed 0, worse than e016's 0.6333. But that's within noise (std 0.0026, diff 0.0042 ≈ 1.6 std). Hmm, actually e019 trained longer (387→? steps) — let me guess: reserve 50 → t_end = T0+130, training about 117s, about 445 steps. Slightly longer training, slightly worse score. Consistent with "more training doesn't help, maybe slightly hurts".)
+
+So: reserve 50 + 2 extra TTA passes (vertical flip): training 117s (445 steps), prediction about 63s, total about 13+117+63 = 193 > 180. No good.
+
+Reserve 55 + 2 extra passes: t_end = 125, training 112s, prediction 63s, total 13+112+63 = 188. No good.
+
+Hmm, prediction is 42s for 4 passes + crop generation. Let me separate: crop generation for 41879 boxes × 2 crops. Each crop: PIL resize to 160 + numpy ops. Probably about 1.5ms per crop → 41879×2×1.5ms ≈ 126s?? That can't be right, prediction total is 42s. So crop generation is probably about 0.3ms per crop (about 25ms per batch of 256… hmm). Let's say crop generation ≈ 15s, 4 forward passes ≈ 20s, writing ≈ 7s (53780 rows). Roughly.
+
+Adding 2 vertical-flip passes: +10s → 52s. With reserve 55: 13 + 112 + 52 = 177s. Just barely. Margin 3s. Too risky? The harness kills at the limit; 3s margin is thin but the run is fairly deterministic. Hmm.
+
+Alternatively, **replace** horizontal flip with… no, keep it.
+
+OK, another thought — **what about dropping the wide crop at test time and using the saved time for more TTA on the tight crop?** No, the wide crop is important for stain.
+
+Let me step back and think about what a strong researcher would do here.
+
+State: 0.6337, baseline 0.638, ceiling 0.758. We're at a local plateau after 19 experiments. The per-class APs suggest pore is the main drag (0.524).
+
+Pore: small round holes. In a 1.5x tight crop at 160px, a pore is a few pixels. The classifier needs to see small dark circles. What helps: higher resolution, or a model that preserves high-frequency detail (a deeper net with more down-sampling loses it; a shallower net or larger input helps).
+
+e017 (224px) timed out. What about **192px with a smaller/faster model**? E.g., resnet18 at 192? Compute: b0@160 is the baseline. resnet18@192: params 11.7M vs 4.1M (about 2.8x FLOPs by params, but FLOPs scale with size²: (192/160)²=1.44). Probably about 2.5-3x slower per step → about 35s per epoch vs 34s… wait, current: 141 steps/epoch in about 34s (102s/3). So b0@160: 34s/epoch. resnet18@192 probably about 90s/epoch → only 1 epoch in 102s. Undertrained. No good.
+
+**convnext_atto at 224?** convnext_atto is tiny (about 0.1M? or 2.6M?). timm's convnext_atto: 0.1M params? Let me recall timm's convnext table:
+- convnext_femto: 0.07M
+- convnext_pico: 0.25M
+- convnext_atto: 0.1M?
+
+Hmm, I don't really remember. I think convnext_atto is about 0.1M? No wait. Let me think: "convnext_atto" — atto is 10^-18, the smallest. In timm: convnext_femto_001? The listed models: convnext_atto, convnext_nano, convnext_pico. Sizes: nano 50.3M, pico 0.25M, atto 0.1M? That ordering is odd (nano >> pico). Actually yes — timm's convnext naming: femto (0.07M), pico (0.25M), atto (?), nano (50.3M), tiny (28.6M), base, small, medium, large. Hmm, atto might be 0.1M? I'm not sure atto exists between pico and nano… the brief lists convnext_atto, convnext_nano, convnext_pico as available. If atto is tiny (about 0.1-0.25M), it's too small for this task (no capacity).
+
+I shouldn't guess at obscure model sizes. Safer: resnet18, resnet34, resnet50, resnet26d, regnety_016, efficientnet_b0/b2, tf_efficientnetv2_b0, mobilenetv3_large_100.
+
+**tf_efficientnetv2_b0** (7.8M): similar speed to b0@160 (maybe 1.5-2x slower). At 160px: about 50-60s/epoch → about 2 epochs in 102s. Slightly undertrained vs 3 epochs for b0. Hmm.
+
+**resnet18** (11.7M) at 160: probably about 1.5-2x slower than b0 → about 2 epochs. Similar.
+
+So any backbone swap loses about 1 epoch of training. e019 suggests epochs beyond 3 don't matter, but 2 vs 3 might (loss was still decreasing: 0.31→0.24).
+
+This is all marginal. Let me think about **the one untested high-leverage idea: using the detector's confidence as a training signal / sample weighting.**
+
+Actually, here's a thought: **the training data is GT crops, but the eval boxes are detector boxes.** The distribution mismatch is box placement. e005/e015 tried training on detector boxes and it was bad. Why? Probably because detector boxes include many false alarms, and labeling by IoU>0.5 gives a noisy mix; or the added boxes diluted the GT signal.
+
+But what about **using detector conf to weight the GT training samples**? GT crops don't have conf… but we can compute the max conf of detector boxes overlapping each GT crop (from dets.csv train). Then weight the training loss by that conf — samples the detector found confidently get more weight. Hmm, that's a weird prior (the detector is class-agnostic; its conf on a GT box indicates detectability). Probably weak.
+
+**Another angle: the score.** Let me reconsider. score = conf × p[c]. What about **score = conf × p[c] × p[c] / (sum over c of p[c]²)**? No, that's just renormalization, doesn't change within-class ranking… wait, within-class ranking: for class c, scores are conf × p[c] × p[c]²/Σp². The factor p[c]²/Σp² varies per box, so within-class ranking changes. It's like p³ normalized. Sharpening — e004 (p²) hurt, so no.
+
+What about **subtracting a background estimate**: p_bg = 1 - max_c p[c]. score = conf × p[c] × (1 - p_bg)? = conf × p[c] × (1 - (1-maxp)) = conf × p[c] × maxp. That's exactly e008 (×maxp), which was bad. OK.
+
+**score = conf^a × p[c]** with a < 1: a=0.5. Within-class ranking: boxes with low conf get boosted relative to high-conf ones. If low-conf boxes are more likely to be… hmm, the detector's low-conf boxes are either hard true defects or weak false alarms. For a given class, true boxes' conf distribution vs FP boxes' conf distribution — FPs have lower conf on average (that's why single-class mAP works). So boosting low-conf boxes boosts FPs more. Probably bad. a=2: boosts high-conf boxes; within a class, true boxes have higher conf than FPs, so a>1 might improve the separation! Wait, but that's the same for all classes and… let me think: within class c, ranking by conf^a × p[c]. Increasing a makes conf dominate. Since conf separates true defects from background well (0.755 single-class), making conf dominate should improve the ranking… but p[c] is needed to separate class-c true boxes from class-d true boxes (a box that's actually deposit is a FP for stain regardless of conf). Hmm, both signals matter. conf^2 × p: let's try a=2? Or a=1.5?
+
+Hmm wait, actually, is there evidence about the conf distribution? The detector is YOLOv7-tiny class-agnostic. Its conf on GT boxes is probably high (it detected them), on false alarms lower. Single-class mAP 0.755 means the conf ranking is decent but not perfect.
+
+Let me estimate: if we used score = conf only (p=1 for all classes), each class would get mAP about 0.755 but with class confusion… no wait, if all 4 rows have the same score = conf, then for class c the ranking is by conf, and TPs are boxes overlapping a GT of class c. That's like single-class mAP but restricted: a box overlapping a pore GT is a TP for pore (score conf) and also a FP for deposit (if it doesn't overlap a deposit GT). The 4-class mAP would be about 0.755 × (fraction of boxes overlapping a GT of the same class)… roughly, if class assignment is random, per-class AP ≈ 0.755 × (precision of class match). Current 0.6337/0.755 ≈ 0.84 — so the classifier is doing 84% of the work of perfect class assignment.
+
+OK, my decision: I'll go with **a 2-model ensemble with shared precomputed crops**, because it's the biggest remaining method change with a decent chance, and I'll manage the time budget carefully. Actually wait — let me reconsider once more.
+
+Hmm, actually, let me reconsider the simplest highest-EV option: **vertical flip TTA**. e013 (horizontal flip) was the only inference change that worked, +about 0.005. Adding vertical flip is a natural extension. Time cost: +2 passes ≈ +10s → total about 167s. Safe. EV: +0.001 to +0.005. Downside risk: about -0.002 if vertical flip is anti-symmetric for stain.
+
+Versus the ensemble: EV +0.001 to +0.005 with more variance and time risk.
+
+Versus backbone: EV +0.002, variance ±0.01.
+
+Versus conf^2: EV +0.002, cheap, low risk.
+
+Hmm, hmm. Let me think about which is most likely to clear the 0.6337 bar on 5-seed average.
+
+Actually — wait. Let me reconsider the problem from the mAP mechanics. There's a subtlety: "up to the top 300 highest-scoring rows per image are counted". 41879 detections over 1022 images ≈ 41 per image. With 4 rows per box, about 164 rows per image < 300. So the cap rarely binds. OK.
+
+Another subtlety: mAP@0.5 matching — a predicted box matches a GT at IoU≥0.5. Detector boxes are "slightly shifted". If a detector box is shifted enough that IoU with GT < 0.5, it's a FP for every class (and the GT is missed). That loss is inherent to stage 1 (the ceiling 0.758 already accounts for it).
+
+So the only lever is class assignment quality + ranking.
+
+Given that, the classifier's probability calibration matters a lot. Let me think about **temperature scaling of the final softmax**: score = conf × softmax(logits/T)[c]. T>1 softens (lifts 2nd place), T<1 sharpens. e004 was p² = T=0.5 (sharpening) — hurt. So try T=1.5 or 2 (softening)? Softening lifts 2nd-place stain predictions (stain/deposit confusion) and lifts FPs. For stain AP: true stain boxes where deposit is top-1 (p_stain about 0.3-0.5) get lifted → better ranking within stain. FPs (background boxes with p_stain about 0.1-0.2) also get lifted but less in absolute terms… actually, softening lifts low probabilities more in relative terms. Hmm, it's a trade-off. Since sharpening hurt, softening is the untested opposite direction. Cheap test (scoring category, no retraining change — wait, it's a retrain run anyway, but the change is only in the scoring line).
+
+Hmm OK wait, I realize I should think about what's most likely to actually help, given the evidence:
+
+Evidence summary:
+1. Sharpening the score (p²) hurt → the classifier's uncertainty is useful; 2nd-place predictions matter (consistent with stain/deposit confusion).
+2. ×maxp hurt → same direction.
+3. Top-1 only hurt a lot → 2nd/3rd-place rows matter a lot.
+4. Background class hurt a lot → the model shouldn't be told "this is background"; it should keep class probabilities meaningful.
+5. TTA flip helped → variance reduction works.
+6. 2x oversampling of weak classes helped; 3x hurt → mild rebalancing is good.
+7. More training (e019) didn't help → the model is at its data/feature limit, not an optimization limit.
+8. Class-weighted loss always hurt (per brief).
+9. MixUp, label smoothing, focal, jitter, context 3.5, low-res, detector-box training: all neutral to negative.
+
+From 7: the model has plateaued. From 5: variance reduction (TTA) is a proven positive direction. From 1-4: the probability values are well-calibrated; don't distort them.
+
+So the proven positive direction is **inference-time averaging (TTA)** and **mild data rebalancing**.
+
+Untested TTA extensions: vertical flip, both flips (4 views: original, hflip, vflip, hvflip), scale jitter at test time.
+
+e013 currently does: tight, tight-hflip, wide, wide-hflip (4 views). Adding vflip and hvflip → 8 views. Time: +4 passes ≈ +20s → total about 177s. Too tight. Adding only vflip (2 more passes) → about 167s. OK.
+
+Or: drop the tight crop's flip and add… no.
+
+Let me go with **vertical flip TTA**: logits = (model(xt) + model(xt.flip(3)) + model(xt.flip(2)) + model(xt.flip(2).flip(3)) + model(xw) + model(xw.flip(3)) + model(xw.flip(2)) + model(xw.flip(2).flip(3))) / 8.
+
+Hmm, that's 8 passes. Time about +20s → 177s. Margin 3s. Risky.
+
+Alternative: 6 views (add only vflip, no hvflip): tight, tight-h, tight-v, wide, wide-h, wide-v → +2 passes ≈ +10s → 167s. Margin 13s. Safer.
+
+Hypothesis: averaging over vertical flips (in addition to horizontal) further reduces prediction variance and improves class probabilities, especially for stain (which is vertically asymmetric spatter) and pore; e013 showed horizontal flip TTA helps, so extending TTA should help again.
+
+Wait, but is vertical flip a valid symmetry for weld images? Weld beads are horizontal lines; spatter is often below or around the bead. Vertical flip moves spatter above the bead — an unnatural image. The model might give a different (wrong) answer on vflipped crops, and averaging could hurt. Hmm. But the model was trained without vertical flips, so vflip crops are OOD.
+===== attempt 2 =====
+The user is asking me to propose the next experiment in the exact reply format. Let me think about what to do next.
+
+Current state:
+- Best is e016, 5-seed average 0.6337
+- Per-class AP: pore 0.524, deposit 0.626, discontinuity 0.779, stain 0.606
+- Ceiling is 0.758 (stage-1 boxes with perfect classes)
+- Single-class score is 0.755
+
+What's been tried:
+- Training on detector boxes with background class: e002 0.5172 (bad), e005 0.6248 (bad), e015 0.6285 (bad)
+- Low-res crops: e003 0.6251 (bad)
+- Scoring: p² 0.6161, conf×p×max(p) 0.6265, top-1 only 0.5916 (all bad)
+- ConvNeXt-Nano: 0.2901 suspicious (probably a bug)
+- MixUp: 0.6292 not confirmed
+- Context 3.5: 0.6309 not confirmed
+- Label smoothing: 0.6254 not confirmed
+- Larger jitter: 0.6294 not confirmed
+- Focal loss: 0.6209 rejected
+- TTA hflip: e013 new best 0.6314
+- 2x oversampling of pore/stain: e016 new best 0.6337
+- 3x oversampling: 0.6200 rejected
+- Reserve 50: 0.6291 rejected
+- IMG_SIZE 224: timeout
+
+Ideas not yet tried:
+1. Ensembling with a different backbone (e.g., add convnext_nano or resnet50 as a second model and average logits/probabilities). The e006 convnext_nano run was suspicious (0.2901, probably a bug) — maybe the bug was something else. But ensembling within the time budget is explicitly in scope. I could train a second smaller model (e.g., convnext_pico or regnety_016) in parallel and average probabilities. This is a big change though.
+
+2. Training on detector boxes with background class failed badly (0.5172). But that might have been a bug or a too-naive approach. e005 (detector boxes overlapping GT, no background) was 0.6248. e015 (adding detector boxes to GT) was 0.6285. All below 0.6337. So the direction of using detector boxes seems unproductive.
+
+3. Scoring: the score is conf × p[c]. The detector conf is class-agnostic. Maybe I should use the classifier's max probability as a "defect vs background" gate: score = conf × p[c] × (max_p)^k? Tried max_p (k=1): 0.6265. p²: 0.6161. Hmm, both worse.
+
+Wait, actually what's interesting is: the single-class 'defect' score is 0.755 mAP. That means the detector conf ranking is already very good at distinguishing true defects from false alarms. The 4-class mAP is 0.6337, well below the 0.758 ceiling. The gap is mostly wrong classes (pore 0.524, stain 0.606).
+
+Actually wait — mAP@0.5 per class: for a box to be a TP for class c, it needs to overlap a GT of class c with IoU>0.5 AND be predicted as class c. If I output 4 rows per box, each with a different class, the box can be a TP for one class and an FP for others (actually no — a box overlapping a GT of class c: if I predict class c it's a TP for class c; predictions of other classes for the same box… hmm, in COCO-style mAP, each detection is matched against GT of the same class. A detection of class d for a box overlapping GT of class c (d≠c) is an FP for class d. But the 4 rows share the same box; in COCO matching, each detection is matched independently. So a box overlapping a pore GT with rows (pore, 0.5), (deposit, 0.3), (disc, 0.1), (stain, 0.1): the pore row matches the GT as TP; the deposit row is an FP for deposit (the box overlaps the pore GT but not the deposit GT). So outputting multiple rows adds FPs for the wrong classes. The top-1-only experiment (e014) was 0.5916, much worse — interesting! So multiple rows really do help, because… hmm, why? Because with top-1 only, when the classifier is wrong, the box gets a wrong label and becomes an FP. With 4 rows, the correct class row might have a higher score than the wrong row… no wait, if the classifier is wrong, the top-1 is wrong. With 4 rows, the correct class row has a lower score, but is still present; if it ranks high enough within that class, it can be a TP. Actually, mAP per class only cares about the ranking within that class. So with 4 rows per box: for class c, the rows are (box, c, score_c). A box overlapping a c GT contributes a candidate TP with score conf×p_c. Even if p_c is low, it might still rank above FPs of class c. With top-1 only, if the top-1 is wrong, the box contributes no row for class c at all → potential TP lost. So multiple rows help recall of the correct class. OK.
+
+So the per-class gap is mainly classification accuracy, especially pore and stain.
+
+Ideas:
+- Ensembling: average probabilities from two different backbones (efficientnet_b0 + another, e.g., convnext_nano or resnet50 or efficientnet_b2). Diverse ensembles usually help. Time budget: e016 trains 387 steps in ~144s, prediction 42s. Training two models halves the steps for each. Hmm, risky. But maybe I can train both models in the same loop (two forward passes, two losses) — doubles compute per step. Then each model gets ~half the steps. Or train a second model with fewer steps.
+
+Actually, the e006 convnext_nano run was 0.2901 "suspicious (probably a bug)". I don't know what the bug was. Maybe convnext_nano needs a different IMG_SIZE, or the pretrained weights failed to load… I can't check. Let me not trust convnext.
+
+Safer ensemble: efficientnet_b0 + efficientnet_b2? Both are EfficientNet, similar. Or resnet50 (different architecture family). Or regnety_016 (small, fast). Or tf_efficientnetv2_b0.
+
+Hmm, but the rule is "one idea per turn". Ensembling is one idea (architecture/inference).
+
+Alternative idea: the scoring. The detector conf × p[c] — maybe I should re-rank with a learned calibration? No, too complex.
+
+Another idea: stain is often confused with deposit and background. Pore is weak. Maybe I could use class-specific context: pore needs a tight crop (small hole), stain needs a wide crop (texture). The current model averages tight and wide logits equally. Maybe weight them differently per class? That's complex.
+
+Another: the two-crop input already uses the same model for both. What about training with more epochs with a better schedule? e019 showed that more training time (reserve 50) didn't help (0.6291). Hmm, that's strange — more training steps should help, but… actually e019 had more steps but the same total budget; the score dropped. So more training didn't help. The model might be overfitting, or the extra steps just shifted the cosine schedule.
+
+Wait, actually e019: reserve 50 vs 65 → t_end is 15s later → more steps (about 440 vs 387). Score 0.6291 < 0.6333 (e016 seed 0). Within noise (±0.005-0.01). So more training is neutral.
+
+What about LR? LR=1e-3 with AdamW for 3 epochs. Maybe a higher LR with fewer epochs? Or lower LR with more epochs? Hmm.
+
+What about batch size? 64.
+
+Let me think about the biggest lever: classification accuracy on pore/stain. The crop classifier with perfect boxes reaches macro-F1 ~0.87. The weak classes are pore and deposit… wait, the brief says "pore and deposit are weak classes; stain is often confused with deposit and background."
+
+Per-class AP: pore 0.524 (weakest), stain 0.606, deposit 0.626, disc 0.779.
+
+Ideas for pore: pores are small dark holes. A tight crop at 160px might blur the hole. Maybe a higher IMG_SIZE for the tight crop? e017 (IMG_SIZE 224) timed out. I could try 192 — moderate. But the timeout risk… e017 timed out at 224. 192 is 1.5× the pixels of 160 (192/160 = 1.2, 1.44× pixels). Training time is roughly proportional to pixels: 144s → ~207s, plus prediction 42s → 1.44× = 60s. Total ~267s > 180s. Timeout. Unless I cut something. Too risky.
+
+What about ensembling with a second model trained on the same crops but with different augmentation/seed? A "self-ensemble" with different seeds on the same architecture might help a bit. But diversity is low.
+
+Actually, let me reconsider: the most promising untried direction is training on detector boxes with a background class — but it failed badly (0.5172 in e002). Why so bad? Maybe it was dominated by background boxes (there are many false alarms), and the model learned to predict background… but 0.5172 is really bad, worse than everything. Maybe there was a bug in the overlap labeling. e005 (only detector boxes overlapping GT, IoU>0.5, no background) was 0.6248 — close to baseline but not better. e015 (GT + overlapping detector boxes) was 0.6285. Hmm.
+
+So the direction of detector-box training is consistently slightly worse. OK, let me abandon it.
+
+What about stain vs deposit confusion? Maybe I should add a "negative" class: crops from background (detector false alarms) as a 5th class, and at inference time score = conf × p[c] × (1 - p_bg)^k? e002 tried 5-class with background and got 0.5172 — bad. Hmm, but maybe because of how it was implemented. Actually, I can't re-examine the e002 code. The fact that it was 0.5172 suggests something was off (probably the background class dominated and p[c] values were compressed).
+
+Alternative: keep 4 classes but add background crops to training as… no, we need a label for them.
+
+Hmm, what about using the detector conf more cleverly in training? No.
+
+Let me think about the scoring side more. mAP@0.5 per class rewards ranking. Currently score = conf × p_c. The conf ranking is already excellent (single-class 0.755). The p_c ranking adds class discrimination.
+
+What if I also output rows with a score that combines conf and p_c differently per class? E.g., for weak classes (pore, stain) use a higher power of p to be more selective? Hmm, that's a per-class scoring tweak.
+
+Actually, here's a thought: the 4 rows per box are all scored by conf × p_c. For a box that's a true defect of class c, the p_c row should rank high within class c. For FPs (background boxes), p_c is probably low but conf might be high. The single-class 0.755 shows conf alone ranks well. Multiplying by p_c drops it to 0.6337 — so p_c is hurting the ranking? No wait — 0.6337 is 4-class mAP; the single-class 0.755 is 1-class mAP. Not directly comparable. The 4-class ceiling is 0.758.
+
+Gap: 0.758 - 0.6337 = 0.124. This gap comes from (a) wrong-class predictions (a box overlapping a pore GT predicted as deposit → FP for deposit, and the pore row is low-scoring), and (b) ranking issues.
+
+The most direct fix: improve classification accuracy, especially pore and stain.
+
+Ideas:
+1. Ensemble of 2 backbones (efficientnet_b0 + resnet50 or convnext_nano). Diversity → better accuracy. Time: train both in the same loop. Each step does 4 forward passes instead of 2 (tight+wide per model). That halves the steps: ~190 steps per model in 144s. e016 got 0.6337 with 387 steps. A single model with 190 steps would be worse, but the ensemble might beat it. Risky but a standard technique. Alternatively, train model A for the full budget, skip model B… no.
+
+Actually, I could train the second model with a smaller IMG_SIZE or fewer channels to make it faster. E.g., regnety_016 or convnext_pico are much faster than efficientnet_b0. Then: train effnet_b0 for ~100s, then train the small model for ~30s, and ensemble at inference time. The small model is a weak member but adds diversity. Hmm.
+
+2. Better: keep one model but use a larger, better backbone: efficientnet_b2 (listed, pretrained). b2 is ~3× the params of b0, ~2-3× slower. Training steps would drop to ~130. Probably worse overall.
+
+3. tf_efficientnetv2_b0 — similar speed to b0. Marginal diversity with b0.
+
+4. resnet50 — different family, similar speed to b0? ResNet50 at 160px is probably similar FLOPs to effnet_b0.
+
+An ensemble of b0 + resnet50 trained in the same loop (both updated each step, 4 forward passes total per step) → each gets ~190 steps. Then average probabilities: p = (p_b0 + p_resnet)/2, score = conf × p. This is a clean "one idea": ensemble two backbones.
+
+But wait — is the time OK? Per step: currently 2 forward + 2 backward (tight, wide). With 2 models: 4 forward + 4 backward. Step time ~2×. 144s → ~288s > budget. So each model gets ~190 steps in the available time. Compared to e016's 387 steps. Hmm, is 190 steps enough? Loss at 387 steps was 0.2449. At ~190 steps, ~0.31. The ensemble of two 0.31-loss models might beat one 0.24-loss model? Possibly, but uncertain.
+
+Alternative: train both models but only forward-pass the second model on half the batches? No, that's weird.
+
+Alternative ensemble approach: train model A (b0) for the full budget as now, and at inference time use TTA… already have hflip TTA.
+
+Hmm, what about a simpler, higher-value idea: change the class head. Currently the logits of tight and wide are averaged before softmax. What about per-class weighting: stain needs wide context, pore needs tight. E.g., logits = 0.5*(tight+wide) is the current. Instead, use a per-class mix: for pore, weight tight more; for stain, weight wide more. But that's inference-time, and I'd need to know which class… I'd compute both logit vectors: L_t, L_w. Then for each class c, score_c = p_c( L_t + alpha_c * (L_w - L_t) )? That's a per-class linear combination. Hacky, but testable. Hmm, but the model is trained with an average of the two views; the per-view logits are calibrated to the average training.
+
+Actually simpler: train with a per-view loss already done. The inference-time change: instead of averaging logits, average probabilities: softmax(L_t)/2 + softmax(L_w)/2. Slightly different. Probably marginal.
+
+Let me think about what has the best expected value:
+
+The per-class AP gap is dominated by pore (0.524) and stain (0.606).
+
+Pore: small holes. At 160px with a 1.5× tight crop, a small pore might be a few pixels. Higher resolution would help but times out. Alternative: a second tight crop at 1.0× (exactly the box)? The pore is inside the box; a 1.0× crop centers the hole. Adding a third view (1.0×) increases forward passes (3 forward at inference, 3 forward + 3 backward at training) → ~50% slower. Steps drop to ~260. Hmm.
+
+Stain: texture confusion with deposit/background. Wide context helps (tried 3.5×: 0.6309, not confirmed but close to baseline).
+
+What about a data-side idea: crop augmentation with random resize/shift is already there. What about color jitter (hue/saturation)? Weld images may have lighting variation. The current brightness is 0.8-1.2. Adding hue/saturation jitter might regularize. Category: augmentation. Simple, low risk.
+
+Hmm, but "tuning hyperparameters alone helped little in earlier experiments; method changes helped more."
+
+Let me reconsider ensembling more carefully, since it's explicitly in scope ("ensembling within the time budget") and is a method change.
+
+Plan: train 2 models in the same loop:
+- Model A: efficientnet_b0 (as now)
+- Model B: convnext_nano? (e006 was suspicious bug — avoid) or resnet50 or regnety_016 or tf_efficientnetv2_b0.
+
+Actually wait, why was e006 0.2901? That's really bad, like a broken model. Maybe the pretrained weights for convnext_nano failed to load (no internet? but weights should be local). Or the model's forward returned something weird. I can't diagnose without running it. Risk: if I pick a broken backbone for the ensemble, the ensemble is ruined. Safer to pick from the "safe" family: efficientnet_b2, tf_efficientnetv2_b0, resnet50, resnet18, regnety_016, mobilenetv3_large_100.
+
+For diversity + safety: resnet50 (different family, mid-size) or tf_efficientnetv2_b0 (similar speed to b0).
+
+Time math for b0 + resnet50 in the same loop:
+- Current: 2 forward + 2 backward per step, ~144s for 387 steps → ~0.37s/step.
+- 2 models: 4 forward + 4 backward → ~0.74s/step → ~195 steps in 144s.
+- Inference: 4 forward per batch (tight, wide, hflip each for 2 models) → 8 forward vs 4 → ~84s? Wait, current inference is 42s with 4 forward per box (tight, tight_flip, wide, wide_flip). With 2 models: 8 forward → ~84s. Total: 13 (load) + 144 (train) + 84 (inference) + write ~5s = ~246s > 180s. Timeout!
+
+Hmm wait, let me recompute from the log: load 13s, training ends at ~115s+ (3 epochs, 157s total, inference+write = 157-115 = 42s). Training budget t_end = 180-65 = 115s. So training is 102s (13→115), inference+write 42s.
+
+With 2 models at 2× compute: training 204s > 102s budget. So the loop runs until t_end=115s, ~195 steps. Inference 2× = 84s. Total = 13 + 102 + 84 + write ~5 = ~204s > 180. Timeout. So I'd need to cut the reserve to ~30s: t_end = 150s → training 137s (~185 steps), inference 84s + write 5 = 89s ≤ 150-… wait, deadline 180, training ends at 150, inference+write must fit in 30s but needs 89s. No good.
+
+So a full 2-model ensemble in one loop doesn't fit the time unless the second model is much smaller/faster. E.g., regnety_016 or convnext_pico — very small (~10-20 MFLOPs vs effnet_b0's ~400 MFLOPs? Actually effnet_b0 is ~390 MFLOPs, regnety_016 is ~8.4 GFLOPs at 224? No wait. regnety_016: 0.16 GFLOPs? Let me recall: RegNetY-0.16B is ~8.4 GFLOPs at 224? No — RegNetY-0.16: 0.16 GFLOPs? The "0.16" is GFLOPs at 224: 0.16? Hmm, regnety_016 = 0.16 GFLOPs? That seems too low; actually regnety_016: 0.16 GFLOPs? I think regnety_016 is ~8.4 GFLOPs… no.
+
+Let me recall timm model sizes: regnety_016: 0.16 GFLOPs? The naming: regnety_016 = 0.16 GFLOPs? I think regnety_016 is ~0.16 GFLOPs? Hmm, actually I recall regnety_016 has 0.16 GFLOPs? No wait, that's too small — regnety_016 has 0.16 GFLOPs? Let me think: regnety_016: 16.4 M params? No, regnety_016: 0.16 GFLOPs, 2.4 M params? Hmm, I think regnety_016 is ~2.4M params, 0.16 GFLOPs? That doesn't sound right either. RegNetY-0.16: 0.16 GFLOPs? I think the number in the name is GFLOPs at 224: regnety_016 → 0.16? No… RegNetY-0.16 has 0.16 GFLOPs? I really do recall regnety_016 being ~8.4 GFLOPs? No.
+
+OK, let me just recall: regnety_016: 0.16 GFLOPs? The "016" = 0.16 GFLOPs? Hmm, I think so: regnety_016 = 0.16 GFLOPs? Actually I'm fairly confident: regnety_016: 0.16 GFLOPs, 2.4M params? No, 0.16 GFLOPs with 2.4M params is plausible for a tiny model. Hmm, but convnext_pico is ~0.11 GFLOPs? convnext_atto ~0.07? These are tiny.
+
+Anyway: a small second model (convnext_pico/regnety_016) is ~5-10× faster than effnet_b0. Then the 2-model loop: per step cost ≈ b0 (2f+2b) + small (2f+2b ≈ 0.2× b0) → ~1.2× slower → ~320 steps. Inference: b0 4 forward + small 4 forward ≈ 1.2× → ~50s. Total: 13 + 122 (training ~1.2×102) + 50 + 5 = 190s. Slightly over 180. Hmm, tight. I'd need to cut the reserve to ~40s: t_end = 140 → training 127s (~310 steps), inference 50 + write 5 = 55 > 40. No good.
+
+Hmm. The inference cost is the problem: 41879 boxes × 4 forward (TTA) for b0 = 42s. Adding a small model adds ~10s. So inference ~52s. Reserve needs ~57s. Training budget = 180-13-57 = 110s. At 1.2× step cost: ~290 steps.
+
+Is a b0 with 290 steps + a pico ensemble better than a b0 with 387 steps alone? Uncertain. The small model is weak (probably ~0.60 alone) but might add diversity.
+
+Alternative: drop TTA for the small model (only 1 forward, no flip): +5s inference.
+
+Or: train the small model first? No.
+
+Hmm, this is getting complicated and uncertain. Let me think of a simpler, higher-EV idea.
+
+Alternative: improve the single model's accuracy on pore/stain via a targeted data change:
+
+Idea: "stain is often confused with deposit and background". What if I add a 5th class "background" but only use it in the score as a gate, and train with a balanced background sample (not all false alarms)? e002 got 0.5172 — probably because all false alarms (~thousands) dominated. If I subsample background to, say, 1:1 with defects, and use score = conf × p_c × (1-p_bg)… but e002's implementation is unknown. Risky to redo.
+
+Alternative idea: per-class scoring with a learned temperature. Currently score = conf × p_c. What if I use conf × p_c^T per class with T>1? Tried global T=2 (p²): 0.6161, worse. Global max_p: worse. So sharpening hurts. Interesting — that means the current p_c ranking is already good; sharpening removes true TPs faster than FPs.
+
+Hmm wait, actually that's a useful signal: the ranking is dominated by conf (which is good), and p_c is a mild tiebreaker. So maybe I should weaken p_c's influence? E.g., score = conf × p_c^0.5? That's "unsharpening". Let me think: with score = conf × sqrt(p_c), the within-class ranking is more conf-driven (good, since single-class 0.755) and the class discrimination is softened. But the class discrimination is what makes it 4-class… the 4 rows per box: a box overlapping a pore GT with p = (pore 0.4, deposit 0.3, disc 0.2, stain 0.1): rows are pore 0.4c, deposit 0.3c, disc 0.2c, stain 0.1c. The deposit row is an FP for deposit. If I use sqrt: pore 0.63c, deposit 0.55c — the FP row gets closer to the TP row. That seems bad for the deposit class ranking. Hmm, actually for mAP, within class deposit, the FPs include these wrong-class rows. Making them higher-scoring hurts the deposit AP. So p_c^0.5 is probably worse.
+
+OK, another angle: the ceiling with perfect classes is 0.758, and single-class is 0.755. The difference between 4-class 0.6337 and the ceiling 0.758 is 0.124. If classification accuracy were perfect, we'd be at 0.758. The classifier's macro-F1 with perfect boxes is ~0.87. So there's a lot of room: improving pore/stain accuracy directly lifts mAP.
+
+What method changes could boost pore/stain accuracy?
+
+1. Higher resolution for the tight crop — times out at 224. What about training at 160 but using the tight crop at a higher internal resolution? No.
+
+2. A pore-specific view: a 1.0× box crop (no context). Pores are small; the box tightly surrounds them. A 1.0× crop at 160px gives the hole more pixels than 1.5×. Adding a third view = 1.5× slower. Steps: 387 → ~258. Inference: 6 forward (3 views × flip) → 63s. Total: 13 + 153 (1.5×102) + 63 + 5 = 234 > 180. Timeout. I'd need to cut the reserve to ~40: t_end 140, training 127s (~250 steps), inference 63+5=68 > 40. No good. Doesn't fit.
+
+Hmm, the time budget is really tight. Most "add compute" ideas time out. The e017 timeout and e019 rejection (more training doesn't help) suggest the model is near its data-limited accuracy at ~387 steps.
+
+So the levers are: (a) better data/training signal per step, (b) better inference-time signal (TTA already added), (c) better scoring.
+
+Scoring ideas not yet tried:
+- Currently: score = conf × p_c.
+- What about score = conf^a × p_c? The conf is already well-calibrated for defect-vs-background. Hmm.
+- What about using the ratio p_c / max_p? No.
+
+Actually, here's a scoring idea: the 4 rows per box all share the same box. In COCO mAP, each (box, class) row is a detection. A box overlapping a pore GT: the pore row is a potential TP; the other 3 rows are FPs for their classes (unless they also overlap a GT of that class). The FPs hurt the AP of the other classes. The magnitude of the harm depends on their score. Currently they're conf × p_wrong, which can be substantial (e.g., conf 0.8, p_wrong 0.3 → 0.24, competing with true deposit detections).
+
+What if I output the 4 rows but scale the non-top-1 rows more aggressively? E.g., top-1 row: conf × p_top; other rows: conf × p_c × 0.5? Hmm, that's a per-rank penalty. e014 (top-1 only) was 0.5916 — much worse. So the non-top-1 rows contribute net positive value (they provide TP candidates for the correct class when the top-1 is wrong). But they also add FPs. A middle ground: keep all 4 rows but penalize the non-top-1 rows slightly. Actually wait — the value of the non-top-1 rows: when the top-1 is wrong (say top-1=deposit but GT=pore), the pore row (2nd) is the only TP candidate for that box in class pore. Removing it (top-1 only) loses that TP. In e014, that loss outweighed the FP reduction.
+
+Hmm, what about outputting only 2 rows: top-1 and top-2? That keeps most of the TP candidates while halving the wrong-class FPs. Testable, cheap, no retraining! Category: scoring. Just change the write loop: output rows for the top-2 classes per box (by p_c).
+
+Let me estimate: currently 4 rows/box = 53780 rows. Top-2 = ~26900 rows. The removed rows are the 3rd and 4th classes per box — low p_c, low score. As TPs: they only matter when the GT class is the 3rd/4th predicted class (rare, the model is usually within top-2). As FPs: they're low-scoring, so they rarely affect the AP curve (AP integrates over the ranking; low-score FPs only matter if there are few higher-score TPs… they still count as FPs when the precision is computed at their rank, but at low scores they're at the tail of the curve where precision is already low).
+
+Hmm, so removing the 3rd/4th rows: FP reduction at low scores (small AP gain), TP loss when GT is 3rd/4th (small AP loss). Probably net neutral to slightly positive. Not a strong hypothesis.
+
+What about the reverse: the problem is that the wrong-class rows are too high-scoring relative to true detections of that class? E.g., a pore box with p_deposit=0.3 creates a deposit FP at score 0.3×conf. True deposit boxes have p_deposit~0.6-0.8. So the FPs are usually below the TPs. OK.
+
+Let me step back and think about what's most likely to give a >0.005 gain:
+
+Option A: ensemble b0 + small model (regnety_016 or convnext_pico). Diversity gain probably +0.005-0.015 in accuracy → mAP maybe +0.005-0.01. Time: tight but doable if the small model is fast enough. The e006 convnext_nano bug worries me about non-EfficientNet backbones, but regnety/convnext_pico are different. Actually, the bug might have been something else entirely (e.g., the model needed a different normalization, or the pretrained flag failed). I can't verify. Risk: if the second model is broken (random init, no pretrained), the ensemble is ruined. Mitigation: I could verify the second model's accuracy… but I can't access the eval labels. I could check the training loss convergence — a broken pretrained load would show high initial loss. But I can't inspect interactively; the run is one-shot. I could print the first-batch loss for each model; if the second model's loss is ~ln(4)=1.39 (random) vs ~0.6 (pretrained), that's a signal, but I can't act within the run… actually I could: if the second model's first loss > 1.0, fall back to single-model scoring. That's a nice safety net!
+
+Option B: 3rd crop view (1.0× tight). Time: doesn't fit (computed above).
+
+Option C: stain/deposit confusion — train a separate stain-vs-deposit binary head? Too complex.
+
+Option D: change the loss to per-class focal? Tried focal (0.6209, rejected).
+
+Option E: LR/schedule: e016's schedule is 5% warmup + cosine over the budget. What about a higher LR (2e-3) to learn faster in fewer steps? If the model is undertrained (loss still dropping), a higher LR might reach a better loss in the same time. But 387 steps at 1e-3 → loss 0.245. At 2e-3, maybe 0.26 with the same steps but… no, higher LR converges faster, so at the same step count the loss is lower. Worth trying? Category: optimisation. Simple, no time risk (same compute). Hmm, but e019 showed that more steps didn't help — suggesting we're at the accuracy plateau, not step-limited. A higher LR probably won't break the plateau either. Weak.
+
+Option F: data — use low-res crops for the second model only? e003 (adding low-res to the same model) was 0.6251, worse. Hmm.
+
+Option G: inference TTA beyond hflip: add a 90° rotation? Weld beads have orientation (usually horizontal). A 90° rotation is a different view; averaging might help. But it's more forward passes: 4→8, inference 42→84s. Doesn't fit (total 13+102+84+5=204>180). I'd need to cut the reserve to ~35: training ends at 145, inference 89 > 35. No good.
+
+Option H: reduce inference cost to free time for training: drop the hflip TTA (saves 21s) and use it for more training? But TTA was the gain that made e013 the best. No good.
+
+Option I: batch the inference more efficiently? The 42s inference is 41879 boxes × 4 forward at 160px. With channels_last + bf16, probably GPU-bound. Not much to gain.
+
+Option J: train on both high and low res? e003 rejected. No good.
+
+Option K: class-balanced sampling was tried (2x oversample of pore/stain = best; 3x worse). What about oversampling pore only? Or pore 2x + stain 1.5x? Fine-tuning — probably within noise.
+
+Option L: a different preprocessed input: normalize per-image (e.g., divide by image mean)? Weld images may have varying illumination; ImageNet normalization assumes fixed statistics. Per-image standardization could help stain (lighting-sensitive). Category: data/augmentation. Implementation: compute the per-image mean/std once (cheap), use for normalization instead of global MEAN/STD. And brightness augmentation becomes redundant. This is a real method change with a plausible mechanism for stain/deposit (illumination variation). Risk: moderate (could hurt if illumination is consistent).
+
+Hmm, let me weigh: L is simple, no time risk, plausible mechanism. J/L: per-image normalization.
+
+Actually wait — the crops are already brightness-augmented (0.8-1.2) and the model is trained with global normalization. If the test images have different illumination, the global normalization leaves that variation in. Per-image normalization removes it. I think this is a decent idea.
+
+But hmm, is illumination variation actually a problem here? Unknown. The brief doesn't mention it.
+
+Let me reconsider Option A (ensemble) more carefully, since it's explicitly in scope and is a "method change".
+
+The cleanest, most time-safe ensemble: train b0 as now (full budget), and at inference time… no, I need to train the second model.
+
+Actually — here's a clever time-saving ensemble: train the second model on a subset of the data (e.g., 50% of the training boxes) for the full time? No, that halves its data.
+
+Alternative: train the second model with a smaller IMG_SIZE (e.g., 128)? The crop is made at IMG_SIZE; I'd need a second dataset with a different size. More code.
+
+Alternative: the second model = the same b0 but trained with a different seed/augmentation (self-ensemble). Same compute → 2× slower → same time problem.
+
+OK, another thought: what about distilling the ensemble into one? No.
+
+Let me look at the numbers again: training 102s for 387 steps (0.26s/step), inference 42s (4 forward/box), load 13s, write ~5s. Total 162s, 18s of slack (reserve 65, used 47).
+
+Ensemble with regnety_016 (assume ~5× faster than b0 per forward):
+- Training step: b0 (2f+2b) + reg (2f+2b) ≈ (1 + 0.2)× = 1.2× → 0.32s/step → ~319 steps in 102s. Hmm, that's 18% fewer steps for b0.
+- Inference: 4 forward b0 + 4 forward reg ≈ 1.2× → 50s.
+- Total: 13 + 102 + 50 + 5 = 170s ≤ 180. Fits with ~10s slack. OK!
+
+But b0 gets 319 steps instead of 387 (18% fewer). e019 showed that step count matters little (102→117s, +40 steps, no gain). So losing 68 steps is probably OK if the ensemble adds diversity.
+
+Expected ensemble gain: two models with different architectures, same data, averaged probabilities. Typical accuracy gain 1-3% → mAP +0.005-0.015. Plausible to beat the 0.005 noise floor.
+
+But the risk: the pretrained load for regnety_016 might fail (like the e006 convnext_nano mystery). Safety: check the first-step loss of the second model; if > 1.2 (random init ~1.39), drop it from the ensemble at inference time. Actually, a better safety: evaluate the second model on the training set after training? I can't measure "accuracy" without… wait, I have training labels! I can compute the training accuracy of each model on a held-out subset of the training boxes (e.g., the last 500 boxes, or a random 500 with no jitter). That's legitimate (training labels only). If the second model's training accuracy is much lower (say < 0.5 vs b0's 0.8), it's broken → use b0 only. Even better: weight the ensemble by training accuracy, or just gate it.
+
+Hmm, but is training accuracy a good proxy? A broken (random) model has ~25% training accuracy; a fine pretrained model has 80%+. A fine but undertrained model has 60-70%. Gating at, say, 55% is safe.
+
+Actually, simpler and more robust: compute the training accuracy of both models on 1000 random training boxes (no augmentation), and if acc_B < 0.5×acc_A, use A only. That protects against the e006-style failure.
+
+Let me also double-check the timm name for regnety_016: "regnety_016" is in the list. Good. convnext_pico is also in the list. Which to pick? regnety_016: ~0.16 GFLOPs? Let me estimate its speed vs effnet_b0 (~0.39 GFLOPs at 224; at 160 ~0.21 GFLOPs). regnety_016 at 160: ~0.045 GFLOPs? ~5× faster. convnext_pico: ~0.11 GFLOPs at 224? At 160 ~0.06? ~3.5× faster. Either works. Let me pick regnety_016… hmm, actually convnext_pico might be safer (ConvNeXt family, modern). But e006's convnext_nano was buggy — if the bug is ConvNeXt-specific (e.g., a timm version quirk), convnext_pico might also fail. The safety gate would catch it, but then the experiment is wasted (falls back to b0 only = e016, no gain). For the experiment to have a chance, the second model must actually work.
+
+Why was e006 0.2901? Possible causes: (1) pretrained weights didn't load (no internet? but the brief says pretrained weights are available for these models — so they should be local). (2) convnext_nano needs a different IMG_SIZE? No. (3) the model's forward output is fine but training diverged? (4) the harness scored it wrong? "Suspicious (probably a bug)" — the harness flagged it as far below the best.
+
+Hmm, I really can't know. The safety gate handles it. But to maximize the chance the second model works, pick from the family with a proven track record in this codebase: EfficientNet (b0 works). So the second model = efficientnet_b2 or tf_efficientnetv2_b0.
+
+efficientnet_b2: ~0.77 GFLOPs at 224 → at 160 ~0.42? ~2× slower than b0. Training step: 1 + 2×(0.5)… wait, b2 is ~2× b0's cost. Step cost = b0(2f+2b) + b2(2f+2b) ≈ 3× → 387→129 steps. b0 gets 129 steps — too few (loss ~0.5, bad). No good.
+
+tf_efficientnetv2_b0: ~0.40 GFLOPs at 224? Similar to b0 (~1.0-1.2× cost). Step cost ~2.1× → ~184 steps for b0. Hmm, b0 at 184 steps: loss ~0.31 (from the epoch-1 curve). And v2_b0 at 184 steps: similar. Ensemble of two ~0.31-loss models vs a single 0.245-loss model. Uncertain — maybe a slight gain from diversity, maybe not.
+
+regnety_016: b0 gets ~319 steps (loss ~0.26), reg gets 319 steps (it's small, probably loss ~0.35 but decent accuracy). The ensemble is probably better than a single b0 at 387 steps. I think regnety_016 is the best time/quality tradeoff.
+
+Or convnext_pico: similar to regnety.
+
+Let me go with regnety_016 with a safety gate. Actually, wait — let me reconsider the safety gate design. After training, before inference:
+1. Take 2000 random training boxes (with labels), no augmentation, make crops (train=False).
+2. Compute the forward pass for both models, measure accuracy.
+3. If acc_B < 0.5 (or acc_B < 0.7×acc_A), set w_B = 0.
+4. Inference: p = (w_A p_A + w_B p_B)/(w_A+w_B), default w_A=w_B=1.
+
+This costs a few seconds (2000 boxes × 2 forward × 2 views… 8000 forward at 160px ≈ 8000/41879×42s×… ~8s). Acceptable.
+
+Hmm wait, but actually, is the gate worth the complexity? If regnety_016's pretrained loads fine (it should — it's in the list of available weights), the gate never triggers. If it doesn't load, the gate saves the run from being scored as a bug. The cost is ~10 lines of code + ~8s. Worth it.
+
+Now, the code changes:
+
+1. Add MODEL_B = "regnety_016".
+2. Create model_b = timm.create_model(MODEL_B, pretrained=True, num_classes=4).to(device).channels_last.
+3. opt_b = AdamW(model_b.parameters(), lr=LR, weight_decay=WD).
+4. In the training loop: loss = crit((model(xt)+model(xw))/2, y) + crit((model_b(xt)+model_b(xw))/2, y). Both opt.step().
+5. After training: compute the gate accuracy.
+6. Inference: logits_A as now (4 forward), logits_B similarly (4 forward), p = weighted average of softmaxes.
+7. Write as before.
+
+Time check: training step ~1.2× (regnety is fast) → ~122s in the 102s budget? Wait: current 387 steps in 102s = 0.263s/step. With regnety added: +0.2×(2f+2b) of b0's step… b0's step includes 2 forward + 2 backward + optimizer. Adding regnety: 2 forward + 2 backward of a small model ≈ 0.15-0.25 of b0's step. So ~0.32s/step → 318 steps in 102s. OK.
+
+Gate: ~8s. Inference: b0 4 forward (42s) + regnety 4 forward (~8s) = 50s. Write 5s. Total: 13 + 102 + 8 + 50 + 5 = 178s. Very tight against 180! The reserve is 65s but I'm using 63s. Hmm, risky. Let me cut: skip the gate's TTA (single forward, no flip): 2000 boxes × 2 models × 2 views = 8000 forward ≈ 8s → still. Or reduce the gate to 1000 boxes: ~4s. And drop the hflip for regnety at inference (only 2 forward for B: tight, wide): saves 4s. Inference = 42 + 4 = 46s. Total: 13+102+4+46+5 = 170s. 10s slack. OK.
+
+Actually, let me also consider reducing the gate cost: the gate is only needed if I'm worried about a broken load. Alternative cheap check: the first training loss of model_b. If model_b's loss on the first batch > 1.2 (random init ~1.386, pretrained ~0.5-0.8), mark it broken and skip it at inference (but keep training? no — if it's broken, stop training it to save time, and use A only at inference). That's nearly free! But a single-batch loss is noisy; a pretrained model's first-batch loss with random init head: the head is random → loss is usually ~1.2-1.5 even with a good backbone! Because the classification head is randomly initialized. Hmm, right — timm models have a random head, so the first-batch loss is ~1.3-1.4 for any model, pretrained or not. So the first-loss check doesn't discriminate. The e006 bug must have been something else (maybe the whole pretrained backbone failed to load, or the model was wrong).
+
+So the post-training accuracy gate is the right check. Keep it, 1000 boxes, single forward (no TTA), both models. Cost: 1000×2 views×2 models = 4000 forward ≈ 4s.
+
+Wait, actually, do I even need the gate? Let me think about what could go wrong with regnety_016: timm.create_model("regnety_016", pretrained=True) — if the weights aren't actually available locally, timm raises an exception or warns and uses random init. If it raises, the run crashes (bad). If it warns + random init, the model is weak but trainable; after 319 steps on 9084 boxes, a small model from scratch might reach ~60-70% training accuracy — the gate at 0.5×acc_A would probably keep it (it's not broken, just weak). A weak member in an ensemble barely hurts (averaging with a decent model is roughly neutral to slightly positive). Actually, averaging with a 60%-accuracy model vs a 85% model: the ensemble accuracy is ~75%? That could be worse than A alone! Hmm. So the gate should be: weight B by its accuracy, or only include B if acc_B ≥ 0.8×acc_A? Let me think: if acc_A=0.85, acc_B=0.70 (random-init backbone but trained), the equal-weight ensemble ≈ 0.78 < 0.85. Bad. So the gate: if acc_B < 0.9×acc_A → use A only? If acc_B=0.80, acc_A=0.85: ensemble ≈ 0.83 < 0.85. Still bad! Ensembling with a much weaker member hurts. So the gate should be strict: only include B if acc_B ≥ 0.95×acc_A
+===== attempt 3 =====
+Let me analyze the situation. I need to propose the next experiment for the two-stage weld defect detection system.
+
+Current best is e016 with 5-seed val mAP@0.5 of 0.6337.
+
+Key observations:
+1. The classifier is trained on GT crops (perfect boxes) but at test time it sees detector boxes which are "slightly misplaced"
+2. Per-class AP: pore 0.524, deposit 0.626, discontinuity 0.779, stain 0.606
+3. The model trains for ~3 epochs with loss still falling (0.62→0.31→0.24)
+4. e019 tried to get more training time by reducing reserve - rejected (0.6291)
+5. e003 tried including low-res crops - rejected (0.6251)
+6. e015 tried adding detector boxes to training - rejected (0.6285)
+7. e002 tried training on detector boxes with background class - rejected (0.5172)
+8. e011 tried increasing jitter - not confirmed (0.6356 seed 0, 0.6294 5-seed)
+9. e009 tried wider context - not confirmed (0.6342 seed 0, 0.6309 5-seed)
+10. e013 TTA with hflip - became new best (0.6392 seed 0, 0.6314 5-seed)
+11. e016 oversampling weak classes 2x - new best (0.6333 seed 0, 0.6337 5-seed)
+
+Wait, e013 was 0.6314 5-seed and e016 is 0.6337 5-seed. So e016 is the current best.
+
+Let me think about what hasn't been tried and could help:
+
+1. **Architecture**: e006 tried ConvNeXt-Nano but crashed (likely bug). Other architectures like RegNetY-016 or ResNet50 haven't been tried. But architecture changes are risky.
+
+2. **Inference**: TTA with hflip helped. What about vertical flip? Or both flips? The current TTA does hflip on both tight and wide crops. Adding vflip would double the inference time but might help.
+
+3. **Scoring**: The score is conf × p[c]. Various scoring changes have been tried (p², p×max(p)). What about using a different combination?
+
+4. **Data**: Training on detector boxes has been tried and failed. Low-res crops failed. What about using the detector confidence as a training signal somehow?
+
+5. **Loss**: Focal loss failed, label smoothing failed, class-weighted loss failed.
+
+6. **Optimization**: More training time (e019) failed. What about a different optimizer or learning rate?
+
+7. **Augmentation**: MixUp (e007) not confirmed. What about other augmentations like color jitter, random erasing?
+
+Let me think about what's most promising:
+
+The key insight is that the model is undertrained (loss still falling) but e019 tried to get more time and it didn't help. This suggests the issue isn't just training time but perhaps the training signal quality.
+
+Wait, e019 got 0.6291 which is worse than e016's 0.6333. So more training time actually hurt? That's surprising. Maybe the model overfits with more time, or the cosine schedule with more steps doesn't work as well.
+
+Actually, looking more carefully: e019 had RESERVE_S=50 instead of 65, giving ~15s more training. The result was 0.6291 vs 0.6333. So slightly more training time actually hurt. This could be:
+- Overfitting
+- The cosine schedule being disrupted
+- Just noise (within ±0.005)
+
+Let me think about what could actually help:
+
+**Idea: Add vertical flip TTA**
+The current TTA does hflip. Adding vflip would give 4 views per crop (original, hflip, vflip, hflip+vflip) for each of tight and wide = 8 forward passes instead of 4. This might help with stain and pore which are asymmetric.
+
+But wait, the inference time would double. Currently prediction takes ~42s of the 65s reserve. Doubling would make it ~84s which exceeds the reserve. So this might not work without reducing training time.
+
+Actually, let me re-read: "prediction only consumes ~42s of the 65s reserve". So if I add vflip, it would be ~84s which is more than 65s. That would be a problem.
+
+But I could reduce training time a bit and add vflip. Or I could be smarter about it.
+
+Actually wait - the current TTA does:
+```python
+logits = (model(xt) + model(xt.flip(3)) + model(xw) + model(xw.flip(3))) / 4
+```
+
+That's 4 forward passes per batch. Adding vflip would make it 8. The eval has 41879 detections with batch size 256, so about 164 batches. With 4 forward passes that's ~42s. With 8 it would be ~84s.
+
+Hmm, that's too much. Unless I reduce the number of training steps.
+
+**Idea: Use a different, faster backbone**
+What about mobilenetv3_large_100 or resnet18? These are faster, allowing more training steps in the same time, and might be sufficient for this task.
+
+Actually, the key issue might be that EfficientNet-B0 at 160x160 is not optimal. e017 tried 224x224 and timed out. What about a smaller/faster model that allows more epochs?
+
+**Idea: Reduce IMG_SIZE to 128 for faster training**
+This would allow more training steps. But might lose detail needed for small pores.
+
+**Idea: Use a learning rate warmup + different schedule**
+The current schedule is 5% warmup then cosine. What about a step decay or a different warmup fraction?
+
+**Idea: Add color/photometric augmentation**
+The current augmentation is geometric (jitter, flip) and brightness. What about contrast jitter, hue jitter? Weld images might have lighting variations.
+
+**Idea: Use the detector confidence as a training weight**
+Boxes with high detector confidence are more likely to be true defects. Weight the loss by detector confidence for detector-box training samples.
+
+Wait, but the current training uses GT crops, not detector boxes. So detector confidence isn't available in the training set.
+
+**Idea: Train with a mix of GT crops and slightly perturbed GT crops**
+The current jitter is ±10% center, 0.85-1.2× size. What if I also add some "false" boxes (random positions) labeled as background? This would teach the model to reject non-defect regions.
+
+But e002 tried adding a background class and it failed badly (0.5172). However, e002 used detector boxes with IoU>0.5 overlap labeling. Maybe a simpler approach: just add random background crops with a 5th class?
+
+Actually, the problem with a background class is that the model needs to output 5 classes but we only need 4 predictions. The scoring would need to be adjusted.
+
+**Idea: Use label smoothing specifically for the weak classes**
+No, this is too complex and label smoothing already failed.
+
+**Idea: Use a different augmentation strategy - cutout/random erasing**
+Random erasing (CutOut) could help the model not rely on specific texture patterns.
+
+**Idea: Ensemble two models**
+Train two different models (e.g., EfficientNet-B0 and ResNet50) and average their probabilities. This would require splitting the training time.
+
+Actually, let me think about what's most likely to work:
+
+The per-class APs are: pore 0.524, deposit 0.626, discontinuity 0.779, stain 0.606.
+
+Pore is the weakest. Pores are small holes. The 160x160 input might not have enough resolution to see them well. But e017 (224x224) timed out.
+
+What about using a smaller model at 224x224? Like ResNet18 or MobileNetV3? These are much faster than EfficientNet-B0.
+
+Actually, let me reconsider. The training takes about 100s (3 epochs, 387 steps) and prediction takes 42s. Total ~157s out of 180s budget.
+
+If I use a faster model, I could train for more epochs. The loss is still falling, so more training should help.
+
+Let me think about **ResNet18**:
+- Much faster than EfficientNet-B0
+- At 160x160, should be quite fast
+- Could potentially train for 5-6 epochs instead of 3
+- Pretrained on ImageNet
+
+But will it be as good as EfficientNet-B0 for this task? Hard to say.
+
+**Alternative: Keep EfficientNet-B0 but use a smaller input size (128) to train faster**
+This would allow more epochs. But might hurt pore detection.
+
+**Another idea: Use the wide crop only (drop tight crop) to halve training time**
+The tight crop (1.5x) and wide crop (2.5x) are both used. If the wide crop alone is sufficient, dropping the tight crop would halve training time, allowing ~6 epochs instead of 3.
+
+But the tight crop gives a closer view of the defect which might be important for small pores.
+
+**Idea: Use a lower learning rate for longer training**
+Current LR is 1e-3 with cosine decay. What about 5e-4 with more epochs? The model might be too aggressive with the current LR.
+
+Actually, let me look at this from a different angle. The e019 experiment (more training time) slightly hurt. This suggests the model might be overfitting slightly, or the cosine schedule isn't optimal.
+
+What if the issue is that the cosine schedule reaches very low LR at the end, and the model hasn't fully converged? With more time, the LR gets even lower and the model plateaus.
+
+**Idea: Use a constant learning rate with a short warmup, no cosine decay**
+This would keep the LR at 1e-3 throughout, potentially allowing the model to keep learning.
+
+But this is risky - constant LR often leads to instability at the end.
+
+**Idea: Use a step LR schedule**
+Start at 1e-3, drop to 1e-4 after 50% of training, drop to 1e-5 after 80%.
+
+Hmm, let me think about what's most likely to give a clear improvement:
+
+1. The model is undertrained but more time didn't help → maybe the issue is data quality/augmentation
+2. Pore is the weakest class → needs better representation
+3. The model sees GT boxes in training but detector boxes in test → distribution gap
+
+The distribution gap is key. e015 tried adding detector boxes to training and it didn't help (0.6285). e005 tried training only on detector boxes and it didn't help (0.6248).
+
+What about a different approach to the distribution gap: **train with larger jitter that better matches the detector's error distribution**?
+
+e011 tried ±15% center, 0.75-1.3× size and got 0.6356 seed 0 but 0.6294 5-seed (not confirmed). So it was within noise.
+
+**Idea: Use a two-stage training approach**
+First train on GT crops for a few epochs, then fine-tune on detector boxes (with IoU labeling) for the remaining time. This way the model first learns good features, then adapts to the detector's box distribution.
+
+But this is complex and e015 (adding detector boxes) didn't help.
+
+**Let me think about the scoring more carefully.**
+
+The score is `conf * p[c]`. The detector confidence is from YOLOv7-tiny. For true defects, conf is probably moderate to high. For false alarms, conf is lower but not zero.
+
+What if I use `conf^alpha * p[c]^beta` with alpha < 1? This would reduce the impact of the detector confidence and rely more on the classifier.
+
+Actually, e004 tried p² (increasing classifier weight) and it failed. e008 tried p * max(p) and it failed.
+
+What about `conf^0.5 * p[c]`? This reduces the weight of detector confidence.
+
+Hmm, but the detector confidence is useful for distinguishing true from false. If I reduce its weight, false alarms with high classifier probability would get higher scores.
+
+**Idea: Use a temperature-scaled softmax**
+Instead of `softmax(logits)`, use `softmax(logits / T)` where T > 1. This makes the probability distribution more uniform, reducing the impact of the classifier's confidence. Combined with the detector conf, this might improve ranking.
+
+But this is similar to what p² does (making the distribution more peaked), just in the opposite direction.
+
+Actually, T > 1 makes it LESS peaked (more uniform), which would reduce the difference between classes. This might not help.
+
+T < 1 makes it MORE peaked, similar to p².
+
+**Let me think about what's fundamentally different that hasn't been tried:**
+
+1. **Different model architecture** (e006 crashed, others not tried)
+2. **Different input resolution** (e017 timed out at 224)
+3. **Multi-scale training** (train at multiple resolutions)
+4. **Feature-level fusion** (use intermediate features from the backbone)
+5. **Attention mechanisms** (add attention to the classifier)
+6. **Data augmentation with CutOut/Random Erasing**
+7. **Different optimizer** (SGD with momentum instead of AdamW)
+8. **Learning rate scheduling** (different from cosine)
+9. **Batch size changes**
+10. **Mixing high and low res training data** (e003 tried this, failed)
+
+I think the most promising untried idea is **SGD with momentum** instead of AdamW. 
+
+Why? 
+- AdamW with LR=1e-3 might be too aggressive
+- SGD with momentum is known to generalize better in many vision tasks
+- The model is undertrained but more time didn't help → maybe the optimizer is the issue
+- SGD typically needs a higher LR (e.g., 0.1 with momentum 0.9) but for fine-tuning pretrained models, 1e-2 to 5e-3 is common
+
+Actually, for fine-tuning a pretrained model, SGD with LR=0.01, momentum=0.9, weight_decay=1e-4 is a standard recipe. This is very different from AdamW with LR=1e-3, weight_decay=0.05.
+
+The higher weight decay in AdamW (0.05) might be too aggressive for fine-tuning. Standard weight decay for SGD fine-tuning is 1e-4 to 1e-3.
+
+Let me propose: **Switch from AdamW to SGD with momentum, with appropriate LR and weight decay.**
+
+Parameters:
+- SGD, lr=0.01, momentum=0.9, weight_decay=1e-4
+- This is a standard fine-tuning recipe
+- Should allow the model to learn more effectively from the pretrained features
+
+This is a focused change: just the optimizer.
+
+Let me write the edit:
+
+```python
+opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+```
+
+becomes:
+
+```python
+opt = torch.optim.SGD(model.parameters(), lr=LR, momentum=0.9, weight_decay=WEIGHT_DECAY)
+```
+
+But I also need to change LR and WEIGHT_DECAY:
+- LR = 1e-3 → 0.01 (10x higher for SGD)
+- WEIGHT_DECAY = 0.05 → 1e-4 (50x lower, standard for SGD)
+
+Wait, but the cosine schedule uses LR as the base. With SGD at LR=0.01, the warmup and cosine would work differently. Let me think...
+
+The schedule is:
+```python
+f = frac / 0.05 if frac < 0.05 else 0.5 * (1 + math.cos(math.pi * (frac - 0.05) / 0.95))
+for pg in opt.param_groups:
+    pg["lr"] = LR * max(f, 1e-3)
+```
+
+So the LR starts at 0 (warmup) and goes to LR, then cosine decays to 0. With LR=0.01 for SGD, this should work fine.
+
+Actually, for SGD, a common approach is:
+- LR = 0.1 for training from scratch
+- LR = 0.01 for fine-tuning
+- Momentum = 0.9
+- Weight decay = 1e-4
+
+Let me go with LR=0.01, momentum=0.9, weight_decay=1e-4.
+
+But wait, I need to be careful. The `max(f, 1e-3)` at the end means the minimum LR fraction is 1e-3, so minimum LR would be 0.01 * 1e-3 = 1e-5. That's fine.
+
+Let me write the focused edit. I'll change:
+1. LR = 1e-3 → 0.01
+2. WEIGHT_DECAY = 0.05 → 1e-4  
+3. AdamW → SGD with momentum
+
+Actually, I realize I should be more careful. Let me just change the optimizer line and the LR/WD constants.
+
+The changes:
+```
+LR = 1e-3
+WEIGHT_DECAY = 0.05
+```
+→
+```
+LR = 0.01
+WEIGHT_DECAY = 1e-4
+```
+
+And:
+```
+opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+```
+→
+```
+opt = torch.optim.SGD(model.parameters(), lr=LR, momentum=0.9, weight_decay=WEIGHT_DECAY)
+```
+
+This is a clean, focused experiment. The hypothesis is that SGD with momentum generalizes better than AdamW for fine-tuning pretrained vision models, and the current AdamW setup (high weight decay, lower LR) may be suboptimal.
+
+Let me finalize this.

@@ -1,0 +1,664 @@
+===== attempt 1 =====
+Let me analyze the current situation:
+
+1. Current best: 0.6311 mAP@0.5 (5-seed mean)
+2. Baseline to beat: 0.638 mAP@0.5 (one-step 4-class detector)
+3. Ceiling: 0.758 mAP@0.5 (stage-1 boxes with perfect classes)
+4. Single-class score: 0.755 mAP@0.5
+
+The key insight from the background:
+- Many errors are wrong types, not missed defects
+- A crop classifier with perfect boxes reaches macro-F1 ~0.87
+- The current approach trains on "true training boxes" (crops.csv) which are the ground truth boxes
+- The problem: the classifier was trained on perfect boxes but the detector boxes are slightly misplaced
+- "train the classifier on detector boxes from the training images (dets.csv split 'train'), labelled by overlap with the true boxes in crops.csv, including a 'background' class for false alarms"
+
+This is a very promising direction. The current approach:
+1. Trains on crops.csv (ground truth boxes) - these are "perfect" boxes
+2. At inference, scores = detector_conf * class_probability
+
+The problem is:
+- The classifier has no notion of "not a defect" - it always assigns some class
+- The detector boxes include false alarms (background) and slightly misplaced boxes
+- Training on detector boxes with a background class would help the model learn to reject false positives
+
+Let me think about what the most impactful single change would be:
+
+**Option 1: Train on detector boxes with background class**
+This is explicitly mentioned in the "in scope" ideas. The approach would be:
+- Use dets.csv split "train" boxes
+- Label them by overlap with crops.csv (IoU > 0.5 → class, else → background)
+- Add a 5th class for background
+- Score = detector_conf * class_probability / (1 + background_probability) or similar
+
+This addresses two issues:
+1. The model learns to recognize background (false alarms)
+2. The model sees the actual box positions the detector produces (not perfect boxes)
+
+**Option 2: Use low-res training crops**
+Currently TRAIN_ON = ("high",). Including "low" would add more training data.
+
+**Option 3: Test-time augmentation**
+Averaging over multiple crops/transforms at inference.
+
+**Option 4: Architecture change**
+Try a different backbone.
+
+I think Option 1 is the most impactful because:
+- It directly addresses the mismatch between training (perfect boxes) and inference (detector boxes)
+- It adds a background class which helps with ranking (mAP@0.5 rewards good ranking)
+- The brief explicitly says "Several rows per box (one per class) are allowed and often help" and the background class would naturally reduce scores for false positives
+
+Let me design this:
+
+1. Load dets.csv split "train" boxes
+2. For each detector box, compute IoU with all crops.csv boxes on the same image
+3. If max IoU > 0.5, label = that class; else label = 4 (background)
+4. Train with 5 classes
+5. At inference: for each eval box, get 5 probabilities
+6. Score for class c = detector_conf * p[c] * (1 - p[4]) or detector_conf * p[c] / (1 + p[4])
+
+Actually, let me think more carefully about the scoring. If we have 5 classes (0-3 defect, 4 background):
+- For a true defect of class c, we want high score
+- For a false alarm, we want low score for all classes
+- The background probability p[4] is high for false alarms
+
+A natural scoring: score_c = conf * p[c] * (1 - p[4])
+This way, if p[4] is high (likely background), all class scores are suppressed.
+
+Or: score_c = conf * p[c] / (1 + p[4])
+This also suppresses when background probability is high.
+
+The first one is simpler and more interpretable.
+
+Wait, but there's a subtlety. The crops.csv has both "high" and "low" resolution. The dets.csv train boxes are on training images. Let me check what the overlap should be with.
+
+Actually, looking at the data more carefully:
+- crops.csv: labelled training boxes with res "high"/"low", image, x1, y1, x2, y2, img_w, img_h, cls
+- dets.csv: detector boxes with split "train"/"eval", image, x1, y1, x2, y2, img_w, img_h, conf
+
+For training the classifier on detector boxes:
+- Take dets.csv where split == "train"
+- For each such box, find overlapping crops.csv boxes (same image, IoU > threshold)
+- If overlap found: label = class of the overlapping crop
+- If no overlap: label = background (4)
+
+Then train the model with 5 classes.
+
+For the crop generation, I should use the detector box coordinates (not the ground truth), since that's what the model will see at inference.
+
+Let me also think about whether to keep the two-crop approach. The two-crop (tight 1.5x + wide 2.5x) was the starting recipe. I'll keep it.
+
+One concern: the number of training samples. dets.csv train split might have many more boxes than crops.csv (6052). Let me assume it's reasonable.
+
+Also, I should consider: should I still include the crops.csv boxes in training? Probably not - the whole point is to train on detector boxes. But I could include both... Let me start with just detector boxes for a clean test of the hypothesis.
+
+Actually wait - let me re-read the brief more carefully:
+
+"train the classifier on detector boxes from the training images (dets.csv split "train"), labelled by overlap with the true boxes in crops.csv, including a "background" class for false alarms"
+
+Yes, this is exactly what I'm proposing.
+
+Let me also think about the IoU threshold for matching. IoU > 0.5 is standard for detection matching. But for labeling training boxes, maybe a lower threshold like 0.3 or 0.1 would be more lenient. Actually, for the purpose of training a crop classifier, if the detector box overlaps significantly with a ground truth box, it's reasonable to label it with that class. IoU > 0.5 is a good threshold - it means the detector box captures at least half of the true defect.
+
+Wait, actually IoU > 0.5 means the intersection is more than half of the union. That's quite strict. Maybe I should use a different metric. Let me think...
+
+For a detector box and a ground truth box:
+- IoU = intersection / union
+- If IoU > 0.5, they overlap significantly
+
+Actually for labeling, I think IoU > 0.3 or even 0.1 might be more appropriate, because:
+- A detector box that's slightly off but still mostly on the defect should be labeled with that class
+- IoU > 0.5 might be too strict
+
+But let me start with 0.5 since that's the standard detection threshold and it's what mAP@0.5 uses. If the box matches a GT box at IoU 0.5, it's a valid detection of that class.
+
+Hmm, but actually there's another consideration. What if a detector box overlaps with multiple GT boxes? I'll take the one with the highest IoU.
+
+What if a detector box overlaps with a GT box of a different class? E.g., detector box is on a stain but overlaps with a pore GT box. In this case, I should probably label it with the class of the GT box it overlaps most with.
+
+Let me code this up:
+
+```python
+def compute_iou(box1, box2):
+    x1 = max(box1[0], box2[0])
+    y1 = max(box1[1], box2[1])
+    x2 = min(box1[2], box2[2])
+    y2 = min(box1[3], box2[3])
+    inter = max(0, x2 - x1) * max(0, y2 - y1)
+    area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+    union = area1 + area2 - inter
+    return inter / union if union > 0 else 0
+```
+
+For efficiency with potentially many boxes, I'll group crops by image and for each detector box, only check crops on the same image.
+
+Let me now write the full modified train.py:
+
+Key changes:
+1. Instead of using crops.csv directly for training, use dets.csv (train split) with labels from overlap with crops.csv
+2. Add background class (5 classes total)
+3. Modify scoring to incorporate background probability
+4. Keep everything else the same (two-crop, EfficientNet-B0, etc.)
+
+Let me think about the scoring formula more carefully:
+- score_c = conf * p[c] * (1 - p[bg])
+
+This means:
+- If the model is confident it's background (p[bg] ≈ 1), all scores ≈ 0
+- If the model is confident it's class c (p[c] ≈ 1, p[bg] ≈ 0), score ≈ conf
+- This naturally handles false alarms
+
+For the mAP scoring:
+- True positives: boxes that overlap a GT defect. We want these to have high scores for the correct class.
+- False positives: boxes that don't overlap any GT defect. We want these to have low scores.
+- The background class helps suppress false positives.
+
+This should improve the ranking component of mAP.
+
+Now, one more consideration: the number of training samples. The dets.csv train split might have many boxes. Let me not worry about it - the DataLoader will handle it.
+
+Also, I need to handle the case where a detector box in train doesn't overlap any GT box - it gets label 4 (background). This is actually a great thing because it teaches the model what background looks like from the detector's perspective.
+
+Let me also think about whether to include low-res crops for matching. The dets.csv boxes are on training images. The crops.csv has both high and low res boxes on those images. I should match against all crops.csv boxes on the same image (regardless of res), since the detector box is on the image and should match any GT box on that image.
+
+Wait, actually I need to be careful. The crops.csv has x1, y1, x2, y2 in image coordinates (with img_w, img_h). The dets.csv also has x1, y1, x2, y2 in image coordinates. So I can directly compute IoU between them.
+
+Let me write the code now. I'll make focused changes:
+
+1. Change MODEL to have 5 classes
+2. Add a function to label detector boxes
+3. Change training data to use labeled detector boxes
+4. Change scoring to use background probability
+
+Actually, let me reconsider. The change is quite substantial. Let me make sure I'm keeping the edit focused on the one idea: "train on detector boxes with background class."
+
+Here's my plan for the changes:
+
+1. Add `NUM_CLASSES = 5` (4 defect + 1 background)
+2. Add a function `label_det_boxes(dets_train, crops)` that returns labels for each train detection
+3. Change the training data construction to use dets_train with labels
+4. Change model to 5 classes
+5. Change scoring: `score_c = conf * p[c] * (1 - p[4])` for c in 0..3
+
+Let me write this out carefully.
+
+```python
+def label_det_boxes(dets_train, crops_by_image, iou_thresh=0.5):
+    """Label detector boxes by overlap with ground truth crops."""
+    labels = []
+    for d in dets_train:
+        img = d["image"]
+        dbox = (d["x1"], d["y1"], d["x2"], d["y2"])
+        best_iou = 0
+        best_cls = 4  # background
+        if img in crops_by_image:
+            for c in crops_by_image[img]:
+                cbox = (c["x1"], c["y1"], c["x2"], c["y2"])
+                iou = compute_iou(dbox, cbox)
+                if iou > best_iou:
+                    best_iou = iou
+                    best_cls = c["cls"]
+        if best_iou < iou_thresh:
+            best_cls = 4
+        labels.append(best_cls)
+    return labels
+```
+
+Wait, I need to be careful about the crops. The crops.csv has both high and low resolution. But the coordinates should be in the same image coordinate system. Let me check... The crops.csv has img_w, img_h which should match the actual image dimensions. And dets.csv also has img_w, img_h. So the coordinates should be directly comparable.
+
+Actually, I realize there might be an issue. If crops.csv has both high and low resolution versions of the same image, the coordinates might be different (scaled). But looking at the data format, it says "image" is the filename, and x1,y1,x2,y2 are in image coordinates. If the same image appears at both high and low res, the coordinates would be different (scaled by the resolution ratio).
+
+Hmm, but actually I think "high" and "low" refer to the resolution of the image, not the box. So if an image is at high res (say 1920x1080) and low res (say 960x540), the box coordinates would be in the respective image's coordinate system.
+
+For matching detector boxes to ground truth, I should use the same resolution image. But wait - the detector was run on specific images. The dets.csv has img_w, img_h for each detection. The crops.csv also has img_w, img_h. So I should match based on the same image AND same resolution (or at least same img_w/img_h).
+
+Actually, let me simplify: I'll match based on the image name AND check that img_w and img_h are the same (within some tolerance). Or better yet, I'll normalize coordinates by img_w and img_h to make them resolution-independent.
+
+Let me use normalized coordinates for the IoU computation:
+- nx1 = x1 / img_w, ny1 = y1 / img_h, nx2 = x2 / img_w, ny2 = y2 / img_h
+
+This way, I can match boxes regardless of resolution.
+
+Actually, even simpler: I'll group crops by (image, img_w, img_h) and only match detector boxes to crops with the same image and same dimensions. This is the safest approach.
+
+Wait, but what if the detector was run on high-res images and the crops only have low-res boxes? Then I'd need to scale. Let me just use normalized coordinates to be safe.
+
+Let me revise:
+
+```python
+def compute_iou_norm(d, c):
+    # Normalize to [0,1] using each box's image dimensions
+    dx1 = d["x1"] / d["img_w"], dy1 = d["y1"] / d["img_h"]
+    dx2 = d["x2"] / d["img_w"], dy2 = d["y2"] / d["img_h"]
+    cx1 = c["x1"] / c["img_w"], cy1 = c["y1"] / c["img_h"]
+    cx2 = c["x2"] / c["img_w"], cy2 = c["y2"] / c["img_h"]
+    
+    ix1 = max(dx1, cx1), iy1 = max(dy1, cy1)
+    ix2 = min(dx2, cx2), iy2 = min(dy2, cy2)
+    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+    area_d = (dx2 - dx1) * (dy2 - dy1)
+    area_c = (cx2 - cx1) * (cy2 - cy1)
+    union = area_d + area_c - inter
+    return inter / union if union > 0 else 0
+```
+
+This is O(N_dets * N_crops_per_image) which could be slow if there are many boxes. Let me think about the scale...
+
+From the log: "train 6052 boxes, eval 41879 detections, 1022 images". So there are about 6052 training crops. The dets.csv train split might have a similar or larger number. With 1022 images, that's about 6 boxes per image on average. So the matching should be fast.
+
+Actually, I don't know how many train detections there are. It could be much more than 6052 (the detector produces many more boxes than there are actual defects). But even if it's 50,000 train dets, with ~6 crops per image, the matching is 50000 * 6 = 300,000 IoU computations, which is fine.
+
+Let me now write the full code. I'll keep the changes minimal and focused:
+
+1. Add NUM_CLASSES = 5
+2. Add label_det_boxes function
+3. Change training to use labeled det boxes
+4. Change model to 5 classes
+5. Change scoring
+
+Let me also think about whether I should keep TRAIN_ON = ("high",) or change it. Since I'm now training on detector boxes (not crops), the TRAIN_ON filter doesn't apply the same way. The detector boxes are on specific images, and I need to match them to crops. I should use all crops for matching (both high and low res), since the detector might have been run on either resolution.
+
+Actually, I realize I should check: are the train detector boxes on the same images as the crops? The brief says "dets.csv split 'train'" are "on training images (their true class can be found by overlap with crops.csv)". So yes, they're on the same images.
+
+Let me finalize my approach:
+
+1. Load all crops.csv (both high and low) for matching purposes
+2. Load dets.csv, split into train and eval
+3. For train dets: label by overlap with crops (normalized IoU > 0.5 → class, else → 4)
+4. Train on labeled train dets (using the det box coordinates for cropping)
+5. At inference: 5-class model, score_c = conf * p[c] * (1 - p[4])
+
+One more thought: should I filter out train dets with very low confidence? The detector conf might be useful as a signal - very low conf boxes are more likely false alarms. But I'll keep all of them for now and let the model learn.
+
+Actually, I should also consider: what if a train det box overlaps with multiple GT boxes of different classes? I'll take the one with the highest IoU. This is standard.
+
+Let me also think about the IoU threshold. 0.5 is the standard for detection matching. But for training a crop classifier, maybe I should be more lenient. If a det box has IoU 0.4 with a GT box, it's still mostly on the defect. But if I label it as background, the model learns to reject it, which might hurt. Let me use 0.3 as the threshold - this is more lenient and should give the model more positive examples.
+
+Actually, let me stick with 0.5 for now. It's the standard, and it's what mAP@0.5 uses. If a box doesn't match at IoU 0.5, it's not a valid detection, so labeling it as background is consistent.
+
+Hmm, but wait. There's a subtlety. In mAP@0.5, a detection is a true positive if it matches a GT box at IoU >= 0.5. But for training, I want the model to recognize the defect even if the box is slightly off. Using IoU > 0.5 for labeling means the model only sees "clean" matches as positives, and everything else as background. This might be too strict.
+
+Let me use a lower threshold for training labels, say 0.3. This way, boxes that are mostly on the defect (even if not perfectly aligned) are labeled as the correct class. Only boxes that barely overlap or don't overlap at all are labeled as background.
+
+Actually, you know what, let me think about this differently. The purpose of the background class is to help with ranking: false alarms should get low scores. If I use IoU > 0.5, then boxes that are slightly off (IoU 0.3-0.5) get labeled as background. At inference, these boxes would get suppressed scores. But in mAP@0.5, a box with IoU 0.4 with a GT is NOT a true positive (it's a false positive). So labeling it as background is actually correct for the scoring metric!
+
+Wait no, IoU 0.4 < 0.5, so it IS a false positive in mAP@0.5. So labeling it as background is correct.
+
+But what about a box with IoU 0.51? It's a true positive in mAP@0.5, and with threshold 0.5, it gets labeled as the correct class. Good.
+
+What about a box with IoU 0.49? It's a false positive in mAP@0.5, and with threshold 0.5, it gets labeled as background. Also good - the model learns to suppress it.
+
+So IoU > 0.5 is actually the right threshold for training labels, because it's consistent with the evaluation metric.
+
+OK let me go with 0.5.
+
+Now let me write the actual code changes. I need to be careful to keep the edit focused and the SEARCH blocks exact.
+
+Let me identify the changes:
+
+1. Add `NUM_CLASSES = 5` to settings
+2. Add `compute_iou` and `label_det_boxes` functions
+3. In main(): 
+   - Load all crops (not just TRAIN_ON) for matching
+   - Get train dets and label them
+   - Use labeled train dets for training
+   - Create model with 5 classes
+   - Modify scoring
+
+Let me write this out:
+
+```python
+NUM_CLASSES = 5  # 4 defect classes + 1 background
+```
+
+For the labeling function, I'll add it after the settings:
+
+```python
+def compute_iou_norm(d, c):
+    dx1, dy1 = d["x1"] / d["img_w"], d["y1"] / d["img_h"]
+    dx2, dy2 = d["x2"] / d["img_w"], d["y2"] / d["img_h"]
+    cx1, cy1 = c["x1"] / c["img_w"], c["y1"] / c["img_h"]
+    cx2, cy2 = c["x2"] / c["img_w"], c["y2"] / c["img_h"]
+    ix1, iy1 = max(dx1, cx1), max(dy1, cy1)
+    ix2, iy2 = min(dx2, cx2), min(dy2, cy2)
+    inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+    ad = (dx2 - dx1) * (dy2 - dy1)
+    ac = (cx2 - cx1) * (cy2 - cy1)
+    union = ad + ac - inter
+    return inter / union if union > 0 else 0.0
+
+
+def label_det_boxes(dets_train, crops):
+    """Label detector boxes: class if IoU>0.5 with a GT crop, else background (4)."""
+    from collections import defaultdict
+    crops_by_img = defaultdict(list)
+    for c in crops:
+        crops_by_img[c["image"]].append(c)
+    labels = []
+    for d in dets_train:
+        best_iou, best_cls = 0.0, 4
+        for c in crops_by_img.get(d["image"], []):
+            iou = compute_iou_norm(d, c)
+            if iou > best_iou:
+                best_iou, best_cls = iou, c["cls"]
+        labels.append(best_cls if best_iou > 0.5 else 4)
+    return labels
+```
+
+In main(), the changes:
+- Load all crops for matching: `all_crops = read_csv(...)` 
+- Get train dets: `tr = [d for d in dets if d["split"] == "train"]`
+- Label them: `tr_labels = label_det_boxes(tr, all_crops)`
+- Create training rows with labels
+- Use these for training
+
+Let me now think about the BoxDataset. Currently it takes `rows` which have a "cls" field. I need to modify the train rows to have the label. I can just set `d["cls"] = label` for each train det.
+
+Actually, the BoxDataset uses `r.get("cls", -1)` for the label. So I just need to set the "cls" field on the train det rows.
+
+Let me restructure main():
+
+```python
+# Load data
+all_crops = read_csv(os.path.join(args.data, "crops.csv"))
+dets = read_csv(os.path.join(args.data, "dets.csv"))
+ev = [d for d in dets if d["split"] == "eval"]
+tr = [d for d in dets if d["split"] == "train"]
+
+# Label train dets
+tr_labels = label_det_boxes(tr, all_crops)
+for d, l in zip(tr, tr_labels):
+    d["cls"] = l
+
+# Load images
+needed = {d["image"] for d in tr} | {d["image"] for d in ev}
+images = {p: ... for p in needed}
+
+# Create datasets
+dl_tr = DataLoader(BoxDataset(tr, images, True), ...)
+dl_ev = DataLoader(BoxDataset(ev, images, False), ...)
+
+# Model
+model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=NUM_CLASSES)
+```
+
+And for scoring:
+```python
+for d, p in zip(ev, probs):
+    bg = float(p[4])
+    for c in range(4):
+        s = d["conf"] * float(p[c]) * (1.0 - bg)
+        if s > MIN_SCORE:
+            w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+
+This looks good. Let me now write the actual SEARCH/REPLACE blocks.
+
+I need to be very careful with the exact text matching. Let me go through the file line by line and identify what to change.
+
+Changes:
+1. In settings: add NUM_CLASSES = 5
+2. After settings (before read_csv or after make_crop): add compute_iou_norm and label_det_boxes functions
+3. In main(): change data loading and training setup
+4. In main(): change model creation
+5. In main(): change scoring
+
+Let me be precise about the SEARCH blocks.
+
+Actually, let me reconsider the approach. The current code uses `crops` (filtered by TRAIN_ON) for training. I need to change this to use `tr` (labeled detector boxes). The key changes in main() are:
+
+Current:
+```python
+    crops = [r for r in read_csv(os.path.join(args.data, "crops.csv")) if r["res"] in TRAIN_ON]
+    dets = read_csv(os.path.join(args.data, "dets.csv"))
+    ev = [d for d in dets if d["split"] == "eval"]
+    needed = {r["image"] for r in crops} | {d["image"] for d in ev}
+```
+
+New:
+```python
+    all_crops = read_csv(os.path.join(args.data, "crops.csv"))
+    dets = read_csv(os.path.join(args.data, "dets.csv"))
+    ev = [d for d in dets if d["split"] == "eval"]
+    tr = [d for d in dets if d["split"] == "train"]
+    tr_labels = label_det_boxes(tr, all_crops)
+    for d, l in zip(tr, tr_labels):
+        d["cls"] = l
+    needed = {d["image"] for d in tr} | {d["image"] for d in ev}
+```
+
+And the DataLoader:
+Current:
+```python
+    dl_tr = torch.utils.data.DataLoader(BoxDataset(crops, images, True), batch_size=BATCH_SIZE, shuffle=True,
+```
+
+New:
+```python
+    dl_tr = torch.utils.data.DataLoader(BoxDataset(tr, images, True), batch_size=BATCH_SIZE, shuffle=True,
+```
+
+And the print:
+Current:
+```python
+    print(f"train {len(crops)} boxes, eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
+```
+
+New:
+```python
+    print(f"train {len(tr)} boxes ({sum(1 for l in tr_labels if l < 4)} defect, {sum(1 for l in tr_labels if l == 4)} bg), eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
+```
+
+And model:
+Current:
+```python
+    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
+```
+
+New:
+```python
+    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=NUM_CLASSES)
+```
+
+And scoring:
+Current:
+```python
+    for d, p in zip(ev, probs):
+        for c in range(4):
+            s = d["conf"] * float(p[c])
+            if s > MIN_SCORE:
+                w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+
+New:
+```python
+    for d, p in zip(ev, probs):
+        bg = float(p[4])
+        for c in range(4):
+            s = d["conf"] * float(p[c]) * (1.0 - bg)
+            if s > MIN_SCORE:
+                w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+
+OK, I think this is a solid experiment. Let me write it up.
+
+Wait, one more thought: the number of training samples might be different. The current code trains on 6052 boxes (crops). The new code trains on however many train dets there are. This could be much more (the detector produces many boxes). If there are, say, 30,000 train dets, the training will take longer per epoch. But the time budget handles this - it just trains until the budget is used up.
+
+Also, I should consider: with 5 classes, the loss might behave differently. But cross-entropy should handle it fine.
+
+One potential issue: if most train dets are background (say 80%), the model might be biased towards background. But that's actually what we want - the detector produces many false alarms, and we want the model to learn to reject them.
+
+However, this could also mean the model becomes too conservative and rejects true defects. The scoring formula `conf * p[c] * (1 - p[bg])` should handle this: for true defects, p[bg] should be low, so the (1-p[bg]) factor is close to 1.
+
+Let me also think about whether I should weight the background class differently. The brief says "Class-weighted loss hurt classification every time it was tried." So I should NOT use class weights. Plain cross-entropy it is.
+
+I'm satisfied with this experiment. Let me write it up.
+
+Actually, one more consideration: the `TRAIN_ON` variable is no longer used. I should remove it or leave it (it won't cause an error). I'll leave it to minimize changes.
+
+Also, I need to make sure the `from collections import defaultdict` is at the top or inside the function. I'll put it inside the function to keep changes local.
+
+Let me finalize the code.
+===== attempt 2 =====
+The user is saying that Block 5's SEARCH text was not found. I need to re-read the current file and copy the exact lines. Let me look at the current best train.py file again.
+
+Looking at the file, the section I need to edit is:
+
+```python
+    for d, p in zip(ev, probs):
+        for c in range(4):
+            s = d["conf"] * float(p[c])
+            if s > MIN_SCORE:
+                w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+
+Wait, let me look more carefully at the actual file content. The file shows:
+
+```python
+    for d, p in zip(ev, probs):
+        for c in range(4):
+            s = d["conf"] * float(p[c])
+            if s > MIN_SCORE:
+                w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+
+Hmm, but the error says it wasn't found. Let me look at the exact indentation in the file. The file uses 4-space indentation. Let me re-read:
+
+```
+    for d, p in zip(ev, probs):
+        for c in range(4):
+            s = d["conf"] * float(p[c])
+            if s > MIN_SCORE:
+                w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+
+Wait, I think the issue might be that in my previous edit, the file was already modified by blocks 1-4, and block 5's search text might have been affected. But no, the blocks are applied sequentially to the same file, and block 5's search text is in a different part of the file that wasn't touched by blocks 1-4.
+
+Let me look very carefully at the original file:
+
+```python
+    for d, p in zip(ev, probs):
+        for c in range(4):
+            s = d["conf"] * float(p[c])
+            if s > MIN_SCORE:
+                w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+
+Actually wait - I need to check if there's a trailing space or something. Let me look at the exact text in the file:
+
+```
+    for d, p in zip(ev, probs):
+        for c in range(4):
+            s = d["conf"] * float(p[c])
+            if s > MIN_SCORE:
+                w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+
+Hmm, I'm copying it exactly. Let me check if maybe the issue is that the previous blocks already modified the file and this text no longer exists. But blocks 1-4 don't touch this area of the file.
+
+Wait, I think the issue might be simpler. Let me re-read the file more carefully:
+
+```python
+    for d, p in zip(ev, probs):
+        for c in range(4):
+            s = d["conf"] * float(p[c])
+            if s > MIN_SCORE:
+                w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+
+Actually, I wonder if the issue is that in the file, the indentation might be different. Let me look at the original file text again very carefully:
+
+```
+    for d, p in zip(ev, probs):
+        for c in range(4):
+            s = d["conf"] * float(p[c])
+            if s > MIN_SCORE:
+                w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+
+This looks right to me. But the error says it wasn't found. Maybe there's a subtle difference. Let me try a different approach - I'll use a smaller, more unique search string.
+
+Actually, I realize the issue might be that the SEARCH text needs to match EXACTLY what's in the file. Let me look at the file one more time...
+
+The file has:
+```
+    for d, p in zip(ev, probs):
+        for c in range(4):
+            s = d["conf"] * float(p[c])
+            if s > MIN_SCORE:
+                w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+
+I'm going to try again with the exact same text. Maybe there was a copy-paste issue in my previous response. Let me be very careful this time.
+
+Actually, I wonder if the issue is that the file uses a different quote style or has some invisible character. Let me just try again with the exact text, being very careful about every character.
+
+Let me re-examine: the file shows `w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1` - note the semicolon and the `n += 1` on the same line.
+
+I'll try using a slightly different anchor point to make sure it's found. Let me use the line before it as context.
+===== attempt 3 =====
+I need to look at the current file and find the exact text for the prediction loop. Let me look at the current best train.py that was shown. The prediction section is:
+
+```python
+    # Classify every eval detection; one prediction per class with score = detector conf x class probability.
+    model.eval()
+    probs = []
+    with torch.no_grad(), torch.autocast(**amp):
+        for xt, xw, _ in dl_ev:
+            xt = xt.to(device).to(memory_format=torch.channels_last)
+            xw = xw.to(device).to(memory_format=torch.channels_last)
+            probs.append(torch.softmax(((model(xt) + model(xw)) / 2).float(), 1).cpu())
+    probs = torch.cat(probs).numpy()
+    os.makedirs(args.out, exist_ok=True)
+    n = 0
+    with open(os.path.join(args.out, "preds.csv"), "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["det_id", "cls", "score"])
+        for d, p in zip(ev, probs):
+            for c in range(4):
+                s = d["conf"] * float(p[c])
+                if s > MIN_SCORE:
+                    w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+
+So the exact text is:
+```
+    with open(os.path.join(args.out, "preds.csv"), "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["det_id", "cls", "score"])
+        for d, p in zip(ev, probs):
+            for c in range(4):
+                s = d["conf"] * float(p[c])
+                if s > MIN_SCORE:
+                    w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+
+The issue was that my SEARCH text started with `for d, p in zip(ev, probs):` which has 8 spaces of indentation (2 levels of 4 spaces). Let me count: it's inside `main()`, inside `with open(...)`, so it's 8 spaces. Let me look again:
+
+```
+    with open(os.path.join(args.out, "preds.csv"), "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["det_id", "cls", "score"])
+        for d, p in zip(ev, probs):
+            for c in range(4):
+                s = d["conf"] * float(p[c])
+                if s > MIN_SCORE:
+                    w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+
+So `for d, p in zip(ev, probs):` has 8 spaces. `for c in range(4):` has 12 spaces. `s = d["conf"] * float(p[c])` has 16 spaces. `if s > MIN_SCORE:` has 16 spaces. `w.writerow(...)` has 20 spaces.
+
+My previous SEARCH had:
+```
+    for d, p in zip(ev, probs):
+        for c in range(4):
+            s = d["conf"] * float(p[c])
+            if s > MIN_SCORE:
+                w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+
+That has 4 spaces for `for d, p`, 8 for `for c`, 12 for `s =`, 12 for `if`, 16 for `w.writerow`. But the actual file has 8, 12, 16, 16, 20. So my indentation was wrong - I was missing 4 spaces on each line.
+
+Let me use the correct indentation now. I'll use a broader SEARCH block that includes the `with open` line to be safe.

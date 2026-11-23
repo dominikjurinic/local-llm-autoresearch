@@ -1,0 +1,236 @@
+===== attempt 1 =====
+Let me analyze the situation carefully.
+
+**Current state:**
+- Best: e005, 5-seed val mAP@0.5 = 0.6345
+- Per-class: pore 0.505, deposit 0.639, discontinuity 0.781, stain 0.613
+- 19 experiments so far, many crashed/rejected
+
+**Key diagnostics:**
+- mAP if every box had correct class: 0.7464 (yours: 0.6345). The gap is 0.112 — this is what wrong classes cost.
+- Confusion matrix on boxes overlapping true defects:
+  - pore: 62% right, 21/75 predicted as stain
+  - deposit: 80% right, 48/269 predicted as stain
+  - discontinuity: 96% right
+  - stain: 90% right, 41/611 predicted as deposit
+
+The biggest error source: pore→stain (21 cases) and deposit→stain (48 cases). Stain is being confused with pore and deposit.
+
+**What's been tried and failed:**
+- Data: detector boxes as training data (e001, e002, e009, e016, e017) - multiple crashes, e002 got 0.6307, e009 rejected at 0.6325
+- Jitter/simulation: e003 (0.6294), e008 (crashed), e010 (0.6335) - no confirmed gain
+- Architecture: e005 (new best, 0.6345), e006 (wider MLP, rejected), e007 (box size input, not confirmed)
+- Inference: e011 (TTA flips, timeout)
+- Optimisation: e004 (precompute, bug), e012 (precompute, crashed), e013 (num_workers=0, timeout), e014 (on-demand decode, not confirmed), e015 (uint8 views, rejected), e019 (SWA, crashed)
+- Loss: e018 (margin loss, not confirmed)
+
+**What went wrong with e019 (SWA):**
+The crash is because `state_dict()` includes the head's weight which is float, but also... wait, the error says "result type Float can't be cast to the desired output type Long". This means one of the tensors in state_dict is Long type. That would be... hmm, actually looking at the model, it's a timm backbone + MLP head. All parameters should be float. Unless... the backbone has some integer parameter? Actually, some timm models might have a `num_classes` buffer or something. Wait, no - `num_classes=0` means no classification head. 
+
+Actually, looking more carefully: the error is at `swa_avg[k].mul_(0.98).add_(v, alpha=0.02)`. The issue is that `swa_avg` was created with `v.clone()` which preserves dtype. If `v` is a Long tensor (maybe a buffer like `num_batches_tracked` in BatchNorm), then `swa_avg[k]` is Long and `mul_(0.98)` would fail because you can't multiply a Long tensor by a float in-place.
+
+Actually wait - `mul_(0.98)` on a Long tensor would try to cast 0.98 to Long, which gives 0, but the error says "result type Float can't be cast to the desired output type Long". So the operation produces a Float result but the in-place target is Long. This confirms there's a Long buffer in the state_dict.
+
+The fix: only average float parameters, skip non-float tensors. Or better, only average `model.parameters()` (which are all float) rather than `state_dict()` (which includes buffers).
+
+**Now, what should I do next?**
+
+Let me think about what's most promising:
+
+1. **Fix SWA (e019)**: The crash is a simple bug - averaging buffers that are Long. The fix is to only average float parameters. SWA could help because the loss is still falling at the cut (0.169 at step 436). By maintaining a running average in the last 30% of training, we might get a better final model. This is a low-risk fix with potential to help.
+
+2. **Detector boxes as training data**: This has been tried 5+ times with crashes. The idea is sound (train on the actual distribution of boxes the model will see at test time) but it keeps crashing. The crashes were:
+   - e001: broadcasting bug in IoU
+   - e016: `np.asarray(cands)` on list of dicts
+   - e017: fix for e016 still crashed
+   - e002: fixed e001's bug, got 0.6307 (not confirmed)
+   - e009: got 0.6325 (rejected)
+   
+   So it was properly implemented twice (e002, e009) and got 0.6307 and 0.6325 - both below the current best of 0.6345. This direction seems exhausted - it doesn't help even when implemented correctly.
+
+3. **The confusion pattern**: pore→stain and deposit→stain are the main errors. The guide says "Look for one change that helps the whole pore / deposit / stain confusion, not one class." 
+
+   What could help with the pore/deposit/stain confusion?
+   - The current model sees 1.5x and 2.5x crops. Pore and stain might look different at different scales.
+   - Actually, looking at the confusion: stain is being confused WITH pore and deposit (stain→deposit: 41, deposit→stain: 48, pore→stain: 21, stain→pore: 9). So stain is both over-predicted (from deposit and pore) and under-predicted (as deposit).
+   
+   Wait, let me re-read: rows = true class, columns = chosen class.
+   - true pore → stain: 21 (pore misclassified as stain)
+   - true deposit → stain: 48 (deposit misclassified as stain)
+   - true stain → deposit: 41 (stain misclassified as deposit)
+   - true stain → pore: 9 (stain misclassified as pore)
+   
+   So the main confusion is:
+   - deposit ↔ stain (48 + 41 = 89 total)
+   - pore → stain (21)
+   
+   This is a texture/appearance confusion. What could help?
+   - Higher resolution for these specific classes? But resolution changes have been tried (9 attempts, no gain).
+   - Different crop contexts? The 2.5x context might not be enough to distinguish stain from deposit.
+   - Actually, the guide mentions "combine the two views better than averaging logits, for example one shared backbone whose pooled features from both crops are joined before a small head" - this is exactly what e005 did (concatenate features, MLP head). And it worked (+0.0057).
+
+4. **Training steps**: The log shows 436 steps in ~125s of training. Loss is still falling (0.169 at the end). More steps would help. The optimisation category has been tried 6 times with 4 crashes/timeouts. But the specific issue is that epoch 0 takes 44s (vs 18s for later) due to worker initialization and image loading.
+
+   Actually, looking at the log more carefully:
+   - Load: 13s
+   - Epoch 0: 94 steps in 44s (57-13)
+   - Epoch 1: 94 steps in 18s (75-57)
+   - Epoch 2: 94 steps in 18s
+   - Epoch 3: 94 steps in 19s
+   - Epoch 4: 60 steps in 13s
+   - Total training: ~125s
+   - Prediction: ~37s (162-125)
+   
+   The first epoch is slow due to worker startup. If we could eliminate that, we'd get ~20 more steps. But this has been tried (e013, e014, e015) without success.
+
+5. **SWA fix**: This is the most immediate thing to do. The crash is a simple bug. SWA is a well-known technique that can help when training is cut short (which it is - loss still falling). The fix is straightforward: only average float parameters.
+
+Let me go with fixing the SWA crash. The hypothesis:
+- The crash was because `state_dict()` includes non-float buffers (like BatchNorm's `num_batches_tracked` which is Long). Fixing this to only average float parameters should make SWA work.
+- SWA should help because the model is undertrained (loss still falling at 0.169 when training stops). Averaging weights in the last 30% of training should find a better minimum.
+- This differs from e019 only in the bug fix; the underlying idea (SWA) hasn't been properly tested yet.
+
+Let me write the fix:
+
+```python
+if frac >= SWA_START:
+    if swa_avg is None:
+        swa_avg = {k: v.clone() for k, v in model.named_parameters() if v.dtype == torch.float32}
+    else:
+        for k, v in model.named_parameters():
+            if v.dtype == torch.float32:
+                swa_avg[k].mul_(0.98).add_(v, alpha=0.02)
+```
+
+Wait, but `named_parameters()` returns parameters, not buffers. That's the right approach - only average parameters (which are all float), not buffers.
+
+And for loading back:
+```python
+if swa_avg is not None:
+    model.load_state_dict({**model.state_dict(), **swa_avg}, strict=False)
+```
+
+Actually, `load_state_dict` with `strict=False` should work if we pass a partial dict. Or we can just do:
+```python
+if swa_avg is not None:
+    for k, v in model.named_parameters():
+        if k in swa_avg:
+            v.data.copy_(swa_avg[k])
+```
+
+Let me look at the exact code in e019 to make sure my SEARCH/REPLACE is correct.
+
+From the diff, the relevant sections in e019 are:
+
+```python
+    # Train until the budget minus the reserve is used up.
+    # Phase 1 (first 70%): 5% linear warm-up, then cosine decay to SWA_FRAC * LR.
+    # Phase 2 (last 30%): constant LR = SWA_FRAC * LR while maintaining a running
+    # average of the weights (SWA); the averaged weights are used for prediction.
+    SWA_FRAC = 0.1
+    SWA_START = 0.70
+    t_start = time.time()
+    t_end = deadline - RESERVE_S
+    budget = max(1.0, t_end - t_start)
+    steps, epoch, done = 0, 0, False
+    swa_avg = None
+    model.train()
+```
+
+And the SWA update:
+```python
+            if frac >= SWA_START:
+                if swa_avg is None:
+                    swa_avg = {k: v.clone() for k, v in model.state_dict().items()}
+                else:
+                    for k, v in model.state_dict().items():
+                        swa_avg[k].mul_(0.98).add_(v, alpha=0.02)
+```
+
+And the loading:
+```python
+    if swa_avg is not None:
+        model.load_state_dict(swa_avg)
+        print(f"using SWA-averaged weights from {steps} steps", flush=True)
+```
+
+The fix:
+1. In the SWA update, use `model.named_parameters()` instead of `model.state_dict().items()`
+2. In the loading, use a loop over parameters instead of `load_state_dict`
+
+Let me write this carefully. I'll use BASE: last since I'm fixing e019.
+
+Actually wait - let me re-read the rules. "Every change is applied on top of the current best train.py (or the most recent version with BASE: last)." So BASE: last means I'm editing e019's train.py.
+
+Let me write the SEARCH/REPLACE blocks:
+
+Block 1: Fix the SWA initialization and update
+```
+SEARCH:
+            if frac >= SWA_START:
+                if swa_avg is None:
+                    swa_avg = {k: v.clone() for k, v in model.state_dict().items()}
+                else:
+                    for k, v in model.state_dict().items():
+                        swa_avg[k].mul_(0.98).add_(v, alpha=0.02)
+REPLACE:
+            if frac >= SWA_START:
+                if swa_avg is None:
+                    swa_avg = {k: v.clone() for k, v in model.named_parameters()}
+                else:
+                    for k, v in model.named_parameters():
+                        swa_avg[k].mul_(0.98).add_(v, alpha=0.02)
+```
+
+Block 2: Fix the loading
+```
+SEARCH:
+    if swa_avg is not None:
+        model.load_state_dict(swa_avg)
+        print(f"using SWA-averaged weights from {steps} steps", flush=True)
+REPLACE:
+    if swa_avg is not None:
+        for k, v in model.named_parameters():
+            if k in swa_avg:
+                v.data.copy_(swa_avg[k])
+        print(f"using SWA-averaged weights from {steps} steps", flush=True)
+```
+
+This should fix the crash. The `named_parameters()` only returns float parameters (all learnable params in a timm model + MLP head are float32), so the in-place operations will work.
+
+Let me double-check: in the timm EfficientNet-B0 with `num_classes=0`, the parameters are all float32. The buffers include things like BatchNorm running_mean, running_var (float32) and num_batches_tracked (int64/Long). By using `named_parameters()` we skip all buffers, which is what we want for SWA (we only want to average the learnable weights).
+
+This is a clean, low-risk fix. The hypothesis is that SWA will help because:
+1. The model is undertrained (loss 0.169 and falling at the cut)
+2. SWA is known to improve generalization when training is cut short
+3. The fix is minimal and the underlying idea hasn't been properly tested
+
+Expected gain: modest, maybe +0.003 to +0.008. It might not be enough to pass the acceptance threshold on its own, but it's a safe experiment that either confirms or rules out SWA, and if it works, we can build on it.
+
+Actually, let me reconsider. Is there something more impactful I should do?
+
+Looking at the diagnostics again:
+- pore 0.505 is the weakest class
+- The main confusion is deposit↔stain and pore→stain
+- The gap between my mAP and "perfect classes" is 0.112
+
+The guide says to focus on "Close the box-quality gap" as the main phase. The directions are:
+1. Simulate detector errors (tried in e003, e008, e010 - no confirmed gain)
+2. Weight/sample by box quality (not explicitly tried)
+3. Combine views better (e005 did this - it's the current best)
+
+Hmm, "weight or sample training boxes by box quality" - this hasn't been tried. The idea would be: during training, weight the loss for each sample based on how well the training box matches what a detector box would look like. But wait, the training boxes are ground truth (perfect boxes), so they're all "high quality". The issue is that at test time, the boxes are detector boxes (imperfect). 
+
+Actually, the more I think about it, the detector boxes as training data (e002, e009) IS the way to address box quality, and it didn't help (0.6307, 0.6325). So that direction is exhausted.
+
+What about the confusion pattern? Pore→stain (21 cases), deposit→stain (48), stain→deposit (41). 
+
+One thing that could help: the 2.5x context crop. Stain and deposit might look different in terms of their surrounding context. If stain is a broader, more diffuse marking while deposit is a localized bump, the wider context might help distinguish them. But the current model already uses 2.5x context.
+
+What about a THIRD view at an even wider context (like 4x)? This was tried in earlier runs (3 attempts, "accepted twice (5-seed 0.6342 both, +0.005), gain almost entirely from the pore class"). But those were on the OLD base (logit averaging), not on e005 (feature concatenation). And the gain was small (+0.005) and mainly from pore.
+
+Actually, I think the SWA fix is the most sensible next step. It's low-risk, the underlying idea is sound, and it directly addresses the "undertrained" problem. Let me go with it.
+
+Wait, one more thought: could I combine SWA with a slightly longer training (reduce RESERVE_S)? The prediction takes ~37s, and RESERVE_S is 55. If I reduce it to 45, I get 10 more seconds of training. But e012 tried this and crashed. And the guide says "a reserve that matches the measured prediction time with a safety margin". 37s prediction + 10s safety = 47s. So RESERVE_S=47 would be safe. But this is a minor tweak and might not be worth a separate experiment.
+
+Let me stick with the SWA fix. It's clean, low-risk, and tests a hypothesis that hasn't been properly evaluated yet.

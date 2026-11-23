@@ -1,0 +1,351 @@
+===== attempt 1 =====
+Let me analyze the situation carefully.
+
+**Current state:**
+- Best: 0.6288 mAP@0.5 (5-seed mean)
+- Per-class AP: pore 0.502, deposit 0.624, discontinuity 0.780, stain 0.609
+- Ceiling with perfect classes: 0.758
+- Single-class "defect": 0.755
+- One-step baseline to beat: 0.638
+
+**Key diagnostics:**
+- Class confusion matrix (on boxes overlapping true defects):
+  - pore: 63% right (48/76) — 20 confused with stain, 6 with deposit
+  - deposit: 78% right (210/269) — 55 confused with stain
+  - discontinuity: 96% right (443/460)
+  - stain: 88% right (540/614) — 46 confused with deposit
+- mAP with correct classes but same scores: 0.7461 vs my 0.6288. Difference = 0.117 lost to wrong classes.
+- Gap to perfect-classes ceiling (0.758): my scores cost 0.758 - 0.7461 = 0.012 compared to detector conf.
+
+So the biggest loss is in class decision: 0.117 mAP. The score ranking costs only 0.012.
+
+**What's been tried (from the 5 earlier runs):**
+1. Score row manipulation (16 attempts): no gain. AP depends only on order within class.
+2. Background class (9 attempts): no gain.
+3. Detector boxes from train as extra data (6 attempts): +0.004, accepted twice.
+4. Third wide view (3 attempts): +0.005, accepted twice, mostly pore.
+5. Low-res crops (4 attempts): no gain.
+6. Bigger backbone / ensembles (8 attempts): no gain.
+7. Resolution / small-box handling (9 attempts): no gain.
+8. TTA (8 attempts): no gain.
+9. Longer training (6 attempts): no gain.
+10. Class-balanced sampling / weighted loss (4 attempts): no gain.
+11. Training augmentation (5 attempts): no gain.
+12. Focal loss (2 attempts): no gain.
+13. Box size/aspect as extra input (4 attempts): never properly tested.
+
+**Where is the error?**
+
+The confusion matrix shows:
+- Pore → stain: 20 cases (biggest single confusion)
+- Deposit → stain: 55 cases
+- Stain → deposit: 46 cases
+- Pore → deposit: 6 cases
+
+So the main confusions are:
+1. Deposit ↔ stain (55 + 46 = 101 cases)
+2. Pore → stain (20 cases)
+
+Pore is the weakest class (0.502 AP). It's confused with stain (20) and deposit (6).
+
+**What could help?**
+
+The per-class APs are: pore 0.502, deposit 0.624, discontinuity 0.780, stain 0.609.
+
+Pore is the weakest. Let me think about what makes pore different. Pores are small circular holes in the weld bead. Stains are surface discolorations. Deposit is extra material.
+
+The key insight: the confusion is between visually similar classes. The current model uses 160px crops with 1.5x and 2.5x context.
+
+**Ideas not yet tried:**
+
+1. **Box size/aspect as extra input** — never properly tested (4 attempts, 2 crashes, 1 edit failure, 1 run at 0.629). This could help because pore (small, round) vs stain (larger, irregular) vs deposit might have different size distributions. But this was tried and mostly crashed. The one run that worked got 0.629, no gain.
+
+2. **Multi-scale views** — a third view was tried (4x context), accepted twice at +0.005. But that's a "wide" context. What about a TIGHTER view? The current tight is 1.5x. What about 1.0x (just the box)? For pore detection, the tight texture matters. Actually, the "Resolution and small-box handling" family tried 224px and larger MIN_CROP — no gain. But that's different from adding a tighter view.
+
+3. **Training on detector proposals instead of GT boxes** — the Faster R-CNN insight. The current model trains on GT boxes (crops.csv). At test time, it sees detector boxes which are slightly misplaced. Training on detector boxes from the train split was tried (family 3) and gave +0.004. But that's adding detector boxes as extra data, not replacing GT boxes. What about training ONLY on detector boxes (or mixing)? Actually, family 3 added them as extra data. The "R-CNN trains on proposals" idea is somewhat covered.
+
+4. **Concatenating the two views instead of averaging logits** — currently the two views go through the same model and logits are averaged. What if we concatenate the two crop images into a single wider image? That changes what the model sees. But this changes the input format significantly.
+
+5. **Using a different combination of views** — instead of 1.5x and 2.5x, maybe 1.0x and 2.0x? The "Resolution and small-box handling" family tried various things but mostly resolution changes, not view context changes. Actually, the third wide view (4x) was tried. What about replacing one of the existing views?
+
+6. **Ensemble of two different models** — tried (family 6), no gain.
+
+7. **Snapshot ensemble / SWA** — not explicitly tried. SWA averages weights along the training trajectory. This is different from model ensembles (family 6).
+
+8. **Training with the detector conf as a signal** — at test time, we multiply conf × p. But during training, we could weight samples by the detector conf of the overlapping detector box. Boxes the detector is confident about are more likely to be real defects. This is a form of importance weighting. Not explicitly tried.
+
+9. **Using both high and low resolution crops** — TRAIN_ON is currently ("high",). The "Low-resolution crops added to training" family tried adding low-res and got no gain.
+
+10. **Per-class score calibration** — the score is conf × p. But maybe p should be adjusted per class. For example, pore predictions might be systematically overconfident. But "score row manipulation" family tried many things and got no gain. However, that family was about which rows to output and how to rank them. Per-class score scaling that changes the ORDER within a class could help. Actually, scaling all scores of a class by a constant doesn't change the order within that class, so it doesn't change AP for that class. But it changes the ranking ACROSS classes, which doesn't matter for per-class mAP. So per-class scaling is useless for mAP. What matters is the order within each class.
+
+Wait, let me re-read the metric: "mAP@0.5 is computed per class and averaged. For one class, all predictions of that class are sorted by score; a prediction is a hit if it overlaps an unmatched true box of that class by IoU > 0.5."
+
+So for each class, we sort that class's predictions by score. The score is conf × p_class. The order within a class is determined by conf × p_class. Since conf is fixed per box, the order within a class is determined by p_class. So the AP for class c depends on the order of p_c across boxes.
+
+To improve AP for class c, we need to reorder the predictions of class c so that true positives come before false positives. Currently, the score is conf × p_c. If we could boost p_c for boxes that are truly class c and lower it for boxes that are false alarms for class c, that would help.
+
+But the classifier already tries to do this. The issue is that the classifier's p_c isn't discriminative enough.
+
+**Key insight from the diagnostics:**
+- 0.7461 with correct classes but same scores vs 0.6288 actual. The 0.117 gap is from wrong classes.
+- The confusion matrix shows specific patterns: pore→stain (20), deposit→stain (55), stain→deposit (46).
+
+**What's fundamentally different from all tried families?**
+
+Let me think about what hasn't been tried:
+
+1. **Input representation change**: The current model sees two separate crops through the same backbone, averaging logits. What if we:
+   - Concatenate the crops horizontally into one image (so the model sees both scales simultaneously)?
+   - Use a different backbone architecture that's better at fine-grained texture?
+   - Use a higher resolution for the tight crop specifically?
+
+2. **Training strategy**: 
+   - Train on detector proposals (partially tried as extra data)
+   - Use the detector conf as a training weight
+   - Curriculum learning (easy to hard)
+
+3. **Architecture**:
+   - The "bigger backbone" family tried EfficientNet-B2, ResNet-50 — no gain.
+   - What about a different architecture entirely? Like a vision transformer? But timm's available models are limited: convnext_atto, convnext_nano, convnext_pico, efficientnet_b0, efficientnet_b2, mobilenetv3_large_100, regnety_016, resnet18, resnet26d, resnet34, resnet50, tf_efficientnetv2_b0.
+   - ConvNeXt might be better for fine-grained texture. But "bigger or other backbone" was tried with 8 attempts and no gain. However, ConvNeXt specifically wasn't tried (the list says EfficientNet-B2, ResNet-50, 2-3 model ensembles).
+
+Wait, let me re-read: "Bigger or other backbone (EfficientNet-B2, ResNet-50, 2-3 model ensembles) | 8 | no gain: best 5-seed 0.636 (not confirmed), others 0.600-0.631; 1 timeout."
+
+So ResNet-50 and EfficientNet-B2 were tried. ConvNeXt wasn't explicitly mentioned. But the family is "bigger or other backbone" and it's marked as no gain. I should be cautious about trying another backbone.
+
+4. **The tight crop context**: Currently TIGHT_CONTEXT = 1.5. What if we make it tighter (1.0 or 1.2)? For pore detection, the pore itself is small and the texture within the box matters. A 1.5x crop includes 25% extra context on each side. A 1.0x crop would be exactly the box. But "Resolution and small-box handling" tried various things including "enlarged tight crops for small boxes" — no gain.
+
+5. **What about the WIDE crop context?** Currently CONTEXT = 2.5. The third view at 4x was tried and helped pore slightly. What about going wider, like 5x or 6x? Or what about replacing the 2.5x with something else?
+
+6. **A fundamentally different approach to the class decision**: Instead of a crop classifier, what about a comparison-based approach? For example, compare the crop to class prototypes? Or use a metric learning approach?
+
+7. **Using the detector's confidence in a smarter way**: Currently score = conf × p. What if we use a different combination? The "score rows" family tried many things. But what about using the detector conf as a feature in the classifier? I.e., the classifier sees (crop, conf) and outputs class probabilities. This is different from "box size and aspect ratio as extra input" (family 13) which was about geometric features.
+
+Actually, wait. Let me re-examine the problem. The biggest loss is:
+- Pore AP: 0.502 (should be higher)
+- The pore class is confused with stain (20 out of 76 true pore boxes)
+
+What makes a pore look like a stain? Pores are small circular holes. Stains are surface discolorations. At low resolution or with the wrong crop context, they might look similar.
+
+**Idea: Use a tighter crop for the pore-specific features.**
+
+Actually, here's a thought: what if we use a DIFFERENT crop context for each view? Currently both views use the same box but different contexts (1.5x and 2.5x). What if the tight view is 1.0x (exactly the box) and the wide view is 2.0x? Or what if we add a very tight view at 1.0x?
+
+But "Resolution and small-box handling" tried 9 things including various crop sizes and got no gain. I need to be careful.
+
+Let me think about what's truly untried:
+
+**Idea: Train the classifier to distinguish between the specific confusion pairs by using hard example mining or pair-based training.**
+
+No, that's too complex and might not fit in the budget.
+
+**Idea: Use the detector boxes from the train split as the training set (instead of GT boxes), matching the test distribution.**
+
+Family 3 tried adding detector boxes as extra data (+0.004). But what about REPLACING GT boxes with detector boxes? The Faster R-CNN insight says train on proposals. The detector boxes are what the model will see at test time. If we train on detector boxes (which are slightly misplaced), the model learns to classify what it will actually see. This is fundamentally different from adding them as extra data.
+
+But wait, family 3 was "Detector boxes from the train split as extra training data (IoU > 0.5 with a true box, labelled with its class)" — 6 attempts, accepted twice at +0.004. So adding them helped a little. Replacing GT with detector boxes is a bigger change. But it's in the same family.
+
+**Idea: Use a two-stage approach within stage 2: first a coarse classifier (e.g., is it pore-like or not-pore-like), then a fine classifier.**
+
+Too complex for the budget.
+
+**Idea: Increase the training resolution to 224px.**
+
+"Resolution and small-box handling (224 px, larger MIN_CROP, enlarged tight crops for small boxes) | 9 | no gain: best 5-seed 0.634 (not confirmed); 2 crashes"
+
+So 224px was tried. No gain.
+
+**Idea: Use tf_efficientnetv2_b0 instead of efficientnet_b0.**
+
+This is a different architecture (V2 vs V1). The "bigger or other backbone" family tried EfficientNet-B2 and ResNet-50. tf_efficientnetv2_b0 is a different model. But it's in the same family.
+
+**Idea: Use convnext_nano.**
+
+Same family concern.
+
+**Idea: Change the input format — concatenate the two crops into one image.**
+
+Currently: two separate 160×160 crops, each through the model, logits averaged.
+Alternative: one 160×320 image (two crops side by side), through the model.
+
+This changes what the model sees: it can directly compare the tight and wide views. This is a fundamentally different input representation. It's not in any of the tried families.
+
+But wait, this changes the input size to 160×320, which is non-square. The model would need to handle this. Also, the pretrained weights expect 224×224 (or whatever the default is). Resizing to 160×320 might not be ideal.
+
+Actually, we could make it 224×224 by putting the two crops in a 2×2 grid (each 112×112). But that's a significant change.
+
+**Idea: Use the detector confidence as a training weight.**
+
+During training, for each GT box, find the overlapping detector box (IoU > 0.5) and use its conf as a weight in the loss. Boxes the detector is confident about are more likely to be real, so the model should learn more from them. This is a form of importance weighting that matches the test distribution.
+
+This is different from:
+- Class-weighted loss (family 10): weights by class, not by detector conf
+- Adding detector boxes as data (family 3): adds new samples, doesn't reweight existing ones
+
+This seems like a reasonable, focused change. Let me think about whether it could help.
+
+At test time, the score is conf × p. The AP for class c depends on the order of conf × p_c. If the classifier learns to be more confident on boxes the detector is also confident about (high conf), then the product conf × p_c will better separate true positives from false positives.
+
+But actually, the classifier doesn't see the detector conf during training. It just sees the crop. So there's no reason for it to correlate with the detector conf. By weighting the training loss by detector conf, we're telling the model "focus on getting these boxes right" — and these boxes are the ones the detector is confident about, which are the ones that matter most for the final score.
+
+Hmm, but this is a subtle effect. The model already tries to classify all boxes correctly. Weighting by conf might shift focus but the effect might be small.
+
+**Let me think about the biggest lever.**
+
+The per-class APs: pore 0.502, deposit 0.624, discontinuity 0.780, stain 0.609.
+
+Pore is the weakest. If I could improve pore from 0.502 to, say, 0.60, that's +0.098/4 = +0.0245 mAP. That's a big gain.
+
+What makes pore hard?
+- Pore is confused with stain (20/76 = 26%)
+- Pore is confused with deposit (6/76 = 8%)
+- Pore is the smallest defect type (typically)
+
+The "third wide view" family helped pore specifically (+0.005, "gain almost entirely from the pore class"). This suggests that wider context helps pore. Why? Because pores are small, and without context, a small dark spot could be a stain, a pore, or noise. With wider context, the model can see the weld bead structure and distinguish a pore (hole in the bead) from a stain (surface discoloration).
+
+So the direction of "more context helps pore" is confirmed. The 4x view helped. What about even wider? Or what about a different combination?
+
+Actually, the 4x view was added as a THIRD view (logits averaged over 3 views). It added ~20s per run and was close to the time limit. What if we REPLACE the 1.5x view with a 1.0x view (tighter) and keep the 2.5x? Or replace 2.5x with 4x?
+
+Wait, the current views are 1.5x and 2.5x. The third view at 4x was added on top. What if we change the two views to 1.0x and 4x? That gives a wider range of scales. The tight view (1.0x) would focus on the defect itself, and the wide view (4x) would give lots of context.
+
+But this is in the "Resolution and small-box handling" family or the "third wide view" family. Let me check:
+- "Resolution and small-box handling (224 px, larger MIN_CROP, enlarged tight crops for small boxes)" — this is about pixel resolution and minimum crop size, not about the context multiplier.
+- "Third, very wide view (4x the box) next to the 1.5x and 2.5x crops" — this is about adding a third view.
+
+Changing the context multipliers of the existing two views (e.g., 1.5→1.0, 2.5→4.0) is a new variation. It's not exactly the same as adding a third view or changing pixel resolution.
+
+But I'm worried it's too close to the tried families. Let me think of something more different.
+
+**Idea: Use a different loss function that specifically targets the confusion pairs.**
+
+For example, a contrastive loss that pushes apart the embeddings of pore and stain. Or a margin-based loss.
+
+But focal loss was tried (family 12, no gain). And class-weighted loss (family 10, no gain). A contrastive loss is different, but it's a big change and might not fit in the budget.
+
+**Idea: Use the model's own predictions to generate pseudo-labels for the detector boxes on eval images, then fine-tune.**
+
+This is a form of self-training / pseudo-labeling. But it's risky and might not help.
+
+**Idea: Use a larger batch size to get more stable gradients.**
+
+Currently BATCH_SIZE = 64. With 6052 training boxes, that's ~94 steps per epoch. What if we use BATCH_SIZE = 128 or 256? Fewer steps but each step is more stable. Under a fixed time budget, fewer steps might hurt. But with a cosine LR schedule that decays to zero, the number of steps matters.
+
+Actually, the log shows 433 steps in ~125s of training. Each step is ~0.29s. With BATCH_SIZE=128, each step would be ~0.58s, so ~216 steps in 125s. That's half the steps. Probably not helpful.
+
+**Idea: Use a learning rate that's higher initially.**
+
+Currently LR = 1e-3 with 5% warmup. What if we use LR = 3e-3? The "optimisation" category hasn't been explicitly tried (except maybe within other families). A higher LR might help the model converge faster within the limited steps.
+
+But this is a small tweak and might not give a 0.01 gain.
+
+**Let me reconsider the problem from scratch.**
+
+The mAP is 0.6288. The ceiling with perfect classes is 0.758. The one-step baseline is 0.638. So I'm just below the baseline.
+
+The error breakdown:
+- Wrong classes cost 0.117 (0.7461 - 0.6288)
+- Score ranking costs 0.012 (0.758 - 0.7461)
+
+The wrong-class error is the big one. The confusion matrix shows:
+- Pore: 63% correct (37% wrong: 20 stain, 6 deposit, 1 discontinuity, 1 no row)
+- Deposit: 78% correct (22% wrong: 55 stain, 2 pore, 2 discontinuity, 1 no row)
+- Discontinuity: 96% correct
+- Stain: 88% correct (12% wrong: 46 deposit, 15 pore, 9 discontinuity, 4 no row)
+
+The main confusions:
+1. Deposit → Stain: 55
+2. Stain → Deposit: 46
+3. Pore → Stain: 20
+4. Stain → Pore: 15
+
+Total wrong: 141 out of 560 (25%).
+
+If I could fix half of the deposit↔stain confusion (50 cases) and half of the pore→stain (10 cases), that's 60 cases fixed. Out of 560 boxes, that's 10.7% improvement in classification accuracy. In terms of mAP, this might translate to ~0.05-0.10 improvement.
+
+**What distinguishes deposit from stain?**
+- Deposit: extra material on the weld surface. It's 3D, raised.
+- Stain: surface discoloration. It's flat, 2D.
+
+In a 2D image, they might look similar (both are dark/colored patches). The difference is subtle texture.
+
+**What distinguishes pore from stain?**
+- Pore: small circular hole. Dark, round.
+- Stain: irregular discoloration.
+
+At small sizes, a pore might look like a small stain.
+
+**Key insight: The model needs to see fine texture to distinguish these. The current 160px crop might not have enough detail.**
+
+But 224px was tried and didn't help. Hmm.
+
+Wait, 224px was tried as part of "Resolution and small-box handling" which also included "larger MIN_CROP" and "enlarged tight crops for small boxes." The 224px change might have been confounded with other changes. Or maybe 224px alone doesn't help because the model's receptive field at 160px already covers the relevant features.
+
+**Let me think about a different angle: the score.**
+
+The score is conf × p. The AP for class c depends on the order of scores within class c. Currently, the order is determined by conf × p_c.
+
+What if the classifier's p_c is not well-calibrated? For example, if the model is overconfident on false positives (p_c high for boxes that aren't class c), then those false positives get high scores and rank above true positives.
+
+One way to fix this: use a different scoring function. But the "score rows" family tried 16 different scoring rules and got no gain.
+
+However, those were all about which rows to output and how to combine conf and p. What about using the model's logit (pre-softmax) instead of the probability? The logit is more spread out and might give better ranking.
+
+Actually, the score is conf × p where p = softmax(logit). If I use conf × exp(logit) instead (unnormalized), the order within a class changes because the denominator of softmax varies per box. This could reorder predictions.
+
+Wait, but the "score rows" family tried "other conf x p rules" — 16 attempts, no gain. So this is probably covered.
+
+**Let me think about what's truly untried and could have a big effect.**
+
+1. **Input representation: concatenate crops** — not tried.
+2. **Train on detector proposals (replace GT)** — partially tried (added as extra).
+3. **Detector conf as training weight** — not tried.
+4. **Different context multipliers for existing views** — close to tried families.
+5. **ConvNeXt backbone** — close to "bigger or other backbone" family.
+6. **tf_efficientnetv2_b0** — close to backbone family.
+7. **Higher LR** — small tweak, probably <0.005.
+8. **Self-training / pseudo-labels** — not tried, but risky.
+9. **Contrastive / metric learning loss** — not tried, but complex.
+10. **Using the image-level context (full image or large crop) as an additional view** — the 4x view was tried. What about 8x or 10x (nearly the full image)?
+
+Actually, wait. Let me re-examine the "third wide view" result. It was accepted twice at 0.6342 (+0.005), gain almost entirely from pore. It added ~20s per run, close to time limit. The current best (0.6288) does NOT include this change (it's the starting point). So the third wide view is available as an improvement but wasn't incorporated into the current best.
+
+Hmm, but the current best is the starting train.py (e000). The earlier runs' accepted changes were on a different codebase. So I can't directly use them.
+
+Actually, re-reading: "Every change is applied on top of the current best train.py (or the most recent version with BASE: last)." The current best is e000, the starting file. So I'm starting fresh.
+
+The earlier runs' results are just information. I need to find something new.
+
+**Let me focus on the most promising untried idea.**
+
+I think the most promising direction is **changing what the model sees** (input representation) rather than tweaking hyperparameters. The tried families that changed the input (third wide view, resolution) got small gains or no gain. But a fundamentally different input representation hasn't been tried.
+
+**Idea: Replace the two-crop logits-averaging with a single concatenated input.**
+
+Instead of:
+- Crop 1 (1.5x) → model → logit 1
+- Crop 2 (2.5x) → model → logit 2
+- Average logit 1 and logit 2
+
+Do:
+- Concatenate Crop 1 and Crop 2 horizontally → single 160×320 image → model → logit
+
+But the model expects square input (or at least, the pretrained weights are for square). 160×320 is non-square. We could resize to 224×224, but that changes the aspect ratio.
+
+Alternative: Use a 2×2 grid. Put the tight crop in the top-left and the wide crop in the bottom-right (or top-right), with the other quadrants being padding. This gives a 224×224 input where each crop is 112×112.
+
+But 112×112 for each crop is lower resolution than the current 160×160. That might hurt.
+
+Alternative: Use 224×224 with each crop at 224×112 (side by side). Resize the input to 224×224 from 224×112? No, that doesn't make sense.
+
+Actually, the simplest approach: keep the two crops at 160×160 each, concatenate to 160×320, then resize to 224×224. The model sees both crops in one image. The aspect ratio change (160×320 → 224×224) distorts the image, but it's a consistent distortion.
+
+Or: keep 160×160 for each, concatenate to 320×160 (vertically), resize to 224×224.
+
+This is a significant change to the input pipeline. Let me estimate the compute cost:
+- Currently: 2 forward passes per sample (one per crop), each 160×160.
+- New: 1 forward pass per sample, 224×224 (after resize from 320×160 or 160×320).
+
+224×224 is larger than 160×160 (1.96x pixels). But it's one forward pass instead of two. So the compute is roughly 1.96/2 = 0.98x — about the same! Actually, slightly less.
+
+Wait, the model's compute scales with input resolution squared. 224Thinking budget reached. Stop thinking now and write the reply in the required format.

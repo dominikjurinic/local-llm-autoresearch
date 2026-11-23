@@ -1,0 +1,332 @@
+===== attempt 1 =====
+Let me start by understanding the current situation.
+
+Current best: 0.6288 mAP@0.5 (5-seed mean).
+
+Key diagnostics:
+- mAP if every box had the correct class but kept my scores: 0.7461. My score: 0.6288. So the wrong-class cost is 0.117! That's huge. The remaining gap to the perfect-class ceiling (0.758) is 0.012, which is what my scores cost compared to the detector's conf.
+
+So the dominant error is the class decision on detector boxes that overlap real defects. This is the train/test mismatch problem: the classifier is trained on true (hand-drawn) boxes but scored on stage-1 detector boxes (slightly misplaced, different sizes).
+
+Per-class: pore 0.502 (weak), deposit 0.624, discontinuity 0.780, stain 0.609.
+
+Confusion matrix on boxes overlapping true defects:
+- pore: 48 right, 6 deposit, 1 disc, 20 stain, 1 no-row → 63% right. Pore is often confused with stain (20) and deposit (6).
+- deposit: 210 right, 2 pore, 2 disc, 55 stain, 1 no-row → 78% right. Deposit confused with stain (55).
+- disc: 443 right → 96%.
+- stain: 540 right, 15 pore, 46 deposit, 9 disc → 88% right.
+
+So the main confusion is pore↔stain and deposit↔stain. Stain is involved in many confusions (20+55+15+46 = 136). Pore is the weakest class.
+
+Now, the research guide says:
+1. Consolidate (first 2-4 experiments): train on detector boxes from the train split (IoU > 0.5 with a true box, labelled with its class), alongside the true boxes. This was accepted twice in earlier runs (5-seed 0.6337 and 0.6342, about +0.004).
+2. Close the box-quality gap (main phase):
+   - simulate detector errors on the true boxes during training: random shifts and scale changes so that the IoU between the jittered box and the true box covers the range the detector produces (about 0.5 to 1.0), instead of the current small crop jitter;
+   - weight or sample training boxes by box quality;
+   - combine the two views better than averaging logits.
+3. Buy training steps.
+4. Fine-grained classes (only after 2 and 3).
+
+Wait, but there's a subtlety. The confusion matrix shows the class decision on boxes that DO overlap real defects. The biggest issue is pore being confused with stain/deposit. Let me think about why.
+
+Actually, let me reconsider. The diagnostic "mAP@0.5 if every box had its correct class but kept your scores: 0.7461" — this means if I just got the class right, I'd be at 0.7461. My current is 0.6288. So getting the class right is worth 0.117. That's the biggest lever by far.
+
+The reason the class is wrong: the classifier sees detector boxes (imperfect) and makes wrong class decisions. Two possible causes:
+1. Train/test mismatch: trained on perfect boxes, tested on imperfect boxes.
+2. The classifier genuinely can't distinguish pore/stain/deposit well.
+
+The guide says treat it as train/test mismatch first. And the confusion matrix is on boxes that overlap real defects — so these boxes are "close enough" to be the right defect, but the classifier picks the wrong type.
+
+Hmm, but wait. If the box overlaps the true defect by IoU > 0.5, then the crop contains the defect. The classifier should be able to tell the type. The fact that it confuses pore/stain suggests either (a) the crop is off enough that it's looking at the wrong region, or (b) the classes are genuinely hard to distinguish.
+
+Let me think about what the first experiment should be. The guide strongly recommends: "Consolidate (first 2-4 experiments). The only idea earlier runs accepted twice is training on detector boxes from the train split (IoU > 0.5 with a true box, labelled with its class), alongside the true boxes. Implement it carefully (vectorised IoU, correct shapes) and confirm it."
+
+This is the recommended first step. It directly addresses the train/test mismatch: the classifier will see detector-quality boxes during training, so at test time the detector boxes are in-distribution. This should help the class decision on detector boxes.
+
+Let me think about how to implement this carefully.
+
+The idea:
+- We have crops.csv: labelled training boxes (id, res, image, x1, y1, x2, y2, img_w, img_h, cls).
+- We have dets.csv: detector boxes (det_id, split, image, x1, y1, x2, y2, img_w, img_h, conf). The "train" boxes are on training images.
+- For each "train" det box, find if it overlaps (IoU > 0.5) with a true box in crops.csv (same image). If so, label the det box with that true box's class. Add these det boxes as extra training data (alongside the true boxes).
+
+Wait, but there's a subtlety: a det box could overlap multiple true boxes. We should pick the one with max IoU, and only if IoU > 0.5.
+
+Also, we need to be careful: the det box coordinates are in the same image coordinate system as crops. Let me verify. Both have x1, y1, x2, y2, img_w, img_h. So yes, same coordinate system.
+
+Let me write the IoU computation. For each train det box, compute IoU with all true boxes in the same image. Vectorised.
+
+Actually, let me think about the size. How many train det boxes are there? The eval has 41879 detections. Train probably similar order. Let me not assume; I'll compute.
+
+Actually wait, the eval has 41879 detections across 1022 images (but eval images are a subset). Let me estimate: total images loaded = 1022. The train det boxes could be a lot. Let me think about the IoU computation cost.
+
+Let me structure it:
+- Group true boxes by image.
+- Group train det boxes by image.
+- For each image, compute pairwise IoU between its det boxes and its true boxes.
+
+Let me think about the number. crops has 6052 boxes (high res) across training images. dets train could be... let me estimate. If eval is 41879 and there are ~1022 images total, and eval is maybe half the images... Actually I don't know the split. Let me just compute it in code and print.
+
+The IoU computation: for each image, if it has D det boxes and T true boxes, that's D*T pairs. Could be large but manageable with numpy vectorization per image.
+
+Let me think about a cleaner vectorized approach. Actually, let me just do it per-image to keep memory bounded.
+
+Let me write:
+
+```python
+def iou_boxes(a, b):
+    # a, b: (N,4) arrays [x1,y1,x2,y2]
+    ax1, ay1, ax2, ay2 = a[:,0], a[:,1], a[:,2], a[:,3]
+    bx1, by1, bx2, by2 = b[:,0], b[:,1], b[:,2], b[:,3]
+    ix1 = np.maximum(ax1[:,None], bx1[None,:])
+    iy1 = np.maximum(ay1[:,None], by1[None,:])
+    ix2 = np.minimum(ax2[:,None], bx2[None,:])
+    iy2 = np.minimum(ay2[:,None], by2[None,:])
+    iw = np.clip(ix2 - ix1, 0, None)
+    ih = np.clip(iy2 - iy1, 0, None)
+    inter = iw * ih
+    area_a = (ax2-ax1)*(ay2-ay1)
+    area_b = (bx2-bx1)*(by2-by1)
+    union = area_a[:,None] + area_b[None,:] - inter
+    return inter / np.clip(union, 1e-9, None)
+```
+
+Then for each image:
+```python
+by_img_true = {}
+for r in crops:
+    by_img_true.setdefault(r["image"], []).append(r)
+by_img_det = {}
+for d in dets:
+    if d["split"] == "train":
+        by_img_det.setdefault(d["image"], []).append(d)
+
+extra = []
+for img, trs in by_img_true.items():
+    if img not in by_img_det:
+        continue
+    ds = by_img_det[img]
+    A = np.array([[r["x1"], r["y1"], r["x2"], r["y2"]] for r in trs])
+    B = np.array([[d["x1"], d["y1"], d["x2"], d["y2"]] for d in ds])
+    I = iou_boxes(B, A)  # (D, T)
+    best = I.argmax(1)
+    best_iou = I[np.arange(len(ds)), best]
+    for i, d in enumerate(ds):
+        if best_iou[i] > 0.5:
+            r = trs[best[i]]
+            extra.append({... d's coords ..., "cls": r["cls"], "image": img})
+```
+
+Then add these to the training rows.
+
+Now, the key question: how to add them to the dataset. The BoxDataset takes rows and images. The rows need x1,y1,x2,y2, image, cls. I'll create row dicts for the extra boxes with the det box coordinates and the true class.
+
+But wait — there's a concern about the number. If there are, say, 20000 train det boxes with IoU > 0.5, that's a lot of extra training data. Combined with 6052 true boxes, that's ~26000 boxes. Each box is 2 crops. That's more data per epoch, so fewer steps per epoch... no wait, more data means more steps per epoch, but the time budget is fixed, so we'd do fewer epochs. Actually with more data, each epoch takes longer, so we do fewer epochs in the same time. The total number of steps is roughly the same (bounded by time). Hmm.
+
+Actually, the concern from the guide: "Every second of training you gain is a free improvement; every slower model, bigger input or extra view must pay for itself in fewer training steps." Adding training data doesn't slow down per-step (same batch size, same model), it just means more steps per epoch. In a fixed time budget, the total number of steps is the same. So adding data is "free" in the sense that it doesn't reduce the step count — it just means we cover more data in the same number of steps. Actually no: if data is 4x, then in the same time we do the same number of steps but each step sees a different (random) subset. The model sees more diverse data. That's the benefit.
+
+Wait, but there's a subtlety with drop_last=True and the DataLoader. With more data, drop_last drops fewer. Fine.
+
+Actually, let me reconsider. The real question is whether training on detector boxes helps. The intuition: the classifier is trained on perfect boxes but tested on detector boxes. If we train on detector boxes (which are imperfect), the classifier learns to be robust to the box placement it will actually see at test time. This is a classic domain adaptation / train-test distribution matching idea (Faster R-CNN trains stage 2 on stage 1 proposals).
+
+This was accepted twice in earlier runs with +0.004. So it's a real but modest gain. The guide says to do it first to consolidate.
+
+Let me estimate the effect. The guide says "A change needs a broad effect across classes and images to be accepted. Effects below ~0.005 cannot be told apart from noise." The earlier gain was +0.004, which is right at the noise boundary. Hmm. But the guide explicitly recommends it as the first consolidation step. And it was accepted twice under a looser rule. Under today's rule (which counts validation image noise), it might not be confirmed. But the guide says "If it is accepted, build on it; if it fails twice, drop it and move on."
+
+Actually, let me reconsider the whole strategy. The dominant error is the class decision (0.117 cost). The confusion is pore↔stain, deposit↔stain. Let me think about what would actually move these.
+
+Hmm, wait. Let me reconsider. The confusion matrix is on boxes that overlap true defects. Let me look again:
+- true pore → stain 20, deposit 6. Pore is small (pore = tiny holes). 
+- true deposit → stain 55.
+- true stain → deposit 46, pore 15.
+
+So stain is the "magnet" — it's both confused with other things and confuses other things into it. Stain is a large diffuse area (discoloration), deposit is extra material, pore is small holes, discontinuity is a gap.
+
+Why would pore be confused with stain? Pore is small; if the detector box is slightly off or the crop is too wide, the pore (small) might look like a small stain. Or if the box is misplaced, the crop might be mostly background with a small spot.
+
+Actually, here's a thought: the crop is centered on the box. If the box is misplaced, the crop center shifts, and the defect might be at the edge or off-center. For a small pore, a small shift means the pore is mostly out of the crop or at the edge, and the classifier sees mostly background → might predict stain (which is diffuse) or something.
+
+The current jitter is small: cx += uniform(-0.1, 0.1)*side, side *= uniform(0.85, 1.2). So the crop center moves by up to 10% of the side, and the side changes by 15-20%. This is mild.
+
+The detector boxes are "slightly misplaced". How much? The IoU > 0.5 threshold means the detector box overlaps the true box by at least half. That allows significant misplacement. For a box, IoU 0.5 can mean the detector box is shifted by up to ~30-40% of its size.
+
+So the idea of simulating detector errors: random shifts and scale changes so that the IoU between the jittered box and the true box covers 0.5 to 1.0. This is direction 2a in the guide.
+
+But the guide says to do consolidation first (direction 1: train on detector boxes). Let me follow the guide.
+
+Actually, let me reconsider. There are two related but distinct ideas:
+1. Train on the actual detector boxes from the train split (real detector errors).
+2. Simulate detector errors on the true boxes (synthetic jitter covering IoU 0.5-1.0).
+
+Both address the mismatch. #1 uses real detector boxes (better, in-distribution). #2 augments the true boxes with jitter.
+
+The guide's plan:
+1. Consolidate: #1 (train on detector boxes).
+2. Main phase: #2 (simulate detector errors), plus box-quality weighting, plus better view combination.
+
+So the first experiment should be #1. Let me implement it.
+
+Let me now think carefully about the implementation to avoid bugs (the history shows crashes in IoU code).
+
+Let me write the code. I'll add a function to build the extra training rows, and add them to `crops` before creating the dataset.
+
+Let me look at the current code structure:
+
+```python
+crops = [r for r in read_csv(os.path.join(args.data, "crops.csv")) if r["res"] in TRAIN_ON]
+dets = read_csv(os.path.join(args.data, "dets.csv"))
+ev = [d for d in dets if d["split"] == "eval"]
+needed = {r["image"] for r in crops} | {d["image"] for d in ev}
+images = {p: np.asarray(...) for p in needed}
+print(...)
+```
+
+I need to:
+1. Compute extra rows from train dets overlapping true crops.
+2. Add them to crops.
+3. Make sure `needed` includes the images for extra rows (they're on training images, already in `needed` via crops).
+
+Wait, the extra rows are on training images (the train split of dets is on training images). The training images are already loaded because crops are on them. So `needed` is fine. But I should compute extra rows BEFORE the `needed` set? No — the extra rows are on training images which are already in needed (from crops). Actually, could a train det box be on an image that has no true crops? Then it wouldn't overlap any true box, so it wouldn't be added. So all extra rows are on images that have true crops, hence in needed. Good.
+
+But I need `crops` to be available for the IoU computation. Let me compute extra after reading crops and dets, before building `needed`/images. Actually, the extra rows reference images already in needed, so order doesn't matter for image loading. But let me compute extra right after reading, and add to crops, then build needed.
+
+Let me write:
+
+```python
+crops = [r for r in read_csv(os.path.join(args.data, "crops.csv")) if r["res"] in TRAIN_ON]
+dets = read_csv(os.path.join(args.data, "dets.csv"))
+ev = [d for d in dets if d["split"] == "eval"]
+
+# --- extra training rows: train-split detector boxes that overlap a true box (IoU>0.5) ---
+def _iou(A, B):
+    ax1, ay1, ax2, ay2 = A[:,0], A[:,1], A[:,2], A[:,3]
+    bx1, by1, bx2, by2 = B[:,0], B[:,1], B[:,2], B[:,3]
+    ix1 = np.maximum(ax1[:,None], bx1[None,:]); iy1 = np.maximum(ay1[:,None], by1[None,:])
+    ix2 = np.minimum(ax2[:,None], bx2[None,:]); iy2 = np.minimum(ay2[:,None], by2[None,:])
+    inter = np.clip(ix2-ix1,0,None) * np.clip(iy2-iy1,0,None)
+    union = (ax2-ax1)*(ay2-ay1)[:,None] + (bx2-bx1)*(by2-by1)[None,:] - inter
+    return inter / np.clip(union, 1e-9, None)
+
+by_true = {}
+for r in crops:
+    by_true.setdefault(r["image"], []).append(r)
+by_det = {}
+for d in dets:
+    if d["split"] == "train":
+        by_det.setdefault(d["image"], []).append(d)
+extra = 0
+for img, trs in by_true.items():
+    if img not in by_det:
+        continue
+    ds = by_det[img]
+    A = np.array([[r["x1"], r["y1"], r["x2"], r["y2"]] for r in trs])
+    B = np.array([[d["x1"], d["y1"], d["x2"], d["y2"]] for d in ds])
+    I = _iou(B, A)
+    j = I.argmax(1)
+    best = I[np.arange(len(ds)), j]
+    for i in range(len(ds)):
+        if best[i] > 0.5:
+            r = trs[j[i]]; d = ds[i]
+            crops.append({"image": img, "x1": d["x1"], "y1": d["y1"],
+                          "x2": d["x2"], "y2": d["y2"], "cls": r["cls"],
+                          "img_w": d["img_w"], "img_h": d["img_h"]})
+            extra += 1
+print(f"added {extra} detector-box training rows", flush=True)
+```
+
+Wait, `d["img_w"]` and `d["img_h"]` — are these floats? read_csv converts x1,y1,x2,y2,conf to float but not img_w/img_h. Let me check. In read_csv: `for k in ("x1", "y1", "x2", "y2", "conf"): r[k] = float(r[k])`. So img_w, img_h remain strings. But make_crop doesn't use img_w/img_h (it uses img.shape). So it doesn't matter. But to be safe, I'll not include them or include as-is. Actually make_crop uses `img.shape[:2]` for h, w. So img_w/img_h are unused. I'll include them for completeness but they're strings; harmless since unused. Actually, let me just omit them to avoid confusion. The BoxDataset uses r["image"], r["x1"], r["y1"], r["x2"], r["y2"], r.get("cls", -1). So I only need those. Let me include image, x1,y1,x2,y2, cls.
+
+Now, a concern: the number of extra rows. Let me think. If there are many train det boxes, this could be a lot. Let me estimate the time cost of the IoU computation. For each image, D*T pairs. If an image has, say, 20 det boxes and 5 true boxes, that's 100 pairs — trivial. Across 1022 images, total pairs maybe ~100k-1M. Numpy handles that in <1s. Fine.
+
+But the bigger concern: adding, say, 15000 extra rows to 6052 true rows = 21000 rows. This changes the training. Each epoch is now ~21000/64 = 328 steps (was 94). So each epoch is ~3.5x longer. In the same time budget, we'd do fewer epochs (maybe 1-2 instead of 5). Total steps similar (~430). So the model sees more diverse data in the same number of steps. Good.
+
+But wait — is there a risk that the extra rows dominate and the model overfits to detector-box artifacts? The extra rows are ~70% of the data. Hmm. But they're real detector boxes with real labels, so they should be fine. And the guide recommends it.
+
+Actually, let me reconsider whether to mix or replace. The guide says "alongside the true boxes". So mix. Good.
+
+Let me also consider: should I dedupe? A det box might be very close to a true box (near-identical). That's fine, it's just another sample.
+
+Let me also double check: the extra rows use the DET box coordinates (imperfect), which is the point — we want the classifier to see imperfect boxes. Yes.
+
+Now, one more consideration: the `needed` set and image loading. The extra rows are on training images. Are all training images loaded? `needed = {r["image"] for r in crops} | {d["image"] for d in ev}`. After I add extra rows to crops, the extra rows' images are training images (already in needed via original crops). But I add extra rows to crops BEFORE computing needed. So needed will include them (same images). Fine. Actually, even if a training image had no original high-res crops but had a train det box overlapping... no, if it has no true crops, by_true won't have it, so no extra rows. So all extra images are in needed. Good.
+
+Wait, actually there's a subtle issue: I add extra rows to `crops` (the list) before computing `needed`. `needed = {r["image"] for r in crops}` — this now includes extra rows' images. But those are training images that already had true crops (since by_true only has images with true crops). So no new images. Fine.
+
+Let me now also think: does adding data change the DataLoader's drop_last behavior or the number of epochs printed? It'll just print more steps per epoch. Fine.
+
+Now let me reconsider the time budget. Adding data doesn't change per-step time. The training loop runs until t_end = deadline - RESERVE_S. So same total steps. Good. No time risk.
+
+Let me now write the edit. I'll insert the extra-rows code after the `ev = ...` line and before `needed = ...`.
+
+Actually, let me place it right after `ev = [d for d in dets if d["split"] == "eval"]`.
+
+Let me write the SEARCH/REPLACE.
+
+Current:
+```python
+    crops = [r for r in read_csv(os.path.join(args.data, "crops.csv")) if r["res"] in TRAIN_ON]
+    dets = read_csv(os.path.join(args.data, "dets.csv"))
+    ev = [d for d in dets if d["split"] == "eval"]
+    needed = {r["image"] for r in crops} | {d["image"] for d in ev}
+```
+
+I'll replace with the extra-rows code inserted.
+
+Let me write it carefully with correct indentation (4 spaces inside main).
+
+```python
+    crops = [r for r in read_csv(os.path.join(args.data, "crops.csv")) if r["res"] in TRAIN_ON]
+    dets = read_csv(os.path.join(args.data, "dets.csv"))
+    ev = [d for d in dets if d["split"] == "eval"]
+
+    # Extra training rows: train-split detector boxes that overlap a true box (IoU>0.5),
+    # labelled with that true box's class. This matches the classifier to the imperfect
+    # stage-1 boxes it is scored on (train/test box-quality mismatch).
+    def _iou(A, B):
+        ax1, ay1, ax2, ay2 = A[:, 0], A[:, 1], A[:, 2], A[:, 3]
+        bx1, by1, bx2, by2 = B[:, 0], B[:, 1], B[:, 2], B[:, 3]
+        ix1 = np.maximum(ax1[:, None], bx1[None, :]); iy1 = np.maximum(ay1[:, None], by1[None, :])
+        ix2 = np.minimum(ax2[:, None], bx2[None, :]); iy2 = np.minimum(ay2[:, None], by2[None, :])
+        inter = np.clip(ix2 - ix1, 0, None) * np.clip(iy2 - iy1, 0, None)
+        union = (ax2 - ax1) * (ay2 - ay1)[:, None] + (bx2 - bx1) * (by2 - by1)[None, :] - inter
+        return inter / np.clip(union, 1e-9, None)
+
+    by_true, by_det = {}, {}
+    for r in crops:
+        by_true.setdefault(r["image"], []).append(r)
+    for d in dets:
+        if d["split"] == "train":
+            by_det.setdefault(d["image"], []).append(d)
+    n_extra = 0
+    for img, trs in by_true.items():
+        if img not in by_det:
+            continue
+        ds = by_det[img]
+        A = np.array([[r["x1"], r["y1"], r["x2"], r["y2"]] for r in trs])
+        B = np.array([[d["x1"], d["y1"], d["x2"], d["y2"]] for d in ds])
+        I = _iou(B, A)
+        j = I.argmax(1)
+        best = I[np.arange(len(ds)), j]
+        for i in range(len(ds)):
+            if best[i] > 0.5:
+                r, d = trs[j[i]], ds[i]
+                crops.append({"image": img, "x1": d["x1"], "y1": d["y1"],
+                              "x2": d["x2"], "y2": d["y2"], "cls": r["cls"]})
+                n_extra += 1
+    print(f"added {n_extra} detector-box training rows (total {len(crops)})", flush=True)
+    needed = {r["image"] for r in crops} | {d["image"] for d in ev}
+```
+
+This looks correct. Let me double-check the IoU function. A is true boxes (T,4), B is det boxes (D,4). _iou(B, A) returns (D, T). For each det box i, j[i] = argmax over true boxes, best[i] = max IoU. If > 0.5, add det box i with class of true box j[i]. Correct.
+
+Wait, I need to double check: `I = _iou(B, A)` where B is (D,4) and A is (T,4). Inside _iou, A param = B (det), B param = A (true). So ax1.. = det, bx1.. = true. Returns (D, T). Good. j = I.argmax(1) → (D,), the true box index. Good.
+
+Edge case: what if a det box has zero area? Then union could be small, but clip(union, 1e-9) handles division. And inter would be 0 if no overlap. Fine. Actually if det box has zero area, (bx2-bx1)*(by2-by1) = 0, union = area_a + 0 - inter. inter = 0 (since det has zero area, iw or ih = 0). So IoU = 0. Fine, won't be added.
+
+Now, is there a risk that `by_det` is empty (no train split)? Then n_extra = 0, no change. Safe.
+
+Let me also make sure I'm not breaking the `crops` list being used elsewhere. crops is used for the dataset and for needed. Adding rows is fine.
+
+Now, let me reconsider the hypothesis and expected gain. The guide says this was accepted twice at +0.004. Under today's stricter rule, it might be borderline. But it's the recommended consolidation step, and it directly targets the dominant error (class decision on detector boxes = 0.117 cost). The mechanism: training on real detector boxes makes the classifier robust to box misplacement, which should reduce the pore↔stain and deposit↔stain confusions (which arise when the crop is off).
+
+Let me also predict which diagnostic should move: "true pore predicted as stain" and "true deposit predicted as stain" should drop, and per-class pore AP should rise. The "mAP if every box had its correct class" (0.746Thinking budget reached. Stop thinking now and write the reply in the required format.

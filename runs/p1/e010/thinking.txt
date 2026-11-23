@@ -1,0 +1,225 @@
+===== attempt 1 =====
+Let me carefully review the current train.py and plan the edit.
+
+Current best is e009, which has a `MultiScaleClassifier` with:
+- shared backbone over 4 scale crops
+- per-scale 1x1 projection to proj_dim=256
+- `f = f.mean(dim=[2, 3])` — global average pooling
+- concat along channel dim → [B, num_scales * proj_dim]
+- MLP head: Linear(num_scales*proj_dim, hidden=512), GELU, Linear(hidden, 4)
+
+The plan: replace pooled concat with a spatial feature pyramid:
+1. Keep per-scale projections but drop mean pooling. EfficientNet-B0's forward_features outputs [B, C, H, W] where H=W=160/32=5. So each projected feature is [B, 256, 5, 5].
+2. Concat on channel axis → [B, 4*256, 5, 5] = [B, 1024, 5, 5].
+3. Fusion stem: Conv2d(4*proj_dim, hidden, 3, padding=1), GELU, Conv2d(hidden, proj_dim, 3, padding=1), GELU, then global mean pool → [B, proj_dim], then existing MLP head? Wait, the existing head takes num_scales*proj_dim = 1024 inputs. If we pool to proj_dim=256, the head's first Linear needs to take 256 inputs, not 1024.
+
+Let me re-read the plan: "Add a small fusion stem: Conv2d(4*proj_dim, hidden, 3, padding=1), GELU, then a second conv to proj_dim, GELU, then global pool (mean over H,W) into the existing MLP head."
+
+"into the existing MLP head" — but the existing MLP head's first layer is Linear(num_scales * proj_dim, hidden) = Linear(1024, 512). If we pool to proj_dim=256, that doesn't match. So we need to either:
+- Change the head's input dim to proj_dim (256), or
+- Pool to 4*proj_dim.
+
+The plan says "global pool (mean over H,W) into the existing MLP head". The existing MLP head is `nn.Linear(num_scales * proj_dim, hidden)`. To keep it "existing", the pooled vector should be of size num_scales*proj_dim. But the second conv outputs proj_dim channels. So pooling gives proj_dim, not num_scales*proj_dim.
+
+Options:
+a) Change the head to take proj_dim inputs: Linear(proj_dim, hidden), GELU, Linear(hidden, 4). This is the natural reading of "fusion stem → pool → MLP head". The "existing MLP head" phrasing is slightly loose but the intent is a small MLP after the pooled feature.
+
+b) Make the second conv output 4*proj_dim channels so the pooled vector matches the existing head. But that's bigger.
+
+I think the cleanest is: fusion stem convs, pool, then a head Linear(proj_dim, hidden) → GELU → Linear(hidden, 4). This keeps the "MLP head" concept but adjusts input dim. Actually, to minimize the change and keep close to "existing MLP head", maybe I should keep the head as Linear(num_scales*proj_dim, hidden) but that requires the pooled vector to be 1024. 
+
+Hmm. Let me reconsider. The plan explicitly says: "concatenate the 4 projected grids on the channel axis, giving [B, 4*proj_dim, 5, 5]" and "then global pool (mean over H,W) into the existing MLP head". 
+
+The existing MLP head input is `num_scales * proj_dim` = 4*256 = 1024. For the pooled vector to feed "the existing MLP head" unchanged, the vector must be 1024-dim. But after the second conv to proj_dim and pooling, it's 256-dim. So there's a mismatch. The plan has a shape inconsistency.
+
+The instruction says: "If a detail of the plan cannot work as written (time budget, tensor shapes, missing names), make the smallest fix that keeps the idea and say so at the end of the HYPOTHESIS."
+
+So I need to fix the shape mismatch. The smallest fix that keeps the idea: after the fusion stem (two convs), the feature is [B, proj_dim, 5, 5]. Global pool → [B, proj_dim]. Then feed into a head. To keep the head "existing" in spirit (a 2-layer MLP with hidden=512), I'll make the first Linear take proj_dim. So:
+
+self.head = nn.Sequential(
+    nn.Linear(proj_dim, hidden),
+    nn.GELU(),
+    nn.Linear(hidden, num_classes),
+)
+
+Wait but that changes the head input from 1024 to 256. Alternatively, I could keep the concat of pooled per-scale features (4 * proj_dim) and skip the spatial convs — but that's not the idea.
+
+Actually, let me reconsider the whole thing. The idea is spatial fusion. Let me design it cleanly:
+
+```
+class MultiScaleClassifier(nn.Module):
+    def __init__(self, backbone, num_scales=4, proj_dim=256, hidden=512, num_classes=4):
+        super().__init__()
+        self.backbone = backbone
+        C = backbone.num_features
+        self.scale_projs = nn.ModuleList([nn.Conv2d(C, proj_dim, 1) for _ in range(num_scales)])
+        self.stem = nn.Sequential(
+            nn.Conv2d(num_scales * proj_dim, hidden, 3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(hidden, proj_dim, 3, padding=1),
+            nn.GELU(),
+        )
+        self.head = nn.Sequential(
+            nn.Linear(proj_dim, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, num_classes),
+        )
+
+    def forward(self, views):
+        feats = []
+        for i, x in enumerate(views):
+            f = self.backbone.forward_features(x)
+            f = self.scale_projs[i](f)   # [B, proj_dim, H, W]
+            feats.append(f)
+        f = torch.cat(feats, dim=1)      # [B, num_scales*proj_dim, H, W]
+        f = self.stem(f)                 # [B, proj_dim, H, W]
+        f = f.mean(dim=[2, 3])           # [B, proj_dim]
+        return self.head(f)
+```
+
+This is clean. The head input changes from num_scales*proj_dim to proj_dim. That's the smallest fix for the shape mismatch. I'll note it.
+
+Actually, wait — is the head change a problem? The "existing MLP head" had input 1024. Now it's 256. That's fine, it's still a 2-layer MLP with hidden 512. The idea is preserved. Let me note this in the hypothesis.
+
+Alternatively, to keep the head input exactly 1024 (num_scales*proj_dim), I could make the second conv output num_scales*proj_dim channels instead of proj_dim. But that's a bigger change to the stem and the plan explicitly said "second conv to proj_dim". So I'll keep second conv to proj_dim and adjust the head input to proj_dim. That's the smallest fix.
+
+Let me double check EfficientNet-B0 forward_features output size. EfficientNet-B0: input 160 → /32 = 5. Yes, 5x5. Good. proj_dim=256, so concat = 1024 channels on 5x5. Stem convs: Conv2d(1024, 512, 3, pad=1), GELU, Conv2d(512, 256, 3, pad=1), GELU. Then mean pool → 256. Head: Linear(256, 512), GELU, Linear(512, 4).
+
+Parameter count: stem conv1 = 1024*512*9 + 512 ≈ 4.7M. stem conv2 = 512*256*9 + 256 ≈ 1.18M. head = 256*512 + 512*4 ≈ 131K. Total added ~6M params. The current head was Linear(1024,512)=524K + Linear(512,4)=2K ≈ 526K. So we add ~5.5M params. That's more parameters but the convs are on 5x5 spatial so compute is small. Should be fine within budget.
+
+Actually wait, is 6M extra params going to slow things? The backbone is EfficientNet-B0 (~4M params). The stem convs operate on [B, 1024, 5, 5] and [B, 512, 5, 5] — very small spatial, so compute is minimal. Parameter count affects memory and optimizer state but the forward compute is tiny. Should be fine.
+
+Let me reconsider: do I want hidden=512 in the stem conv1? 1024→512 with 3x3 on 5x5. That's 1024*512*9 = 4.7M. Fine.
+
+Now let me also reconsider whether to keep proj_dim the same. Yes.
+
+Let me now verify the rest of the file stays consistent. The forward signature takes `views` (a list of 4 tensors). The dataset returns `views, r.get("cls", -1)`. The training loop unpacks `for views, y in dl_tr`. The eval loop `for views, _ in dl_ev`. All consistent with the current file. I'm only changing the MultiScaleClassifier class. Good.
+
+Let me write the SEARCH/REPLACE block for the class.
+
+Current class:
+```
+class MultiScaleClassifier(nn.Module):
+    """Shared backbone over 4 scale crops, per-scale 1x1 projection, concat, MLP head."""
+
+    def __init__(self, backbone, num_scales=4, proj_dim=256, hidden=512, num_classes=4):
+        super().__init__()
+        self.backbone = backbone
+        C = backbone.num_features
+        self.scale_projs = nn.ModuleList([nn.Conv2d(C, proj_dim, 1) for _ in range(num_scales)])
+        self.head = nn.Sequential(
+            nn.Linear(num_scales * proj_dim, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, num_classes),
+        )
+
+    def forward(self, views):
+        feats = []
+        for i, x in enumerate(views):
+            f = self.backbone.forward_features(x)   # [B, C, H, W]
+            f = self.scale_projs[i](f)              # [B, proj_dim, H, W]
+            f = f.mean(dim=[2, 3])                  # [B, proj_dim]
+            feats.append(f)
+        f = torch.cat(feats, dim=1)                 # [B, num_scales * proj_dim]
+        return self.head(f)
+```
+
+New class:
+```
+class MultiScaleClassifier(nn.Module):
+    """Shared backbone over 4 scale crops, per-scale 1x1 projection, spatial feature-pyramid fusion, MLP head."""
+
+    def __init__(self, backbone, num_scales=4, proj_dim=256, hidden=512, num_classes=4):
+        super().__init__()
+        self.backbone = backbone
+        C = backbone.num_features
+        self.scale_projs = nn.ModuleList([nn.Conv2d(C, proj_dim, 1) for _ in range(num_scales)])
+        self.stem = nn.Sequential(
+            nn.Conv2d(num_scales * proj_dim, hidden, 3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(hidden, proj_dim, 3, padding=1),
+            nn.GELU(),
+        )
+        self.head = nn.Sequential(
+            nn.Linear(proj_dim, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, num_classes),
+        )
+
+    def forward(self, views):
+        feats = []
+        for i, x in enumerate(views):
+            f = self.backbone.forward_features(x)   # [B, C, H, W]
+            f = self.scale_projs[i](f)              # [B, proj_dim, H, W]
+            feats.append(f)
+        f = torch.cat(feats, dim=1)                 # [B, num_scales * proj_dim, H, W]
+        f = self.stem(f)                            # [B, proj_dim, H, W]
+        f = f.mean(dim=[2, 3])                      # [B, proj_dim]
+        return self.head(f)
+```
+
+This is the minimal change. The head input dim changes from num_scales*proj_dim to proj_dim to match the pooled stem output — that's the shape fix.
+
+Let me make sure the SEARCH text matches exactly. I'll copy the class verbatim from the current file.
+
+Let me check the exact text in the file:
+
+```
+class MultiScaleClassifier(nn.Module):
+    """Shared backbone over 4 scale crops, per-scale 1x1 projection, concat, MLP head."""
+
+    def __init__(self, backbone, num_scales=4, proj_dim=256, hidden=512, num_classes=4):
+        super().__init__()
+        self.backbone = backbone
+        C = backbone.num_features
+        self.scale_projs = nn.ModuleList([nn.Conv2d(C, proj_dim, 1) for _ in range(num_scales)])
+        self.head = nn.Sequential(
+            nn.Linear(num_scales * proj_dim, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, num_classes),
+        )
+
+    def forward(self, views):
+        feats = []
+        for i, x in enumerate(views):
+            f = self.backbone.forward_features(x)   # [B, C, H, W]
+            f = self.scale_projs[i](f)              # [B, proj_dim, H, W]
+            f = f.mean(dim=[2, 3])                  # [B, proj_dim]
+            feats.append(f)
+        f = torch.cat(feats, dim=1)                 # [B, num_scales * proj_dim]
+        return self.head(f)
+```
+
+Yes. I'll use this as SEARCH.
+
+Now let me double-check: is there any other place that references `num_scales * proj_dim` or the head? No, the head is internal. The model is created as `MultiScaleClassifier(backbone, num_scales=len(SCALES))`. Good.
+
+Time budget: the added convs are on 5x5 spatial, negligible compute. The parameter increase adds a bit to optimizer state and memory but not wall time meaningfully. Training steps per second should be essentially unchanged. Good.
+
+Let me verify the hypothesis text. I'll adapt the lead's hypothesis and add the shape-fix note at the end.
+
+The lead's HYPOTHESIS: "The dominant remaining error is class confusion (pore→stain, deposit→stain) on boxes that overlap real defects, costing ~0.10 mAP. Global average pooling in e009's fusion head discards spatial structure within each crop; detector boxes are often offset from the true defect, so the defect sits at different positions across the 4 scale crops and the MLP cannot use this cue. Restoring a spatially-aware feature-pyramid fusion (per-scale 1x1 projections concatenated on a 5×5 grid, then small convs before pooling) lets the head localize the defect relative to each crop, which should lift pore/stain/deposit classification and small-box accuracy."
+
+I'll keep it and add the shape fix note: "Shape fix: the plan's 'global pool into the existing MLP head' is inconsistent because the second conv outputs proj_dim channels, so the pooled vector is proj_dim, not num_scales*proj_dim; I change the head's first Linear input to proj_dim (smallest fix keeping the spatial-fusion idea)."
+
+That's the required note.
+
+Now, one concern: the hypothesis mentions "differs from e007/e008". e007/e008 were cross-attention / MLP fusion architectures. This is a spatial feature pyramid with convs. Good, it's distinct.
+
+Let me also sanity check: the plan says "cheaper to run than the current head's full MLP on concatenated vectors? Actually this adds convs but keeps the same backbone cost". The current head is a 2-layer MLP on 1024-dim vectors (cheap). The new stem adds convs but on tiny spatial. Net compute roughly similar. Fine.
+
+Let me finalize. I'll write the reply.
+
+Let me make sure I only include the required fields and one SEARCH/REPLACE block.
+
+Actually, let me reconsider whether I should keep the head input as num_scales*proj_dim to be more "existing". The alternative: after stem convs (output proj_dim), I could concatenate... no. The cleanest minimal fix is head input = proj_dim. I'm confident.
+
+Wait, but there's a subtlety. If I change head input to proj_dim, I'm losing the information that there were 4 scales (the stem already fused them). That's fine — the stem convs fuse spatially and the pooled 256-dim vector carries the fused info. Good.
+
+Let me write it.
+
+Double-check the SEARCH block appears exactly once. The class definition appears once. Good.
+
+Let me verify indentation: 4 spaces per level. The class body is 4 spaces, methods 8, etc. I'll match.
+
+Final answer.

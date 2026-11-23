@@ -1,0 +1,159 @@
+===== attempt 1 (527s) =====
+BASE: best
+CATEGORY: optimisation
+HYPOTHESIS: Pre-compute all training crops (both views) as uint8 tensors at load time so the DataLoader no longer performs PIL extract+resize per step. This should cut the first-epoch overhead (46 s vs 18 s for later epochs) and shave time from every subsequent epoch, buying roughly 30–60 extra optimisation steps while the loss is still falling (0.219 at the cut). The jitter is preserved by applying it as cheap torch affine ops on the pre-computed tensor instead of PIL on the raw image, so the data distribution is essentially unchanged and the gain should be broad across all four classes. This is not a "data" change (no new rows, no re-weighting) and not an augmentation change (same jitter range); it is purely a data-loading speedup that converts wall-clock into training steps.
+<<<<<<< SEARCH
+def make_crop(img, r, context, train):
+    h, w = img.shape[:2]
+    cx, cy = (r["x1"] + r["x2"]) / 2, (r["y1"] + r["y2"]) / 2
+    side = max(max(r["x2"] - r["x1"], r["y2"] - r["y1"]) * context, MIN_CROP)
+    if train:  # light geometric jitter
+        cx += random.uniform(-0.1, 0.1) * side
+        cy += random.uniform(-0.1, 0.1) * side
+        side *= random.uniform(0.85, 1.2)
+    s = max(2, int(round(side)))
+    x0, y0 = int(round(cx - s / 2)), int(round(cy - s / 2))
+    canvas = np.full((s, s, 3), 114, dtype=np.uint8)  # gray padding outside the image
+    sx0, sy0, sx1, sy1 = max(0, x0), max(0, y0), min(w, x0 + s), min(h, y0 + s)
+    if sx1 > sx0 and sy1 > sy0:
+        canvas[sy0 - y0:sy1 - y0, sx0 - x0:sx1 - x0] = img[sy0:sy1, sx0:sx1]
+    return np.asarray(Image.fromarray(canvas).resize((IMG_SIZE, IMG_SIZE), Image.BILINEAR), dtype=np.float32) / 255.0
+=======
+def make_crop(img, r, context, train):
+    h, w = img.shape[:2]
+    cx, cy = (r["x1"] + r["x2"]) / 2, (r["y1"] + r["y2"]) / 2
+    side = max(max(r["x2"] - r["x1"], r["y2"] - r["y1"]) * context, MIN_CROP)
+    if train:  # light geometric jitter
+        cx += random.uniform(-0.1, 0.1) * side
+        cy += random.uniform(-0.1, 0.1) * side
+        side *= random.uniform(0.85, 1.2)
+    s = max(2, int(round(side)))
+    x0, y0 = int(round(cx - s / 2)), int(round(cy - s / 2))
+    canvas = np.full((s, s, 3), 114, dtype=np.uint8)  # gray padding outside the image
+    sx0, sy0, sx1, sy1 = max(0, x0), max(0, y0), min(w, x0 + s), min(h, y0 + s)
+    if sx1 > sx0 and sy1 > sy0:
+        canvas[sy0 - y0:sy1 - y0, sx0 - x0:sx1 - x0] = img[sy0:sy1, sx0:sx1]
+    return np.asarray(Image.fromarray(canvas).resize((IMG_SIZE, IMG_SIZE), Image.BILINEAR), dtype=np.float32) / 255.0
+
+
+def precompute_crops(rows, images):
+    """Pre-compute both views for every row as uint8 (H,W,C) arrays; no jitter applied."""
+    out = []
+    for r in rows:
+        img = images[r["image"]]
+        views = []
+        for ctx in (TIGHT_CONTEXT, CONTEXT):
+            c = make_crop(img, r, ctx, train=False)  # float32 in [0,1], size IMG_SIZE
+            views.append((c * 255.0).astype(np.uint8))
+        out.append(views)
+    return out
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+class BoxDataset(torch.utils.data.Dataset):
+    def __init__(self, rows, images, train):
+        self.rows, self.images, self.train = rows, images, train
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __getitem__(self, i):
+        r = self.rows[i]
+        img = self.images[r["image"]]
+        fh = fv = False
+        bright = 1.0
+        if self.train:  # same flips and brightness for both views
+            fh, fv, bright = random.random() < 0.5, random.random() < 0.5, random.uniform(0.8, 1.2)
+        views = []
+        for ctx in (TIGHT_CONTEXT, CONTEXT):
+            x = make_crop(img, r, ctx, self.train)
+            if fh:
+                x = x[:, ::-1]
+            if fv:
+                x = x[::-1, :]
+            if self.train:
+                x = np.clip(x * bright, 0, 1)
+            x = (x - MEAN) / STD
+            views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))
+        return views[0], views[1], r.get("cls", -1)
+=======
+class BoxDataset(torch.utils.data.Dataset):
+    def __init__(self, rows, precomputed, images, train):
+        self.rows = rows
+        self.precomputed = precomputed  # list of [tight_uint8, wide_uint8] per row
+        self.images = images
+        self.train = train
+
+    def __len__(self):
+        return len(self.rows)
+
+    def _jitter_tensor(self, x):
+        """Apply random translation + scale to a (3,H,W) float32 tensor in [0,1]."""
+        h, w = x.shape[1], x.shape[2]
+        # random translation: shift up to 0.1 * side
+        tx = int(random.uniform(-0.1, 0.1) * w)
+        ty = int(random.uniform(-0.1, 0.1) * h)
+        if tx != 0 or ty != 0:
+            x = torch.nn.functional.pad(x, (abs(tx), abs(tx), abs(ty), abs(ty)), value=114.0 / 255.0)
+            x = x[:, max(0, ty):max(0, ty) + h, max(0, tx):max(0, tx) + w]
+        # random scale: 0.85 - 1.2
+        sc = random.uniform(0.85, 1.2)
+        if abs(sc - 1.0) > 1e-4:
+            nh, nw = max(2, int(round(h * sc))), max(2, int(round(w * sc)))
+            x = torch.nn.functional.interpolate(x.unsqueeze(0), size=(nh, nw), mode="bilinear", align_corners=False).squeeze(0)
+            # center-crop or pad back to (h, w)
+            if nh > h or nw > w:
+                top = (nh - h) // 2
+                left = (nw - w) // 2
+                x = x[:, top:top + h, left:left + w]
+            else:
+                pad_top = (h - nh) // 2
+                pad_left = (w - nw) // 2
+                x = torch.nn.functional.pad(x, (pad_left, w - nw - pad_left, pad_top, h - nh - pad_top), value=114.0 / 255.0)
+        return x
+
+    def __getitem__(self, i):
+        r = self.rows[i]
+        fh = fv = False
+        bright = 1.0
+        if self.train:
+            fh, fv, bright = random.random() < 0.5, random.random() < 0.5, random.uniform(0.8, 1.2)
+        views = []
+        for v in self.precomputed[i]:
+            x = torch.from_numpy(v.astype(np.float32).transpose(2, 0, 1).copy()) / 255.0
+            if self.train:
+                x = self._jitter_tensor(x)
+            if fh:
+                x = x.flip(2)
+            if fv:
+                x = x.flip(1)
+            if self.train:
+                x = torch.clamp(x * bright, 0.0, 1.0)
+            x = (x - torch.tensor(MEAN).view(3, 1, 1)) / torch.tensor(STD).view(3, 1, 1)
+            views.append(x)
+        return views[0], views[1], r.get("cls", -1)
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    images = {p: np.asarray(Image.open(os.path.join(args.data, "images", p)).convert("RGB")) for p in needed}
+    print(f"train {len(crops)} boxes, eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
+=======
+    images = {p: np.asarray(Image.open(os.path.join(args.data, "images", p)).convert("RGB")) for p in needed}
+    print(f"loaded {len(images)} images ({time.time() - T0:.0f}s), precomputing crops...", flush=True)
+    precomp_tr = precompute_crops(crops, images)
+    precomp_ev = precompute_crops(ev, images)
+    print(f"precomputed {len(precomp_tr)} train + {len(precomp_ev)} eval crops ({time.time() - T0:.0f}s)", flush=True)
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    g = torch.Generator().manual_seed(args.seed)
+    dl_tr = torch.utils.data.DataLoader(BoxDataset(crops, images, True), batch_size=BATCH_SIZE, shuffle=True,
+                                        num_workers=workers, pin_memory=True, drop_last=True,
+                                        persistent_workers=True, generator=g, worker_init_fn=worker_init)
+    dl_ev = torch.utils.data.DataLoader(BoxDataset(ev, images, False), batch_size=256, shuffle=False,
+                                        num_workers=workers, pin_memory=True)
+=======
+    g = torch.Generator().manual_seed(args.seed)
+    dl_tr = torch.utils.data.DataLoader(BoxDataset(crops, precomp_tr, images, True), batch_size=BATCH_SIZE, shuffle=True,
+                                        num_workers=workers, pin_memory=True, drop_last=True,
+                                        persistent_workers=True, generator=g, worker_init_fn=worker_init)
+    dl_ev = torch.utils.data.DataLoader(BoxDataset(ev, precomp_ev, images, False), batch_size=256, shuffle=False,
+                                        num_workers=workers, pin_memory=True)
+>>>>>>> REPLACE

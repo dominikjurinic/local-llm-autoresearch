@@ -1,0 +1,355 @@
+===== attempt 1 =====
+Let me carefully analyze the situation.
+
+**Current state:**
+- Best: e000, 5-seed mean 0.6288
+- Baseline to beat: one-step 4-class detector 0.638
+- Ceiling: 0.758 (perfect classes on stage-1 boxes)
+- Class-agnostic: 0.755
+
+**Per-class AP:** pore 0.502, deposit 0.624, discontinuity 0.780, stain 0.609
+
+**Diagnostics:**
+- Error is dominated by wrong class assignment (0.7461 with perfect classes vs 0.6288)
+- Confusion: stain absorbs pore (20) and deposit (55), deposit↔stain (46+55), pore→stain (20)
+- Pore is weakest (63% right), discontinuity is strong (96%)
+- 74 true defects missed by stage 1 (unfixable)
+
+**History analysis:**
+
+1. **Score rows / ranking** (16 attempts in earlier runs): no gain. AP depends only on order within class. Exhausted.
+2. **Background class** (9 attempts): no gain. Exhausted.
+3. **Detector train boxes as extra data** (6 attempts): accepted twice at ~+0.004, but under today's stricter rule that's below threshold. e003 and e005 tried this again: not confirmed. So this family has been tried many times with small gains that don't pass today's bar.
+4. **Third wide view** (3 attempts): +0.005, mostly pore, but close to time limit. e013 (1.0x texture crop) rejected. Views family: mixed, small.
+5. **Low-res crops**: no gain.
+6. **Bigger backbone / ensembles**: no gain, fewer steps.
+7. **Resolution/small-box handling**: no gain.
+8. **TTA**: no gain.
+9. **Longer training**: no gain.
+10. **Class-balanced sampling / weighted loss**: no gain (and class-weighted loss hurt every time).
+11. **Training augmentation**: no gain.
+12. **Focal loss**: no gain.
+13. **Box size/aspect as input**: never properly tested (crashes). e002, e007 tried. e007 rejected at 0.6215.
+
+**This run's history:**
+- e001: side-by-side 224 input: 0.6275 not confirmed
+- e002: size/aspect channels: crashed
+- e003: detector train boxes: 0.6295 not confirmed
+- e004: EMA: 0.3561 bug
+- e005: detector train boxes (again): 0.6301 not confirmed
+- e006: (data, something about texture): crashed
+- e007: box geometry input: 0.6215 rejected
+- e008: multi-label BCE: 0.6296 not confirmed
+- e009: per-crop normalization: timeout
+- e010: class-margin loss: 0.6183 rejected
+- e011: feature concat: crashed
+- e012: feature concat fixed: 0.6313 not confirmed
+- e013: 1.0x texture crop third view: 0.6267 rejected
+- e014: copy-paste pore: crashed
+- e015: copy-paste pore fixed: 0.6269 not confirmed
+- e016: (data, local texture): timeout
+- e017: SGD optimizer: 0.6318 not confirmed (+0.0031, needed >0.0051)
+
+So essentially nothing has been confirmed yet. Everything hovers around 0.627-0.632.
+
+**Key insight from diagnostics:**
+The dominant error is wrong class assignment. The confusion matrix shows:
+- stain is a magnet: deposit→stain 55, pore→stain 20, stain→deposit 46
+- pore is weak: 63% right, mostly misread as stain
+
+The gap: 0.7461 (perfect classes) - 0.6288 (current) = 0.117 lost to wrong classes. That's huge.
+
+But wait — the "perfect classes" number uses the detector's conf as score. The class-agnostic number is 0.755. So if we had perfect classes AND used the detector conf, we'd get 0.7461. The class-agnostic (single class) is 0.755. So the score ranking (conf) is already near-optimal; the loss is almost entirely in the class decision.
+
+Actually let me reconsider. The diagnostic says: "mAP@0.5 if every box had its correct class but kept your scores: 0.7461". So with our current scores (conf × p), if classes were perfect, we'd get 0.7461. Our current is 0.6288. So 0.117 is lost to wrong classes.
+
+The remaining gap to 0.755 (class-agnostic single class) is 0.755 - 0.7461 = 0.009, which is what our scores cost vs detector conf. That's small.
+
+So the whole game is: get the class right more often. Specifically:
+- Reduce stain absorbing pore and deposit
+- Improve pore (weakest)
+
+**What hasn't been tried?**
+
+Let me think about what fundamentally different approaches exist:
+
+1. **Two-stage / hierarchical classification**: Since stain is a magnet and pore/deposit/discontinuity are "not stain", maybe a hierarchical approach: first decide stain vs not-stain, then within not-stain decide pore/deposit/discontinuity. But this is a loss change / architecture.
+
+2. **The confusion is deposit↔stain and pore→stain.** These classes differ by local texture. The brief says "These classes differ mainly by local [texture]". Higher resolution might help but resolution family was exhausted (no gain).
+
+Wait, but the resolution family was about 224px, larger MIN_CROP, enlarged tight crops. Those didn't help. Hmm.
+
+Actually, let me reconsider. The "resolution and small-box handling" family: 9 attempts, no gain, best 0.634 not confirmed. So increasing resolution didn't help. That's surprising given the texture argument.
+
+3. **What about the training data itself?** We train on crops.csv "high" resolution. There's also "low" resolution. The brief says "Adding data from a different source or resolution can help or hurt." The low-res crops were tried (no gain). 
+
+4. **What about using BOTH high and low resolution crops for training?** TRAIN_ON = ("high",). Maybe using both gives more data. But low-res alone was no gain. Combining? Not clearly tried. Actually "Low-resolution crops added to training: 4 attempts, no gain". So adding low-res didn't help.
+
+5. **The core issue: stain is the majority class (~40%) and it's a magnet.** Class-weighted loss hurt. Class-balanced sampling: no gain.
+
+Hmm, let me think differently.
+
+**Key realization about the metric and the problem:**
+
+mAP@0.5 per class. For each class, predictions sorted by score; a hit needs IoU>0.5 with an unmatched true box of that class.
+
+The confusion: when a box overlaps a true stain but we predict deposit, that's a false deposit (wrong class). When a box overlaps a true pore but we predict stain, that's a false stain AND a missed pore.
+
+The "stain magnet" means we over-predict stain. If we could make the model less eager to say stain, we'd convert some false stains into correct pore/deposit.
+
+But how? A direct approach: **rebalance the training so stain is under-represented, or penalize stain predictions.** Class-weighted loss hurt. Class-balanced sampling no gain. 
+
+Wait — class-weighted loss "hurt classification every time it was tried" and "class-balanced sampling or class-weighted loss: 4 attempts, no gain". So rebalancing is exhausted.
+
+**Let me think about what's fundamentally different and untried.**
+
+The diagnostics show the error is in the CLASS DECISION on boxes that overlap real defects. The ranking (scores) is near-optimal. So we need better classification.
+
+Ideas that change what the model sees or learns:
+- Higher resolution: exhausted (no gain)
+- More views: mostly small/no gain, close to time limit
+- Different backbone: no gain
+- Extra inputs (size/aspect): never worked properly, e007 rejected
+- Copy-paste: crashed then no gain
+- Extra training data (detector boxes): small gains, not confirmed
+
+**What about the input representation more cleverly?**
+
+The two-crop approach: tight 1.5x and wide 2.5x. The model sees the box at fixed fraction. 
+
+Hmm, what about **the actual pixel content**? The crops are rescaled to 160x160. Different-sized boxes get rescaled to the same size, so the model sees texture at different effective resolutions. A small box (say 20px) rescaled to 160px is upscaled 8x — blurry. A large box (200px) rescaled to 160px is downscaled.
+
+The diagnostic: "Share of those boxes with the right class, by defect size (area thirds): small 80%, medium 91%, large 93%". So small boxes are harder (80% right vs 93% large). Small boxes are harder because upscaling loses texture.
+
+But the resolution family (enlarged tight crops for small boxes) was exhausted with no gain. Hmm.
+
+Wait, let me re-read: "Resolution and small-box handling (224 px, larger MIN_CROP, enlarged tight crops for small boxes): 9 attempts, no gain". So enlarging small boxes didn't help. OK.
+
+**Let me think about the confusion structure more.**
+
+stain→deposit 46, deposit→stain 55: these two are confused with each other a lot. pore→stain 20, stain→pore 15.
+
+So the main confusions are:
+- deposit ↔ stain (55 + 46 = 101)
+- pore ↔ stain (20 + 15 = 35)
+
+Stain is involved in almost all confusion. Stain is the majority class.
+
+**Idea: Since stain is a magnet and the majority, and the model over-predicts it, what if we train the model to be more discriminative specifically on the stain boundary?**
+
+Actually, here's a thought: **What if the issue is that stain and deposit look similar at the "wide" context but differ at the "tight" texture?** The two-crop averaging might be blending them. 
+
+Hmm, but feature concat (e012) was 0.6313, not confirmed.
+
+**Let me reconsider the whole framing.**
+
+The reference numbers:
+- one-step 4-class: 0.638 (baseline to beat)
+- perfect classes on stage-1 boxes: 0.758
+- class-agnostic: 0.755
+
+We're at 0.6288, below the one-step baseline 0.638. So we haven't even beaten the baseline yet!
+
+The gap to perfect classes (0.7461 with our scores) is 0.117. That's the class decision error.
+
+To beat 0.638, we need to close some of that 0.117 gap.
+
+**What's the most impactful untried change?**
+
+Let me think about the confusion matrix again and what would directly reduce it.
+
+The model assigns stain too often. This is partly because stain is the majority class (~40%) and partly because stain is visually a catch-all.
+
+**New idea: Temperature / decision threshold on stain?** No, that's a scoring change, and scoring changes that only re-order are ignored. But changing the class decision (argmax) matters. Actually the score is conf × p[c]. The argmax class is argmax p[c]. If we want to reduce stain, we'd need to reduce p[stain] relative to others.
+
+Hmm, but we output all 4 rows per box. The "class chosen" in the diagnostic is the highest-scoring row = argmax p[c] (since conf is same for all rows of a box). So the class decision is argmax p.
+
+To fix the stain magnet, we need the model to output lower p[stain] for pore/deposit boxes.
+
+**Idea: Asymmetric loss that penalizes predicting stain more heavily (since it's over-predicted).** But class-weighted loss hurt. However, class-weighted loss typically up-weights the rare classes (pore, deposit) to make the model predict them more. That "hurt classification every time". Hmm, that's counterintuitive but it's the finding.
+
+Wait, let me reconsider. "Class-weighted loss hurt classification every time it was tried." So up-weighting pore/deposit made things worse. That's a strong signal. So don't do that.
+
+**What about the opposite: down-weight stain?** That's a form of class weighting too. If up-weighting rare classes hurt, maybe down-weighting stain also hurts. Risky.
+
+**Let me think about data augmentation differently.**
+
+The brief says "Ideas that change what the model sees or learns from usually matter more than turning one more knob."
+
+What the model sees: two crops (1.5x, 2.5x) at 160px.
+
+**Idea: Add a high-resolution detail crop.** Wait, the texture crop 1.0x (e013) was rejected. And 4x wide (earlier) gave +0.005 mostly pore.
+
+Hmm. Let me think about what pore looks like. Pores are small holes. They need high resolution to see the holes. The 1.0x crop (box fills frame) would show the pore detail but e013 was rejected at 0.6267.
+
+Actually wait, e013 added a 1.0x crop as a THIRD view averaged with 1.5x and 2.5x. It was rejected. But maybe the issue is averaging dilutes it.
+
+**Let me think about a fundamentally different architecture: a multi-scale feature pyramid or a model that processes the crop at native resolution.**
+
+Actually, here's a cleaner idea I haven't seen tried: **Use a higher input resolution but a smaller/faster backbone to keep steps up.** The resolution family used the same B0 at 224px (slower, fewer steps). But what if we use a faster backbone (convnext_atto or regnety_016) at higher resolution? That trades backbone size for resolution.
+
+Hmm, but "Bigger or other backbone" family: 8 attempts, no gain. And "Resolution": 9 attempts, no gain. Combining them (small backbone + high res) is a new combination but both individually failed.
+
+Actually, let me reconsider. The resolution family's best was 0.634 (not confirmed) — that's actually above the current 0.6288! And the backbone family's best was 0.636 (not confirmed). So both are in the "close but not confirmed" range. Under today's stricter rule they don't pass, but they suggest the direction has some effect.
+
+Hmm, but I can't rely on "not confirmed" from a looser rule.
+
+**Let me step back and think about the BIGGEST lever.**
+
+The class decision error is 0.117. The confusion is dominated by stain. 
+
+What if I'm overthinking the model and the real issue is simpler?
+
+Let me reconsider: the model is trained on crops.csv "high" boxes (6052 boxes). The eval has 41879 detections. So there are ~7x more eval boxes than training boxes. The training boxes are the ground-truth defect boxes. The eval boxes include false alarms and misplaced boxes.
+
+**Key idea: The model is trained only on true defect boxes (crops.csv). At test time, it must classify boxes that include false alarms (no defect) and misplaced boxes.** The model has never seen a "no defect" crop. So when it sees a false alarm, it still outputs some class with high probability, creating false positives.
+
+But the diagnostic says the loss is mostly in wrong classes on boxes that DO overlap real defects (the confusion matrix). And "mAP if every box had correct class but kept scores: 0.7461". So even fixing all false alarms... wait, no. The 0.7461 assumes every box has its correct class. For false alarms (no true box), what's their "correct class"? In the perfect-class ceiling, false alarms are kept as class 0 (pore) with detector conf. So 0.7461 includes false alarms as pore.
+
+Hmm wait, let me re-read the diagnostic: "mAP@0.5 if every box had its correct class but kept your scores: 0.7461 (yours: 0.6288)." 
+
+I think "every box had its correct class" means: for boxes overlapping a true defect, assign the true class; for false alarms, ... hmm. Actually the perfect-class ceiling (0.758) keeps false alarms as class 0. The 0.7461 with "your scores" — I think it means reassign classes perfectly but keep our score values. This is a bit ambiguous but the point is: 0.117 is lost to class misassignment.
+
+So the fix must improve class assignment. The model needs to be better at distinguishing pore/deposit/discontinuity/stain.
+
+**Given all the exhausted families, what's genuinely new?**
+
+Let me list what's been tried and rule it out:
+- Scoring/ranking tricks: exhausted
+- Background class: exhausted
+- Extra detector-box training data: small gains, not confirmed
+- Views (1.0x, 4x): small/no gain
+- Resolution: no gain
+- Backbone size: no gain
+- TTA: no gain
+- Longer training: no gain
+- Class rebalancing (sampling/weighting): no gain, weighting hurt
+- Augmentation (rotation, mixup, color, geometry): no gain
+- Focal loss: no gain
+- Size/aspect input: never worked
+- Optimizer (SGD): +0.0031 not confirmed
+- Feature concat: +0.0025 not confirmed
+- Multi-label BCE: not confirmed
+- Per-crop norm: timeout
+- Margin loss: rejected
+- Copy-paste: crashed then no gain
+
+**What's NOT tried?**
+
+1. **Label smoothing** — mentioned in background but not in the tried list. But "label smoothing improves calibration... can reduce information in class probabilities that ranking metrics use." Since AP depends on order, label smoothing might not help ranking. Probably not impactful.
+
+2. **Mixup/CutMix** — "Training augmentation (rotation, mixup, stronger colour or geometry): 5 attempts, no gain". So mixup was tried. Exhausted.
+
+3. **A different crop strategy that's fundamentally different** — e.g., instead of fixed 1.5x/2.5x, use the box's actual extent plus a fixed pixel margin (so small boxes get more relative context, large boxes get less). But that's "small-box handling" which was exhausted.
+
+4. **Ensemble of two models trained with different seeds/recipes** — "2-3 model ensembles: no gain". Exhausted.
+
+5. **Snapshot ensemble / SWA** — not explicitly in the tried list! The background reading mentions SWA and snapshot ensembles. e004 was EMA (crashed/bug). SWA is different from EMA. But under a fixed budget, SWA averages weights over the last portion of training. Hmm. But the "optimisation" category only has 2 ideas (e004 EMA bug, e017 SGD). SWA could be a new optimisation idea. But would it give 0.01+? Unlikely. Probably not.
+
+6. **A fundamentally different model input: the full image with the box location (like a R-CNN region proposal but with the box as input).** Not tried. But complex.
+
+7. **Use the detector confidence as a feature / prior.** The detector conf might correlate with defect-ness. But we already multiply score by conf. Using conf as an input feature to the classifier... that's like the size/aspect input idea (e007 rejected). Probably not.
+
+8. **Two-pass / iterative refinement.** Not tried but complex.
+
+9. **Train on the detector's train-split boxes with HIERARCHICAL or different labeling.** e003/e005 tried detector boxes with IoU>0.5 labeled by class. Small gains.
+
+10. **A cleaner, stronger backbone at the SAME compute by using a faster one + higher res.** Combination.
+
+Hmm, let me reconsider the problem from the angle of "what would a strong researcher do."
+
+The confusion is stain-dominated. Stain is the majority. The model over-predicts stain. 
+
+**Insight: What if we train a classifier that is explicitly biased against the majority class in a way that class-weighted loss didn't do?** Class-weighted loss up-weights rare classes and it hurt. But what about a different mechanism: **training with a stain-specific penalty only on the confused pairs** (deposit→stain, pore→stain)? That's a targeted loss. e010 was a "class-margin (triplet-style) loss" pulling true class above the two most-confused classes — rejected (0.6183). So targeted margin loss hurt.
+
+Hmm. So loss-based fixes have been tried and mostly hurt.
+
+**Let me reconsider the data angle.**
+
+We train on 6052 high-res boxes. The class distribution: stain ~40%, so ~2400 stain, pore ~? Let me estimate from the confusion matrix rows (these are eval boxes, not train, but similar): pore 76, deposit 269, discontinuity 447, stain 610. So stain is ~50% of overlapping boxes. Pore is rare (~7%).
+
+If stain is 50% of training data, the model learns stain well and defaults to it.
+
+**Idea: Reduce stain in training (undersample stain) to force the model to be more discriminative.** But "class-balanced sampling: no gain". Undersampling stain is a form of class-balanced sampling. Exhausted.
+
+Hmm, everything data-side is exhausted.
+
+**Let me reconsider the input representation, which is where "what the model sees" matters most.**
+
+Current: two crops, 1.5x and 2.5x, each 160px, logits averaged.
+
+The model sees the defect at a fixed fraction of the frame. The issue: for the stain/deposit confusion, the difference is in local texture. 
+
+**New idea: Instead of averaging logits of two crops, feed a SINGLE image that contains BOTH the tight and wide views at full detail, arranged so the model can compare them.** e001 tried side-by-side at 112x112 each in a 224 image — not confirmed (0.6275). So that specific arrangement failed.
+
+**What about a 3x3 grid or a different arrangement?** Probably not fundamentally different from e001.
+
+**Let me think about the actual pixel resolution of the texture.**
+
+At 160px, the tight crop (1.5x box) means the box fills 160/1.5 ≈ 107px. The wide crop (2.5x box) means the box fills 160/2.5 = 64px. So the box texture is rendered at ~107px (tight) and ~64px (wide).
+
+For pore (small holes), 107px might not be enough to see individual pores if the box is small. But the box is the defect, so the box IS the pore region. Hmm.
+
+Actually, the crops are rescaled to 160px regardless of the box's pixel size. So a 20px box becomes 30px (1.5x) then rescaled to 160px — 5.3x upscaling, very blurry. A 100px box becomes 150px (1.5x) then rescaled to 160px — ~1x, sharp.
+
+So small boxes are blurry. The diagnostic confirms small boxes are harder (80% vs 93%). But "enlarged tight crops for small boxes" was exhausted.
+
+Wait, "enlarged tight crops for small boxes" — how was that done? Probably by increasing the context or MIN_CROP. But that doesn't add real pixels; it just shows more (blurry) context. To actually see more detail in a small box, you'd need to NOT downscale — i.e., keep the small box at its native (small) size and pad, or use a higher input resolution.
+
+**Idea: Higher input resolution (e.g., 320 or 384) with a faster backbone to keep steps.** This directly addresses the small-box blur. The resolution family tried 224px (no gain) but with B0 (slower). Let me check: 224px B0 — how many steps? The current 160px B0 does 433 steps in ~150s. At 224px, ~1.9x compute per step, so ~230 steps. The "resolution" family best was 0.634 not confirmed. So 224px B0 gave ~0.634.
+
+What if we go to 320px or 384px with a faster backbone (convnext_atto or regnety_016)? A faster backbone at higher res could give more steps AND higher res. This is a combination not tried.
+
+But honestly, the resolution family's 9 attempts with no gain is a strong signal that resolution isn't the lever. Let me not over-index on it.
+
+**Let me reconsider from the "what the model learns" angle.**
+
+The model is fine-tuned from ImageNet pretrained. The weld defects are a specific domain. Maybe the pretrained features aren't great for weld texture. But we can't train from scratch (time budget).
+
+**Idea: Use a backbone with features better suited to texture, like ConvNeXt (which is known for texture/local features) at the same compute.** The backbone family tried "EfficientNet-B2, ResNet-50, 2-3 model ensembles" — no ConvNeXt mentioned! Let me re-read: "Bigger or other backbone (EfficientNet-B2, ResNet-50, 2-3 model ensembles): 8 attempts, no gain". So they tried B2 and R50 but maybe not ConvNeXt specifically. ConvNeXt is in the available pretrained list.
+
+Hmm, but "other backbone" is a broad family that's marked as tried (8 attempts). Even if ConvNeXt wasn't specifically tried, the family is "exhausted?" per the lessons. But the lessons table shows architecture as "EXHAUSTED? (3+ ideas, no new best)". 
+
+Actually, I should be careful. The instructions say: "A direction where three or more attempts gave no confirmed gain is exhausted: do not propose another variant of it unless you can say what is fundamentally different."
+
+So I need something fundamentally different, not another backbone.
+
+**Let me think about what's fundamentally different.**
+
+The fundamental issue: stain is a magnet, pore is weak. The difference between these classes is local texture at the scale of the defect.
+
+**Radical idea: Crop at the defect's native resolution and classify texture directly, using a model that's good at texture.** But that's resolution + backbone, both tried.
+
+**Another radical idea: Use the detector's train-split boxes for training but with a DIFFERENT label strategy — specifically, use the boxes that the detector is uncertain about, or use hard negatives.** e003/e005 used IoU>0.5 boxes labeled by class. What about using IoU in (0.1, 0.5) as hard negatives for a background-ish signal? That's the "background class" family (exhausted, 9 attempts).
+
+Hmm.
+
+**Let me reconsider the scoring.**
+
+Wait, I keep saying scoring is exhausted, but let me re-examine. The diagnostic: "mAP if every box had correct class but kept your scores: 0.7461". Our scores are conf × p[c]. 
+
+The class-agnostic single-class score is 0.755 (using just conf). So conf alone gives 0.755. Our conf × p[c] per-class gives 0.6288. If classes were perfect, conf × p[c] gives 0.7461.
+
+Interesting: conf alone (single class) = 0.755. conf × p[c] with perfect classes = 0.7461. So multiplying by p[c] (even with perfect classes) LOSES 0.009 vs just conf. That means p[c] is a slightly worse ranker than conf for the true class. But that's small.
+
+The big loss (0.117) is from wrong classes. So the fix is class accuracy, not ranking.
+
+**OK here's a cleaner idea I think is genuinely new and targets the core error:**
+
+**Hierarchical / two-stage classification within stage 2.** 
+
+Rationale: The confusion is dominated by stain. Stain is visually a "catch-all" — when uncertain, the model says stain. If we structure the decision as:
+1. First: is this stain or not-stain? (2-way)
+2. If not-stain: pore / deposit / discontinuity (3-way)
+
+This forces the model to make the stain decision explicitly and separately, which might reduce the "magnet" effect because the stain classifier is trained only on stain vs the rest, and the sub-classifier is trained only on non-stain.
+
+But this is a loss/architecture change. And it's somewhat related to the confusion-targeting losses (e010) which hurt. Hmm. But e010 was a margin loss on the 4-way, not a hierarchical decomposition. Different mechanism.
+
+Actually, wait. Let me reconsider whether hierarchical helps. The issue is the model confuses deposit with stain (55) and pore with stain (20). In a hierarchical scheme, the first stage "stain vs not" would need to correctly separate deposit from stain. If deposit and stain are hard to separate, the first stage makes the same errors. So it might not help.
+
+Hmm.
+
+**Let me think about the ACTUAL visual difference between stain and deposit.**
+
+The brief (e006 hypothesis, which crashed) said: "These classes differ mainly by th[e local texture]". And e016 (timeout) was about "local [texture]". So the idea that stain/deposit differ by local texture was explored (e006 crashed, e01Thinking budget reached. Stop thinking now and write the reply in the required format.

@@ -1,0 +1,305 @@
+===== attempt 1 =====
+Let me analyze the current situation:
+
+Current best: e013 with 5-seed val mAP@0.5 = 0.6314
+- Per-class AP: pore 0.507, deposit 0.629, discontinuity 0.781, stain 0.609
+- The model uses EfficientNet-B0, two-crop input (1.5x tight + 2.5x wide), test-time augmentation with horizontal flip
+- Training: 6052 boxes, 5 epochs, ~381 steps in ~157s total
+
+Key observations:
+1. Pore is the weakest class (0.507), followed by stain (0.609), deposit (0.629), discontinuity (0.781)
+2. The ceiling is 0.758 mAP, so there's significant room for improvement
+3. The one-step 4-class baseline is 0.638 - we're actually below it at 0.6314!
+4. Previous experiments show:
+   - Training on detector boxes with background class (e002): 0.5172 - much worse
+   - Training on detector boxes without background (e005): 0.6248 - slightly worse
+   - Low-res crops (e003): 0.6251 - slightly worse
+   - Score modifications (e004, e008): all worse
+   - Architecture change to ConvNeXt-Nano (e006): crashed/bug
+   - MixUp (e007): 0.6292 - not confirmed
+   - Wider context 3.5x (e009): 0.6309 - not confirmed
+   - Label smoothing (e010): 0.6254 - not confirmed
+   - More jitter (e011): 0.6294 - not confirmed
+   - Focal loss (e012): 0.6209 - rejected
+   - TTA with hflip (e013): 0.6314 - new best
+
+The key insight from the background: "When all types are merged into one class, the same detector reaches 0.77, so many errors are wrong types, not missed defects." This means the detector is finding defects well, but the classification is the bottleneck.
+
+The fact that we're below the one-step baseline (0.638) is concerning. The two-stage approach should be better since the detector is class-agnostic and finds defects well.
+
+Let me think about what could help:
+
+1. **Training duration**: We only get ~5 epochs in the budget. The model might not be fully trained. But we're limited by the time budget.
+
+2. **Learning rate schedule**: Currently using cosine decay with 5% warmup. Maybe a different schedule could help.
+
+3. **The score formula**: Currently score = conf × p[c]. The detector conf is a fixed value. Maybe we should use the classifier probability more aggressively. But e004 (p²) and e008 (× max_p) both hurt.
+
+4. **Multi-row predictions**: Currently we output one row per class (4 rows per box). Maybe we should only output the top class, or use a threshold.
+
+5. **The background problem**: The detector produces false alarms. The current model was trained only on true boxes, so it has no notion of "not a defect." When it sees a background box, it still assigns some probability to each class. The detector conf should help filter these, but maybe not enough.
+
+6. **Training on detector boxes**: e002 (with background class) was 0.5172 - much worse. e005 (without background, just using detector box coordinates) was 0.6248. Both worse than training on GT boxes. This is surprising.
+
+Wait, let me reconsider e005. Training on detector boxes that overlap GT (IoU>0.5) but using the detector box coordinates instead of GT coordinates. This got 0.6248, slightly worse than 0.6314. The hypothesis was to close the train/test distribution gap, but it didn't help.
+
+Let me think about what hasn't been tried:
+
+1. **Ensemble of two models**: Train two different models (e.g., EfficientNet-B0 and another) and average their probabilities. But this might not fit in the time budget.
+
+2. **More aggressive TTA**: We already have hflip. Could add vertical flip, or 90-degree rotation? But weld beads have orientation, so rotation might not help.
+
+3. **Score calibration**: The detector conf might not be well-calibrated. Maybe we should use a different combination.
+
+4. **Only output top-1 class**: Instead of 4 rows per box, only output the top class. This reduces false positives for wrong classes.
+
+5. **Threshold on classifier probability**: Only output a row if p[c] > some threshold.
+
+6. **Training longer**: We're limited to ~5 epochs. What if we use a smaller batch size to get more steps?
+
+7. **Different optimizer**: Maybe SGD with momentum instead of AdamW?
+
+8. **Pretrained model choice**: We're using EfficientNet-B0. What about EfficientNet-B2 (larger)?
+
+9. **The key insight**: "Class-weighted loss hurt classification every time it was tried." So we shouldn't do that.
+
+10. **The per-class AP**: pore 0.507 is very weak. What's special about pore? Pores are small circular defects. Maybe they need a different crop size or context.
+
+Let me think about what's most likely to help:
+
+The fact that we're below the one-step baseline (0.638) is the most concerning issue. The two-stage approach should theoretically be better because:
+- Stage 1 finds defects well (0.755 mAP as single class)
+- Stage 2 just needs to classify
+
+But we're at 0.6314, below the one-step 0.638. This suggests the classifier is making many wrong-type errors.
+
+One thing that stands out: the current model outputs 4 rows per box (one per class). This means for each detector box, we're making 4 predictions. If the classifier is wrong, we get a false positive for the wrong class. 
+
+What if we only output the top-1 class per box? This would reduce false positives for wrong classes. The trade-off is we might miss some true detections if the top-1 is wrong.
+
+Actually, let me reconsider. The mAP@0.5 scoring: for each class, we look at all predictions of that class and match them to GT boxes of that class. A prediction is a true positive if it matches a GT box of the same class with IoU > 0.5.
+
+If we output 4 rows per box, and the classifier is uncertain, we might get:
+- Box overlaps GT pore, classifier says 0.4 pore, 0.3 deposit, 0.2 stain, 0.1 disc
+- We output 4 rows: pore (conf*0.4), deposit (conf*0.3), stain (conf*0.2), disc (conf*0.1)
+- The pore row matches the GT pore → TP
+- The deposit row doesn't match any GT deposit → FP
+- etc.
+
+If we only output the top-1 (pore in this case), we avoid the FP for deposit/stain/disc. This should help precision for all classes.
+
+But wait, what if the classifier is wrong? Box overlaps GT pore, but classifier says 0.5 deposit, 0.3 pore, 0.1 stain, 0.1 disc. If we only output top-1 (deposit), we get an FP for deposit and miss the pore. With 4 rows, we'd get a TP for pore (if it matches) and FPs for deposit/stain/disc.
+
+Hmm, actually with 4 rows, the pore row would still match the GT pore (IoU > 0.5), so we'd get a TP for pore. The deposit row would be an FP. So 4 rows gives us TP + 3 FPs, while top-1 gives us 1 FP (and missed TP).
+
+For mAP, having more FPs is worse than having fewer TPs, depending on the ranking. But the FPs from wrong-class rows are always harmful (they're FPs for that class).
+
+Actually, I think outputting only the top-1 class (or maybe top-2) would help by reducing false positives for wrong classes. Let me think about this more carefully.
+
+For class c, a prediction row (box, c, score) is:
+- TP if it matches a GT box of class c with IoU > 0.5
+- FP otherwise (either no GT box of class c overlaps, or it's already matched)
+
+If we output 4 rows per box, for each box we add 4 potential FPs (one per class, except the one that might be TP). If we output only top-1, we add at most 1 potential FP per box.
+
+The key question: does the reduction in FPs outweigh the potential loss of TPs? If the classifier is correct, top-1 gives the same TP. If the classifier is wrong, top-1 loses the TP but also loses 3 FPs.
+
+I think top-1 (or top-2) would help, especially for the weak classes where the classifier is most uncertain.
+
+Actually, let me reconsider. The score = conf × p[c]. If p[c] is low for the wrong classes, their scores are low, and they rank below true detections. So they might not affect mAP much. But they still count as FPs if they rank above the threshold.
+
+Hmm, but mAP is computed by sorting all predictions by score and computing precision-recall. Low-scoring FPs at the end don't hurt much. But if the wrong-class rows have moderate scores (because conf is high and p is moderate), they could hurt.
+
+Let me think about a different approach: **only output the top-1 class per box, with score = conf × p[top1]**. This is a clean change that should reduce FPs.
+
+Actually, wait. Let me re-read the problem statement: "Several rows per box (one per class) are allowed and often help." So the problem statement says multiple rows often help. But that might be in general, not for this specific setup.
+
+Let me think about another angle. The per-class APs are:
+- pore 0.507 (very weak)
+- deposit 0.629
+- discontinuity 0.781 (good)
+- stain 0.609
+
+Pore is the weakest. What's special about pore? In welding, pores are small gas bubbles. They might be:
+- Small in size
+- Hard to distinguish from other small defects
+- The crop might not capture enough context
+
+One idea: **use a smaller crop for pore-like boxes**. But we don't know the class before classifying, so this is circular.
+
+Another idea: **train a separate classifier for the weak classes**. But this is complex and might not fit in the time budget.
+
+Let me focus on what's most likely to give a measurable improvement:
+
+1. **Top-1 output**: Reduce FPs by only outputting the most likely class per box. This is a simple change that should help precision.
+
+2. **Score = conf × p[c] / max(p)**: Normalize by max probability. This makes the score relative to the classifier's confidence. But e008 tried × max(p) and it hurt.
+
+3. **Score = conf × p[c]^α** for α > 1: e004 tried α=2 and it hurt.
+
+4. **Only output rows where p[c] > threshold**: E.g., only output if p[c] > 0.1. This reduces low-confidence FPs.
+
+5. **Train with a different augmentation**: The current augmentation is hflip, vflip, brightness, jitter. Maybe add color jitter?
+
+6. **Use a larger model**: EfficientNet-B2 instead of B0. This would be slower but might be more accurate. Need to check if it fits in the time budget.
+
+7. **Ensemble**: Train two models and average. But time budget is tight.
+
+8. **Different learning rate**: Maybe 5e-4 instead of 1e-3? The current schedule might be too aggressive.
+
+Let me think about the most impactful change. The problem statement says "many errors are wrong types, not missed defects." This means the classifier is misclassifying defects. The top-1 output idea directly addresses this by reducing the number of wrong-type predictions.
+
+But wait, if we output top-1 and the classifier is wrong, we still get a wrong-type prediction (just one instead of four). The TP is lost either way (with 4 rows, the correct class row would still match if IoU > 0.5).
+
+Actually, no. With 4 rows, if the box overlaps a GT pore and the classifier says 0.3 pore, 0.4 deposit, 0.2 stain, 0.1 disc:
+- Pore row: score = conf × 0.3. If this matches GT pore → TP for pore.
+- Deposit row: score = conf × 0.4. No GT deposit overlaps → FP for deposit.
+- Stain row: score = conf × 0.2. No GT stain overlaps → FP for stain.
+- Disc row: score = conf × 0.1. No GT disc overlaps → FP for disc.
+
+With top-1 (deposit):
+- Deposit row: score = conf × 0.4. No GT deposit overlaps → FP for deposit.
+- No pore row → missed TP for pore.
+
+So top-1 loses the pore TP but gains by removing 3 FPs (stain, disc, and... wait, the deposit FP is still there).
+
+Actually, with 4 rows: 1 TP (pore) + 3 FPs (deposit, stain, disc)
+With top-1: 0 TP + 1 FP (deposit)
+
+For pore: 4 rows gives TP, top-1 gives miss. Bad for pore.
+For deposit: both give FP. Same.
+For stain: 4 rows gives FP, top-1 gives nothing. Good for stain.
+For disc: 4 rows gives FP, top-1 gives nothing. Good for disc.
+
+So top-1 helps stain and disc precision but hurts pore recall. Given that pore is already the weakest (0.507), this might not be net positive.
+
+Hmm, what about top-2? Output the two most likely classes:
+- Pore row: score = conf × 0.3. TP for pore.
+- Deposit row: score = conf × 0.4. FP for deposit.
+- No stain/disc rows.
+
+This gives 1 TP + 1 FP, which is better than 1 TP + 3 FPs but worse than 4 rows for pore (same TP) and better for stain/disc.
+
+Actually, I think the issue is more subtle. Let me think about what actually drives mAP.
+
+mAP@0.5 for class c: sort all predictions of class c by score, compute precision-recall curve, take the area.
+
+If we have many low-scoring FPs for class c, they dilute the precision at low recall. But if the TPs are high-scoring, they come first and the precision starts high.
+
+The key is the ranking: TPs should be ranked above FPs. The score = conf × p[c] should achieve this if the classifier is good.
+
+But for wrong-class rows (e.g., a box that's actually pore but classified as deposit), the deposit row has score = conf × p[deposit]. If p[deposit] is high (because the classifier is wrong), this FP ranks high and hurts deposit precision.
+
+So the question is: are the wrong-class rows ranked high enough to hurt? If the classifier is uncertain (p is spread across classes), the wrong-class rows have low scores and don't hurt much. If the classifier is confidently wrong (p is concentrated on the wrong class), the wrong-class row has a high score and hurts a lot.
+
+I think a reasonable approach is to **only output the top-1 class per box**. This eliminates all wrong-class FPs from the same box. The only FPs are boxes that are truly background (no GT overlap) or boxes where the top-1 class is wrong.
+
+Let me also consider: what if we output top-1 but with a lower score for uncertain predictions? E.g., score = conf × p[top1] × p[top1] = conf × p[top1]². This down-weights uncertain predictions. But e004 tried p² and it hurt.
+
+Actually, e004 used p² for all classes, not just top-1. The effect is different.
+
+Let me go with **top-1 output** as the next experiment. It's a clean, testable change:
+- Hypothesis: Outputting only the top-1 class per box (instead of all 4 classes) will improve mAP by reducing false positives for wrong classes, since the detector finds defects well but the classifier sometimes assigns the wrong type.
+
+Wait, but the problem statement says "Several rows per box (one per class) are allowed and often help." This suggests that multiple rows are generally beneficial. But in our specific case, the classifier is making wrong-type errors, so multiple rows might be harmful.
+
+Let me reconsider. Maybe instead of top-1, I should try a **score threshold**: only output a row if p[c] > 0.15 (or some threshold). This keeps multiple rows for confident predictions but drops low-confidence ones.
+
+Actually, let me think about this differently. The current score is conf × p[c]. The detector conf is a fixed value from stage 1. If conf is low (say 0.3), then even with p[c] = 0.9, the score is only 0.27. If conf is high (say 0.9) and p[c] = 0.3, the score is 0.27. These two cases are indistinguishable in score.
+
+But the first case (low conf, high p) is more likely to be a true detection (the detector is uncertain but the classifier is confident). The second case (high conf, low p) is more likely to be a wrong-type error (the detector is confident but the classifier is uncertain).
+
+Maybe we should weight the classifier probability more than the detector conf. E.g., score = conf^0.5 × p[c] or score = conf × p[c]^1.5.
+
+But e004 tried p² (which is like conf × p²) and it hurt. So increasing the power of p doesn't help.
+
+Let me try a different angle. What about **using the margin (p[top1] - p[top2]) as a confidence indicator**? If the margin is small, the classifier is uncertain, and we should lower the score.
+
+score = conf × p[top1] × (p[top1] - p[top2]) / p[top1] = conf × (p[top1] - p[top2])
+
+This is interesting: the score becomes conf × margin. If the classifier is uncertain (small margin), the score is low. If the classifier is confident (large margin), the score is high.
+
+But this only works for the top-1 class. For other classes, the margin doesn't apply.
+
+Actually, let me simplify. What if we just output top-1 with score = conf × p[top1]? This is the simplest change and directly addresses the wrong-type FP problem.
+
+Let me go with this. The change is:
+- Instead of outputting 4 rows per box (one per class), output only 1 row per box (the top-1 class).
+- Score = conf × p[top1].
+
+This is a scoring change. The hypothesis is that reducing wrong-class FPs will improve mAP, especially for the weak classes (pore, stain) where the classifier is most uncertain.
+
+Let me write the code change:
+
+Current code:
+```python
+    for d, p in zip(ev, probs):
+        for c in range(4):
+            s = d["conf"] * float(p[c])
+            if s > MIN_SCORE:
+                w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+
+New code:
+```python
+    for d, p in zip(ev, probs):
+        c = int(np.argmax(p))
+        s = d["conf"] * float(p[c])
+        if s > MIN_SCORE:
+            w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+
+This is a clean, minimal change. Let me verify it's correct:
+- `p` is a numpy array of shape (4,) with class probabilities
+- `np.argmax(p)` gives the index of the max probability (top-1 class)
+- We output one row per box with the top-1 class and score = conf × p[top1]
+
+This should reduce the number of prediction rows from ~54378 to ~41879 (one per eval box instead of four).
+
+Let me finalize this as my experiment.
+
+Actually, wait. Let me reconsider whether this will actually help. The problem statement says "Several rows per box (one per class) are allowed and often help." This is a general statement, but in our specific case, the classifier is making wrong-type errors. The "often help" might refer to cases where the classifier is uncertain and multiple rows capture the uncertainty.
+
+But in mAP@0.5, a wrong-class row is always an FP (unless it happens to overlap a GT box of that class, which is unlikely for a single box). So multiple rows add FPs without adding TPs (for the wrong classes).
+
+The only case where multiple rows help is if a box overlaps multiple GT boxes of different classes (which is rare) or if the IoU matching is lenient (IoU > 0.5 is fairly strict).
+
+I'm fairly confident that top-1 output will help or at least not hurt. Let's go with it.
+
+One more consideration: the MIN_SCORE threshold. With top-1, the minimum score is conf × p[top1]. Since p[top1] >= 0.25 (uniform), the minimum score is 0.25 × conf. With MIN_SCORE = 0.001, almost all rows will be written. This is fine.
+
+Let me write the final answer.
+
+Actually, I want to reconsider one more time. Let me think about what happens with the mAP computation:
+
+For class c, we have N_c predictions (rows with cls=c). We sort them by score. For each prediction, we check if it matches a GT box of class c with IoU > 0.5.
+
+With 4 rows per box: N_c ≈ 41879/4 ≈ 10470 per class (roughly, assuming uniform class distribution).
+With 1 row per box: N_c ≈ 41879 × (proportion of boxes where c is top-1).
+
+If the classifier is good, the top-1 class is often the correct class, so N_c for the correct class is high and N_c for wrong classes is low. This should improve precision for all classes.
+
+If the classifier is bad, the top-1 class is random, and N_c is roughly 41879/4 per class. This is the same as 4 rows per box (in terms of N_c), but the scores are different (p[top1] vs p[c]).
+
+I think top-1 is a good experiment. Let's go with it.
+
+Final answer:
+- BASE: best (e013)
+- CATEGORY: scoring
+- HYPOTHESIS: Outputting only the top-1 class per detector box (instead of all 4 classes) will improve mAP by eliminating wrong-class false positives, since the stage-1 detector finds defects well but the stage-2 classifier sometimes assigns the wrong type, and each wrong-class row is an unconditional FP for that class.
+===== attempt 2 =====
+The SEARCH text must match exactly, including indentation. Let me look at the current file:
+
+```python
+    n = 0
+    with open(os.path.join(args.out, "preds.csv"), "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["det_id", "cls", "score"])
+        for d, p in zip(ev, probs):
+            for c in range(4):
+                s = d["conf"] * float(p[c])
+                if s > MIN_SCORE:
+                    w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+
+So the indentation is 8 spaces for `for d, p in zip(ev, probs):`, 12 spaces for `for c in range(4):`, 16 spaces for `s = ...`, etc. In my previous attempt I used 4 spaces. Let me redo it with the correct indentation.

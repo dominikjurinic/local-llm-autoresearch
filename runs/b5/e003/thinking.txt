@@ -1,0 +1,165 @@
+===== attempt 1 =====
+Let me think carefully about the current state.
+
+Current best: e000, 5-seed mean 0.6288. Per-class AP: pore 0.502, deposit 0.624, discontinuity 0.780, stain 0.609.
+
+Reference numbers:
+- One-step 4-class detector: 0.638 (the baseline to beat)
+- Stage-1 boxes with perfect classes: 0.758 (upper bound)
+- Class-agnostic single class: 0.755
+
+So we're at 0.6288 vs. the upper bound of 0.758. The gap is 0.13. The crop classifier given perfect boxes reaches macro-F1 ~0.87 with the initial recipe. So there's a lot of room.
+
+What are the error components?
+1. Wrong class on boxes that overlap real defects (class decision error).
+2. Ranking of false alarms vs. true detections (score ranking).
+3. Box placement (stage 1 is fixed, so we can't change boxes, but we can drop boxes — "leaving a box out drops it").
+
+Per-class analysis:
+- Pore 0.502 — the weakest. Pore is probably small and hard.
+- Stain 0.609 — stain is often confused with deposit.
+- Deposit 0.624.
+- Discontinuity 0.780 — the best.
+
+Ideas tried so far:
+- e001: training on stage-1 detector boxes (with pseudo-labels) — rejected (0.6264 seed 0, below 0.6288).
+- e002: include low-res crops — not confirmed (5-seed mean 0.6261 < 0.6288).
+
+So both data-category experiments failed. Lessons: the data direction hasn't been confirmed yet.
+
+Now, what should I try? The instructions say: method changes have helped more than hyperparameter tuning. Class-weighted loss has hurt every time. Tuning hyperparameters alone has helped little.
+
+Let me think about what fundamentally changes what the model sees or what it learns.
+
+Key insight: the crop classifier uses two views (tight 1.5x and wide 2.5x) through the same EfficientNet-B0, averaging the logits. The model is pretrained EfficientNet-B0 at 160px.
+
+Ideas:
+
+1. **Architecture: use a bigger/better backbone.** E.g., efficientnet_b2 or convnext_nano. The budget: currently 433 steps in ~125s of training (18s load + 55s reserve → 125s training budget). EfficientNet-B0 at 160px, batch 64, 2 forward passes per step (tight + wide). Step time ≈ 125s/433 ≈ 0.29s/step. EfficientNet-B2 is ~2x the compute of B0... actually B2 is 400M? No: B0 is 40M params, B2 is 7.6M? No. EfficientNet-B0: 40M params; B2: 7.6M? No, B2 is 6.8M? Let me recall: EfficientNet-B0 ~40M, B1 ~43M, B2 ~7.6M? No, that's wrong. B2 is 6.8M? Actually EfficientNet-B2 is 7.6M? No — EfficientNet-B0 is 40M params, B2 is 7.6M... I'm confusing it with something else. EfficientNet-B2 has 6.8M? No: B0 = 40M, B1 = 43M, B2 = 76M? Hmm. EfficientNet-B2: 7.6M? I think B2 is 6.8M... let me think again. EfficientNet paper: B0 40M, B1 43M, B2 76M, B3 120M, B4 190M, B5 300M, B6 430M, B7 660M. Yes, B2 ≈ 76M. So B2 is ~2x the params of B0, and ~2x the FLOPs (B0 0.4 GFLOPs, B2 0.8 GFLOPs? Actually B0 0.39, B2 0.76 GFLOPs). So step time roughly doubles: 0.29 → ~0.58s/step, and we'd get ~half the steps (~210 steps). Plus inference: 41879 detections × 2 views / batch 256 → 326 batches; currently inference time is... total 162s, load 13s, training ~125s (up to 125s), so inference ~24s. With B2, inference doubles to ~48s. Total: 13 + 125 + 48 = 186 > 180. Hmm, tight. But the training loop stops at deadline - 55 = 125s, so training is fixed at ~125s regardless; the risk is inference exceeding the reserve. With B2: inference ~48s < 55s reserve, but it cuts it close. Plus load time might grow slightly (model download? No, offline, weights available locally).
+
+Actually wait — is the GPU available? The log shows 94 steps in the first 46s (59-13). 94 steps in 46s = 0.49s/step? Hmm, epoch 0: 94 steps at 59s total (13s load, so 46s for 94 steps = 0.49s/step). Epoch 1: another 94 steps in 18s = 0.19s/step. Epoch 2: 94 steps in 18s. Epoch 3: 94 in 19s. Epoch 4: 57 steps in 11s. So steady-state step time ≈ 0.19s. OK, so with B2 at ~2x compute → ~0.38s/step → ~330 steps in 125s. Inference: 41879 × 2 views = 83758 images at batch 256 → 326 batches. Currently inference ≈ 162 - 125 - a bit = ~30s? Let me compute: done at 162s total; training ended at 125s (t_end = 13 + 125 = 138s? Wait, t_start is after load, t_end = deadline - 55 = 180 - 55 = 125s from T0. So training runs from ~13s to ~125s = 112s of training. Then inference + write = 162 - 125 = 37s. Hmm, that's more than I thought. 326 batches in ~30s (write ~7s?) = ~0.09s/batch. With B2: ~0.18s/batch → ~59s + write 7s = 66s > 55s reserve → risk of timeout. Unless I reduce inference cost: use only 1 view at test time? That halves inference. Or lower the inference resolution? Or use a bigger batch (512) — memory: B2 at 160px, batch 256 × 2 views... channels_last bfloat16, probably fine.
+
+Hmm, but the bigger question: would B2 at the same step count (fewer steps) beat B0? Usually a bigger model with fewer steps is... uncertain. The classifier with perfect boxes reaches F1 0.87 with the initial recipe (B0). The gap to the upper bound is partly class decision error, and partly... hmm.
+
+Actually wait. Let me reconsider the error structure. Upper bound with perfect classes = 0.758. Class-agnostic = 0.755. Our score = 0.6288. If the classifier were perfect on true positives, we'd be at 0.758. The crop classifier with perfect boxes reaches macro-F1 0.87. So the class decision error on TP boxes accounts for some of the gap. But there's another component: false alarms. In the upper bound, false alarms are kept as class 0 with the detector's conf. In our system, false alarms get a class from the classifier and score conf × p(class). If the classifier is confident about a false alarm (e.g., p(pore)=0.9), then that false alarm gets a high score in the pore class and hurts pore's AP. In the upper bound, false alarms are all class 0 (pore) with score conf. So the upper bound also has false alarms in the pore class.
+
+Key subtlety: the score is conf × p(c). For a true detection of class c, the score is conf × p(c|crop). p(c|crop) < 1, so the score is lower than the detector's conf. For false alarms, the score is conf × p(c|crop) for the predicted class. The ranking within a class is what matters for AP.
+
+Hmm, one important consideration: for mAP@0.5 per class, the predictions of that class are sorted by score. If we output one row per class per box, then for class c we have 41879 rows (all boxes), each with score conf × p_c. A box that's a false alarm but has high p_c will rank high in class c and count as a false positive for class c.
+
+Alternative: output only the argmax class per box (one row per box). Then each class's predictions are only the boxes predicted to be that class. This changes the composition of the per-class ranking: for class c, only boxes with argmax = c, scored by conf × p_c (or just p_c, or conf). Would that be better?
+
+Let me think: with one row per class, class c's list contains boxes that are actually class d (d≠c) but have p_c > 0. Those are false positives in class c's ranking. With argmax-only, class c's list contains only boxes predicted as c. A box actually class d predicted as c is still a false positive in class c (if it doesn't match a true c box) — but it's a true box of class d, so it's a "true detection" of class d... no wait, if it's predicted as c and it's actually d, then in class c it's a false positive (it doesn't overlap a true c box, presumably). In class d it's absent (missed detection).
+
+Hmm, which is better depends on the confusion structure. Consider stain vs. deposit confusion. Suppose a stain box is predicted as deposit with p_dep=0.6, p_stain=0.3. With one row per class: it appears in the deposit list (score conf×0.6) and in the stain list (score conf×0.3). In the deposit list it's a false positive (assuming no deposit there); in the stain list it's a true positive with a lower score. With argmax: it only appears in deposit as a false positive, and stain misses it. So one row per class is strictly better for recall on the confused class, at the cost of extra false positives in the other class's ranking.
+
+But the metric: per class, AP depends on the ordering of that class's predictions. Adding false positives to a class's list hurts that class's AP. So there's a trade-off. The current approach (one row per class, all 4 rows) is a reasonable default.
+
+Actually, hmm, there's a subtlety about the 300-row-per-image cap. 41879 detections / ~1000 eval images ≈ 42 boxes per image on average, but some images may have many. 4 rows per box → up to ~168 rows per image, under 300. OK.
+
+2. **Score calibration / ranking ideas (scoring category).** The score is conf × p(c). Is that the right combination? For AP within class c, we want true c boxes ranked above false alarms (and non-c boxes). The detector's conf is a class-agnostic "there's a defect here" confidence. p_c is the classifier's confidence. The product is a natural joint probability. But maybe the classifier's p_c is miscalibrated: e.g., the classifier is overconfident on false alarms (it sees a crop that's mostly background but says pore 0.9). In that case, multiplying by conf doesn't help much, because conf is also high for detector false alarms (the detector fired).
+
+Alternative: use only p_c as the score (drop conf)? Then within class c, the ranking is purely by classifier confidence. True c boxes should have high p_c; false alarms might have low p_c if the classifier learns "background" — but the classifier has no background class! It's forced to pick one of 4 classes. So on a pure background crop, it outputs some confident class. That's a problem: the classifier can't say "no defect." So p_c alone is dangerous for false alarms. conf × p_c at least downweights boxes the detector wasn't sure about.
+
+Hmm, but here's a thought: train the classifier with a "background" class? The eval boxes are all detector boxes; some are false alarms (no true defect). We can't use eval labels. But we can build a background class from training images: crops from regions with no true box? That changes the training data. But then at test time, a box classified as background gets a low score in all classes... but we still have to output rows (or drop the box). If we drop boxes the classifier calls background, we remove false alarms — that could help AP by removing false positives from the per-class rankings!
+
+That's an interesting idea: add a 5th "background/no defect" class. Train on true boxes + background crops (regions of training images that don't overlap any true box). At test time, score for class c = conf × p_c × (1 - p_bg), or just drop boxes with p_bg > threshold. This directly targets the false-alarm ranking error.
+
+But wait — is the false-alarm ranking really a big part of the error? Let me estimate. Class-agnostic AP = 0.755. Our 4-class AP = 0.6288. If the classifier were perfect on TPs, we'd be at 0.758 (upper bound). The difference between the upper bound and class-agnostic (0.758 vs. 0.755) is small. Our gap to the upper bound = 0.13.
+
+How much of that 0.13 is class confusion vs. false-alarm ranking? The crop classifier with perfect boxes reaches macro-F1 0.87. If F1 0.87 on TP boxes, then ~13% of TP boxes get the wrong class (roughly). That would cost about 0.13 × 0.758 ≈ 0.10 in mAP (if all wrong-class TPs become FPs in one class and misses in another). Plus the false-alarm ranking effect.
+
+Hmm, actually there's a subtlety: even with a perfect classifier on TP boxes, false alarms would get some class with score conf × p_c. In the upper bound, false alarms are all class 0. So the upper bound of 0.758 already includes false alarms as class 0. If our classifier assigns false alarms to various classes with various scores, the per-class AP could be lower or higher than the upper bound's configuration.
+
+Let me think about what's most likely to give a gain ≥0.01:
+
+Option A: bigger backbone (efficientnet_b2). Risk: fewer steps, inference time. Expected effect: a better classifier → fewer wrong classes. The initial recipe with B0 reaches F1 0.87; B2 might reach 0.90+. That could be a real gain. But budget risk.
+
+Option B: background class for false-alarm suppression. Directly targets the FP ranking. But the classifier already implicitly handles "is this a defect" via conf... no, it doesn't. Hmm.
+
+Option C: test-time augmentation (TTA) — e.g., average over flips. Doubles inference cost. Probably a small gain.
+
+Option D: train longer / different LR schedule. "Tuning hyperparameters alone has helped little."
+
+Option E: change the input — e.g., a 3rd view, or a different context, or higher resolution (IMG_SIZE 160 → 224). Higher resolution helps small defects (pore!). Pore is the weakest class (0.502), and pores are small — at 160px, a small pore crop may lose detail. But the crop is resized to 160 anyway; a pore box is small, so the crop is small and upscaled to 160 — detail is limited by the original pixels. Hmm, actually for a small box, the crop side = 1.5 × box side, which might be ~20-40px, upscaled to 160. The information is in those 20-40px. Resolution 160 vs. 224: the model sees the same information, just at a different scale. Probably a small effect.
+
+Option F: the two-view averaging — instead of averaging logits, use both views as separate inputs to a small fusion head, or train two separate models? Averaging logits is simple; a learned fusion might help a bit.
+
+Option G: **Use the detector's conf in training** — e.g., weight the training samples... no.
+
+Option H: **Ensemble of 2 different models** (e.g., B0 + resnet18 or convnext) — but the budget for training 2 models is halved each. Probably not enough.
+
+Option I: **Pore-specific**: pores are small and weak. Maybe pore boxes are small and the 1.5x/2.5x context is too much background? Or the opposite: too tight?
+
+Let me reconsider. The instructions emphasize: "identify the error before choosing a fix... is the loss in the class decision on boxes overlapping real defects, in the ranking of false alarms against true detections, or in box placement?"
+
+We don't have direct per-component numbers, but:
+- Upper bound (perfect classes, FAs kept as class 0) = 0.758.
+- Our score = 0.6288.
+
+If we could measure: what if we take our classifier's argmax but keep the score as conf (i.e., ignore p_c in the score)? That's a different experiment.
+
+Actually, let me think about the false-alarm problem more concretely. 41879 eval detections. How many true defects on eval images? Unknown, but the train split has 6052 boxes on training images (high-res only; including low-res it'd be more). Eval has 1022 images total (train + eval). Hmm, "1022 images" is the total needed (train crops + eval dets). Let's say ~500 eval images. If train has ~6052 high-res boxes on ~500 train images... that's ~12 boxes per image. Eval probably similar: ~500 images × ~12 = ~6000 true boxes? But there are 41879 detections — ~7x more detections than true boxes? That seems like a lot of false alarms. Hmm, wait, maybe the train split of dets.csv has similar counts. Actually, I don't know the number of train dets. The ratio of detections to true boxes: if the detector's precision is ~15%, then 41879 detections → ~6300 TPs. Plausible.
+
+So ~85% of eval boxes are false alarms! That's huge. The per-class ranking is dominated by false alarms. For each class c, the list has 41879 entries: ~1500 true c boxes (if 4 classes evenly) and ~40000 false/non-c entries. AP is determined by how the true c boxes rank against everything else.
+
+In that regime, the score function matters a lot. conf × p_c: for a true c box, p_c is probably 0.6-0.9 → score ≈ conf × 0.7. For a false alarm, the classifier is forced to output something; if it's overconfident (p ~0.8 for some class), the false alarm scores ≈ conf × 0.8 — higher than the true box! That's bad.
+
+Can the classifier learn to be less confident on false alarms? Not with 4 classes — softmax is always ~1 in total. But the conf factor: the detector's conf on false alarms is probably lower than on TPs (that's what conf means). So conf × p_c partially separates them.
+
+The background-class idea: train a 5th class "background" using crops from training-image regions with no true box. Then at test time, p_bg gives a "not a defect" signal. Score_c = conf × p_c × (1 - p_bg) or drop boxes with high p_bg. This directly downweights false alarms in every class's ranking. This targets the largest part of the error (85% FAs).
+
+But there's a risk: the detector's boxes are mostly on defects (that's what the detector found). A background crop from an arbitrary image region is not the same distribution as "a detector false-alarm box." The detector's false alarms are regions that look defect-like. So the background class trained on random regions may not match the false-alarm distribution. Better: build the background class from detector boxes on the train split that don't overlap any true box! We have dets.csv with split="train" — those boxes can be labeled by IoU overlap with crops.csv (that's what e001 did for training). The non-overlapping train det boxes are exactly detector false alarms on training images. Use them as the background class!
+
+That's a clean, well-targeted idea:
+- 5 classes: 0-3 defects + 4 background.
+- Training data: true boxes (classes 0-3) + train det boxes with IoU ≤ 0.5 to any true box (class 4, background).
+- At test time: for each eval box, compute p_0..p_4. Score for class c = conf × p_c × (1 - p_4)? Or score = conf × p_c, and drop boxes with p_4 > threshold?
+
+Hmm wait, but e001 trained on all train det boxes (with pseudo-labels from overlap) and was rejected (0.6264 vs. 0.6288). That was a different thing: it replaced the training data with detector boxes. This idea keeps the true boxes and adds false alarms as a 5th class.
+
+How many train det boxes are there? Unknown, but probably similar to eval: if eval has 41879 on ~500 images, train probably ~40000 on ~500 images. If ~15% overlap a true box, then ~34000 background samples vs. 6052 true boxes — a 5.6:1 imbalance. That's heavy; we'd need to subsample the background (e.g., 1-2x the true boxes) or use class weighting (but "class-weighted loss has hurt classification every time" — that was for the 4 defect classes; subsampling is different from weighting).
+
+Also: adding a 5th class changes the softmax; the defect-class probabilities get compressed by p_4. For a true box, p_4 should be small. For a false alarm, p_4 should be large.
+
+Scoring: score_c = conf × p_c × (1 - p_4)? If p_4 is large, all defect scores drop → the box ranks low in every class. Equivalent to dropping the box if p_4 > 0.5 (since all its scores become tiny, though not zero; with MIN_SCORE=0.001 they might still be written). Better: score_c = conf × (p_c / (1 - p_4 + eps))? That renormalizes over defect classes and uses p_4 only as a gate. Hmm, but the simplest: score_c = conf × p_c × (1 - p_4). Let me think about which is better for AP.
+
+Within class c's ranking, we want true c boxes above false alarms. True c box: conf ~0.5, p_c ~0.7, p_4 ~0.1 → score ≈ 0.5 × 0.7 × 0.9 = 0.315. False alarm: conf ~0.4, p_c ~0.5 (some class), p_4 ~0.7 → score ≈ 0.4 × 0.5 × 0.3 = 0.06. Good separation.
+
+With renormalization p_c/(1-p_4): false alarm's score = 0.4 × (0.5/0.3) = 0.67 — bad, renormalization removes the p_4 signal. So the multiplicative (1 - p_4) is the right form. Or simply score_c = conf × p_c and only use p_4 to drop boxes (p_4 > 0.5 → drop). Dropping removes the box from all classes — cleaner. But a hard threshold is brittle; a soft multiplicative gate is smoother. Let's go with score_c = conf × p_c × (1 - p_4)...
+
+Hmm wait, actually there's a subtlety: for a true box, multiplying by (1 - p_4) lowers the score relative to the upper bound's conf. But AP only cares about the order within a class, so that's fine.
+
+Another consideration: does adding a background class hurt the defect-vs-defect discrimination? The 5-way softmax has to split capacity. But the background class is an easy class (defect crops vs. non-defect crops are quite distinguishable), so it shouldn't hurt much and might even regularize.
+
+Budget: training samples increase (6052 + background). If we subsample background to ~6000, total ~12000 → 2x the data, half the steps (~215 steps). That's a concern — fewer steps. Or subsample to 3000 background → 9000 total, ~290 steps. Hmm. Or keep all background and let the time-based loop run (it stops at the deadline regardless; steps just get fewer). The model trains until the time budget; with 2x data, each epoch is 2x longer, so fewer epochs. Total steps ~half. Is that OK? The current training: 433 steps, loss 0.22. With 215 steps, loss maybe ~0.35. That's a real cost.
+
+Alternative: keep the 4-class defect model and add a separate small binary "defect vs. not" head? That's more complex.
+
+Hmm, let me reconsider. Maybe there's a simpler, higher-leverage idea.
+
+Let me reconsider the problem from the metric's perspective. Per-class AP: for class c, sort all rows of class c by score. Hits = overlap with an unmatched true c box.
+
+Currently: 4 rows per box, score = conf × p_c.
+
+Key question: is the conf factor helping or hurting? Consider dropping conf and using p_c alone. False alarms: the classifier is forced to output a defect class, often confidently (softmax saturation). So p_c for a false alarm might be ~0.7-0.9 in some class. True boxes: p_c ~0.6-0.9. No separation → p_c alone is bad. Keep conf.
+
+What about using conf^α × p_c with α > 1? Emphasize the detector's confidence. The detector's conf is a decent "is there a defect" signal. If FAs have systematically lower conf, then conf^2 helps. That's a cheap scoring experiment (no retraining — but we still have to run the full pipeline; the scoring change is free in compute). Actually, any scoring change requires a full run (train + predict), but the training part is identical; the only difference is the output. Since seed-0 noise is ±0.005, a scoring change with a true effect <0.003 is indistinguishable. Hmm.
+
+But wait — a scoring experiment is cheap in the sense that if it fails, we learn about the ranking structure. Still, one run is one run.
+
+Let me estimate the potential gain of the background-class idea. If ~85% of boxes are FAs and they currently pollute every class's ranking, then suppressing them could be worth a lot. The upper bound keeps FAs as class 0 with score conf — and still reaches 0.758. So FAs with score ~conf don't destroy AP (probably because true boxes have higher conf on average, or because AP is robust). Our system at 0.6288 — the gap is 0.13. If the classifier's F1 on TP boxes is 0.87, the wrong-class cost is ~0.10-0.13 of the TP mass...
+
+Honestly, both components (wrong class on TPs, FA ranking) are probably significant. The background idea targets FA ranking; a better backbone targets wrong-class.
+
+Let me think about which has the bigger expected gain and lower risk.
+
+Actually, wait. Let me reconsider the numbers. "A crop classifier given perfect boxes reaches macro-F1 ~0.87 with the initial recipe (two-crop input)." That's on training boxes (perfect boxes = GT boxes). Our actual input is detector boxes, which are noisier (slightly misplaced, some FAs). So the effective F1 on detector TP boxes is lower, maybe 0.80-0.85.
+
+Pore is 0.502 — really weak. Why? Pores are small; small boxes → the detector's boxes may be poorly placed (IoU with GT < 0.5 even if they overlap a pore) → missed detections. Plus class confusion (pore vs. what?). Pores are small bright/dark spots; they might be confused with stain or deposit.
+
+Hmm, let me think about a pore-specific idea: for small boxes, the 1.5x tight crop is very small (e.g., box 10px → crop 15px → upscaled to 160). The wide 2.5x crop is 25px. Both are blurry upscales. Maybe for small boxes, a larger context (e.g., 4x) gives more texture? Or a different resize for small boxes?
+
+This is getting into the weeds. Let me step back and prioritize by expected value:
+
+1. **Background class (5th class) from train false-alarm det boxes** — targets FA ranking, which is likely a big component given ~85% FAs. Novel (e001 used detector boxes as training data with pseudo-labels; this is different: GT boxes + FA boxes as a background class). Risk: data imbalance, fewer steps, the FA distribution on train may differ from eval. Expected gain: if it works,Thinking budget reached. Stop thinking now and write the reply in the required format.

@@ -1,0 +1,140 @@
+===== attempt 1 (395s) =====
+I need to weigh which error to target. The diagnostics show wrong class assignment costs ~0.117 mAP; suboptimal ranking only ~0.012. History shows multi-scale context helped pore (+0.005) but is expensive and marginal, while the detector's conf alone ranks near-optimally (reference 0.755 vs your 0.746 with perfect classes). The e001 hypothesis about the product rule `conf × p(c)` re-ranking cost was never actually tested because it crashed. That idea is cheap to implement, differs fundamentally from every "resolution/backbone/augmentation" family tried, and directly targets the ~0.117 loss (fixing even some of the false-alarm rows ranked too high within a class by classifier confidence would help). The remaining budget (~16s free at 180s) easily covers a test without changing model or resolution.
+
+One concern: changing only scoring could be a small effect. But e001's estimate was ~0.012 with perfect classes; with imperfect classes the gain should be at least that (since wrong-class rows are often the high-confidence ones). Combined with the fact that this is untested and cheap, it's worth trying once. If confirmed, follow-ups can combine it with classification improvements.
+
+Actually, let me reconsider: the e001 hypothesis said conf × p(c) loses 0.012 vs detector conf "even with perfect classes". That means even a classifier that knows the true class can't beat conf for ranking. So this is likely small (~0.01). But it's cheap and untested, and a confirmed +0.01 would be meaningful.
+
+Wait - I should think about whether there's a bigger idea. The confusion matrix shows pore→stain (20) and deposit→stain (55) are huge. These are "uncertain" cases where the model probably defaults to stain. What if we train with a better formulation... e.g., using only high-quality boxes for training? Or adding hard negatives?
+
+Actually, here's a better idea: the "detector boxes from train split as extra training data" family was accepted twice (+0.004 each). That family wasn't fully explored - it just added boxes. What if instead we use ALL detector boxes on train images with IoU>0.5 labels, which includes more false alarms as background? That's already tried though.
+
+Hmm, what about the fundamental problem: pore is 63% right. Pore vs deposit and pore vs stain. The key discriminator for pore is fine texture/edge at small scale. What if we use a class-specific crop: smaller context for small boxes (to magnify more), larger for big? This hasn't been done - "box size and aspect ratio as extra model input" was never properly tested (2 crashes).
+
+But actually, the simplest high-impact idea might be different. Let me reconsider the scoring angle more carefully:
+
+The current score is conf × p(c). The reference shows using just conf achieves 0.755 as single class. If I output every box with all 4 classes but score = conf only (not conf × p(c)), then within each class, ordering is by conf. This would lose the classifier's class-specific confidence for ranking.
+
+But here's the thing: if the classifier knows the class well, conf × p(c) should rank true positives higher in their correct class... no wait. A false alarm with high conf and high p(c) for class c would beat a true positive with moderate conf and moderate p(c). That's exactly the problem.
+
+Actually, let me think about which is better at separating true positives from false alarms within a class:
+- True positives overlap real defects → detector found them, so conf tends to be higher.
+- False alarms don't overlap defects → detector may still have decent conf.
+
+The difference in conf between TP and FP might be smaller than the difference in p(c) (classifier confidence). So conf × p(c) uses both signals. Using conf alone ignores classifier confidence.
+
+Hmm, but the reference numbers suggest conf alone is very strong for ranking. Let me just test it - it's cheap and untested. And there's a variant worth trying: score = conf^α × p(c)^β or similar. But let me start with the cleanest hypothesis: **the product rule over-weights classifier confidence, mis-ranking false alarms above true positives within each class; using detector conf as the primary ranking signal (with classifier probability only as a tie-breaker) should reduce false positives ranked too high.**
+
+Actually wait - I want to be even more careful. Let me reconsider whether this can actually move the needle by ~0.01+. 
+
+With 41879 eval detections and only ~6000-ish true defects (from crops: 6052 train boxes, eval images have similar or more), there are ~35000 false alarms. If many false alarms have high conf AND high p(c) for some class, they'd rank above true positives in that class under the product rule. Under conf-only ranking, they'd still rank by conf - but if the detector is good at distinguishing TP from FP (its own mAP@0.5 would tell us), then conf-only should be better.
+
+The reference "stage-1 boxes scored as single class defect: 0.755" tells me the detector's conf alone achieves near-ceiling when there's just one class. And "d2_boxes_perfect_classes_val_map50 = 0.758" is the ceiling with perfect classes. So the detector conf ranking loses only 0.003 vs perfect ranking! That's remarkably strong.
+
+So: if I rank within each class by conf (or a monotone function), the ranking would be ~optimal. The current conf × p(c) re-ranks and costs 0.012. But wait - with perfect classes, p(c)=1 for the right class, so conf × p(c) = conf for the right class... but for OTHER classes (the wrong ones), p(c) > 0 for all classes. So under product rule, a box gets high score in its TRUE class AND in every other class (since p(c) is non-trivial for all). Hmm.
+
+Actually I think I need to just test this empirically. Let me try a clean version: score = conf * p(c)^0.5 or score = conf (only, no classifier confidence). Actually, the cleanest test of the hypothesis "product rule hurts ranking" is to use score = conf for all classes and see if it improves.
+
+But hmm - that seems like it would lose a lot of the classifier's information. If p(c) is right 63-96% of the time, using conf only means... no wait, we output rows for ALL classes anyway (all 4 rows per box). The row scores determine within-class ranking. Using conf for all rows means: within class c, rank by conf.
+
+Let me think about whether this can gain >0.01 consistently. The e001 estimate was 0.012 with perfect classes. With imperfect classification (which correlates p(c) with correctness), the effect might be different...
+
+Actually here's another thought experiment. Consider a box that overlaps a true pore defect, and our classifier says it's stain with p=0.9. Under product rule: score for class 0 (pore) = conf × 0.1, score for class 3 (stain) = conf × 0.9. The row for class 3 ranks higher than the row for class 0 - correct under product rule (since it IS a stain)... wait no, it IS a pore. So under product rule, this box's row in class 0 is ranked low because p(0)=0.1. But if no other row with cls=0 overlaps that defect... the defect still needs to be covered by SOME row with cls=0 at high rank!
+
+AH - THIS is the key insight. The AP metric requires that for each true box, there's a matched prediction of the same class at high enough rank. If our classifier assigns pore boxes to stain rows (high score), then within class 0, the actual pore boxes get LOW scores and might not cover the true pores if they're outranked by false alarms.
+
+So under product rule, if a true pore has p(0)=0.1, its row in class 0 gets conf × 0.1 - which is low. If there are many false alarms in class 0 with high conf (and moderate p(0)), they could beat the true pores in class 0's ranking! This directly reduces recall for class 0 = pore.
+
+So YES - this idea targets exactly the classification failure: when the classifier is wrong about a box, the product rule ALSO demotes that box's row in its true class (because p(c_true) is low). With conf-only ranking, the row in every class gets conf × [something], and if we give each class the same weight, the true positive row in class 0 still ranks by conf.
+
+Wait, but if I use conf for all rows, then within class 0, a box with cls=0 row ranked by conf... The issue is which boxes get the cls=0 ROW at all - they ALL do in current implementation (one row per class per box). So under conf-only, each box has a row for every class, all scored by conf. Then within class 0, TRUE pore boxes rank by conf (high), and false alarms also rank by conf. Since the detector's conf distinguishes TP from FP reasonably well (0.755 single-class AP!), the true pores would rank above most false alarms in class 0.
+
+Under product rule, true pores have reduced scores in class 0 (× p(0)), so they might fall below false alarms. That's a direct loss!
+
+So the hypothesis: **using conf-only scores (or less classifier-weighted scores) for all rows keeps true positives ranked high within each class even when the classifier is wrong, because detector conf is near-optimally calibrated for TP vs FP ranking; the current product rule demotes wrongly-classified boxes within their true class.**
+
+Expected gain: at least part of the 0.012 (ranking loss) plus potentially more from improved recall on wrong-class rows. The total could be ~0.015-0.02 if we fix some of the mis-ranking.
+
+This is cheap, untested (e001 crashed), and targets a real mechanism. Let me implement it. I'll try score = conf * p(c)^γ with γ small, or just conf. Actually let me test both in one idea - I'll start with score = conf * p(c) vs conf.
+
+Hmm, but actually the cleanest minimal change that tests this: set MIN_SCORE based on conf only, and use score = conf for all rows. But then I lose ALL classifier information for ranking... which might be bad because the classifier's class-specific confidence is informative about whether a TP should rank above another TP in different classes? No - AP is per-class, so within class c, only rows with cls=c matter. The classifier's p(c) tells us how likely the box IS class c, which matters for the "precision" side: if we're evaluating class 0, a row with cls=0 from a box that's actually a stain should count as FALSE POSITIVE. Under conf-only, it ranks by conf; under product rule, by conf × p(0).
+
+Hmm wait, so under product rule, rows in class 0 that are actually stains have score = conf × p_stain(0) - their rank within class 0 depends on how much the classifier thinks they're a pore. Under conf-only, all rows rank by conf regardless of what they actually are.
+
+OK here's the cleaner framing: The current best achieves 0.6288. The e001 hypothesis said the product rule costs ~0.012 vs detector conf. If I implement conf-only and gain 0.01-0.02 consistently, that's a valid improvement.
+
+But is this "broad effect across classes"? Yes - it affects all classes equally (any row where p(c) is low for the true class gets demoted).
+
+Actually hold on, let me reconsider one more time. There's a subtlety: the current implementation outputs ALL 4 rows per box (if score > MIN_SCORE). So within class c, EVERY box contributes a row. The ordering within class c determines AP. Under conf-only, ordering is by conf. Under product rule, ordering is by conf × p(c).
+
+For the true positives of class c, conf × p(c) vs conf: if our classifier is right, p(c) ≈ 1, so no difference. If wrong, p(c) < 1, so product rule demotes them - they might fall below false alarms. So product rule hurts when the classifier is wrong about a box that IS class c. That's exactly the "wrong class assignment" problem: the box overlaps a true defect of class c but our model says it's class d ≠ c. Its row in class c gets a low score under product rule.
+
+So yes - using conf-only scoring fixes part of the wrong-class loss by keeping TP rows ranked high within their true class. And the ranking (conf) is already near-optimal per the reference numbers (0.755 vs 0.758).
+
+This seems like a solid, cheap, untested idea. Let me write it. I'll keep everything else the same and just change the scoring to conf * p(c)^γ with γ=0.5 as a test, or maybe better: score = conf^α × p(c) for small α? Hmm.
+
+Actually, the cleanest implementation of "conf-only": score = d["conf"] for all rows. But that ignores classifier confidence entirely for ranking... which might be too extreme. Let me try score = conf * p(c)^0.5 first - this keeps some class information but weights conf much more. If it gains, I can try γ=0 (pure conf) next.
+
+Hmm, actually let me just test γ=0.25 or something. But simpler: let me just do the pure conf version to test the hypothesis cleanly, since the e001 hypothesis was specifically about product rule vs detector conf. And if that gains, I can refine.
+
+Wait - one more consideration. The harness says changes need "broad effect across classes and images" to be accepted. conf-only affects all 4 classes (any row where p(c) < 1 for the true class). It should be broad. Let me implement it.
+
+Also note: I should make sure the run still finishes in time. Current run: 162s total, 180s budget. Changing scoring doesn't affect speed.
+
+One thing: MIN_SCORE=0.001 uses score. With conf-only, scores would be like 0.3-0.9. MIN_SCORE would filter fewer rows (or none). That's fine - more rows per class could actually help recall... but wait, the metric says "per image at most the 300 highest-scoring rows count". So extra low-score rows don't matter as long as they're below the top 300. Actually, with conf-only, we might have many more rows above MIN_SCORE. Let me check: currently 53606 rows total for ~41879 boxes × 4 classes = ~167516 possible. So most rows are dropped (MIN_SCORE filters). With conf-only, scores range from conf_min to conf_max. If conf is high for all detections (the detector might output boxes with conf ~0.3-0.9), then MIN_SCORE=0.001 would keep almost all rows! That could be a problem: 41879 × 4 = 167516 rows, and "per image at most the 300 highest-scoring rows count". So for each image, only top 300 rows per class... wait, "per image at most the 300 highest-scoring rows count" - does this mean 300 rows total per image, or 300 per class? Re-reading: "per image at most the 300 highest-scoring rows count". So total 300 rows per image.
+
+Currently with product rule, many rows are below MIN_SCORE and dropped. With conf-only, if conf is always > 0.001, we'd keep all rows and the top-300-per-image filter would apply at scoring time (the harness filters). But actually, should I also cap the number of rows written? The brief says "per image at most the 300 highest-scoring rows count" - this is how the harness computes AP. So writing more rows doesn't hurt, as long as scores are right. But to be safe and efficient, I could write fewer.
+
+Actually, the current code writes 53606 rows for 41879 boxes. With conf × p(c), most low-confidence or low-probability rows are filtered. With conf-only, I should probably keep a similar filtering strategy. Let me use MIN_SCORE as-is (it filters by score value). With conf around 0.3-0.9, and MIN_SCORE=0.001, almost all would pass. That's fine - the harness caps at 300 per image anyway.
+
+Hmm wait, but there's a subtlety: "per image at most the 300 highest-scoring rows count". If I write more rows than needed, it doesn't matter (top-300 selected). But if my scores change such that different rows become top-300... The current best already writes 53606 rows. Let me just keep the same filtering and see.
+
+OK let me also think: is there a smarter hypothesis? What about **score = conf × p(c) but with temperature scaling on p?** That's essentially changing γ. Let me do γ=0.5 first (geometric mean-ish). Actually, to be more decisive, let me test the full conf-only version since it cleanly tests the e001 hypothesis.
+
+Hmm, wait. Actually I realize there might be an even better idea that's been tried but not fully explored: **using detector boxes from the train split as extra training data** (+0.004 accepted twice). But we shouldn't repeat a family.
+
+OK, another thought: what about the fact that the current best already achieves 0.7461 with perfect classes? The remaining gap to 0.758 is 0.012 in ranking. If conf-only gets us to ~0.7461 (with perfect classes), and our real classifier is imperfect... Actually the point is that with imperfect classes, using conf-only keeps TP rows ranked high within their true class even when the classifier mislabels them. That directly addresses the 0.117 loss!
+
+Let me estimate: how much of the 0.117 loss comes from TP rows being demoted in their true class? For a box overlapping a true pore, if classifier says it's stain (p(0)=0.05), then under product rule its row in class 0 gets conf × 0.05. Under conf-only, it gets conf. If that true pore needs to rank above false alarms in class 0, conf-only wins big.
+
+But there's a counter-consideration: under conf-only, FALSE alarm rows (box doesn't overlap any defect) also rank by conf. So we're using the detector's TP/FP discrimination - which is strong but not perfect. Under product rule, false alarms get demoted in class 0 if p(0) is low for them. 
+
+So: product rule = conf × p(c). If p(c) is a good classifier, then p(c) is high for true TPs of class c and low for FPs (boxes that are actually other classes or pure background). Under conf-only, we lose that signal - we rely only on the detector's conf.
+
+The question is which is better at separating "this box is a real class-c defect" from "this box is not". The answer depends on:
+- Detector conf reliability (TP vs FP): strong, as shown by 0.755 single-class AP.
+- Classifier p(c) reliability: for true class-c boxes, p(c) is ~63-96% correct depending on class.
+
+Hmm, this is getting complex. The empirical test is the way to go. Let me implement conf-only scoring (γ=0). If it loses, I'll try γ=0.5.
+
+Actually, hmm, wait. There's a risk: if I use conf-only and it hurts badly, that's a wasted run. But e001 claimed it helps by 0.012 at least with perfect classes. Let me just test it.
+
+Let me also think about whether to keep the "one row per class" structure. Yes, keep it. Just change how the score is computed.
+
+Actually, I want to be careful about one thing: MIN_SCORE filtering. With conf-only scores, if conf is high for all boxes (say min conf = 0.1), then nearly all rows pass MIN_SCORE=0.001. That's 167516 rows vs 53606 currently. It doesn't hurt the metric (harness takes top-300 per image), but writing more rows is slower. Actually, maybe I should also filter by something like "only write a row if it could be in the top 300 for its image". That's complex. Let me just use MIN_SCORE=0.001 and see - it's fine.
+
+Hmm, actually let me reconsider: what if I keep conf × p(c) but with a much smaller classifier weight? The hypothesis is that the product rule's ranking is suboptimal because it over-weights p(c). A more conservative test: score = conf^0.5 × p(c)^0.5 (geometric mean) or score = conf × p(c)^0.25. This keeps some class info but reduces re-ranking.
+
+But actually, to cleanly test the hypothesis "detector conf alone is a better ranking signal than conf × p(c)", let me just use conf. If it gains, I can refine later. Let me write the code.
+
+Actually wait - one more important consideration. The current implementation writes rows for ALL 4 classes per box (if score > MIN_SCORE). With conf-only, every box has 4 rows with scores = conf, conf, conf, conf (all equal!). Then within each class, all boxes have the SAME score (conf)! That would make ordering by score meaningless - ties! In the harness's AP computation, ties might be broken arbitrarily or by det_id order. That's actually dangerous - it could hurt or help randomly.
+
+Hmm right. If all rows in class c have identical scores, the ordering is arbitrary. But wait - for the AP metric, what matters is the ORDER of predictions within each class. With all-equal scores, the harness might break ties by det_id. Would that still rank true positives above false alarms?
+===== attempt 2 (176s) =====
+BASE: best
+CATEGORY: scoring
+HYPOTHESIS: The product rule `conf × p(c)` re-ranks boxes within each class by classifier confidence, demoting true positives when the classifier mislabels them (low `p(c)` for their true class). Reference numbers show detector conf alone ranks near-optimally (0.755 vs 0.758 ceiling with perfect classes), so using detector conf as the primary ranker should lift wrongly-classified true positives above false alarms within every class, especially pore/deposit/stain where misclassification is common. This is a broad per-class effect and directly implements the untested e001 idea (which crashed).
+<<<<<<< SEARCH
+        for d, p in zip(ev, probs):
+            for c in range(4):
+                s = d["conf"] * float(p[c])
+                if s > MIN_SCORE:
+                    w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+=======
+        for d, p in zip(ev, probs):
+            conf = float(d["conf"])
+            for c in range(4):
+                s = conf * float(p[c]) ** 0.3
+                if s > MIN_SCORE:
+                    w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+>>>>>>> REPLACE

@@ -1,0 +1,241 @@
+===== attempt 1 =====
+Let me carefully think about what needs to be done.
+
+The research lead's plan:
+1. BASE: last — edit the most recent version (e022), which has the SWA + label cleaning code from the diff.
+2. CATEGORY: architecture
+3. HYPOTHESIS: copy from the lead.
+4. Implement: train on GT boxes + detector boxes from the train split (hybrid training).
+
+Wait — BASE: last means the file being edited is e022's train.py, which includes the SWA/label-cleaning changes from the diff. But e022 was rejected (0.5693). Hmm, but the lead says BASE: last. The rules say "every change is applied on top of the current best train.py (or the most recent version with BASE: last)." So I have to build on e022's file.
+
+But wait — e022's file has the label cleaning + SWA machinery. The lead's plan says "keep all model, LR, epoch logic unchanged, write preds.csv with score = conf × p(c) exactly like e022." So I should keep e022's structure (phase A, cleaning, phase C with SWA) and add detector-box training data to the training set.
+
+Hmm, but e022 was rejected with 0.5693 — a big drop from 0.6359. That's a far-below-best score, which "usually means a bug." But the lead explicitly chose BASE: last. Let me reread the lead's plan: "e013 already tried training on detector boxes but crashed in the IoU code; this time we train a *hybrid* on GT boxes + matched detector-box crops... without touching the score ordering or per-class logits."
+
+Wait, but e022's score was 0.5693, which is far below best. That suggests e022 has a bug (SWA label cleaning broke something). Actually, 0.5693 is quite low. Hmm. But the lead says BASE: last. The instructions say: "If you want to build on (or fix) this most recent version rather than the best, write BASE: last." The lead explicitly wrote BASE: last. So I follow the lead.
+
+Hmm, but wait. Let me think about whether e022's low score is a bug. e022: phase A (45% of budget), then label cleaning (forward pass on 6052 crops — fast), then phase C retraining on the cleaned set with SWA. Final score 0.5693. That's a big drop. Possible bug: the SWA averaging is... actually, the diff shows `swa_average` skips non-float tensors (keeps the last one). That's fine.
+
+Potential bug: in phase C, `train_phase` uses `frac = min(1.0, (time.time() - t_start) / budget)` for LR — that's fine.
+
+Hmm, one potential issue: label cleaning drops boxes where top1 != label and margin > 0.25. With a model trained for only 45% of budget, it might drop a lot of boxes. But 0.5693 is quite low — worse than e001 (0.6276) and e013 (0.6168). Actually, wait, could the SWA averaging be harmful? Or the cleaning removed too many samples?
+
+Actually, wait. Let me reconsider: is there a real bug in e022? The `snapshot()` function clones to CPU. The SWA states are collected every 10 steps in phase C. Phase C is about 55% of budget ≈ 55 seconds ≈ 85 steps? So about 8 snapshots. Averaging 8 snapshots from the tail of training... that should be fine, if anything helpful.
+
+Hmm, but actually there might be a subtle bug: `swa_states` is initialized to `[]` before phase A, and in phase A `swa_collect=False`, so nothing is collected during A. Then phase C collects. Then the final weights are appended. OK.
+
+Another subtle point: `train_phase` references `steps` and `epoch` via `nonlocal` — they're defined in main's scope. Fine.
+
+`forward_probs(crops)` — creates a new dataset/loader over crops with train=False. Fine.
+
+Hmm, why 0.5693? Maybe label cleaning dropped a lot of hard-but-correct boxes and the model collapsed. Or maybe the SWA averaging across a phase with decaying LR... actually, wait, there's a real bug candidate: in phase C, the LR schedule uses `frac` based on the entire budget, so by the end of phase C frac ≈ 1 and LR ≈ LR*1e-3 (the floor). That's fine.
+
+Actually, maybe the cleaning step dropped a huge fraction of boxes: after only 45% of training (about 70 steps), the model is undertrained; for hard classes (pore, deposit) top1 != label with margin > 0.25 might be common. If it dropped 30-40% of pore/deposit boxes, phase C retrains on a biased set → worse. That would explain the drop.
+
+But my job isn't to second-guess the lead's choice — the lead explicitly chose BASE: last and said "implement this experiment exactly in the current train.py, nothing else." So I build on e022's file.
+
+Hmm wait, actually, let me reread: "The next experiment, chosen by the research lead: BASE: last ... Implement this experiment exactly in the current train.py, nothing else. Reply in the reply format: copy the lead's BASE, CATEGORY, HYPOTHESIS, then the SEARCH/REPLACE blocks."
+
+So I must follow. OK.
+
+Now, the key question: what does e022's full train.py look like? It's the best (e009) file with the diff applied. I need to reconstruct the exact current file contents around the regions I'll edit, so that my SEARCH blocks match character-for-character.
+
+Let me reconstruct e022's train.py from the best file + diff.
+
+Best file (e009) — I have the full listing. The diff changes the region after `amp = dict(...)` through the training loop, replacing it with the phase-based code. Let me apply the diff.
+
+Diff context:
+```
+     amp = dict(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda")
+ 
++    def snapshot():
+...
+```
+
+So after the `amp = ...` line and a blank line, the new functions are inserted, then the old training loop is replaced.
+
+Let me write out e022's file from the `amp = ...` line onward:
+
+```python
+    amp = dict(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda")
+
+    def snapshot():
+        return {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+    def swa_average(states):
+        # average only floating-point tensors (skip e.g. BatchNorm integer counters), else load crashed on Long
+        return {k: (torch.stack([s[k] for s in states]).float().mean(0) if states[0][k].is_floating_point() else states[-1][k])
+                for k in states[0]}
+
+    def train_phase(rows, t_lim, swa_collect=False):
+        nonlocal steps, epoch
+        ds = BoxDataset(rows, images, True)
+        dl = torch.utils.data.DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=workers,
+                                         pin_memory=True, drop_last=True, generator=g, worker_init_fn=worker_init)
+        model.train()
+        while time.time() < t_lim:
+            tot, nb = 0.0, 0
+            for views, y in dl:
+                frac = min(1.0, (time.time() - t_start) / budget)
+                f = frac / 0.05 if frac < 0.05 else 0.5 * (1 + math.cos(math.pi * (frac - 0.05) / 0.95))
+                for pg in opt.param_groups:
+                    pg["lr"] = LR * max(f, 1e-3)
+                views = [v.to(device, non_blocking=True).to(memory_format=torch.channels_last) for v in views]
+                y = y.to(device, non_blocking=True)
+                with torch.autocast(**amp):
+                    loss = crit(model(views), y)
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+                opt.step()
+                tot += loss.item(); nb += 1; steps += 1
+                if swa_collect and steps % 10 == 0:
+                    swa_states.append(snapshot())
+                if time.time() >= t_lim:
+                    break
+            print(f"phase loss {tot / max(nb, 1):.4f}, {steps} steps, {time.time() - T0:.0f}s", flush=True)
+            epoch += 1
+
+    def forward_probs(rows):
+        ds = BoxDataset(rows, images, False)
+        dl = torch.utils.data.DataLoader(ds, batch_size=256, shuffle=False, num_workers=workers, pin_memory=True)
+        model.eval()
+        outs = []
+        with torch.no_grad(), torch.autocast(**amp):
+            for views, _ in dl:
+                views = [v.to(device).to(memory_format=torch.channels_last) for v in views]
+                outs.append(torch.softmax(model(views).float(), 1).cpu())
+        return torch.cat(outs).numpy()
+
+    # Train until the budget minus the reserve is used up: 5% warm-up, then cosine decay.
+    t_start = time.time()
+    t_end = deadline - RESERVE_S
+    budget = max(1.0, t_end - t_start)
+    steps, epoch = 0, 0
+    swa_states = []  # SWA: collect weight snapshots during the retrain phase
+
+    # Phase A: initial training on all boxes (~45% of the training budget) to get a model that can flag bad labels.
+    t_A = t_start + 0.45 * budget
+    train_phase(crops, t_A)
+
+    # Phase B: label cleaning - drop boxes the model confidently mislabels (top-1 != label and margin > 0.25).
+    model.eval()
+    probs = forward_probs(crops)
+    label = np.array([r["cls"] for r in crops])
+    top1 = probs.argmax(axis=1)
+    p_label = probs[np.arange(len(crops)), label]
+    margin = probs.max(axis=1) - p_label
+    keep = ((top1 == label) | (margin <= 0.25))
+    kept = [r for r, k in zip(crops, keep) if k]
+    print(f"cleaning: kept {len(kept)}/{len(crops)} training boxes ({time.time() - T0:.0f}s)", flush=True)
+
+    # Phase C: retrain on the cleaned set for the remainder of the budget, collecting SWA snapshots.
+    if time.time() < t_end - 5:
+        train_phase(kept, t_end, swa_collect=True)
+
+    # SWA: include the final weights, then average all snapshots and load them back.
+    swa_states.append(snapshot())
+    if len(swa_states) > 1:
+        avg_state = {k: torch.stack([s[k] for s in swa_states]).mean(0) for k in model.state_dict().keys()}
+        model.load_state_dict(avg_state)
+    # Classify every eval detection; one prediction per class with score = detector conf x class probability.
+    model.eval()
+```
+
+Wait — the last part of the diff:
+
+```
+     # SWA: include the final weights, then average all snapshots and load them back.
+-    swa_states.append({k: v.detach().cpu().clone() for k, v in model.state_dict().items()})
++    swa_states.append(snapshot())
+     if len(swa_states) > 1:
+-        avg_state = {k: torch.stack([s[k] for s in swa_states]).mean(0) for k in model.state_dict().keys()}
++        avg_state = {k: (torch.stack([s[k] for s in swa_states]).float().mean(0) if states[0][k].is_floating_point() else states[-1][k])
+```
+
+Hmm wait, let me reread the diff's tail:
+
+```
+     # SWA: include the final weights, then average all snapshots and load them back.
+-    swa_states.append({k: v.detach().cpu().clone() for k, v in model.state_dict().items()})
++    swa_states.append(snapshot())
+     if len(swa_states) > 1:
+-        avg_state = {k: torch.stack([s[k] for s in swa_states]).mean(0) for k in model.state_dict().keys()}
++        model.load_state_dict(swa_average(swa_states))
+     # Classify every eval detection; one prediction per class with score = detector conf x class probability.
+     model.eval()
+```
+
+Yes, that's what the diff shows. So e022's file ends the training section with:
+
+```python
+    # SWA: include the final weights, then average all snapshots and load them back.
+    swa_states.append(snapshot())
+    if len(swa_states) > 1:
+        model.load_state_dict(swa_average(swa_states))
+    # Classify every eval detection; one prediction per class with score = detector conf x class probability.
+    model.eval()
+    probs = []
+    with torch.no_grad(), torch.autocast(**amp):
+        for views, _ in dl_ev:
+            views = [v.to(device).to(memory_format=torch.channels_last) for v in views]
+            probs.append(torch.softmax(model(views).float(), 1).cpu())
+    probs = torch.cat(probs).numpy()
+    ...
+```
+
+OK. Now, the important thing: e022's file no longer has the `dl_tr` DataLoader (the diff... wait, does it?). Let me check. The best file has:
+
+```python
+    g = torch.Generator().manual_seed(args.seed)
+    dl_tr = torch.utils.data.DataLoader(BoxDataset(crops, images, True), batch_size=BATCH_SIZE, shuffle=True,
+                                        num_workers=workers, pin_memory=True, drop_last=True,
+                                        persistent_workers=True, generator=g, worker_init_fn=worker_init)
+    dl_ev = torch.utils.data.DataLoader(BoxDataset(ev, images, False), batch_size=256, shuffle=False,
+                                        num_workers=workers, pin_memory=True)
+```
+
+The diff starts at `amp = dict(...)`, which is after the `dl_ev` line. So `dl_tr` and `dl_ev` still exist in e022's file (dl_tr is unused now, but still defined). Let me verify from the diff context: the diff's first hunk starts at line 176 with context `amp = dict(...)`. The lines before (model creation, crit, opt, amp) are unchanged. So yes, `dl_tr` and `dl_ev` still exist in e022's file.
+
+So e022's full file = e009's file with the training-loop region replaced as per the diff. Everything else (docstring, settings, read_csv, make_crop, MultiScaleClassifier, BoxDataset, main up to `amp = ...`, and the prediction/writing code after `model.eval()`) is identical to e009.
+
+Now, the lead's plan for my experiment:
+
+1) In read_csv and after loading dets, split dets into `dtr` (split=="train") and keep `ev` for eval.
+2) Build a second dataset over `dtr`: reuse make_crop with the same SCALES/resize, using the detector box coordinates as the crop center; keep all train-split detections as-is (no IoU matching).
+
+Wait — but there's a problem: detector boxes from the train split don't have labels! The plan says "keep all train-split detections as-is (this is the fix: e013 crashed in its IoU code)." But to train a supervised classifier, each box needs a class label. The docstring says: "'train' boxes are on training images (their true class can be found by overlap with crops.csv)." So to get labels, we need to match each train-split detection to a GT box by overlap (IoU > 0.5) and take that GT box's class. If no overlap → it's a false alarm → no label (skip it, or use as background — but the lead says keep all as-is... hmm).
+
+Wait, the lead's plan says "without touching the score ordering or per-class logits" and "keep all train-split detections as-is (this is the fix: e013 crashed in its IoU code)." But "keep as-is" — with what label? We need labels. The only way is IoU matching with crops.csv. The lead says e013 "crashed in its IoU code" — so the fix is to do the IoU matching carefully. Hmm, "keep all train-split detections as-is" probably means: don't filter/reject boxes based on IoU quality — every detection that overlaps a GT box gets that GT box's class label; detections that don't overlap are... hmm.
+
+Actually, let me reread: "2) Build a second dataset over `dtr`: reuse make_crop with the same SCALES/resize to IMG_SIZE, using the detector box coordinates from dets.csv as the crop center; do not recompute IoUs — keep all train-split detections as-is (this is the fix: e013 crashed in its IoU code)."
+
+"Do not recompute IoUs" — so how do we get labels?? Without IoU, we can't assign labels. Unless... hmm. Wait, maybe the lead's intent is: for each train-split detection, find the GT box (from crops.csv) whose center is inside the detection, or with maximum IoU... that's IoU.
+
+Hmm, this is a contradiction. The plan as written cannot work without some overlap computation to assign labels. The instructions say: "If any detail of the plan cannot work as written (time budget, tensor shapes, missing names), make the smallest fix that preserves the idea and say so at the end of the HYPOTHESIS."
+
+So I need to make the smallest fix: to assign labels to train-split detections, compute overlap with GT boxes (IoU > 0.5, or max-IoU assignment) and take the GT class. Keep all detections that match a GT box (no filtering by box quality); skip non-matching ones (false alarms have no label — we can't train a 4-class classifier on them without a background class, and the 5th-background-class family was exhausted with no gain).
+
+Actually wait — "keep all train-split detections as-is" might mean: don't do the IoU>0.5 filtering that e013 did (which crashed). Instead, assign each detection the class of the GT box with maximum IoU (or whose center falls inside), and keep them all. Hmm, but detections with no overlap at all have no label.
+
+Let me think about what's simplest and most robust:
+
+For each train-split detection d (with image, x1,y1,x2,y2):
+- Find all GT boxes (crops.csv, high-res) on the same image.
+- Compute IoU with each; if max IoU > 0.5 (or even > 0?), take that GT box's class.
+- Keep the detection with that class label.
+
+Actually, the most standard approach (Faster R-CNN style, and what the docstring suggests: "their true class can be found by overlap with crops.csv") is: IoU > 0.5 → positive with that class. The docstring literally says train boxes' true class "can be found by overlap with crops.csv." So the intended method is overlap. e013's crash was in the IoU code (a bug), not in the idea. The lead says the fix is to not recompute IoUs... but that's impossible for labeling.
+
+Hmm wait, maybe I'm misreading. Maybe "do not recompute IoUs" means: don't recompute IoU for the purpose of *filtering* boxes (e.g., don't require IoU > 0.5 to keep a box — keep every detection that overlaps a GT box at all, even at low IoU, and label it with the GT class). "Keep all train-split detections as-is" = don't filter. So: for each detection, find the best-overlapping GT box; if any overlap (IoU > 0, or center inside), label with that class and keep; otherwise skip (no label available).
+
+I think the safest interpretation that preserves the idea (train on detector-box crops) and works is:
+
+- For each train-split detection, compute IoU with GT boxes on the same image.
+- If max IoU >= some threshold (use 0.5? or > 0?), assign the GT class and keep.
+
+Hmm. Which threshold? The docstring says "their true class can be found by overlap with crops.csv" — ambiguous. The standard is IoU >= 0.5. But the lead says "keep all train-split detections as-is" and "do not recompute IoUs."
+
+Let me reconsider: maybe the lead really means to avoid IoU entirely. Is there another way to label train-split detections without IoU? ... If we use the GT box whose center is inside the detection box, that's a cheaper test but still a geometric overlap test. Or nearest-neighbor center distance. All of these are "overlap" computations.
+
+Given the contradiction, the smallest fix that preserves the idea: label train-split detections by maximum IoU with GT boxes on the same image; keep detections with IoU > 0.5 (the standard positive criterion, matching the docstring's "overlap"); skip the rest (false alarms, no label). And I'll say so at the end of the HYPOTHESIS: "The plan's 'do not recompute IoUs' is not executable — detector boxes have no labels; the smallest fix is to assign each train-split detection the class of the GT box with maximum IoU (keeping those with IoU > 0.5, i.e. exactly the docstring's 'overlap with crops.csv'), which is the IoThinking budget reached. Stop thinking now and write the reply in the required format.

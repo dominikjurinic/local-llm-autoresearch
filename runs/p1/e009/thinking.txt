@@ -1,0 +1,353 @@
+===== attempt 1 =====
+Let me carefully analyze the plan and the current code to implement the multi-scale crop pyramid architecture.
+
+Current code structure:
+- `make_crop(img, r, context, train)` - creates a single crop at a given context scale
+- `BoxDataset.__getitem__` - returns (views[0], views[1], cls) - two views (tight + wide)
+- Training loop: unpacks `xt, xw, y` from dataloader, computes `model(xt) + model(xw)` averaged, then cross-entropy
+- Inference: same pattern, softmax over averaged logits
+
+The plan:
+1. Replace CONTEXT/TIGHT_CONTEXT with SCALE = (1.25, 1.75, 2.5, 3.5)
+2. `make_crop` returns a list of crops for all scales
+3. `BoxDataset.__getitem__` builds views for all four scales, returns a list of views
+4. New `MultiScaleClassifier`: shared backbone, each crop → forward_features → avg pool to common size → 1x1 conv per scale → fuse → head
+5. Training/inference use the fused output
+6. Budget: 4 crops instead of 2, so ~2x forward cost per step
+
+Let me think about the architecture more carefully:
+
+Each crop is 160x160. EfficientNet-B0 with forward_features gives [B, C, H, W] where C=1280, H=W=5 (for 160 input with B0).
+
+Wait, let me check: EfficientNet-B0 has input 224 → output 7x7. For 160 input: 160/32 = 5, so 5x5 feature map. C=1280 for B0.
+
+So each crop gives [B, 1280, 5, 5].
+
+For the pyramid fusion:
+- Each scale's features: [B, 1280, 5, 5]
+- We can use 1x1 conv to reduce channels (say to 256) for each scale
+- Then since they're all the same spatial size (5x5), we can just concatenate or sum them
+- Actually, the plan says "downsample each feature map with avg pooling (and one 1x1 conv per scale to equalize channels) into a common pyramid, then upsample/add to form a fused representation"
+
+But wait - all crops are resized to 160x160, so they all produce the same feature map size (5x5). There's no actual spatial pyramid here - they're all the same resolution. The "pyramid" is in the sense of different context scales (1.25x to 3.5x) but all fed at the same pixel resolution.
+
+So the fusion is simpler: all 4 feature maps are [B, 1280, 5, 5]. We can:
+- Apply a 1x1 conv to reduce each to some smaller channel dim (e.g., 256)
+- Concatenate them: [B, 4*256, 5, 5] → global avg pool → [B, 1024] → MLP head
+
+Or even simpler:
+- Each: 1x1 conv 1280→256, then global avg pool → [B, 256]
+- Concatenate 4: [B, 1024]
+- MLP: 1024 → 512 → 4
+
+This is clean and should work. Let me think about the compute cost:
+- 4 forward passes through the backbone (shared weights, but 4 separate forward calls)
+- Plus 4 small 1x1 convs (negligible)
+- Plus the MLP head (negligible)
+
+Current: 2 forward passes per step. New: 4 forward passes. So ~2x the backbone compute.
+
+Current training: 433 steps in ~112s (from 13s load to 125s at end of epoch 4). Actually looking at the log:
+- Load: 13s
+- Epoch 0: 94 steps, ends at 59s → 46s for 94 steps → ~0.49s/step
+- Epoch 1: 94 steps, ends at 77s → 18s for 94 steps → ~0.19s/step
+- Epoch 2: 94 steps, ends at 95s → 18s → ~0.19s/step
+- Epoch 3: 94 steps, ends at 114s → 19s → ~0.20s/step
+- Epoch 4: 57 steps, ends at 125s → 11s → ~0.19s/step
+
+Wait, the first epoch is slower probably due to warmup/compilation. After that it's ~0.19s/step.
+
+With 4 crops instead of 2, each step should take roughly 2x for the forward pass. But the backward pass also doubles. So maybe ~0.35-0.40s/step.
+
+Budget: 180s total, 55s reserve for prediction → 125s for training.
+Load: 13s → training window: ~112s (from 13s to 125s).
+
+At 0.35-0.40s/step, we'd get ~280-320 steps. That's about 3 epochs (94 steps/epoch).
+
+Actually wait, let me recalculate. The training loop runs until `time.time() >= t_end` where `t_end = deadline - RESERVE_S`. The deadline is T0 + 180. So t_end = T0 + 125. Training starts at ~T0+13. So training budget is ~112s.
+
+At 2x step time (~0.38s/step), we'd get ~295 steps ≈ 3.1 epochs.
+
+For prediction: 41879 detections / 256 batch = ~164 batches. Currently prediction takes from 125s to 162s = 37s. With 4 crops, that's ~74s. Total: 13 + 112 + 74 = 199s > 180s!
+
+That's a problem. Let me recalculate more carefully.
+
+Actually, looking at the log again:
+- "done: 5 epochs, 433 steps, 53606 prediction rows, 162s total"
+- Training ends at 125s (end of epoch 4)
+- Prediction takes 162-125 = 37s
+
+With 4 crops:
+- Training step time roughly doubles: ~0.38s/step
+- Training budget: 112s → ~295 steps
+- Prediction: 164 batches × 2x time per batch. Current prediction: 37s for 164 batches = 0.225s/batch. With 4 crops: ~0.45s/batch → 74s
+- Total: 13 + 112 + 74 = 199s. OVER BUDGET.
+
+Hmm, this is a problem. I need to adjust.
+
+Options:
+1. Reduce RESERVE_S to account for longer prediction
+2. Train for fewer steps (shorter training)
+3. Use a larger prediction batch size
+4. Reduce number of crops to 3 instead of 4
+
+Actually, the plan says "Reduce epochs by one (train ~145s) so total runtime stays under 180s". But that doesn't work because the training already runs to the time limit - it's not epoch-limited, it's time-limited. The while loop runs until time runs out.
+
+Let me think about this differently. The total budget is 180s.
+- Load: 13s
+- Training: T_train
+- Prediction: T_pred
+
+With 4 crops, T_pred ≈ 2 × 37 = 74s (roughly, since it's 4 forward passes instead of 2).
+Actually, prediction is just forward pass (no backward), so it might scale less than 2x. Let's say 1.8x → 67s.
+
+So T_train = 180 - 13 - 67 = 100s.
+At 0.38s/step → ~263 steps.
+
+That's tight but doable. The key issue is that the current code sets RESERVE_S = 55 which was calibrated for 2-crop prediction. I need to increase it.
+
+Let me set RESERVE_S = 80 to be safe. Then training budget = 180 - 80 - 13 = 87s. At 0.38s/step → ~229 steps. That's about 2.4 epochs.
+
+Hmm, that's a lot fewer steps. Let me think about whether 4 crops is really needed or if 3 would be better.
+
+Actually, let me reconsider. The prediction time with 4 crops:
+- 41879 / 256 = 164 batches
+- Each batch: 4 forward passes through backbone
+- Current: 2 forward passes per batch, 37s total → 18.5s per forward pass set
+- New: 4 forward passes → ~37s per "set" → 74s total
+
+Wait no. Currently each batch does 2 forward passes (xt and xw). 164 batches × 2 forwards = 328 forwards in 37s → 0.113s per forward.
+New: 164 batches × 4 forwards = 656 forwards → 656 × 0.113 = 74s.
+
+So prediction is ~74s. Plus writing the CSV (fast, maybe 2s).
+
+Total non-training: 13 + 74 + 2 = 89s.
+Training budget: 180 - 89 = 91s.
+At 2x step time (0.38s/step): ~239 steps.
+
+That's workable. Let me set RESERVE_S = 90.
+
+Actually, I realize I should be more careful. Let me look at the step time more carefully.
+
+Current step time (after warmup): ~0.19s/step with 2 crops.
+The forward pass is 2 crops, backward is 2 crops. So per-crop cost is roughly 0.095s for forward+backward.
+With 4 crops: ~0.38s/step.
+
+Training budget with RESERVE_S=90: 180 - 90 - 13 = 77s → ~203 steps.
+With RESERVE_S=80: 180 - 80 - 13 = 87s → ~229 steps.
+
+Let me go with RESERVE_S = 85. Training: 180-85-13 = 82s → ~216 steps.
+
+Actually, I'm overthinking this. The code already handles the time budget dynamically - it just stops when time runs out. The RESERVE_S just needs to be large enough that prediction + writing can finish. Let me set it to 85s to be safe.
+
+Now let me think about the architecture more concretely:
+
+```python
+class MultiScaleClassifier(nn.Module):
+    def __init__(self, backbone, num_scales=4, hidden=512, num_classes=4):
+        super().__init__()
+        self.backbone = backbone
+        C = backbone.num_features  # 1280 for B0
+        self.num_scales = num_scales
+        # 1x1 conv to reduce channels for each scale
+        self.scale_projs = nn.ModuleList([
+            nn.Conv2d(C, 256, 1) for _ in range(num_scales)
+        ])
+        # Head: takes num_scales * 256 = 1024 features
+        self.head = nn.Sequential(
+            nn.Linear(num_scales * 256, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, num_classes),
+        )
+    
+    def forward(self, views):
+        # views: list of [B, 3, 160, 160] tensors
+        feats = []
+        for i, x in enumerate(views):
+            f = self.backbone.forward_features(x)  # [B, 1280, 5, 5]
+            f = self.scale_projs[i](f)  # [B, 256, 5, 5]
+            f = f.mean(dim=[2, 3])  # [B, 256]
+            feats.append(f)
+        f = torch.cat(feats, dim=1)  # [B, 1024]
+        return self.head(f)
+```
+
+Wait, but the backbone is shared. In the current code, `model(xt)` and `model(xw)` both go through the same backbone (the whole model including the head). But here I'm using `backbone.forward_features` which is just the feature extractor.
+
+Actually, looking at the current code more carefully:
+```python
+model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
+```
+And in training:
+```python
+loss = crit((model(xt) + model(xw)) / 2, y)
+```
+
+So `model(xt)` goes through the full model (backbone + classifier head) and returns [B, 4] logits. The two sets of logits are averaged.
+
+For my new architecture, I need to:
+1. Create the backbone separately
+2. Use `backbone.forward_features` for each crop
+3. Fuse the features
+4. Apply a shared head
+
+Let me restructure:
+
+```python
+model_backbone = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
+# Actually, I should use the backbone without the classifier head
+# timm models have .forward_features() which gives the feature map
+# and .forward() which gives logits
+
+# Better approach: create the model normally, but use forward_features
+model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
+```
+
+Actually, in timm, `model.forward_features(x)` returns the spatial feature map [B, C, H, W], and `model.forward(x)` returns [B, num_classes] logits (after the classifier head and global pool).
+
+So I can create the model with `num_classes=4` and use `model.forward_features(x)` to get the spatial features. The classifier head of the timm model will be unused, but that's fine (it just adds a few parameters that don't get trained since they're not in the forward pass... wait, they WILL be in the optimizer if I use model.parameters()).
+
+Better approach: create the backbone without a classifier:
+```python
+backbone = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=None)
+```
+With `num_classes=None`, timm creates the model without a classifier head, and `forward_features` returns [B, C, H, W].
+
+Wait, actually with `num_classes=None`, `model(x)` returns the pooled features [B, C], not [B, C, H, W]. Let me check...
+
+In timm, for EfficientNet:
+- `forward_features(x)` → [B, C, H, W] (spatial features before global pool)
+- `forward(x)` → if num_classes is set: [B, num_classes]; if num_classes is None: [B, C] (pooled)
+
+So I should use `forward_features` to get [B, C, H, W].
+
+Let me use:
+```python
+backbone = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=None)
+```
+
+And in my classifier:
+```python
+class MultiScaleClassifier(nn.Module):
+    def __init__(self, backbone, num_scales=4, proj_dim=256, hidden=512, num_classes=4):
+        super().__init__()
+        self.backbone = backbone
+        C = backbone.num_features  # 1280 for B0
+        self.scale_projs = nn.ModuleList([
+            nn.Conv2d(C, proj_dim, 1) for _ in range(num_scales)
+        ])
+        self.head = nn.Sequential(
+            nn.Linear(num_scales * proj_dim, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, num_classes),
+        )
+    
+    def forward(self, views):
+        feats = []
+        for i, x in enumerate(views):
+            f = self.backbone.forward_features(x)  # [B, C, H, W]
+            f = self.scale_projs[i](f)  # [B, proj_dim, H, W]
+            f = f.mean(dim=[2, 3])  # [B, proj_dim]
+            feats.append(f)
+        f = torch.cat(feats, dim=1)  # [B, num_scales * proj_dim]
+        return self.head(f)
+```
+
+This is clean. The backbone is shared, each scale gets its own 1x1 projection, then we concat and pass through the head.
+
+Now for the dataset:
+
+```python
+class BoxDataset(torch.utils.data.Dataset):
+    def __init__(self, rows, images, train):
+        self.rows, self.images, self.train = rows, images, train
+    
+    def __len__(self):
+        return len(self.rows)
+    
+    def __getitem__(self, i):
+        r = self.rows[i]
+        img = self.images[r["image"]]
+        fh = fv = False
+        bright = 1.0
+        if self.train:
+            fh, fv, bright = random.random() < 0.5, random.random() < 0.5, random.uniform(0.8, 1.2)
+        views = []
+        for ctx in SCALES:
+            x = make_crop(img, r, ctx, self.train)
+            if fh:
+                x = x[:, ::-1]
+            if fv:
+                x = x[::-1, :]
+            if self.train:
+                x = np.clip(x * bright, 0, 1)
+            x = (x - MEAN) / STD
+            views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))
+        return views, r.get("cls", -1)
+```
+
+Wait, but the dataloader will collate these. If I return a list of 4 tensors, the default collate will make a list of 4 tensors each with batch dim. That should work.
+
+Actually, let me think about this. If `__getitem__` returns `(views, cls)` where `views` is a list of 4 tensors of shape [3, 160, 160], then the default collate will produce:
+- A list of 4 tensors, each [B, 3, 160, 160]
+- cls: [B]
+
+So in the training loop:
+```python
+for views, y in dl_tr:
+    # views is a list of 4 tensors, each [B, 3, 160, 160]
+    views = [v.to(device) for v in views]
+    logits = model(views)
+    loss = crit(logits, y)
+```
+
+That should work. Let me verify the collate behavior... Yes, `torch.utils.data.default_collate` on a list of tensors returns a list of batched tensors.
+
+Now for the training loop, I need to change:
+```python
+for xt, xw, y in dl_tr:
+```
+to:
+```python
+for views, y in dl_tr:
+```
+
+And:
+```python
+loss = crit((model(xt) + model(xw)) / 2, y)
+```
+to:
+```python
+views = [v.to(device, non_blocking=True).to(memory_format=torch.channels_last) for v in views]
+loss = crit(model(views), y)
+```
+
+Similarly for inference.
+
+Now let me think about the time budget more carefully.
+
+Current state:
+- Load: 13s
+- Training: 112s (433 steps at ~0.26s/step average, but ~0.19s/step after first epoch)
+- Prediction: 37s
+- Total: 162s
+
+With 4 crops:
+- Load: 13s (same images, same loading)
+- Training: each step does 4 backbone forwards + 4 backwards instead of 2+2. So ~2x step time.
+  - First epoch might be ~0.98s/step (2x of 0.49)
+  - Subsequent: ~0.38s/step (2x of 0.19)
+  - With RESERVE_S=85: training budget = 180-85-13 = 82s
+  - ~82/0.38 ≈ 216 steps (after first epoch which is slower)
+  - Actually first epoch: 94 steps at ~0.98s = 92s. That's already over 82s!
+  
+Hmm, this is problematic. The first epoch is slow because of CUDA warmup, cuDNN autotuning, etc.
+
+Let me reconsider. Maybe I should:
+1. Use a smaller projection dim (128 instead of 256) to reduce the 1x1 conv cost (though it's negligible)
+2. Accept fewer steps
+3. Reduce the number of scales to 3
+
+Actually, the 1x1 convs are negligible compared to the backbone. The main cost is 4 backbone forwards vs 2.
+
+Let meThinking budget reached. Stop thinking now and write the reply in the required format.

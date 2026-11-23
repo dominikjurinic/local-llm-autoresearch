@@ -1,0 +1,608 @@
+===== attempt 1 =====
+Let me analyze the situation carefully.
+
+Current best: e016, 5-seed val mAP@0.5 = 0.6337
+- Per-class: pore 0.524, deposit 0.626, discontinuity 0.779, stain 0.606
+- The system uses EfficientNet-B0, two-crop input (tight 1.5x + wide 2.5x), TTA with horizontal flip
+- Training: 9084 boxes (6052 GT + 2x oversample of pore/stain), 3 epochs, 387 steps
+- Score = detector conf × class probability
+- 53780 prediction rows (4 per eval box)
+
+Key observations:
+1. The ceiling for stage 2 is 0.758 mAP (stage-1 boxes with perfect classes). Current is 0.6337.
+2. The single-class 'defect' baseline is 0.755. So the class-agnostic detector is doing well on detection, but the classifier is making wrong type assignments.
+3. Pore (0.524) and stain (0.606) are the weak classes.
+4. Many experiments have been tried: background class training, low-res crops, various scoring functions, mixup, focal loss, label smoothing, different architectures, TTA, oversampling, etc.
+
+What hasn't been tried yet or what could work:
+- Training on detector boxes with background class (e001 crashed, e002 got 0.5172 - very bad, probably because the background class made things worse)
+- e005 tried training on detector boxes that overlap GT (IoU>0.5) - 0.6248, rejected
+- e015 tried adding detector boxes that overlap GT to the GT set - 0.6285, rejected
+
+Let me think about what could actually help:
+
+1. **The scoring function**: Currently score = conf × p[c]. The issue is that for a box that's actually background, all 4 class rows get written with some score. This creates false positives for all classes. The key insight is that mAP@0.5 rewards ranking - true detections should score higher than false ones.
+
+2. **What about using the max probability as a gate?** e008 tried conf × p[c] × max(p) and got 0.6265. e004 tried conf × p[c]² and got 0.6161. e022 tried conf² × p[c] and got 0.6113.
+
+3. **What about the number of rows per box?** Currently 4 rows per box. e014 tried top-1 only and got 0.5916 (bad). So multiple rows help.
+
+4. **What about training duration?** e019 tried cutting reserve to 50s and got 0.6291 (worse). So more training didn't help much.
+
+5. **What about the model architecture?** e006 (ConvNeXt-Nano) crashed, e021 (tf_efficientnetv2_b0) got 0.6259.
+
+6. **What about data augmentation?** e007 (MixUp) got 0.6326/0.6292, e011 (more jitter) got 0.6356/0.294.
+
+Wait, let me re-read the history more carefully:
+- e013: TTA with horizontal flip → 0.6392 seed-0, 0.6314 5-seed → new best
+- e016: 2x oversample pore/stain → 0.6333 seed-0, 0.6337 5-seed → new best
+
+So the current best uses TTA + 2x oversampling.
+
+Let me think about what's fundamentally limiting performance:
+- The classifier is trained on GT boxes but evaluated on detector boxes (which are slightly misplaced)
+- The classifier has no notion of "not a defect" - every box gets 4 class predictions
+- The detector conf is the only signal for "is this a real defect?"
+
+Key insight: The score = conf × p[c]. For a background box, conf might be moderate (0.3-0.7) and p[c] might be spread across classes. For a true defect, conf should be higher AND p[true_class] should be high.
+
+What if we could better separate true defects from background? The detector conf is already doing some of this. But maybe we can use the classifier's uncertainty (entropy of p) as an additional signal.
+
+Actually, wait. Let me think about this differently. The problem is:
+1. For true defects: we need the right class AND high score
+2. For false alarms: we need low scores across all classes
+
+The current scoring gives every box 4 rows. For a false alarm box, if p = [0.25, 0.25, 0.25, 0.25] and conf = 0.5, each row gets score 0.125. These are false positives for all 4 classes.
+
+What if we could make the classifier output a "background" probability that we use to suppress? But e002 tried training with a background class and got terrible results (0.5172).
+
+Hmm, but e002's approach might have been flawed. Let me think about what went wrong there. If you train with 5 classes (4 defects + background), the model might become confused. But what if instead of adding a 5th class, we use the classifier's max probability or entropy as a "defect-ness" score?
+
+Actually, let me think about a different angle. What about **using the detector confidence more smartly**?
+
+The detector is class-agnostic. Its confidence reflects how much it thinks something is a defect. High conf = likely defect, low conf = likely background.
+
+What if we use a threshold or non-linear function of conf? We've tried:
+- conf × p[c] (current)
+- conf² × p[c] (e022, worse)
+- conf × p[c]² (e004, worse)
+- conf × p[c] × max(p) (e008, worse)
+
+What about using conf as a multiplier but with a different transformation? Like conf^0.5 × p[c]? That would boost low-conf boxes... probably not helpful.
+
+Let me think about what else could help:
+
+**Idea: Use the ratio p[c] / max(p) as a class-specific confidence, combined with conf.**
+
+Actually, the current scoring already does this implicitly: score = conf × p[c]. The ranking within a box is determined by p[c], and the overall magnitude by conf × max(p).
+
+**Idea: Train longer / different learning rate schedule**
+
+The model trains for 3 epochs with 387 steps. Loss goes 0.62 → 0.31 → 0.24. It's still decreasing. But e019 (more training time) didn't help.
+
+**Idea: Use a different backbone that's faster, allowing more training**
+
+What about convnext_pico or regnety_016? These are smaller/faster models. But e006 (convnext_nano) crashed and e021 (tf_efficientnetv2_b0) was worse.
+
+**Idea: Use both crops more effectively**
+
+Currently the two crops (tight 1.5x and wide 2.5x) are averaged in logit space. What if we learn a weighted combination? Or what if we concatenate them instead of averaging?
+
+Actually, wait. Let me reconsider the problem. The key issue is:
+- Stage 1 ceiling: 0.758
+- Current: 0.6337
+- Gap: 0.124
+
+The gap comes from:
+1. Wrong class assignments (the classifier picks the wrong type)
+2. Poor ranking (false alarms score too high relative to true detections)
+3. Missed detections (but stage 1 is fixed, so these are already accounted for in the 0.758 ceiling)
+
+Since the single-class baseline is 0.755, the detection quality is fine. The issue is purely classification + ranking.
+
+**What about using the wide crop more for context?** Stain is confused with deposit and background. The wide crop should help distinguish these. What if we weight the wide crop more heavily?
+
+Currently: logits = (model(xt) + model(xw)) / 2
+
+What about: logits = model(xt) * 0.3 + model(xw) * 0.7? Or some other weighting?
+
+Actually, this is a reasonable experiment. The tight crop focuses on the defect itself (good for pore - small holes), while the wide crop gives context (good for stain - needs surrounding weld pattern). Maybe we should weight them differently.
+
+But wait, this is a bit of a shot in the dark. Let me think of something more principled.
+
+**What about using the difference between tight and wide crop predictions as a signal?**
+
+If tight and wide agree, the prediction is more confident. If they disagree, it's less confident. This could be used as an additional confidence signal.
+
+But this is getting complicated. Let me think about simpler ideas.
+
+**What about increasing the image size?** e017 tried 224×224 but timed out. What about 192×192? That's a moderate increase that might fit in the time budget.
+
+Actually, e017 timed out at 224. The current setup does 3 epochs in ~120s of training time. Going to 192 would increase compute by (192/160)² = 1.44x. So training would take ~173s instead of ~120s. With a 180s budget and 65s reserve, we have 115s for training. 173s > 115s, so we'd get fewer epochs. Probably not worth it.
+
+**What about using a different augmentation strategy?**
+
+Current augmentations:
+- Random crop jitter (±10% center, 0.85-1.2x size)
+- Random horizontal flip (50%)
+- Random vertical flip (50%)
+- Random brightness (0.8-1.2)
+
+What about color jitter? Or random erasing? Or CutMix?
+
+Actually, let me reconsider the problem from the scoring perspective.
+
+**Key insight about mAP@0.5:**
+- For each class, mAP is computed by ranking all predictions for that class by score
+- A prediction is a TP if it matches a GT box of that class with IoU ≥ 0.5
+- A prediction is a FP if it doesn't match any GT box of that class
+
+The current system outputs 4 rows per box. For a box that's a true pore:
+- Row (box, pore): TP if score is high enough
+- Row (box, deposit): FP (wrong class)
+- Row (box, discontinuity): FP (wrong class)
+- Row (box, stain): FP (wrong class)
+
+For a box that's background:
+- All 4 rows are FP
+
+The issue is that the 3 wrong-class rows for each true detection are FPs that hurt the precision of those classes. And the 4 rows for each background box are FPs that hurt all classes.
+
+**What if we output fewer rows?** e014 tried top-1 only and got 0.5916 (much worse). So 4 rows is better than 1 row.
+
+What about 2 rows? Top-2 classes? This might reduce the FP burden while keeping the benefit of multiple rows.
+
+Actually, wait. Let me re-read: "Several rows per box (one per class) are allowed and often help." So the research brief explicitly says multiple rows help. e014 (top-1) was worse. So 4 rows > 1 row.
+
+But what about the scores? If we make the non-top-1 scores much lower, they'll rank below the true FPs and not hurt as much.
+
+**Idea: Use p[c]² for the score but keep 4 rows.** Wait, e004 tried this and got 0.6161. Worse.
+
+**Idea: Use a temperature-scaled softmax.** Instead of softmax(logits), use softmax(logits / T) with T > 1 to make probabilities less peaked. This would reduce the confidence of wrong-class predictions.
+
+Actually, this is similar to label smoothing (e010, 0.6328/0.6254, not confirmed) or to the p² scoring (e004, 0.6161).
+
+Let me think differently.
+
+**What about the training data?**
+
+Currently training on 6052 GT boxes (high-res only), with 2x oversampling of pore/stain → 9084 total.
+
+What if we also train on low-res crops? e003 tried this and got 0.6251 (worse). So low-res doesn't help.
+
+What about training on detector boxes? e005 (0.6248) and e015 (0.6285) both tried this and were worse.
+
+**What about the model?**
+
+We've tried:
+- EfficientNet-B0 (current best)
+- ConvNeXt-Nano (crashed)
+- tf_efficientnetv2_b0 (0.6259, worse)
+
+What about:
+- ResNet50?
+- MobileNetV3-Large?
+- RegNetY-016?
+- ConvNeXt-Pico?
+
+These are all available. But the pattern suggests that EfficientNet-B0 is a good choice and switching isn't likely to help much.
+
+**What about ensemble?**
+
+The research brief mentions "ensembling within the time budget." What if we train two models (e.g., two seeds of EfficientNet-B0) and average their probabilities?
+
+But this would halve the training time per model. With 3 epochs currently, we'd get 1.5 epochs per model. That might not be enough.
+
+Actually, what if we train one model and use it with TTA (which we already do), and also train a second model with a different augmentation seed? The time budget is 180s with 65s reserve, so 115s for training. Currently 3 epochs in ~120s. So we can't really fit two models.
+
+**What about a different approach to the two crops?**
+
+Currently both crops go through the same model and logits are averaged. What if we:
+1. Use different models for tight vs wide crops?
+2. Concatenate the crops into a single 160×320 image?
+3. Use a weighted average instead of equal average?
+
+Option 3 is interesting and easy to test. Let me think about what weight to use.
+
+The tight crop (1.5x) shows the defect itself. For pore (small holes), this is critical. For stain (which needs context), the wide crop (2.5x) is more useful.
+
+A simple experiment: try logits = 0.4 * model(xt) + 0.6 * model(xw) instead of 0.5 * model(xt) + 0.5 * model(xw).
+
+But this is a bit of a shot in the dark. The optimal weight might be different.
+
+**What about using the product of probabilities instead of sum of logits?**
+
+Instead of averaging logits, what if we multiply the softmax probabilities? This would make the final probability lower when the two views disagree.
+
+p_final[c] = p_tight[c] * p_wide[c] / (sum_c p_tight[c] * p_wide[c])
+
+This is a different combination strategy. When both views agree on class c, p_final[c] is high. When they disagree, both are moderate and the product is lower.
+
+Actually, this is equivalent to:
+logits_final[c] = log(p_tight[c]) + log(p_wide[c]) = logit_tight[c] + logit_wide[c] (approximately, if we use log-softmax)
+
+Wait, that's just the sum of logits, which is what we're already doing (up to a constant factor). So this is the same as the current approach.
+
+Hmm, actually no. The current approach averages logits: (logit_tight + logit_wide) / 2. Then softmax is applied. This is equivalent to:
+p_final[c] = softmax((logit_tight[c] + logit_wide[c]) / 2)
+
+Which is the same as:
+p_final[c] = softmax(logit_tight[c] + logit_wide[c]) (since softmax is invariant to adding a constant)
+
+And this is the same as:
+p_final[c] = p_tight[c] * p_wide[c] / sum_c p_tight[c] * p_wide[c]
+
+So the current approach already does this. OK.
+
+**Let me think about what's really the bottleneck.**
+
+The per-class APs are:
+- pore: 0.524 (weakest)
+- deposit: 0.626
+- discontinuity: 0.779 (strongest)
+- stain: 0.606
+
+Pore is the weakest. Pores are small holes in the weld. They're hard to detect and classify. The tight crop should be most useful for pores since they're small features.
+
+Stain is confused with deposit and background. The wide crop should help here.
+
+**What if we use class-specific crop contexts?**
+
+For pore: use a tighter crop (1.2x instead of 1.5x)
+For stain: use a wider crop (3.5x instead of 2.5x)
+
+But this would require knowing the class before classifying, which is circular. Unless we use it during training only... but that doesn't help at inference.
+
+**What about data augmentation specific to the weak classes?**
+
+For pore: add small noise to simulate detection uncertainty
+For stain: add color variation to simulate different stain appearances
+
+This is getting too speculative. Let me focus on something concrete.
+
+**Let me reconsider the scoring function.**
+
+The current score is conf × p[c]. The issue is:
+1. For true defects: conf is moderate-to-high, p[true_class] is high → good score
+2. For background: conf is low-to-moderate, p is spread → moderate score for each class
+
+The problem is that background boxes with moderate conf and moderate p[c] can score higher than true defects with lower conf but higher p[c].
+
+What if we use a non-linear function that more aggressively separates high-confidence from low-confidence predictions?
+
+For example: score = conf × p[c] × (p[c] / max(p))^α
+
+This would boost the top class relative to others. But this is similar to what we've already tried.
+
+**What about using the detector confidence as a soft threshold?**
+
+score = max(0, conf - τ) × p[c] for some threshold τ
+
+This would zero out all predictions for boxes with conf < τ. But we've tried conf² which is similar.
+
+**What about a two-stage scoring?**
+
+First, compute a "defect-ness" score: d = conf × max(p)
+Then, for each class: score = d × (p[c] / max(p))^β
+
+This separates the "is it a defect?" question from the "what type?" question.
+
+With β=1: score = conf × p[c] (current)
+With β=2: score = conf × p[c]² / max(p) (similar to e004 but normalized)
+
+Hmm, e004 tried conf × p[c]² and got 0.6161. The normalized version might be different.
+
+Actually, let me think about this more carefully. The issue with conf × p[c]² is that it penalizes all classes equally, including the correct one. For a true detection where p = [0.7, 0.1, 0.1, 0.1], the score for the correct class is conf × 0.49, while for a background where p = [0.25, 0.25, 0.25, 0.25], the score is conf × 0.0625. The ratio is 8x, which is good.
+
+But for a true detection where p = [0.5, 0.2, 0.2, 0.1], the score is conf × 0.25, while for background p = [0.3, 0.3, 0.2, 0.2], the score is conf × 0.09. The ratio is only 2.8x. Not as good.
+
+The issue is that p² doesn't help when the classifier isn't very confident about the true class.
+
+**What about using the log-odds?**
+
+score = conf × exp(α × logit[c]) where α < 1
+
+This would compress the logit range, making the scores less extreme. For α=0.5, it's like taking the square root of the probability (in logit space).
+
+But this is hard to reason about and might not help.
+
+**Let me try a different angle: what about the training process?**
+
+The model trains for 3 epochs with 387 steps. The loss goes 0.62 → 0.31 → 0.24. It's still decreasing. But e019 (more training) didn't help.
+
+What about a different learning rate? Currently LR=1e-3 with AdamW. What about LR=5e-4 or LR=2e-3?
+
+Actually, let me look at what's been tried:
+- e019: more training time → 0.6291 (worse)
+- e020: SGD instead of AdamW → 0.6242 (worse)
+- e012: focal loss → 0.6209 (worse)
+- e010: label smoothing → 0.6328/0.6254 (not confirmed)
+
+The optimization space seems well-explored. Let me think about data.
+
+**What about using the detector confidence as a training weight?**
+
+During training, we could weight the loss by the detector confidence of the overlapping detection box. High-conf boxes get more weight, low-conf boxes get less. This would make the model focus on the boxes it's most likely to see at inference.
+
+But wait, during training we use GT boxes, not detector boxes. The detector confidence isn't available for GT boxes.
+
+Unless... we match GT boxes to detector boxes and use the detector conf as a weight. But e015 tried adding detector boxes to training and it was worse.
+
+**What about using the detector confidence to filter training examples?**
+
+Only train on GT boxes that have a corresponding detector box with conf > τ. This would focus training on the boxes the detector actually finds.
+
+But this might reduce the training set size and we might miss important examples.
+
+**Let me think about what's fundamentally different about this problem.**
+
+The key challenge is:
+1. The classifier is trained on GT boxes but evaluated on detector boxes (distribution shift)
+2. The classifier has no background class (can't distinguish defects from non-defects)
+3. The scoring needs to balance class accuracy with ranking quality
+
+For point 1, we've tried training on detector boxes (e005, e015) and it didn't help. The jitter augmentation (e011) also didn't help.
+
+For point 2, we've tried adding a background class (e002) and it was terrible.
+
+For point 3, we've tried various scoring functions (e004, e008, e022) and none helped.
+
+**What about a completely different approach?**
+
+What if instead of classifying each box independently, we use a global context? For example, if there are many boxes in an image, they're more likely to be true defects (welds with defects have multiple defects). If there's only one box, it's more likely to be a false alarm.
+
+But this would require a different architecture (e.g., a transformer that processes all boxes in an image). And it's complex to implement.
+
+**What about using the image-level context?**
+
+For each box, we could also compute a "background" crop (the area around the box but not the box itself) and use it to determine if the box is in a weld region.
+
+But this is complex and might not help.
+
+**Let me focus on something concrete and testable.**
+
+Given the constraints (one idea per turn, focused edit), I think the most promising untried idea is:
+
+**Weighted combination of tight and wide crop logits.**
+
+Currently: logits = (model(xt) + model(xw)) / 2
+
+The tight crop is better for small features (pore), the wide crop is better for context-dependent features (stain). Instead of equal weighting, we could try:
+- Weighting the wide crop more: logits = 0.3 * model(xt) + 0.7 * model(xw)
+- Or: logits = 0.4 * model(xt) + 0.6 * model(xw)
+
+This is a simple, testable change. If the wide crop is more informative (which it should be for stain and deposit), this should help.
+
+Actually, wait. Let me reconsider. The two crops are:
+- Tight: 1.5x the box size
+- Wide: 2.5x the box size
+
+The tight crop shows the defect itself plus a small margin. The wide crop shows the defect plus more surrounding context.
+
+For pore (small holes): the tight crop is more relevant because the holes are small
+For stain: the wide crop is more relevant because stain needs context to distinguish from deposit
+For deposit: probably the tight crop is fine
+For discontinuity: probably the tight crop is fine
+
+So the optimal weighting might be class-dependent. But we can't do class-dependent weighting at inference (we don't know the class yet).
+
+A compromise: weight the wide crop slightly more, since 3 out of 4 classes (pore, stain, and maybe deposit) might benefit from more context.
+
+Let me try: logits = 0.35 * model(xt) + 0.65 * model(xw)
+
+This is a focused, testable change. Let me write it up.
+
+Actually, wait. Let me reconsider whether this is likely to help. The current equal weighting already uses both crops. If the wide crop were significantly more useful, we'd expect the wide-crop-only model to be better. But we don't have that data point.
+
+The fact that e009 (increasing wide context from 2.5x to 3.5x) got 0.6342/0.6309 (not confirmed, slightly below the 0.6337 best) suggests that more context isn't clearly better.
+
+Hmm, so maybe the weighting isn't the answer.
+
+**Let me think about another angle: the MIN_SCORE threshold.**
+
+Currently MIN_SCORE = 0.001. This means rows with score < 0.001 are not written. With conf × p[c], and conf typically 0.1-0.9 and p[c] typically 0.05-0.9, the minimum score is around 0.005. So MIN_SCORE = 0.001 doesn't actually filter anything.
+
+What if we increase MIN_SCORE to filter out very low-confidence predictions? For example, MIN_SCORE = 0.01 or 0.05.
+
+This would reduce the number of rows written, potentially reducing FPs. But it might also remove some true detections with low scores.
+
+Let's think: for a true detection with conf=0.5 and p[true]=0.6, score = 0.3. For a background with conf=0.3 and p[c]=0.25, score = 0.075. A threshold of 0.05 would remove the background row but keep the true detection.
+
+But the issue is that some true detections might have low conf (the detector isn't perfect) and the classifier might not be very confident. So a hard threshold might remove true detections.
+
+However, since we're writing 4 rows per box, even if we remove some low-scoring rows, the top-scoring row for each box is still there. So the threshold mainly affects the lower-scoring rows (wrong-class FPs and low-conf background FPs).
+
+Actually, this is a reasonable experiment. Let me think about what threshold to use.
+
+The scores range from ~0 to ~0.8 (conf × p, both max ~1). The median score is probably around 0.1-0.2. A threshold of 0.05 would remove the bottom ~20-30% of rows.
+
+But wait, the problem is that mAP is computed per class. If we remove low-scoring rows for class c, we remove FPs for class c (good) but we might also remove TPs for class c (bad). The net effect depends on the ratio of TPs to FPs at that score level.
+
+For the weak classes (pore, stain), the TP rate might be lower, so a threshold might hurt more. For the strong class (discontinuity), the TP rate is higher, so a threshold might help.
+
+This is getting complicated. Let me just try a moderate threshold.
+
+Actually, I realize I should think about what's most likely to give a measurable improvement. The seed-to-seed noise is ±0.005 to 0.01. So I need an idea that's likely to give > 0.01 improvement.
+
+Let me reconsider the problem from scratch.
+
+**The fundamental issue:**
+- Stage 1 finds boxes (some true, some false)
+- Stage 2 needs to: (a) classify each box, (b) assign a score
+- The score determines ranking for mAP
+
+**What determines mAP@0.5?**
+For each class c:
+- All predictions for class c are ranked by score
+- A prediction is TP if it matches a GT box of class c with IoU ≥ 0.5
+- AP = area under precision-recall curve
+
+To improve AP for class c:
+1. Increase the score of true detections for class c
+2. Decrease the score of false detections for class c
+3. Both
+
+**Current scoring: score = conf × p[c]**
+
+For a true detection of class c: conf is moderate-to-high, p[c] is high → good
+For a false detection (background): conf is low-to-moderate, p[c] is moderate → moderate
+For a wrong-class detection (true defect of class d ≠ c): conf is moderate-to-high, p[c] is low → low
+
+The main problem is case 2: background boxes get moderate scores for all classes.
+
+**What if we could better estimate "is this a defect?" separately from "what type is it?"**
+
+The detector conf already estimates "is this a defect?" But it's not perfect.
+
+What if we use the classifier to also estimate "is this a defect?" by looking at the overall confidence?
+
+For a true defect: p is peaked (max(p) is high, entropy is low)
+For background: p is flat (max(p) is low, entropy is high)
+
+So max(p) or 1/entropy could be a "defect-ness" score.
+
+Current score: conf × p[c]
+Alternative: conf × max(p) × (p[c] / max(p))^β
+
+With β=1: conf × p[c] (current)
+With β=2: conf × p[c]² / max(p)
+
+Wait, I already considered this. e004 tried conf × p[c]² and got 0.6161. The normalized version conf × p[c]² / max(p) is different.
+
+Let me compute: for a true detection with p = [0.7, 0.1, 0.1, 0.1], max(p) = 0.7
+- Current: conf × 0.7
+- Normalized: conf × 0.49 / 0.7 = conf × 0.7 (same!)
+
+For a background with p = [0.25, 0.25, 0.25, 0.25], max(p) = 0.25
+- Current: conf × 0.25
+- Normalized: conf × 0.0625 / 0.25 = conf × 0.25 (same!)
+
+Oh, so conf × p[c]² / max(p) = conf × p[c] × (p[c] / max(p)). This is different from conf × p[c]².
+
+For the true detection: conf × 0.7 × (0.7/0.7) = conf × 0.7
+For the background: conf × 0.25 × (0.25/0.25) = conf × 0.25
+
+So it's the same as the current scoring! Because p[c]² / max(p) = p[c] × (p[c]/max(p)), and when p[c] = max(p), this equals p[c].
+
+Wait, that's only true when p[c] = max(p). For other classes:
+True detection, class 1 (p[1] = 0.1): conf × 0.1 × (0.1/0.7) = conf × 0.0143
+Background, class 0 (p[0] = 0.25): conf × 0.25 × (0.25/0.25) = conf × 0.25
+
+So the wrong-class rows get lower scores (0.0143 vs 0.1 in current), while the top-class rows stay the same. This is actually a good property! It suppresses wrong-class FPs without affecting the top-class TP.
+
+Let me verify: score = conf × p[c] × (p[c] / max(p))
+
+For the top class: p[c] = max(p), so score = conf × p[c] × 1 = conf × p[c] (same as current)
+For other classes: p[c] < max(p), so score = conf × p[c] × (p[c]/max(p)) < conf × p[c] (lower than current)
+
+This is a pure improvement in the sense that it only lowers the scores of non-top-class rows, which are FPs. It doesn't change the score of the top-class row.
+
+But wait, what if the top class is wrong? If the classifier picks the wrong top class, then the top-class row is a FP and the true-class row is a TP with a lower score. In this case, the new scoring makes the FP (top class) the same score and the TP (true class) a lower score. This is worse than the current scoring.
+
+So the new scoring helps when the classifier is correct (top class = true class) and hurts when it's wrong. Since the classifier is correct most of the time (macro-F1 ~0.87), this should be a net positive.
+
+Let me estimate: if the classifier is correct 87% of the time:
+- 87% of boxes: top class = true class → new scoring helps (lowers FP scores)
+- 13% of boxes: top class ≠ true class → new scoring hurts (lowers TP score)
+
+The net effect should be positive.
+
+But wait, I need to be more careful. The mAP is computed per class. Let me think about it per class.
+
+For class c, the predictions include:
+1. Boxes where c is the top class (score = conf × p[c], unchanged)
+2. Boxes where c is not the top class (score = conf × p[c] × (p[c]/max(p)), lowered)
+
+In group 1, some are TP (true class = c) and some are FP (true class ≠ c or background).
+In group 2, some are TP (true class = c but c is not the top class) and some are FP.
+
+The new scoring lowers the scores of group 2. This helps if group 2 has more FPs than TPs (which it should, since the classifier is usually correct).
+
+I think this is a reasonable experiment. Let me write it up.
+
+Actually, let me simplify. The scoring is:
+score = conf × p[c] × (p[c] / max(p))
+
+This can be written as:
+score = conf × p[c]² / max(p)
+
+Let me double-check with numbers:
+p = [0.5, 0.3, 0.1, 0.1], max(p) = 0.5
+- Class 0: 0.5² / 0.5 = 0.5 ✓ (same as p[0])
+- Class 1: 0.3² / 0.5 = 0.18 (lower than p[1]=0.3)
+- Class 2: 0.1² / 0.5 = 0.02 (lower than p[2]=0.1)
+- Class 3: 0.1² / 0.5 = 0.02 (lower than p[3]=0.1)
+
+Yes, the top class is unchanged and others are lowered. Good.
+
+But wait, e004 tried conf × p[c]² and got 0.6161. The difference is the division by max(p). Let me compare:
+
+e004: score = conf × p[c]²
+New: score = conf × p[c]² / max(p)
+
+For the top class: e004 gives conf × p[top]², new gives conf × p[top]. So the new scoring gives a HIGHER score to the top class than e004. This is important because e004's problem was that it lowered the top-class score too much.
+
+For a true detection with p[top] = 0.7:
+- e004: conf × 0.49
+- New: conf × 0.7
+- Current: conf × 0.7
+
+So the new scoring keeps the top-class score the same as current, while lowering the non-top-class scores. This should be a clear improvement over both e004 and current.
+
+I'm fairly confident this is a good experiment. Let me write it up.
+
+The change is in the scoring section:
+```python
+s = d["conf"] * float(p[c])
+```
+becomes:
+```python
+max_p = float(p.max())
+s = d["conf"] * float(p[c]) ** 2 / max_p if max_p > 0 else 0.0
+```
+
+Wait, I need to be careful. p is a numpy array (from torch.cat(probs).numpy()). So p.max() should work.
+
+Let me write the exact code change:
+
+Current:
+```python
+        for d, p in zip(ev, probs):
+            for c in range(4):
+                s = d["conf"] * float(p[c])
+                if s > MIN_SCORE:
+                    w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+
+New:
+```python
+        for d, p in zip(ev, probs):
+            max_p = float(p.max())
+            for c in range(4):
+                s = d["conf"] * float(p[c]) ** 2 / max_p if max_p > 1e-8 else 0.0
+                if s > MIN_SCORE:
+                    w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+
+This is a focused, single change. The hypothesis is clear: by normalizing by max(p), we keep the top-class score unchanged while suppressing non-top-class scores, reducing wrong-class FPs without hurting correct-class TPs.
+
+Let me finalize this.
+
+Actually, I want to double-check: is p a numpy array? Let's trace through the code:
+
+```python
+probs.append(torch.softmax(logits.float(), 1).cpu())
+probs = torch.cat(probs).numpy()
+```
+
+Yes, probs is a numpy array of shape (n_eval, 4). So p is a numpy array of shape (4,). p.max() returns a numpy scalar. float(p.max()) converts it to a Python float. Good.
+
+Let me also make sure the division is safe. max_p could be 0 if all probabilities are 0, but softmax always produces positive values, so max_p > 0 always. The 1e-8 check is just for numerical safety.
+
+OK, I'm confident in this change. Let me write the final response.
+
+Wait, one more thought. The category should be "scoring" since we're changing the score computation.
+
+HYPOTHESIS: By computing score = conf × p[c]² / max(p) instead of conf × p[c], the top-class score is unchanged (p[c]=max(p) → p[c]²/max(p) = p[c]) while non-top-class scores are suppressed (p[c]<max(p) → p[c]²/max(p) < p[c]), reducing wrong-class false positives without hurting correct-class true positives.
+
+This is a clean, testable hypothesis. Let me write the response.

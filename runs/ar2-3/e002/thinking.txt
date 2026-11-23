@@ -1,0 +1,100 @@
+===== attempt 1 =====
+Let me analyze the situation:
+
+1. The current best (e000) has a 5-seed val mAP@0.5 of 0.6311.
+2. The most recent experiment (e001) crashed because `img_w` and `img_h` are strings in the CSV (they weren't converted to float in `read_csv`). The `read_csv` function only converts `x1, y1, x2, y2, conf` to float, but not `img_w` and `img_h`.
+
+The fix is straightforward: either add `img_w` and `img_h` to the list of fields converted in `read_csv`, or handle the conversion in `compute_iou_norm`.
+
+But wait - I should think about what the best next experiment is. The e001 idea (training on detector boxes with background class) is a good idea but it crashed. I should fix it and re-run.
+
+The crash is simple: `d["img_w"]` and `d["img_h"]` are strings because `read_csv` doesn't convert them. The fix is to either:
+1. Add `img_w` and `img_h` to the conversion list in `read_csv`
+2. Convert them in `compute_iou_norm`
+
+Option 1 is cleaner. Let me look at the `read_csv` function:
+
+```python
+def read_csv(path):
+    rows = list(csv.DictReader(open(path)))
+    for r in rows:
+        for k in ("x1", "y1", "x2", "y2", "conf"):
+            if k in r:
+                r[k] = float(r[k])
+        if "cls" in r:
+            r["cls"] = int(r["cls"])
+    return rows
+```
+
+I need to add `img_w` and `img_h` to the tuple of keys to convert.
+
+Now, let me think about whether I should just fix the crash (BASE: last) or start fresh from best (BASE: best). Since the idea in e001 is good and only had a trivial bug, I'll fix it with BASE: last.
+
+Let me also think about whether there are other potential issues with the e001 code:
+
+1. The `label_det_boxes` function uses normalized coordinates (dividing by img_w/img_h) for IoU computation. This is fine since IoU is scale-invariant, but it's unnecessary - we could just use raw pixel coordinates. But it works.
+
+2. The `needed` set for images: `needed = {d["image"] for d in tr} | {d["image"] for d in ev}` - this should be correct, we need images for training dets and eval dets.
+
+3. The training data now uses detector boxes instead of GT crops. This means the boxes are less precise (detector boxes vs ground truth). The jitter in `make_crop` should help with this.
+
+4. The background class: boxes with IoU <= 0.5 to any GT crop are labeled as background (class 4). This is the key idea.
+
+5. The scoring: `s = d["conf"] * float(p[c]) * (1.0 - bg)` - this multiplies by (1 - bg_prob) to suppress predictions when the model thinks it's background. This makes sense.
+
+6. Wait, there's a potential issue: the training data size. Let me think about how many detector boxes are in the training split. The eval has 41879 detections. The training split might have a similar number. With 6052 GT crops, the detector might produce many more boxes. This could mean:
+   - More training data (good)
+   - But also more background examples (the detector produces many false positives)
+   - The class balance might be very skewed
+
+7. Another concern: with detector boxes, the boxes are less tight than GT crops. The `make_crop` function uses the box coordinates to determine the crop size. For detector boxes that are larger or offset from GT, the crop might include more context. This should be fine since we have both tight (1.5x) and wide (2.5x) crops.
+
+8. The `TRAIN_ON` filter is no longer used since we're using dets.csv instead of crops.csv. That's fine.
+
+Let me just fix the bug. The simplest fix is to add `img_w` and `img_h` to the conversion in `read_csv`.
+
+Actually, wait. Let me re-read the code more carefully. The `read_csv` function converts `x1, y1, x2, y2, conf` to float. But `img_w` and `img_h` are not in that list. In the original code (e000), `img_w` and `img_h` were never used as numbers - they were just stored as strings in the dict. The `make_crop` function uses `img.shape[:2]` for dimensions, not `img_w`/`img_h`.
+
+So the fix is to add `img_w` and `img_h` to the tuple in `read_csv`:
+
+```python
+for k in ("x1", "y1", "x2", "y2", "conf", "img_w", "img_h"):
+```
+
+This is a one-line fix. Let me write it up.
+
+Actually, I want to make sure the rest of the e001 code is correct. Let me trace through it:
+
+1. `all_crops = read_csv(os.path.join(args.data, "crops.csv"))` - reads all crops (both high and low res)
+2. `tr = [d for d in dets if d["split"] == "train"]` - gets training detector boxes
+3. `tr_labels = label_det_boxes(tr, all_crops)` - labels them by IoU with GT crops
+4. For each det box, it finds the GT crop with the highest IoU. If IoU > 0.5, it gets that crop's class. Otherwise, it's background (4).
+5. The model is trained with 5 classes.
+6. At inference, background probability is used to scale down the defect scores.
+
+This looks correct. The only bug is the string vs float issue.
+
+Let me also consider: should I use `IOU_THRESH = 0.5` or something lower? The mAP is computed at IoU 0.5, so using 0.5 as the threshold for labeling makes sense - if a detector box overlaps a GT box by 0.5 IoU or more, it's a "true" detection of that class.
+
+One thing I notice: the `label_det_boxes` function iterates over all crops for each detection. If there are many crops and many detections, this could be slow. But with ~6000 crops and maybe ~40000 detections, that's ~240M IoU computations... wait no, it's per-image. The `crops_by_img` dict groups crops by image, so each detection only checks crops in the same image. That should be fine.
+
+Let me also think about whether the training will work well. The detector boxes are noisier than GT boxes. The jitter in `make_crop` (±10% center, 0.85-1.2x size) should help. But the detector boxes might be systematically different from GT boxes (e.g., larger, or offset). The model needs to learn to classify defects even when the box is slightly off.
+
+I think the fix is straightforward. Let me write it.
+
+Wait, I should also consider: the `TRAIN_ON` variable is no longer used. That's fine, it's just a leftover.
+
+Let me write the fix:
+
+```
+SEARCH:
+        for k in ("x1", "y1", "x2", "y2", "conf"):
+REPLACE:
+        for k in ("x1", "y1", "x2", "y2", "conf", "img_w", "img_h"):
+```
+
+This is the minimal fix. Let me verify this appears exactly once in the file. Yes, it's in the `read_csv` function.
+
+Actually, I realize I should double-check: in the e001 version, the `read_csv` function is the same as in e000 (it wasn't modified). So the SEARCH text should match the e001 file, which has the same `read_csv` as e000.
+
+Let me write the response.

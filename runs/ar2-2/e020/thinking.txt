@@ -1,0 +1,420 @@
+===== attempt 1 =====
+Let me analyze the current state and think about what to try next.
+
+Current best (e016): 5-seed val mAP@0.5 = 0.6411
+- Per-class: pore 0.537, deposit 0.635, discontinuity 0.780, stain 0.612
+- Architecture: EfficientNet-B0, single wide-crop (2.5×), IMG_SIZE=224
+- Training: ~660 steps (2.5 epochs), AdamW lr=1e-3, wd=0.05
+- Inference: TTA with horizontal flip
+- Score: conf × prob[c]
+- Data: GT crops (high+low) + matched detector boxes (IoU≥0.5)
+
+What's been tried and rejected:
+- Background class (e001, e005) - hurt
+- Squaring prob (e004) - hurt
+- Focal loss (e006) - hurt
+- Mixup (e007) - hurt
+- Batch size 32 (e010) - hurt
+- Weighted sampling (e011) - hurt
+- Vertical flip TTA (e012) - hurt
+- EfficientNet-B2 (e013) - hurt
+- Max prob multiplier (e014) - hurt
+- ConvNeXt-Nano (e015) - hurt
+- Higher LR (e017) - hurt
+- IMG_SIZE 192 (e018) - hurt
+- Margin scoring (e019) - hurt badly (0.5805)
+
+What's worked:
+- Adding detector boxes to training (e002)
+- Adding low-res crops (e003)
+- Single wide crop instead of two-crop (e008)
+- Horizontal flip TTA (e009)
+- IMG_SIZE 224 (e016)
+
+Key observations:
+1. The model is undertrained - only ~660 steps, loss still dropping fast (0.52 → 0.29)
+2. Pore (0.537) and stain (0.612) are the weak classes
+3. The ceiling is 0.758, so there's a lot of room
+4. The one-step baseline is 0.638, so we're barely above it
+
+Let me think about what could help:
+
+1. **More training steps**: The model is clearly undertrained. The loss went from 0.52 to 0.29 in 2 epochs. The cosine schedule is decaying LR too aggressively. What if we use a different LR schedule? Or what if we reduce the reserve time to get more training?
+
+2. **Different architecture**: We've tried B2 (too slow), ConvNeXt-Nano (worse). What about other options?
+   - resnet50 - might be too slow
+   - regnety_016 - lightweight, might work
+   - tf_efficientnetv2_b0 - newer, might be better
+   - resnet34 - lighter than B0?
+   - Actually, the issue is that with 224×224 input and ~660 steps, we need something fast enough to train well.
+
+3. **Training data**: We're using GT crops + matched detector boxes. What about:
+   - Using more aggressive augmentation (color jitter, random erasing)
+   - Using the detector confidence as a training signal somehow
+
+4. **Inference**: 
+   - Multi-scale TTA (resize crops to different sizes)
+   - More crops at different scales
+
+5. **Scoring**: 
+   - The margin approach failed badly
+   - What about using a temperature-scaled probability?
+   - What about conf^alpha * prob?
+
+6. **The key issue**: We're at 0.6411, barely above the one-step baseline of 0.638. The ceiling is 0.758. The main gap is:
+   - Pore: 0.537 (very weak)
+   - Stain: 0.612 (weak)
+   - Deposit: 0.635
+   - Discontinuity: 0.780 (good)
+
+Let me think about what's most likely to help...
+
+The model is undertrained. With only 660 steps and loss still dropping, getting more effective training is key. Options:
+- Reduce RESERVE_S to get more training time (currently 55s, prediction takes ~15s, so maybe 30s is enough)
+- Use a simpler/faster model to get more steps
+- Use a different LR schedule that doesn't decay so aggressively
+
+Actually, let me look at the time budget more carefully:
+- Total: 180s
+- Loading: 17s
+- Training: ~108s (from 17s to 125s)
+- Prediction: ~39s (from 125s to 164s)
+- RESERVE_S = 55s
+
+So prediction takes about 39s. If I reduce RESERVE_S to 40s, I get 15s more training. That's about 25% more steps.
+
+But wait - the prediction time is dominated by the TTA (2 forward passes per image) on 41879 detections. That's a lot of images.
+
+Actually, let me think about a different approach. What about **using a lighter model with more training steps**?
+
+The current model (EfficientNet-B0) does 660 steps in ~108s. That's about 0.16s per step.
+
+What about resnet18 or regnety_016? These are lighter models that could potentially train faster per step, giving more steps in the same time.
+
+Actually, wait. Let me reconsider. The per-step cost includes:
+- Data loading (crop extraction, resize, augment)
+- Forward pass
+- Backward pass
+- Optimizer step
+
+The data loading might be the bottleneck, not the model. Let me check...
+
+With 224×224 input and batch size 64, the forward+backward for EfficientNet-B0 should be fast on GPU. The data loading with 8 workers should also be fast.
+
+Actually, looking at the numbers: 660 steps × 64 batch = 42,240 samples in ~108s. That's about 390 samples/sec. With 26,347 training samples, that's about 1.6 epochs of data seen (but with shuffle, it's 2.5 epochs as stated).
+
+Hmm, let me think about what else could help...
+
+**Idea: Reduce RESERVE_S and use a simple warmup-constant LR schedule instead of cosine**
+
+The cosine schedule decays to near-zero by the end, which means the last 30% of training is at very low LR. If the model is still learning, this wastes time. A constant LR (after warmup) would give more effective training.
+
+But actually, the issue is that with only 660 steps, even a constant LR might not be enough. The model needs more steps.
+
+**Idea: Use a faster model (e.g., resnet18 or regnety_016) to get more training steps**
+
+Let me think about this more carefully. If I switch to resnet18:
+- It's about 11M params vs 4M for EfficientNet-B0
+- Wait, actually resnet18 is 11.7M params, which is MORE than EfficientNet-B0 (4M)
+- regnety_016 is about 9M params
+- convnext_pico is about 2M params
+- convnext_atto is about 0.25M params
+
+Actually, for speed, I want fewer FLOPs, not fewer params. Let me think:
+- EfficientNet-B0: ~0.4B FLOPs at 224×224
+- ResNet18: ~1.8B FLOPs at 224×224
+- RegNetY-016: ~0.1B FLOPs at 224×224
+- ConvNeXt-Pico: ~0.1B FLOPs at 224×224
+
+So RegNetY-016 or ConvNeXt-Pico would be much faster per step, allowing more training steps.
+
+But would they have enough capacity? The task is 4-class classification of weld defects, which is relatively simple. A small model might be sufficient if well-trained.
+
+Actually, let me reconsider. The issue might not be model capacity but training steps. With 660 steps, the model hasn't converged. If I could get 2000+ steps, even a smaller model might do better.
+
+Let me estimate: if RegNetY-016 is 4× faster per step than EfficientNet-B0, I'd get ~2640 steps. That's 4× more training.
+
+But wait, I need to be careful. The data loading might be the bottleneck, not the model. If data loading takes 0.1s per batch and model forward+backward takes 0.05s, then making the model faster won't help much.
+
+Let me think about this differently. What if I use a **simpler approach to get more effective training**:
+
+**Idea: Reduce RESERVE_S from 55 to 35, and change the LR schedule to warmup-constant (no cosine decay)**
+
+This gives:
+- 20s more training time (from ~108s to ~128s)
+- Constant LR means every step is equally effective
+- ~20% more steps at full LR
+
+Actually, the prediction takes 39s. If I reduce RESERVE_S to 35, I'm cutting it close. Let me be more conservative and set it to 45.
+
+Hmm, but the main issue is that the cosine schedule wastes the last 30% of training at very low LR. Let me calculate:
+
+With the current schedule:
+- 5% warmup (33 steps): LR ramps from 0 to 1e-3
+- 95% cosine (627 steps): LR goes from 1e-3 to ~0
+
+The effective training is mainly in the first 50% of the cosine phase (first ~313 steps after warmup), where LR is above 0.5× peak. After that, the LR is below 0.5× peak and the model is barely learning.
+
+So effectively, the model gets about 350 "full-power" steps out of 660. That's very undertrained.
+
+**Better idea: Use a constant LR with a short warmup, and reduce RESERVE_S**
+
+Let me propose:
+- RESERVE_S = 40 (prediction takes ~39s, so this is tight but should be OK... actually no, let me keep it at 45 to be safe)
+- LR schedule: 5% warmup, then constant LR (no cosine decay)
+- This means all steps after warmup are at full LR
+
+Wait, but constant LR without decay might cause the loss to oscillate and not converge. A better approach might be:
+- 5% warmup
+- Cosine decay but with a minimum LR of 0.1× peak (instead of 1e-3× peak)
+
+Or even simpler: just use a constant LR of 5e-4 (half of current peak) with 5% warmup. This is a common approach for small models with limited training.
+
+Actually, let me think about what's most impactful:
+
+1. More steps (by reducing reserve or making model faster)
+2. Better LR schedule (less waste at low LR)
+3. Better architecture (faster per step)
+
+I think the most impactful single change would be to **reduce RESERVE_S and use a more aggressive LR schedule**. Let me go with:
+
+- RESERVE_S = 40 (gives 15s more training)
+- Change cosine to: 10% warmup, then cosine with minimum 0.1× peak LR
+
+Wait, actually, let me reconsider the whole approach. The model is at 0.6411, barely above the one-step baseline of 0.638. The ceiling is 0.758. That's a huge gap.
+
+The per-class APs are:
+- Pore: 0.537
+- Deposit: 0.635
+- Discontinuity: 0.780
+- Stain: 0.612
+
+The main issues are pore and stain. What makes these hard?
+- Pore: small, round holes. Might be confused with background or stain.
+- Stain: surface discoloration. Might be confused with deposit or background.
+
+The classifier is trained on GT crops + matched detector boxes. The detector boxes include false alarms. But we don't have a background class (e005 showed that adding one hurt).
+
+Wait, e005 added a 5th background class AND multiplied score by (1-prob_bg). That hurt. But what if we just train with background (to make the model robust to false alarms) but DON'T use the background probability in scoring? The model would learn to be more confident on true defects and less confident on false alarms, which would naturally improve the prob-based scoring.
+
+Actually, e001 tried training on detector boxes with a background class and got 0.5691. That was much worse. But e001 didn't include GT crops - it replaced them with detector boxes. e005 added background to the existing setup (GT + matched dets) and got 0.6039.
+
+So adding background class consistently hurts. Let me not go there.
+
+Let me focus on what's most likely to help: **more effective training**.
+
+I'll propose: **Reduce RESERVE_S from 55 to 40, and change the LR schedule to use a higher minimum LR (0.1× peak instead of 1e-3× peak) in the cosine phase.**
+
+This should give:
+- 15s more training (~20% more steps)
+- The last 50% of training at 0.1× peak instead of ~0× peak
+- Net effect: significantly more effective training
+
+Actually wait, let me reconsider. The prediction takes 39s. If I set RESERVE_S to 40, I only have 1s margin. That's too risky. Let me set it to 45, giving 10s more training.
+
+Hmm, but 10s more is only about 10% more steps. Is that enough to matter?
+
+Let me think about a different angle. What about **using a smaller/faster model to get significantly more steps**?
+
+If I use convnext_pico (2M params, ~0.1B FLOPs), it should be about 4× faster per step than EfficientNet-B0. That would give ~2640 steps instead of 660. Even if the model is less capable, 4× more training might more than compensate.
+
+But wait, convnext_pico is very small. Would it have enough capacity? The task is 4-class classification, which is relatively simple. And we're using pretrained weights. I think it could work.
+
+Actually, let me look at the available models again:
+- convnext_atto (0.25M) - too small
+- convnext_pico (2M) - small but might work
+- convnext_nano (5M) - tried in e015, got 0.5833 (much worse)
+- efficientnet_b0 (4M) - current
+- efficientnet_b2 (7M) - tried in e013, got 0.6340 (slightly worse)
+- mobilenetv3_large_100 (5M) - not tried
+- regnety_016 (9M) - not tried
+- resnet18 (11M) - not tried
+- resnet26d (16M) - not tried
+- resnet34 (21M) - not tried
+- resnet50 (25M) - not tried
+- tf_efficientnetv2_b0 (6M) - not tried
+
+ConvNeXt-Nano (5M) was tried and was much worse (0.5833). That's concerning - it suggests that architecture matters and not all models work well for this task.
+
+EfficientNet-B2 (7M) was slightly worse (0.6340). So bigger isn't necessarily better either.
+
+I think the issue with ConvNeXt-Nano might be that it's not as well-suited for this type of texture-based classification. EfficientNet's compound scaling might be better for this task.
+
+Let me think about what else to try...
+
+**Idea: Use tf_efficientnetv2_b0**
+
+This is a newer, better-optimized version of EfficientNet-B0. It has 6M params (vs 4M for B0). It should be slightly slower per step but might have better representations. The key advantage is that it's still in the EfficientNet family, so it should be well-suited for this task.
+
+Actually, the speed difference between B0 and V2-B0 should be small (maybe 1.2× slower). So we'd get ~550 steps instead of 660. That's a 17% reduction in steps. If the model is significantly better, it could still win.
+
+But I'm not sure this is the best bet. Let me think about other options.
+
+**Idea: Use a different augmentation strategy**
+
+Currently, the augmentation includes:
+- Random geometric jitter (±10% center, 0.85-1.2× scale)
+- Random horizontal flip (50%)
+- Random vertical flip (50%)
+- Random brightness (0.8-1.2×)
+
+What about adding:
+- Color jitter (hue, saturation, contrast)
+- Random erasing (cutout)
+- Gaussian blur
+- Random rotation (small angles)
+
+Weld defects have specific textures. Color augmentation might help the model be robust to lighting variations. Random erasing might help the model not rely on specific patterns.
+
+But e007 (mixup) was rejected. That's a different kind of augmentation. Let me think about whether standard data augmentation (beyond what's already there) would help.
+
+Actually, the current augmentation is already quite aggressive (geometric jitter + flips + brightness). Adding more might not help much.
+
+**Idea: Use a two-stage training approach**
+
+First train for a few epochs with a higher LR, then fine-tune with a lower LR. This is essentially what the cosine schedule does, but the issue is that the total training time is too short for the cosine to be effective.
+
+What if I use a step LR schedule? E.g., start at 1e-3, drop to 3e-4 after 50% of training, drop to 1e-4 after 80%.
+
+Or what if I just use a constant LR of 5e-4? This avoids the problem of the LR decaying to near-zero.
+
+Let me think about this more carefully. With 660 steps:
+- Current schedule: 33 steps warmup, then 627 steps cosine from 1e-3 to ~0
+- The "effective" training (LR > 0.5× peak) is about 33 + 313 = 346 steps
+- The last 313 steps are at < 0.5× peak, contributing less
+
+If I use constant 5e-4:
+- All 660 steps are at the same LR
+- More consistent training
+- But might not converge as well (no decay to fine-tune)
+
+If I use constant 1e-3:
+- All 660 steps at peak LR
+- Might be too aggressive, loss might oscillate
+
+I think a good compromise is: 5% warmup to 1e-3, then constant 1e-3 for the rest. Or: 5% warmup to 1e-3, then cosine with minimum 0.2× peak.
+
+Actually, let me just try **reducing RESERVE_S to 45 and changing the cosine minimum from 1e-3 to 0.1 (i.e., 10% of peak)**. This is a focused change that should give:
+- 10s more training (~15% more steps)
+- The last 50% of training at 10% peak instead of ~0% peak
+- Net: significantly more effective training
+
+Let me write this up.
+
+Wait, actually I want to be more careful. Let me re-examine the time budget:
+
+From the log:
+- Loading: 17s
+- Training epoch 0: 94s (so 77s of training)
+- Training epoch 1: 125s (so 31s of training)
+- Total training: 108s
+- Prediction: 164-125 = 39s
+- Total: 164s
+
+Budget: 180s
+RESERVE_S: 55s
+So training deadline: 180 - 55 = 125s
+Training started at: 17s
+Training duration: 125 - 17 = 108s ✓
+
+Prediction: 164 - 125 = 39s
+Total: 164s, with 16s margin.
+
+If I reduce RESERVE_S to 45:
+- Training deadline: 180 - 45 = 135s
+- Training duration: 135 - 17 = 118s (10s more, ~15% more steps)
+- Prediction starts at 135s, takes 39s, ends at 174s
+- Margin: 6s
+
+That's a bit tight but should be OK. Let me go with RESERVE_S = 45.
+
+Now for the LR schedule change. Current code:
+```python
+f = frac / 0.05 if frac < 0.05 else 0.5 * (1 + math.cos(math.pi * (frac - 0.05) / 0.95))
+```
+
+This gives:
+- frac < 0.05: linear warmup from 0 to 1
+- frac >= 0.05: cosine from 1 to 0
+
+The minimum LR multiplier is `max(f, 1e-3)` which is 1e-3.
+
+I want to change the minimum to 0.1:
+```python
+f = frac / 0.05 if frac < 0.05 else 0.5 * (1 + math.cos(math.pi * (frac - 0.05) / 0.95))
+```
+And change `max(f, 1e-3)` to `max(f, 0.1)`.
+
+Wait, but the cosine already goes to 0 at frac=1.0. So the minimum of the cosine is 0, and `max(f, 1e-3)` clips it at 1e-3. If I change it to `max(f, 0.1)`, the last portion of training will be at 0.1× peak instead of 1e-3× peak.
+
+Actually, let me look at the cosine more carefully:
+- At frac = 0.05: f = 1.0 (start of cosine)
+- At frac = 0.525: f = 0.5 (midpoint)
+- At frac = 1.0: f = 0.0 (end)
+
+So the cosine goes from 1.0 to 0.0 over the 95% of training after warmup. The `max(f, 1e-3)` only matters in the very last tiny portion where f < 1e-3, which is essentially just the last step.
+
+So changing `max(f, 1e-3)` to `max(f, 0.1)` would mean that for the last ~30% of the cosine phase (where f < 0.1), the LR is held at 0.1× peak instead of continuing to decay. That's a significant change!
+
+Actually, let me calculate: f = 0.5 * (1 + cos(π * (frac - 0.05) / 0.95))
+f = 0.1 when 0.5 * (1 + cos(π * (frac - 0.05) / 0.95)) = 0.1
+cos(π * (frac - 0.05) / 0.95) = -0.8
+π * (frac - 0.05) / 0.95 = arccos(-0.8) = 2.498 rad
+frac - 0.05 = 2.498 * 0.95 / π = 0.760
+frac = 0.810
+
+So for frac > 0.81 (the last 19% of training), the LR would be held at 0.1× peak instead of decaying to 0. That's about 125 steps at 0.1× peak instead of decaying to ~0.
+
+This is a meaningful change. Combined with 10s more training, it should give a noticeable improvement.
+
+Let me finalize my proposal:
+
+1. RESERVE_S: 55 → 45
+2. LR minimum: 1e-3 → 0.1
+
+These are two small changes that together should give more effective training.
+
+Actually, wait. The rules say "One idea per turn, with a short testable hypothesis. Keep the edit focused on that idea." So I should only make one change. Let me pick the most impactful one.
+
+The LR schedule change (minimum 0.1 instead of 1e-3) is the more impactful one, because it changes the effective LR for the last ~19% of training (about 125 steps). The RESERVE_S change only adds 10s (about 100 steps) but at the same decaying LR.
+
+Actually, they're related - both are about "more effective training." Let me frame it as one idea: "The model is undertrained because the cosine LR schedule decays to near-zero in the last 20% of training, wasting that time. Raising the minimum LR to 0.1× peak and reducing the prediction reserve will give more effective training steps."
+
+Hmm, but that's two changes. Let me just do the LR schedule change, since it's the more impactful one and doesn't risk the time budget.
+
+Actually, you know what, let me reconsider. The RESERVE_S change is safe (prediction takes 39s, reserve of 45 gives 6s margin). And it's a simple change. Let me just do that one.
+
+No wait, the LR schedule change is more impactful. Let me do that one.
+
+Let me write the hypothesis: "The cosine LR schedule decays to near-zero in the last ~20% of training (125 of 660 steps), wasting that time at very low LR. Raising the minimum LR multiplier from 1e-3 to 0.1 will keep the model learning at 10% peak LR during that phase, effectively adding ~100 extra meaningful training steps and improving convergence, especially for the weak pore and stain classes."
+
+The change:
+```python
+pg["lr"] = LR * max(f, 1e-3)
+```
+→
+```python
+pg["lr"] = LR * max(f, 0.1)
+```
+
+This is a one-line change. Clean and focused.
+
+Let me double-check: is this really the right thing to try? 
+
+The model loss went from 0.52 to 0.29 in 2 epochs. It's still dropping fast. The cosine schedule means the last 125 steps are at < 0.1× peak LR. Those steps are essentially doing nothing useful. If I keep them at 0.1× peak, the model will continue to learn.
+
+The risk is that a non-zero minimum LR might prevent the loss from converging to a good minimum. But with only 660 steps, the model is far from convergence, so this risk is low.
+
+I think this is a good experiment. Let me go with it.
+
+Wait, one more thought. What about just using a constant LR? That's even simpler:
+
+```python
+pg["lr"] = LR * (frac / 0.05 if frac < 0.05 else 1.0)
+```
+
+This would give full LR for 95% of training. But it might be too aggressive - the loss might oscillate at the end.
+
+I'll stick with the minimum-0.1 approach. It's a safer middle ground.
+
+Let me write the final proposal.

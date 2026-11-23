@@ -1,0 +1,211 @@
+===== attempt 1 =====
+Let me carefully analyze the current state and the plan.
+
+**Current best (e009):** 4-scale crop pyramid (1.25x, 1.75x, 2.5x, 3.5x) through shared EfficientNet-B0, per-scale 1x1 projection, concat, MLP head. 5-seed mean 0.6359.
+
+**The lead's plan (e012):**
+1. In `BoxDataset.__getitem__`, compute an estimated centre for each box: inside r, find the pixel where |gradient| is maximal across RGB channels (max over axes), use that as crop centre; keep the same side computation and jitter.
+2. Add a second training-only augmentation: randomly jitter the crop centre by up to ±0.15*side.
+3. Keep everything else identical.
+
+Wait — but there's a subtlety. The plan says "re-centre the crop on the brightest/darkest point inside the box, or on the point of maximal gradient". The PLAN specifically says: "find the pixel where |gradient| is maximal across RGB channels (max over axes), use that as crop centre".
+
+Let me think about whether this is actually a good idea, and whether it's implementable within the constraints.
+
+Actually, let me reconsider. The lead has already chosen the experiment. My job is to "Implement exactly this experiment in the current train.py, nothing more." So I should implement it faithfully. But I should also check for bugs and make the smallest fix if a detail can't work as written.
+
+Let me think about the implementation carefully.
+
+**Step 1: Compute estimated centre inside box r.**
+
+I need a function that, given the image and box r, finds the pixel of maximal gradient magnitude inside the box. Let me think about how to do this efficiently.
+
+The box is defined by x1, y1, x2, y2 (in image coordinates). I need to:
+- Extract the region inside the box (clipped to image bounds).
+- Compute gradient magnitude (e.g., Sobel or simple finite differences) across RGB.
+- Find the pixel with max gradient magnitude.
+- Return the (cx, cy) of that pixel in image coordinates.
+
+But wait — there's a concern about cost. This is done per-crop, per-view, in the dataset `__getitem__`. The dataset is used for both training and eval. For eval, there are 41879 detections. Computing a gradient over the box region for each detection could be slow, but it's a small region (the box). Let me think.
+
+Actually, the crop side is `max(box_side * context, MIN_CROP)`. The gradient computation would be over the box region (x1..x2, y1..y2), which is the box itself, not the crop. That's fine — the box is the defect region, relatively small.
+
+But actually, do I want to compute the gradient over the box or over the crop? The plan says "inside r" (inside the box). So over the box region.
+
+Let me think about the cost. For each item in the dataset, we compute a gradient over the box region. The box region is maybe 20-100 pixels. Gradient computation via numpy is fast. But we do this 4 times (once per scale) currently... no wait, the centre is the same for all scales (it's the box's estimated centre), so we compute it once per item and reuse for all 4 views.
+
+Actually, let me re-read: "In BoxDataset.__getitem__, compute an estimated centre for each box: inside r, find the pixel where |gradient| is maximal across RGB channels (max over axes), use that as crop centre; keep the same side computation and jitter."
+
+So we compute the centre once, then use it for all 4 scale crops. The side computation (box_side * context) stays the same. The jitter stays the same but now applied to the new centre.
+
+Wait, but there's a subtlety with the jitter. Currently:
+```
+if train:  # light geometric jitter
+    cx += random.uniform(-0.1, 0.1) * side
+    cy += random.uniform(-0.1, 0.1) * side
+    side *= random.uniform(0.85, 1.2)
+```
+
+The plan says "keep the same side computation and jitter" and "Also add a second training-only augmentation: randomly jitter the crop centre by up to ±0.15*side".
+
+Hmm, so there's the existing jitter (±0.1*side) plus a new jitter (±0.15*side)? Or does the new jitter replace the old? Let me re-read.
+
+"1. In BoxDataset.__getitem__, compute an estimated centre for each box ... use that as crop centre; keep the same side computation and jitter."
+
+"2. Also add a second training-only augmentation: randomly jitter the crop centre by up to ±0.15*side so the model learns offset-invariant classification (this mimics test-time offsets without needing them at inference)."
+
+So the existing jitter is kept (±0.1*side), and we ADD a ±0.15*side jitter. Hmm, that's a bit redundant. But the plan says "keep the same side computation and jitter" for step 1, and "add a second training-only augmentation" for step 2. 
+
+Actually, I think the cleanest interpretation: the existing jitter (±0.1) is part of "keep the same jitter", and we add an additional ±0.15 jitter. But that would make total jitter up to ±0.25*side which is a lot. Alternatively, maybe the intent is that the existing ±0.1 jitter is replaced/augmented. 
+
+Let me think about what makes sense. The purpose of the extra jitter is to make the model robust to offsets (because at test time the box is offset from the true centre). If we re-centre on the gradient-max point, the training crops are well-centred. At test time, the box is offset, so the gradient-max point might be off too, but... hmm.
+
+Actually, wait. Let me reconsider the whole theory. The theory is: at test time, detector boxes are offset from true defect centres. So a tight crop centred on the box centre shows mostly normal surface. The fix is to re-centre on an image-derived estimate of the defect centre (gradient max). This should work at BOTH train and test time, because at both times we re-centre on the gradient-max point of the box region. So if the theory is right, re-centring helps at test time directly.
+
+The extra jitter (±0.15) is to make the model robust to imperfect re-centring (the gradient max might not be exactly the defect centre). That makes sense as a regularizer.
+
+OK here's my concern: is this a good use of a run? Let me think about whether this is likely to help.
+
+Actually, I'm the research engineer, and the lead has chosen this. My job is to implement it faithfully and check for bugs. But I should also flag if something can't work as written. Let me focus on correct implementation.
+
+Let me now think about the actual implementation details and potential bugs.
+
+**Gradient computation inside box:**
+
+```python
+def estimate_centre(img, r):
+    h, w = img.shape[:2]
+    x0 = max(0, int(r["x1"])); y0 = max(0, int(r["y1"]))
+    x1 = min(w, int(r["x2"])); y1 = min(h, int(r["y2"]))
+    if x1 - x0 < 2 or y1 - y0 < 2:
+        return (r["x1"] + r["x2"]) / 2, (r["y1"] + r["y2"]) / 2
+    region = img[y0:y1, x0:x1].astype(np.float32)
+    # gradient magnitude via simple finite differences
+    gx = np.zeros_like(region)
+    gy = np.zeros_like(region)
+    gx[:, 1:-1] = (region[:, 2:] - region[:, :-2]) / 2.0
+    gy[1:-1, :] = (region[2:, :] - region[:-2, :]) / 2.0
+    mag = np.sqrt((gx**2).sum(-1) + (gy**2).sum(-1))  # sum over channels
+    # find max
+    idx = np.argmax(mag)
+    iy, ix = np.unravel_index(idx, mag.shape)
+    return x0 + ix, y0 + iy
+```
+
+Wait, `region` is shape (H, W, 3). `(gx**2).sum(-1)` sums over the channel axis, giving (H, W). Good. `mag` is (H, W). Good.
+
+Hmm, but the plan says "|gradient| is maximal across RGB channels (max over axes)". "max over axes" — I think this means the gradient magnitude summed/combined over the 3 channels. My approach (sum of squares over channels) is a reasonable interpretation. Or it could mean max over channels. Let me use sum of squares (magnitude) which is standard. Actually "max over axes" might mean we take the max over the spatial axes to find the point. I'll interpret it as: gradient magnitude (over channels), then find the spatial location of the max. That's what I have.
+
+Actually, let me reconsider. "find the pixel where |gradient| is maximal across RGB channels (max over axes)". I think "max over axes" is a loose description of taking the gradient magnitude. I'll go with sum of squared per-channel gradients, then argmax over spatial location. This is a standard gradient magnitude.
+
+Actually, an even simpler and cheaper approach: use the pixel with max intensity variation. But let me stick with gradient magnitude as specified.
+
+**Cost concern:** This gradient computation is done in `__getitem__` for every item. For eval, 41879 items. Each does a numpy gradient over a small box region. This should be fast (small arrays). But it adds overhead to data loading. Let me estimate: each gradient op on a ~50x50x3 array is microseconds to low milliseconds. 41879 * ~1ms = ~40s. Hmm, that might be significant. But wait, the eval is done in a dataloader with 8 workers, so it's parallelized. And the reserve is 85s. Let me think.
+
+Actually, the eval dataloader has 41879 items, batch 256, 8 workers. The current pred time (from the log) — the total is 168s, training ends around 95s (t_end = deadline - 85 = 180 - 85 = 95s). So prediction + writing takes from ~95s to 168s = ~73s. Wait, that's a lot. Let me recompute.
+
+t_end = deadline - RESERVE_S = (T0 + 180) - 85 = T0 + 95. So training runs until T0+95 (95s). Then prediction from 95s to 168s = 73s. That's the prediction time. Hmm, but the reserve was supposed to be 85s for prediction+writing. 73s < 85s, OK it fits.
+
+Wait, but actually the log says "done: 2 epochs, 157 steps, 55620 prediction rows, 168s total". And t_end = T0 + 95. Training stopped when time >= t_end. The last training print was "epoch 1: loss 0.2745, 157 steps, 95s". So training ended at 95s (2 epochs, 157 steps). Then prediction from 95s to 168s = 73s. Reserve was 85s, so 73s fits within it. Good, margin of 12s.
+
+Now, if I add gradient computation to `__getitem__`, it affects BOTH training and eval data loading. For training, the crops are 6052 items. For eval, 41879 items. The gradient computation adds time to each `__getitem__`.
+
+For training: 157 steps * 64 batch = ~10048 items processed (with drop_last, and 2 epochs of 6052 = 12104 items, but drop_last reduces). Actually 6052/64 = 94.5, so 94 steps per epoch (drop_last). 2 epochs = 188 steps? But log says 157 steps. Hmm, because training stopped at 95s mid-epoch-2. Anyway, ~10000 items.
+
+The gradient computation per item: box region. Let me estimate the box sizes. The crops are defects, probably 20-100px. Gradient over that is fast. Say 0.5ms per item. 10000 * 0.5ms = 5s for training. Negligish.
+
+For eval: 41879 items * 0.5ms = ~21s added to prediction. That would push prediction from 73s to ~94s, exceeding the 85s reserve! That's a problem.
+
+Hmm wait, but the data loading is parallelized with 8 workers. The current 73s prediction time includes the crop computation (make_crop for 4 scales) plus model forward. The gradient computation adds to the crop computation part, which is CPU-bound in the workers. With 8 workers, the effective added time is (total gradient time) / 8 roughly, but it's pipelined with the GPU. Actually the data loading and GPU forward are pipelined, so the question is whether data loading becomes the bottleneck.
+
+Let me reconsider. The current prediction: 41879 items, batch 256, so 164 batches. 73s / 164 = 0.45s per batch. Each batch is 256 items, each item does 4 crops (make_crop 4 times) + normalization + forward. The make_crop involves PIL resize which is somewhat slow.
+
+If I add gradient computation (one numpy op per item), it's 41879 ops total. If each is 0.5ms, that's 21s total across all workers. With 8 workers, the wall-clock addition is ~21s/8 = ~2.6s if it's the bottleneck, or less if GPU is the bottleneck. Actually since data loading is pipelined with GPU, the added CPU time per item competes with the GPU forward time. If GPU forward is the bottleneck, the added CPU time is hidden. If CPU is the bottleneck, it adds.
+
+Given the uncertainty, let me be careful. I could increase RESERVE_S to be safe. But increasing RESERVE_S reduces training time. Currently training gets 95s. If I bump reserve to, say, 100s, training gets 80s, losing ~15s of training = ~15 steps. That's a small loss.
+
+Actually, let me reconsider the cost more carefully. The gradient computation: I'll make it cheap. I can downsample the box region before computing gradient, or just compute on the raw box region. Box regions are small. Let me just compute directly.
+
+Actually, a cheaper alternative that's still "gradient-based": use the box region, compute the max of absolute difference between adjacent pixels (a cheap proxy for gradient). But let me just do the proper gradient magnitude; it's fine.
+
+Hmm, let me reconsider whether I even need to worry. Let me estimate box sizes from the data. Actually I don't have the data. Let me just be safe and bump RESERVE_S a bit, OR make the gradient computation cheap.
+
+Actually, wait. Let me reconsider the whole thing. There's a bigger concern: **does re-centring on gradient-max actually make sense for the crop?**
+
+The crop is centred at (cx, cy) with side = box_side * context. For the tightest scale (1.25x), side = 1.25 * box_side. The box is the detector's box. If I re-centre on the gradient-max point inside the box, the tight crop will be centred on that point. This should show the defect texture better IF the gradient max is at the defect.
+
+But here's a subtle issue: the gradient max inside the box might be at the box edge (where the defect meets normal surface, high contrast) rather than the defect centre. That's actually fine for classification — showing the defect rim is informative.
+
+OK, I think the idea is reasonable. Let me implement it.
+
+**Now the jitter.** Current:
+```
+if train:  # light geometric jitter
+    cx += random.uniform(-0.1, 0.1) * side
+    cy += random.uniform(-0.1, 0.1) * side
+    side *= random.uniform(0.85, 1.2)
+```
+
+The plan says keep the same jitter AND add ±0.15*side jitter. So:
+```
+if train:
+    cx += random.uniform(-0.1, 0.1) * side   # existing
+    cy += random.uniform(-0.1, 0.1) * side   # existing
+    cx += random.uniform(-0.15, 0.15) * side  # new offset-invariance jitter
+    cy += random.uniform(-0.15, 0.15) * side  # new
+    side *= random.uniform(0.85, 1.2)
+```
+
+Hmm, but that's a lot of jitter (up to ±0.25*side). Actually, combining them, the total is effectively uniform-ish over ±0.25. That might be too much and hurt. But the plan explicitly says to add it. Let me follow the plan but be a bit careful. Actually, re-reading: "keep the same side computation and jitter" (step 1) and "add a second training-only augmentation: randomly jitter the crop centre by up to ±0.15*side" (step 2). 
+
+I think the intent is that the new ±0.15 jitter is the "second augmentation" in addition to the existing ±0.1. But to avoid over-jittering, maybe I should just add the ±0.15 as a separate term. Actually, you know what, let me reconsider. The existing ±0.1 jitter already provides some offset invariance. The plan wants to strengthen it to ±0.15 to "mimic test-time offsets". 
+
+I'll implement it as: keep existing ±0.1, add extra ±0.15. Total up to ±0.25. This is the literal reading. But I worry it's too much. However, my job is to implement the plan faithfully. Let me do the literal thing but... hmm.
+
+Actually, let me reconsider. Maybe the cleaner interpretation: the existing jitter is ±0.1, and the plan wants to ADD a centre jitter of ±0.15. But since both are centre jitters, the effective is the sum. I'll implement both as separate additions. This matches "keep the same jitter" + "add a second jitter".
+
+Wait, actually, I realize I should think about whether the re-centring + heavy jitter is coherent. If we re-centre on gradient max (well-centred) and then jitter by ±0.25*side, the model sees crops that are sometimes well-centred and sometimes offset. At test time, the box is offset, so the gradient-max re-centring might partially correct it, and the model is robust to residual offset. This is coherent.
+
+OK let me just implement it.
+
+**Now, a critical detail: the centre is computed from the box region, but make_crop uses cx, cy and side. I need to compute the centre BEFORE the jitter, using the box region. Let me restructure make_crop or compute the centre in __getitem__ and pass it to make_crop.**
+
+The plan says "In BoxDataset.__getitem__, compute an estimated centre for each box ... use that as crop centre". So compute in __getitem__, pass to make_crop.
+
+Currently make_crop computes cx, cy internally from r. I need to modify make_crop to accept an optional centre, OR compute the centre in __getitem__ and modify make_crop to use it.
+
+Let me modify make_crop to accept an optional (cx, cy) override. Actually, cleaner: add a parameter `centre=None` to make_crop. If provided, use it; else compute from r.
+
+Wait, but the jitter is applied inside make_crop currently. If I compute the centre in __getitem__ and pass it, the jitter in make_crop would apply to the passed centre. Let me restructure:
+
+Option A: Compute centre in __getitem__, pass to make_crop. make_crop applies jitter to the passed centre.
+
+Let me rewrite make_crop:
+```python
+def make_crop(img, r, context, train, centre=None):
+    h, w = img.shape[:2]
+    if centre is not None:
+        cx, cy = centre
+    else:
+        cx, cy = (r["x1"] + r["x2"]) / 2, (r["y1"] + r["y2"]) / 2
+    side = max(max(r["x2"] - r["x1"], r["y2"] - r["y1"]) * context, MIN_CROP)
+    if train:  # light geometric jitter
+        cx += random.uniform(-0.1, 0.1) * side
+        cy += random.uniform(-0.1, 0.1) * side
+        side *= random.uniform(0.85, 1.2)
+    s = max(2, int(round(side)))
+    ...
+```
+
+And in __getitem__, compute centre once:
+```python
+centre = estimate_centre(img, r)
+# apply extra jitter for offset invariance (train only)
+if self.train:
+    side_base = max(max(r["x2"] - r["x1"], r["y2"] - r["y1"]), MIN_CROP)
+    centre = (centre[0] + random.uniform(-0.15, 0.15) * side_base,
+              centre[1] + random.uniform(-0.15, 0.15) * side_base)
+views = []
+for ctx in SCALES:
+    x = make_crop(img, r, ctx, self.train, centre=centre)
+   Thinking budget reached. Stop thinking now and write the reply in the required format.

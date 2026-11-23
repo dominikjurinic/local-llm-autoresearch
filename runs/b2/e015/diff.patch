@@ -1,0 +1,76 @@
+--- e000/train.py
++++ e015/train.py
+@@ -45,4 +45,7 @@
+ PRETRAINED = True
+ IMG_SIZE = 160
++N_CLASSES = 5           # 4 defect types + background (defect boxes that overlap no GT)
++BG_IOU = 0.5            # a train det box overlapping a GT with IoU > this is a defect, else background
++BG_FRACTION = 0.6       # fraction of training steps drawn from background boxes
+ CONTEXT = 2.5           # wide crop: side = CONTEXT * long side of the box
+ TIGHT_CONTEXT = 1.5     # tight crop
+@@ -139,5 +142,8 @@
+ 
+     g = torch.Generator().manual_seed(args.seed)
+-    dl_tr = torch.utils.data.DataLoader(BoxDataset(crops, images, True), batch_size=BATCH_SIZE, shuffle=True,
++    dl_def = torch.utils.data.DataLoader(BoxDataset(crops, images, True), batch_size=BATCH_SIZE, shuffle=True,
++                                         num_workers=workers, pin_memory=True, drop_last=True,
++                                         persistent_workers=True, generator=g, worker_init_fn=worker_init)
++    dl_bg = torch.utils.data.DataLoader(BoxDataset(bg, images, True), batch_size=BATCH_SIZE, shuffle=True,
+                                         num_workers=workers, pin_memory=True, drop_last=True,
+                                         persistent_workers=True, generator=g, worker_init_fn=worker_init)
+@@ -145,5 +151,24 @@
+                                         num_workers=workers, pin_memory=True)
+ 
+-    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
++    # Background training boxes: detector boxes on training images that overlap no GT defect.
++    gt = {(r["image"], r): r for r in crops}
++    by_img = {}
++    for r in crops:
++        by_img.setdefault(r["image"], []).append(r)
++    bg = []
++    for d in dets:
++        if d["split"] != "train":
++            continue
++        for g in by_img.get(d["image"], ()):
++            ix1, iy1 = max(d["x1"], g["x1"]), max(d["y1"], g["y1"])
++            ix2, iy2 = min(d["x2"], g["x2"]), min(d["y2"], g["y2"])
++            inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
++            uni = (d["x2"] - d["x1"]) * (d["y2"] - d["y1"]) + (g["x2"] - g["x1"]) * (g["y2"] - g["y1"]) - inter
++            if uni > 0 and inter / uni > BG_IOU:
++                break
++        else:
++            bg.append(dict(d, cls=N_CLASSES - 1))
++    print(f"background boxes: {len(bg)}", flush=True)
++    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=N_CLASSES)
+     model = model.to(device).to(memory_format=torch.channels_last)
+     crit = nn.CrossEntropyLoss()
+@@ -157,7 +182,12 @@
+     steps, epoch, done = 0, 0, False
+     model.train()
++    it_def, it_bg = iter(dl_def), iter(dl_bg)
+     while not done:
+         tot, nb = 0.0, 0
+-        for xt, xw, y in dl_tr:
++        while True:
++            try:
++                xt, xw, y = next(it_def) if random.random() < 1 - BG_FRACTION else next(it_bg)
++            except StopIteration:
++                break
+             frac = min(1.0, (time.time() - t_start) / budget)
+             f = frac / 0.05 if frac < 0.05 else 0.5 * (1 + math.cos(math.pi * (frac - 0.05) / 0.95))
+@@ -188,4 +218,5 @@
+             probs.append(torch.softmax(((model(xt) + model(xw)) / 2).float(), 1).cpu())
+     probs = torch.cat(probs).numpy()
++    keep = 1.0 - probs[:, N_CLASSES - 1]  # defect-ness: down-ranks false alarms in every class
+     os.makedirs(args.out, exist_ok=True)
+     n = 0
+@@ -193,7 +224,7 @@
+         w = csv.writer(f)
+         w.writerow(["det_id", "cls", "score"])
+-        for d, p in zip(ev, probs):
++        for d, p, k in zip(ev, probs, keep):
+             for c in range(4):
+-                s = d["conf"] * float(p[c])
++                s = d["conf"] * float(p[c]) * float(k)
+                 if s > MIN_SCORE:
+                     w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1

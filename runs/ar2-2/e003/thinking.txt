@@ -1,0 +1,207 @@
+===== attempt 1 =====
+Let me analyze the current state:
+
+**Current best (e002):** 0.6293 mAP@0.5 (5-seed mean)
+- Trains on GT crops + matched detector boxes (IoU≥0.5)
+- Two-crop input (tight 1.5x + wide 2.5x), EfficientNet-B0
+- Score = detector conf × class probability
+- Per-class: pore 0.510, deposit 0.621, discontinuity 0.778, stain 0.608
+
+**Key observations:**
+1. The ceiling is 0.758 (perfect classes on stage-1 boxes). Current is 0.6293.
+2. The single-class baseline is 0.755. So the classifier needs to do well to beat just saying "defect".
+3. Pore (0.510) and stain (0.608) are the weakest classes.
+4. e001 (adding background class) was rejected at 0.5691 - it hurt.
+5. The classifier was trained on matched detector boxes already, so it sees misplacement.
+
+**What to try next?**
+
+Let me think about what would help most:
+
+1. **Score calibration**: Currently score = conf × class_prob. The detector conf is a fixed value. Maybe we should use a different combination. For instance, the background probability could be used to downweight. But e001 tried adding background and it hurt. However, that was about training with a 5th class, not just using background probability in scoring.
+
+2. **Class imbalance**: Pore and stain are weak. Maybe class-weighted loss? But the brief says "Class-weighted loss hurt classification every time it was tried." So skip that.
+
+3. **Architecture**: Maybe a larger/better backbone? EfficientNet-B2, ConvNeXt, etc. But training time is limited (~100s for 2 epochs). A larger model would be slower.
+
+4. **Training on low-res crops too**: Currently TRAIN_ON = ("high",). Adding low-res might help with robustness.
+
+5. **Test-time augmentation (TTA)**: At inference, use multiple crops (different scales, flips) and average. This could help without changing training.
+
+6. **Better scoring**: Instead of conf × prob, maybe use conf^α × prob^β, or incorporate the max probability as a confidence gate.
+
+7. **More training data from detector boxes**: Currently we only use matched detector boxes (IoU≥0.5). What about using ALL detector boxes, labeling non-matched ones as... wait, e001 tried adding background and it hurt. But maybe the issue was the 5-class setup. Let me re-read e001.
+
+e001: "Training on detector boxes (labelled by IoU≥0.5 overlap with ground truth, plus a 5th 'background' class for false alarms) instead of perfect crops" - score 0.5691, rejected. So replacing GT crops with detector boxes + background class was bad.
+
+But e002 kept GT crops AND added matched detector boxes. That worked.
+
+8. **Using low-res training crops**: The data has "high" and "low" resolution crops. Currently only "high" is used. Adding "low" could increase training data and robustness.
+
+9. **Inference: TTA with multiple scales**: At test time, instead of one tight + one wide crop, use multiple scales and average. This costs inference time but we have 55s reserve.
+
+10. **Score: use max probability as a gate**: Currently score = conf × p[c]. If we use conf × p[c] × (p[c] / max(p)), that would downweight uncertain predictions. Or maybe conf^0.5 × p[c] to reduce the impact of very low conf.
+
+Let me think about what's most likely to help:
+
+The weakest classes are pore (0.510) and stain (0.608). The per-class AP suggests:
+- Pore: very weak, lots of false positives or missed detections
+- Stain: confused with deposit and background
+
+**Idea: Test-time augmentation (TTA)**
+At inference, for each eval box, generate multiple crops (different scales, flips) and average the predictions. This is a common technique that can improve classification accuracy without changing training.
+
+But wait, we need to be careful about time. Currently inference takes about 161-98-25 ≈ 38s for the eval set. With TTA (say 4x), it would be ~150s, which might exceed the reserve.
+
+Actually, let me recalculate. Total time is 161s. Training takes about 98s (from start to end of epoch 0). Wait, let me re-read:
+- Loading: 16s
+- Epoch 0: 98s (so 82s for training)
+- Epoch 1: 125s (so 27s for training)
+- Total: 161s
+
+So training takes about 109s (82+27), and inference+writing takes about 52s (161-109). With 55s reserve, we're cutting it close.
+
+Actually wait, the reserve is 55s. The deadline is T0 + seconds. Training runs until deadline - 55s. So training gets (seconds - 55 - loading_time) seconds. Then inference must complete in 55s.
+
+Current: 161s total, 180s budget. So 19s of slack. Inference takes about 52s, which is within the 55s reserve but barely.
+
+TTA would multiply inference time. If we do 2x TTA (e.g., original + horizontal flip), inference would be ~104s, exceeding the 55s reserve. So TTA is risky unless we reduce training time.
+
+**Idea: Use low-res crops for training**
+This is a data change. Adding low-res crops increases training data. The low-res images might be noisier but provide more examples. This could help with robustness, especially for weak classes.
+
+Let me check: TRAIN_ON = ("high",). Changing to ("high", "low") would add low-res crops.
+
+This is a simple change, low risk, and could help. The hypothesis: adding low-res training crops increases diversity and data volume, helping the classifier generalize better, especially for weak classes like pore and stain.
+
+**Idea: Better scoring function**
+Currently: score = conf × p[c]
+
+Alternative: score = conf^α × p[c]^β
+
+If the detector conf is noisy, maybe we should rely more on the classifier. For example, conf^0.5 × p[c] would reduce the impact of very low/high conf values.
+
+Or: score = p[c] × (1 - p_bg) where p_bg is the probability of "not a defect". But we don't have a background class in the current model.
+
+Actually, a simpler idea: the current scoring gives 4 rows per box (one per class). The mAP at IoU 0.5 means that for a true defect of class c, we need the box to be predicted as class c with a high score. If the classifier is uncertain, all 4 scores are similar, and the ranking within the box doesn't matter much (they're all close). But across boxes, the conf × p[c] determines ordering.
+
+Maybe we should use a sharper score: score = conf × p[c] / sum(p) = conf × p[c] (since p sums to 1, this is the same). So that's not different.
+
+What about: score = conf × max(0, p[c] - threshold)? This would zero out very uncertain predictions. But this is risky.
+
+Or: score = conf × p[c]^2? This would make the classifier more decisive. If p[c] = 0.5, score drops from 0.5 to 0.25. If p[c] = 0.8, score drops from 0.8 to 0.64. This penalizes uncertainty more.
+
+**Idea: Train for more steps / different LR schedule**
+Currently 2 epochs, 425 steps. The loss goes from 0.45 to 0.24. Maybe more training would help. But we're time-limited.
+
+Actually, looking at the training: 285 steps in epoch 0 (82s), 425 steps total (109s). Wait, that's 285 + 140 = 425? No, 425 - 285 = 140 steps in epoch 1. That's less than epoch 0. Why? Because the time budget was hit.
+
+The dataset has 18271 samples, batch size 64, so ~285 steps per epoch. Epoch 0 did 285 steps (full epoch), epoch 1 did 140 steps (half epoch). So we got 1.5 epochs of training.
+
+If we could train longer, it might help. But we're time-limited.
+
+**Idea: Use a smaller/faster model to train longer**
+If we use a smaller model (e.g., convnext_pico or regnety_016), we could train for more steps. But a smaller model might have lower accuracy.
+
+**Idea: Increase batch size to train faster**
+Currently batch_size=64. If we increase to 128, we get fewer steps per epoch but each step is faster (on GPU). Actually, on GPU, larger batches are more efficient. But we need to check if the GPU can handle it.
+
+Actually, the key bottleneck is probably the data loading (crops are generated on CPU). With 8 workers, the GPU might be starved.
+
+**Let me focus on the most promising idea:**
+
+Given the constraints:
+- Pore (0.510) and stain (0.608) are weak
+- Training on detector boxes helped (e002)
+- Background class hurt (e001)
+- Class-weighted loss hurt
+- Time is limited
+
+I think the most promising next step is **adding low-res training crops**. This is:
+1. Simple to implement (one line change)
+2. Low risk (just more data)
+3. Could help with robustness (low-res images are closer to what the detector sees)
+4. Doesn't require more compute time (just more data, same number of steps)
+
+Wait, actually adding more data means more steps per epoch, which means less time per step. But the total number of steps is determined by time, not epochs. So adding low-res crops would just mean more diverse data in the same time budget.
+
+Actually, let me reconsider. The number of training samples would increase. Currently 18271 (6052 GT + 12219 det). If low-res adds, say, 6000 more GT crops, total would be ~24000. With batch size 64, that's ~375 steps per epoch instead of 285. So in the same time, we'd do fewer epochs but see more diverse data.
+
+This seems reasonable. Let me go with this.
+
+Actually wait, I should also consider: the low-res crops might be at a different scale than what the detector produces. The detector operates on the full image, and the crops are extracted from the image. The "res" field in crops.csv indicates whether the crop was from a high-res or low-res image. If the detector was trained on high-res images, the low-res crops might not match the detector's output distribution.
+
+But the detector boxes in dets.csv are on the same images as the crops. So if we add low-res GT crops, they're from the same images but at a different resolution. The detector boxes are at the original resolution. So the low-res crops might not align with the detector boxes.
+
+Hmm, this is a concern. Let me think...
+
+Actually, the crops.csv has both high and low res crops. The dets.csv has detector boxes. The detector boxes are at the image's native resolution. If a crop is "low", it means the image was downsampled before cropping. So the coordinates might be different.
+
+Wait, looking at the code: `crops = [r for r in all_crops if r["res"] in TRAIN_ON]`. The crops have x1, y1, x2, y2, img_w, img_h. If the image is low-res, the coordinates would be in the low-res space. But the images directory has the actual images. So when we crop from the image, we use the coordinates as-is.
+
+If the image is high-res, the coordinates are in high-res space. If low-res, they're in low-res space. But the image file is the same (the actual image). So if a crop is "low", the coordinates would be wrong for the high-res image.
+
+Wait, that can't be right. Let me re-read the data format:
+- crops.csv: id, res ("high"/"low"), image, x1, y1, x2, y2, img_w, img_h, cls
+
+The "image" field is the filename. The coordinates are in the image's coordinate space. If res is "low", the image might be a downsampled version. But the images/ directory has the actual images.
+
+I think the "res" field indicates the resolution of the original image when the crop was annotated. The coordinates are in the image's coordinate space. So for a "low" image, the coordinates are in the low-res space, and the image file in images/ is the low-res image. For a "high" image, the coordinates are in the high-res space.
+
+But wait, the dets.csv also has image, x1, y1, x2, y2, img_w, img_h. The detector boxes are on the same images. If the image is "low", the detector boxes would be in the low-res space.
+
+So adding low-res crops would add data from low-res images, which is fine. The detector boxes on those images would also be in the low-res space.
+
+But the question is: does the detector work the same way on low-res images? The detector was trained on some set of images. If it was trained on high-res images, it might not work as well on low-res images. But the dets.csv contains boxes from both high and low res images (presumably), so the detector has been run on both.
+
+I think adding low-res crops is reasonable. Let me go with it.
+
+Actually, let me reconsider the scoring idea. The current score is conf × p[c]. The detector conf is a fixed value from stage 1. The classifier probability p[c] is what we're trying to improve.
+
+One issue: if the classifier is confident about the wrong class, the score will be high for the wrong class. This is a fundamental limitation.
+
+Another issue: the conf from the detector might not be well-calibrated. If conf is very low for true defects, they'll be down-ranked. If conf is high for false alarms, they'll be up-ranked.
+
+A simple improvement: use conf^α where α < 1 to reduce the impact of conf. For example, conf^0.5 would make the ranking depend more on p[c] and less on conf.
+
+But this is a scoring change, and it's hard to predict the effect without trying.
+
+Let me think about what's most likely to give a clear improvement:
+
+1. **Low-res crops**: More data, more diversity. Low risk. Could help by 0.01-0.03.
+2. **TTA**: Better inference. Medium risk (time). Could help by 0.01-0.02.
+3. **Scoring change**: Hard to predict. Could help or hurt.
+4. **Larger model**: Might help but time-limited.
+5. **More training**: Time-limited.
+
+I'll go with **adding low-res training crops**. It's the simplest change with the most predictable benefit.
+
+Wait, but I should also consider: the current best already includes matched detector boxes. The detector boxes are on both high and low res images. So the classifier already sees some low-res data through the detector boxes. Adding low-res GT crops would add more clean labels for low-res images.
+
+Let me check: the matched_dets are from train_dets, which are detector boxes on training images. These are on both high and low res images. So the classifier already sees low-res detector boxes. Adding low-res GT crops would add clean labels for low-res images, which should help.
+
+OK, I'll go with this. The change is simple: `TRAIN_ON = ("high",)` → `TRAIN_ON = ("high", "low")`.
+
+Hypothesis: Adding low-resolution ground truth crops to training will improve mAP because the classifier sees more diverse data at the resolution the detector operates on, improving robustness for weak classes like pore and stain.
+
+Let me write the SEARCH/REPLACE block.
+
+The line to change is:
+```
+TRAIN_ON = ("high",)    # resolutions of crops.csv used for training
+```
+
+Change to:
+```
+TRAIN_ON = ("high", "low")    # resolutions of crops.csv used for training
+```
+
+This is a one-line change. Simple and focused.
+
+Let me verify the SEARCH text appears exactly once in the file. Looking at the file:
+```
+TRAIN_ON = ("high",)    # resolutions of crops.csv used for training
+```
+Yes, this appears once.
+
+Let me write the response.

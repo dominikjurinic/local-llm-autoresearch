@@ -1,0 +1,167 @@
+===== attempt 1 =====
+Let me carefully analyze the situation.
+
+**Current state:**
+- Best: e005 (5-seed 0.6345) — EfficientNet-B0, two views (1.5x tight + 2.5x wide), shared backbone, MLP head on concatenated features (2560→128→4).
+- e010 (most recent, based on e005): stage-1 error simulation jitter — not confirmed (5-seed 0.6335, -0.0009 vs e005).
+
+**History analysis:**
+
+| Family | What was learned |
+|---|---|
+| Score rows / ranking (16 attempts) | Exhausted. AP depends only on ordering within a class; dropping rows loses recall. |
+| Background class (9 attempts) | Exhausted, no gain. |
+| Detector boxes as training data (e001 crash, e002 0.6307, e009 0.6325) | 3 attempts on this task (e001 crash, e002 not confirmed, e009 rejected) — plus 6 in earlier runs (2 accepted ~+0.004, 3 rejected, 1 crash). On this task: 3 attempts, no confirmed gain. Hmm, but in earlier runs it was accepted twice at 5 seeds (0.6337, 0.6342, ~+0.004). On this task e002 was 0.6307 (5 seeds) and e009 was 0.6325 (seed 0 only, rejected). That's 3 attempts on this task with no confirmation. The guide says "if it fails twice, drop it and move on." e001 crash + e002 not confirmed + e009 rejected = effectively 2 real failures. The guide says implement carefully and confirm; if it fails twice, drop. I think this family is effectively exhausted on this task — 3 attempts (1 crash, 2 not confirmed). The gain in earlier runs was only ~+0.004, below the confirmation threshold. Drop. |
+| Jitter / box-quality simulation (e003 0.6294, e010 0.6335) | 2 attempts, no confirmed gain. The guide says "two failed variants of a direction: move to the next direction." So the jitter direction is exhausted (2 failed variants). |
+| Precompute crops (e004 bug 0.0531) | Crashed/bug. Could retry as a fix, but the idea is "buy training steps." |
+| Architecture: MLP head (e005 new best +0.0057), wider head (e006 rejected), box-size input (e007 not confirmed) | Head interaction was the win. |
+| Random zoom views (e008 crash) | Crashed. |
+
+**Where is the error?**
+
+Diagnostics:
+- Class chosen on boxes overlapping true defects: pore 62% correct (21 of 66 misclassified as stain!), deposit 80% (48 → stain), stain 90% (41 → deposit), discontinuity 96%.
+- mAP if every box had the correct class but kept my scores: 0.7464 vs my 0.6345. So wrong classes cost 0.112! That's huge. Wait, let me reread: "mAP@0.5 if every box had the correct class but kept your scores: 0.7464 (yours: 0.6345). The difference is what wrong classes cost; the remaining gap to the perfect-class ceiling in the brief is what your scores cost compared with the detector's conf."
+
+Wait, that's interesting. The perfect-class ceiling in the brief is 0.758 (stage-1 boxes with perfect classes, score = detector conf). My "correct class but my scores" is 0.7464. So:
+- Wrong classes cost: 0.7464 - 0.6345 = 0.1119
+- Score ranking cost (relative to detector conf): 0.758 - 0.7464 = 0.0116
+
+Hmm wait, but actually the "correct class but kept my scores" scenario: each box that overlaps a true defect gets the correct class with my score… what exactly is "my scores"? Presumably my score for the correct class row. And false alarms are kept as class 0 with detector conf (as in the ceiling definition)? Or kept with my scores? The brief's ceiling definition: "every detector box overlapping a true defect (IoU > 0.5) gets the correct class; every other box (false alarm) is kept as class 0 with detector conf. Each box's score is its detector conf."
+
+The diagnostic says "mAP@0.5 if every box had the correct class but kept your scores: 0.7464." So boxes overlapping a true defect get the correct class with my score (presumably my score for the correct class), and false alarms are… kept as class 0 with my score? Or detector conf? Ambiguous, but the key number: wrong-class cost is 0.1119, which is the dominant error.
+
+The confusion matrix shows the dominant confusion: pore → stain (21), stain → deposit (41), deposit → stain (48). Pore is the weakest class (AP 0.505).
+
+So the biggest lever is: **reduce pore/stain/deposit confusion**, especially pore→stain (21 out of 66 true pores on overlapping boxes are predicted as stain) and stain→deposit (41).
+
+Wait, let me count: true pore row: 47 pore + 5 deposit + 1 discontinuity + 21 stain + 1 no row = 75 total. 62% correct.
+True deposit: 2 + 217 + 3 + 48 + 1 = 271. 80% correct.
+True stain: 9 + 41 + 6 + 555 + 3 = 614. 90% correct.
+
+So the misclassifications: pore→stain 21, deposit→stain 48, stain→deposit 41, stain→pore 9, pore→deposit 5.
+
+The stain/deposit/pore triangle is the problem. Pore is the weakest class overall (AP 0.505 vs deposit 0.639, stain 0.613).
+
+**What hasn't been tried?**
+
+Families tried (no gain): score rows, background class, detector boxes as data, jitter simulation, low-res crops, bigger backbone, resolution, TTA, longer training, class-balanced sampling, class-weighted loss, training augmentation (rotation, mixup, stronger color/geometry), focal loss, box-size input, wider head, random zoom.
+
+Ideas not tried (from the guide and general knowledge):
+1. **Weight/sample training boxes by box quality** — the guide lists this as direction 2b, but it hasn't been explicitly tried. Hmm, "class-balanced sampling" was tried (no gain), but box-quality weighting is different. But wait — training data is all true boxes (IoU 1.0 with themselves). There is no box-quality variation in the training data unless we add detector boxes. So box-quality weighting doesn't make sense without detector boxes.
+
+2. **Better combination of the two views** — the guide says "one shared backbone whose pooled features from both crops are joined before a small head (one forward pass per view, no extra cost)." But e005 already does exactly this! "Replaces the logit-average head with a small MLP on the concatenated backbone features from both views." So that's already done.
+
+3. **Buy training steps** — the guide's direction 3. The log shows: load 13s, first epoch 44s (94 steps), subsequent epochs ~18-19s. Total 436 steps in ~112s of training. Prediction is ~37s (162 - 125). RESERVE_S = 55.
+
+   Actually wait: t_end = deadline - 55 = 180 - 55 = 125s. Training ends at 125s, prediction takes 162-125 = 37s. So the reserve is 55 but only 37s was used. We could reduce the reserve to ~45-50s to gain 5-10s of training (~25-30 steps). Earlier runs tried "longer training (smaller reserve)" 6 times: no gain, best 5-seed 0.6355 (not confirmed), 2 bugs. Hmm, that family has 6 attempts in earlier runs with no confirmed gain. But on this task, e004 (precompute crops) was a crash/bug — that's the "buy steps" idea that crashed.
+
+   Actually, the "longer training" family in earlier runs: 6 attempts, no gain. That's 3+ attempts with no confirmed gain = exhausted per the rules. Hmm. But the precompute-crops idea (e004) crashed with a bug — the rules say "if a run crashed or timed out, read the log and fix the cause" and "don't repeat an experiment already in the history, even reworded, unless it crashed or had a bug you're now fixing."
+
+   e004 crashed (0.0531, "suspicious (likely bug)"). The hypothesis was: "precompute all training crops (both views) as uint8 tensors at load time so the DataLoader no longer does PIL extract+resize per step. This should cut first-epoch overhead (46s vs 18s for later epochs) and share…" (truncated).
+
+   Why did e004 bug out? I don't have the full log, but 0.0531 suggests the model was essentially untrained or the data was broken. Possible causes:
+   - Precomputed crops with jitter: if you precompute crops at load time, you can't apply per-step random jitter (the jitter is inside make_crop with train=True). If they precomputed the final crops, the data might have been fine but something else broke.
+   - Or a memory issue: 6052 boxes × 2 views × 160×160×3 uint8 = 6052*2*76800 = ~931 MB. That's fine.
+   - Or they precomputed with the same random state and something went wrong.
+   - Or the dataset returned tensors but the normalization was wrong.
+
+   Actually, a likely bug: in the original code, `make_crop` is called with `train` flag, and jitter is applied. If e004 precomputed crops at load time with jitter applied once, then the dataset would return fixed crops — that alone shouldn't cause 0.0531. More likely: a shape/normalization bug, or the precomputation consumed most of the time budget (13s load + precompute time) leaving little training. Actually 0.0531 is very low — that's essentially an untrained model or wrong labels.
+
+   Hmm, I can't see e004's code or log. The rules say I can retry a crashed experiment with a bug fix. But I don't know what the bug was. That's risky.
+
+4. **Fine-grained classes (direction 4)**: "Look for one change that helps the whole pore/deposit/stain confusion, not a single class."
+
+   What could help the pore/stain/deposit confusion?
+   - **Higher resolution**: tried (9 attempts in earlier runs, no gain).
+   - **More context views**: 3rd view (4x) was accepted twice in earlier runs (+0.005, mostly pore). But that's a "third very wide view" — tried 3 times in earlier runs, accepted twice. On this task it hasn't been tried! Wait, the table of earlier runs is "results of prior research runs on this same task" — "five prior 5-hour runs (90 ideas) started from this same train.py." So those 90 ideas were tried on this task in prior 5-hour runs. The "third very wide view (4x the box)" family: 3 attempts, accepted twice (5-seed 0.6342 both, +0.005), gain almost entirely from pore.
+
+   Hmm wait, but those prior runs started from the same train.py (the 0.629-0.630 baseline), not from e005. So the 4x view was tried on the logit-average baseline. On e005 (MLP head), it hasn't been tried. Is that "fundamentally different"? The head change is orthogonal — the 4x view adds information to the input; the head interacts features. Combining them could be synergistic, especially since the gain was "almost entirely from pore" and pore is our weakest class.
+
+   But: "adds ~20s per run, close to the time limit." Current run: 162s total. Adding a 3rd view adds ~1/3 to forward-pass time (backbone runs 3× instead of 2×). Training: ~112s → ~168s? That would blow the budget. Let me compute: training steps take ~112s for 2 views. 3 views ≈ 1.5× → ~168s of training alone, plus 13s load + prediction ~55s (3 views) = way over 180s. So a 3rd full view doesn't fit.
+
+   Unless… we make it cheaper. Hmm.
+
+   Alternative: **use the 4x context only for some of the training** or **use a smaller separate backbone for the wide view**? That's a "bigger or other backbone" variant — 8 attempts, no gain.
+
+5. **What about the stain/deposit confusion specifically?** Stain→deposit 41, deposit→stain 48. Pore→stain 21.
+
+   What distinguishes these classes? Pores are small holes (dark spots), deposits are excess material, stains are discoloration. The confusion suggests texture/scale cues matter.
+
+   Ideas not tried:
+   - **Multi-scale / multi-resolution input**: "low-res crops added to training" was tried (4 attempts, no gain). "Resolution and small-box handling" (9 attempts, no gain).
+   - **Sharpness / frequency features**: e.g., add a high-pass filtered version of the crop? Untried but exotic.
+   - **Color vs grayscale**: stains are discoloration — color matters. Pores are dark spots. Deposits are texture. Currently using RGB. What about adding a color-difference channel (e.g., LAB or HSV channels)? Untried. Hmm, but is this likely to give +0.01? Uncertain.
+   - **Training on more data**: "detector boxes as training data" — 3 attempts on this task, no confirmation. Exhausted.
+   - **Ensembles**: 8 attempts in earlier runs (bigger or other backbone, 2-3 model ensembles), no gain. Exhausted.
+   - **SWA / snapshot ensembles**: not explicitly in the list! The list has "bigger or other backbone (EfficientNet-B2, ResNet-50, 2-3 model ensembles)" — that's model ensembles. SWA (stochastic weight averaging) is different: average weights over the trajectory of one model. Untried. But the gain is usually small (~0.001-0.005), likely below the confirmation threshold.
+   - **Mixup / CutMix**: "training augmentation (rotation, mixup, stronger color or geometry)" — 5 attempts, no gain. Mixup was in that family. Exhausted.
+   - **Label smoothing**: not explicitly listed! The families are: score rows, background class, detector boxes, 3rd view, low-res crops, bigger backbone, resolution, TTA, longer training, class-balanced sampling, class-weighted loss, training augmentation, focal loss, box-size input. Label smoothing is not in the list. But label smoothing usually helps calibration, and AP depends only on ordering — label smoothing might slightly change ordering. Likely small effect.
+   - **Different backbone (ConvNeXt, RegNet)**: "bigger or other backbone (EfficientNet-B2, ResNet-50, 2-3 model ensembles)" — 8 attempts. That family is "bigger or other backbone." ConvNeXt-atto/nano/pico are smaller/faster, not bigger. Hmm, is "other backbone" covered? The family name says "bigger or other backbone" and lists EfficientNet-B2, ResNet-50, ensembles. A smaller backbone (convnext_atto, regnety_016) would buy training steps at the cost of capacity. That's a different angle: not "bigger backbone" but "faster backbone to buy steps." But the "longer training" family (6 attempts, no gain) suggests more steps alone doesn't help… although those runs had the same model and just trained longer.
+
+   Wait, actually, let me reconsider. The model is undertrained? Loss at end: 0.1689 at step 436, still dropping (0.49 → 0.33 → 0.26 → 0.21 → 0.17). Per epoch: 94, 94, 94, 94, 60 steps. Loss is still dropping at the cutoff. So more steps could help. But "longer training" was tried 6 times in earlier runs with no confirmed gain (best 0.6355, not confirmed). Hmm.
+
+   But wait — on this task, we haven't tried "longer training" yet. The 6 attempts were in prior 5-hour runs. Per the rules: "directions where 3+ attempts gave no confirmed gain are exhausted." So longer training is exhausted (6 attempts).
+
+   Hmm, but "precompute crops" (e004) is a way to buy steps that crashed with a bug on this task. The rules explicitly say: "don't repeat an experiment already in the history, even reworded, unless it crashed or had a bug you're now fixing." e004 crashed (0.0531, suspicious bug). So I'm allowed to retry it with a bug fix. But I don't know what the bug was!
+
+   Let me think about what could have gone wrong in e004. The hypothesis: "precompute all training crops (both views) as uint8 tensors at load time so the DataLoader no longer does PIL extract+resize per step."
+
+   Likely implementation: at load time, for each training box, compute both crops (uint8, 160×160×3), store in a list/np array. Dataset returns those arrays. Bug candidates:
+   1. If they precomputed with `train=True` jitter, the crops are fixed after precompute — fine, not a bug per se.
+   2. If they stored as uint8 and the dataset did `torch.from_numpy(arr)` without float conversion, then `(x - MEAN) / STD` on uint8 → overflow/underflow → garbage. That's a very likely bug! In the original code, make_crop returns float32 in [0,1], then the dataset normalizes. If e004 precomputed uint8 and the dataset did `torch.from_numpy(x)` (uint8 tensor) then `(x - MEAN)/STD` — uint8 minus float → error or wraparound. Actually in numpy, uint8 - float64 array → float64, fine. But torch.from_numpy(uint8) then (x - MEAN)/STD with MEAN as np array… type promotion in torch: uint8 tensor - float32 tensor → error in some versions, or in numpy it's fine.
+   3. Memory: 6052 × 2 × 160 × 160 × 3 × 1 byte = 931 MB — fine.
+   4. Time: precomputing 12104 crops at load: each crop is PIL resize of a small region — probably 1-2 ms each → 12-24s. That eats into the budget but shouldn't cause 0.0531.
+   5. **The real likely bug**: if they precomputed crops but the dataset's `__getitem__` still applied per-sample random flips/brightness in numpy, that's fine. Or… if they accidentally precomputed eval crops too, or mixed up indices.
+   6. Or: 0.0531 could mean the model barely trained — e.g., precomputation took 100s+ (if done naively, e.g., with per-crop image opens), leaving little training time. 6052 boxes × 2 views, if each crop reopens the image (Image.open per crop) that's 12104 opens × ~5-10ms = 60-120s. That would leave only ~15s of training → untrained model → 0.0531. Very plausible!
+
+   So a careful retry: precompute crops using the already-loaded `images` dict (no reopens), store as uint8, do normalization in the dataset (converting to float32 first). This should cut per-step cost: currently DataLoader workers do PIL extract + resize per step. With 8 workers and batch 64, 2 views each… first epoch 44s vs later 18s (worker warmup + image cache effects).
+
+   Expected gain from precompute: first epoch 44s → ~20s, saving ~24s in… wait, no. Total training time is fixed by the deadline (train until t_end). Precompute doesn't extend training time; it makes each step faster, so more steps fit in the same time. Currently: 436 steps in 112s (after 13s load). Step time ≈ 112/436 ≈ 0.257s/step. If precompute makes steps ~30% faster (data loading is a big part), we get ~1.4× steps ≈ 600 steps. Is that worth +0.01? The loss is still dropping (0.17 at end). Hard to say. "Longer training" family got best 0.6355 (not confirmed) — so more steps gave at most +0.001-0.006, not confirmed. Hmm.
+
+   Actually wait — those "longer training" runs in prior work: "smaller reserve, measured prediction time" — they just reduced the reserve. The gain was small. So buying steps via a smaller reserve gives small gains. Buying steps via faster data loading is the same direction (more steps). That family is exhausted (6 attempts, no confirmed gain).
+
+   Hmm, OK. So "buy steps" is largely exhausted too.
+
+6. Let me refocus: **the dominant error is wrong classes (0.112 mAP)**, concentrated in pore↔stain and stain↔deposit confusion. What change could reduce this confusion broadly?
+
+   Options:
+   a. **Add a 4x context view** (tried in prior runs on the old baseline, accepted twice, +0.005 mostly pore). Not tried on e005. But time: 3 views = 1.5× forward cost. Training 112s → ~168s. Doesn't fit in 180s budget with prediction. Unless we cut something else. E.g., reduce IMG_SIZE from 160 to 128? "Resolution" family: 9 attempts, no gain. Hmm, but those were on the old baseline too.
+
+   Actually wait, let me reconsider the time. Current: load 13s, train 112s (436 steps), predict 37s, total 162s. Reserve 55s, t_end = 125s.
+
+   With 3 views: step time × 1.5 (backbone dominates; head is negligible). 436 steps would take 168s — over budget. To fit: need training ≤ ~125s (keeping reserve 55) → ~290 steps. That's fewer steps than now. Or reduce reserve to 45 → t_end 135 → ~315 steps. Either way, fewer steps with 3 views. The prior runs showed 3 views + logit-average gave +0.005 (mostly pore) — but that was with the same number of steps? "Adds ~20s per run, close to the time limit." So they had fewer steps too, and still gained. On e005 with the MLP head, the 3rd view's features would be concatenated (3840-dim). Could work.
+
+   But is this a "repeat" of the "third very wide view" family? The family had 3 attempts in prior runs (2 accepted). On this task's history (10 experiments), it hasn't been tried. The rule: "don't repeat an experiment already in the history" — the history here is the 10 experiments of this run. The prior-runs table is "your own prior work" and says "don't repeat families marked 'no gain' unless you can say what's fundamentally different." The 3rd view family is NOT marked no-gain — it was accepted twice. So it's a proven idea that hasn't been tried on the current best. The guide's plan says "close the box-quality gap" is the main phase, but also "fine-grained classes (only after 2 and 3)."
+
+   Hmm, the guide's plan:
+   1. Consolidate: detector boxes as training data — 3 attempts on this task (e001 crash, e002 not confirmed, e009 rejected). The guide says "if it fails twice, drop it and move on." It failed twice (e002, e009). Drop.
+   2. Close box-quality gap: (a) jitter simulation — tried twice on this task (e003, e010), no confirmation. Exhausted per "two failed variants." (b) box-quality weighting — needs detector boxes, which we're dropping. (c) better view combination — already done in e005.
+   3. Buy training steps — largely exhausted (prior runs), e004 crash (retryable with fix but uncertain).
+   4. Fine-grained classes — "look for one change that helps the whole pore/deposit/stain confusion."
+
+   So per the guide, we're at phase 4: fine-grained classes. The confusion: pore→stain 21, stain→deposit 41, deposit→stain 48, pore→deposit 5, stain→pore 9.
+
+   What single change helps all of these? These are texture/scale/contrast differences:
+   - Pores: small dark holes, high local contrast, small scale.
+   - Stains: broad discoloration, low contrast, large scale, color shift.
+   - Deposits: raised material, texture, medium scale.
+
+   The model sees 1.5x and 2.5x crops at 160px. Pores are small — at 1.5x, a small pore might be a few pixels. Stains are broad — at 2.5x they fill the view.
+
+   Ideas:
+   - **Add a high-frequency / edge view**: e.g., a Sobel or Laplacian-filtered version of the crop, or the difference between the crop and its blur. Pores have strong edges; stains are smooth. This directly targets the pore/stain confusion. Untried. But it changes the input representation significantly; risk of hurting other classes.
+   - **Add color-space channels**: stains are color shifts; convert to LAB or add (L - A, L - B) channels. Untried.
+   - **Multi-scale pyramid**: multiple zoom levels. "Low-res crops" tried (no gain), "3rd view" tried (gain).
+   - **Higher resolution** — tried, no gain.
+   - **Train with class-balanced sampling** — tried, no gain.
+   - **A second head / auxiliary task** — e.g., predict box quality or size? Box-size input was tried (no gain).
+   - **Self-supervised / contrastive pretraining** — no time.
+   - **Knowledge distillation from the single-class detector** — the detector's conf is already used in the score.
+   - **Use the detector's conf more strongly in the score** — score-row family: 16 attempts, no gain. Exhausted.
+
+   Hmm, what about **inputting the crop at native scale without resizing to 160**? I.e., preserve the actual pixel density so small pores look small and stains look broad. Currently everything is resized to 160×160 regardless of box size — a 10px box and a 200px box both become 160×160, destroying scale information. The model can't tell if a pore-like pattern is 5px or 50px in the original image. Box-size input (e007) tried to fix this by giving log-size as a scalar — no gain (0.6317, not confirmed). But that was a scalar; the visual information is still destroyed by resizing.
+
+   Alternative: **pad instead of resize** — place the crop at native resolution in a fixed-size canvas (e.g., 160×160 or 224×224), centered, with padding. Then small boxes stay small (many pixels of context visible) and large boxes get downsampled. This preserves absolute scale in the image itself. Untried! The "resolution and small-box handling (224px, larger MIN_CROP, enlarged tight crops for small boxes)" family — "enlarged tight crops for small boxes" is the opposite (upscaling small boxes). "Larger MIN_CROP" pads small crops to a minimum size — hmm, MIN_CROP=16 already pads small boxes to 16px before resize. So small boxes are already upsampled to 16px→160px.
+
+   Actually wait: `side = max(max(w,h) * context, MIN_CROP)` — so a 4px box at 1.5x → 6px → max(6, 16) = 16px crop, resized to 160. So small boxes are already upscaled 10×. The "enlarged tight crops for small boxes" in the resolution family is similar. So native-scale padding is somewhat different: a 100px box at 1.5x = 150px crop → 160 canvas (slight upscale), a 400px box at 1.5x = 600px → downsampled to 160. With padding instead of resize, the 400px box would need a 600px canvas — too big. So we'd cap: canvas 224 or 256,Thinking budget reached. Stop thinking now and write the reply in the required format.

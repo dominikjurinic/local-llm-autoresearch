@@ -1,0 +1,295 @@
+Let me analyze the situation carefully.
+
+The current best (e009) has 5-seed val mAP@0.5 of 0.6359. The reference numbers are:
+- one-step 4-class detector (baseline to beat): 0.638 mAP@0.5
+- stage-1 boxes with perfect classes (ceiling for stage 2): 0.758 mAP@0.5
+- stage-1 boxes scored as a single class 'defect': 0.755 mAP@0.5
+
+The diagnostics of e009 show:
+- Class chosen on detector boxes that overlap a true defect by IoU > 0.5:
+  - true pore: 48 right, 7 deposit, 1 discontinuity, 19 stain, 1 no row (63% right)
+  - true deposit: 1 pore, 210 right, 3 discontinuity, 55 stain, 2 no row (77% right)
+  - true discontinuity: 1 pore, 3 deposit, 437 right, 20 stain, 0 no row (95% right)
+  - true stain: 7 pore, 43 deposit, 9 discontinuity, 551 right, 5 no row (90% right)
+
+So the main error is on pores (63% right) and deposits (77% right), especially pore→stain (19 errors) and deposit→stain (55 errors). Discontinuity is nearly perfect (95% right).
+
+The remaining mAP if every box had correct class but kept scores: 0.7366 vs 0.6359 = +0.1007 potential from fixing the class decision. The perfect-classes ceiling is 0.758, so there's also some cost from the scores themselves (ranking).
+
+So there is substantial room (~0.1 mAP) in the classification error on true defects. The weak classes are pore and deposit, especially pore.
+
+Key observations:
+1. Pore→stain and deposit→stain confusions dominate. These are texture-level discriminations.
+2. e011 tried a dedicated high-resolution stream (3x crop) but scored 0.599 - that was bad. Why? Possibly the extra stream made the model more complex without helping, or there was an issue with how it was combined.
+3. The "lessons so far" says architecture is at 8 ideas, 6 ran, 1 new best (e009), 2 close but not confirmed (e007, e008), 2 crashed.
+
+Now, what's left? Let me think about the families that haven't been tried or that could be fundamentally different:
+
+From the history table:
+- Fewer or re-weighted score rows: no gain
+- 5th "background" class: no gain
+- Detector boxes from train split as extra training data: accepted twice (small gains ~0.004)
+- Third, very wide view: accepted twice (+0.005, mostly pore)
+- Low-res crops: no gain
+- Bigger/backbone or ensembles: no gain
+- Resolution and small-box handling: no gain
+- TTA: no gain
+- Longer training: no gain
+- Class-balanced sampling or class-weighted loss: no gain
+- Training augmentation: no gain
+- Focal loss: no gain
+- Box size/aspect ratio input: never properly tested
+
+So the families that showed small promise: extra detector boxes from train split (+0.004), wider view (+0.005 on pore). The ensemble idea (e014) crashed/was rejected at 0.5771 - but wait, e014 scored 0.5771 at seed 0 and was "rejected". That's far below 0.6359 - that's a bug! The ensemble train.py likely had a bug (e.g., the training loop used `time.time() - t_start` where t_start was reset... Actually looking at e014's code: the second seed's budget calculation: `t_end = t_train_start + (k+1) * per_seed_budget` and `budget = t_end - t_start` where `t_start = time.time()` was set AFTER the first seed's training loop. So the first seed got trained until its deadline, then t_start was reset to after that... no wait, let me re-read:
+
+```
+t_train_start = time.time()
+t_train_end = deadline - RESERVE_S
+train_budget = max(1.0, t_train_end - t_train_start)
+per_seed_budget = train_budget / n_seeds
+
+models = []
+for k in range(n_seeds):
+    s = args.seed + k
+    random.seed(s); np.random.seed(s); torch.manual_seed(s)
+    g = torch.Generator().manual_seed(s)
+    ...
+    # Train this member until its share of the training budget is used: 5% warm-up, then cosine decay.
+    t_start = time.time()
+    t_end = t_train_start + (k + 1) * per_seed_budget
+    budget = max(1.0, t_end - t_start)
+```
+
+Hmm, for k=0: t_start = time.time() (after loading data), t_end = t_train_start + per_seed_budget. So the first seed trains until t_train_start + per_seed_budget but with a budget = t_end - t_start which is roughly per_seed_budget. That's fine-ish.
+
+For k=1: t_start = time.time() (which is now AFTER k=0's training finished, i.e., ~per_seed_budget into the run), t_end = t_train_start + 2*per_seed_budget. budget = t_end - t_start ≈ per_seed_budget - per_seed_budget = 0? No wait: t_train_start is the time at the beginning of training (before loop). For k=1, t_start is set to time.time() at the start of k=1's iteration, which is roughly at t_train_start + per_seed_budget. t_end = t_train_start + 2*per_seed_budget. So budget ≈ per_seed_budget. That also works.
+
+Hmm, but then the second seed trains until t_train_start + 2*per_seed_budget... and the total training time would be 2*per_seed_budget. That's correct. So why did it score so low?
+
+Wait, actually looking at e014's seed-0 score of 0.5771 - that's a big drop from 0.6359. Something is wrong. Perhaps the ensemble didn't actually average properly, or there's an issue with how the probabilities are combined. Actually, I notice the diff was truncated ("20 more diff lines") - so the prediction part may have had a bug. Let me think about what could be wrong...
+
+Actually, e014 might have failed because:
+- The ensemble was trained sequentially and each model got less time, but more importantly, the predictions were averaged. If the second seed's model didn't train properly (budget off by a factor), or the softmax averaging at inference had a bug (e.g., multiplying by conf twice).
+
+Hmm, but I can't see the full diff. The score 0.5771 is far below best (0.6359), so "a result far below the baseline usually indicates a bug". 
+
+Let me think about what experiments to propose next.
+
+The core issue: pore and deposit are confused with stain, especially pore→stain. This is a texture discrimination problem. What hasn't been tried?
+
+Looking at the families:
+1. "Bigger or other backbone" - no gain (EfficientNet-B2, ResNet-50, ensembles).
+2. "Resolution and small-box handling" - no gain.
+3. "Third, very wide view" - +0.005 mostly on pore.
+
+What about the training data itself? The e013 family (training on detector boxes) gave small gains. What about *data augmentation* that specifically targets the texture-level discrimination? Or *sampling* strategies?
+
+Wait - actually a really important observation: the model uses crops at scales 1.25, 1.75, 2.5, 3.5 around the detector box. The problem is that pore vs deposit vs stain are visually similar. What information could distinguish them better?
+
+Let me think about what's fundamentally different from earlier attempts:
+- e009 changed to multi-scale pyramid + MLP head (current best)
+- e010 tried spatial attention (rejected, 0.6282)
+- e011 tried dedicated high-res stream (rejected, 0.599)
+- e012 tried training on detector boxes (rejected, 0.6142 - hmm, that's actually close to e009 but rejected?)
+
+Wait, looking at the table more carefully:
+- e012 | e009 | architecture | ... The current remaining loss (~0.10 mAP) is class confusion on true defects... I hypothesise this happens because the stage-1 detector boxes are systematically offset... | 0.6142 | - | rejected
+
+So e012 was "architecture" but about training on detector boxes? The hypothesis text seems mismatched with the id. Actually the table says e012's hypothesis is about the distribution mismatch of detector boxes vs GT boxes, which was also e001's idea (data). Hmm.
+
+Let me focus: what has not been tried that could plausibly gain 0.01+?
+
+The reference numbers tell us:
+- d2_boxes_perfect_classes_val_map50 = 0.758 (ceiling)
+- Current best = 0.6359
+- Difference = 0.122 mAP to the ceiling.
+
+Actually wait - a key insight from the brief: "mAP@0.5 is computed per class and averaged." The classes have different numbers of boxes. Let me think about which classes matter most.
+
+The diagnostics show the class-level error rates on true defects. Pore has only 63% accuracy and there are a lot of pores (48+7+1+19+1 = 76). Deposit: 210+1+3+55+2 = 271. Discontinuity: 441. Stain: 55+43+9+551+5 = 663... wait, the numbers are counts of boxes. The classes seem imbalanced with stain being dominant.
+
+Actually the mAP@0.5 is per-class averaged, so each class contributes equally to the final metric regardless of count. So improving pore (from 63% right) or deposit (77% right) matters a lot for mAP since those are the low-performing classes.
+
+Key question: what would actually fix the pore/deposit/stain confusion?
+
+Let me think about this from a different angle. The three weak classes (pore, deposit, stain) all look similar. The model gets 95% on discontinuity and 90% on stain. So the issue is specifically between pore, deposit, and stain.
+
+What are these things?
+- Pore: probably small holes/voids in the weld bead
+- Deposit: extra material deposited incorrectly
+- Stain: discoloration (visual difference rather than geometric)
+
+The confusion pattern: pore→stain (19), deposit→stain (55). So both are classified as stain. This suggests the model thinks they're "stains" - perhaps because in the 160px crop, these features don't have enough texture resolution to distinguish.
+
+Actually, let me reconsider. Maybe the issue is that the crops are too small or the wrong aspect ratio for these defects. The detector box might be too tight (only covering part of the defect) or too loose.
+
+What about *context*: a wider crop might show the surrounding bead structure that helps classify. e003/e012's idea of a third wide view gave +0.005 on pore. But e009 already has 4 scales including 3.5x.
+
+Hmm, what about the *label* quality? Maybe the training labels are noisy or inconsistent. That's "data" but that family is exhausted.
+
+What about *test-time augmentation*? e014 in the history tried TTA - no gain. Wait, actually e014 was an ensemble, not TTA. The table says "Test-time augmentation (flips, extra views at inference)" - 8 attempts, no gain, best 5-seed 0.631.
+
+OK so what about... let me think about the problem differently. 
+
+The reference number: "stage-1 boxes scored as a single class 'defect': 0.755 mAP@0.5". So if we just output conf for one class "defect", we get 0.755. And with perfect classes, 0.758. So the *detection* part is already good (0.755 vs 0.6359). The difference between 0.755 and 0.6359 = 0.12 is essentially what's lost in classification... no wait, that can't be right either because if we use one class "defect", the mAP@0.5 over a single class would be different from per-class averaged.
+
+Actually hold on. If all predictions are class "defect" (one class), then mAP@0.5 on that one class... but the eval has 4 classes of ground truth. Hmm, the metric is "mAP at IoU 0.5 over the 4 classes". If we only output one class "defect", how does it score? The reference says "stage-1 boxes scored as a single class 'defect': 0.755 mAP@0.5". 
+
+I think what happens: with one class, predictions of that class overlap any true box by IoU>0.5 regardless of the true class label. So it measures detection recall/precision against all true defects. The 4-class per-class AP would then require correct class assignment.
+
+So the detection quality is essentially captured at 0.755 (detection-only). And the classification loss brings us to 0.6359. The gap from 0.755 to 0.6359 = 0.12 - but that's not exactly right because of per-class averaging weights.
+
+The diagnostics: "mAP@0.5 if every box had its correct class but kept your scores: 0.7366 (yours: 0.6359)". So fixing classification errors would give +0.10 mAP. That's the big win available. And the ceiling is 0.758, so there's 0.02 more from ranking/scores.
+
+So the total addressable gap for stage 2 is ~0.12 mAP (from 0.6359 to 0.758). The perfect-class reference shows that even with perfect classification, your scores cost 0.02 relative to the ceiling. That means there's also some ranking inefficiency.
+
+Actually wait - "stage-1 boxes with perfect classes (ceiling for stage 2): 0.758 mAP@0.5" - this uses detector conf as the score. And "mAP@0.5 if every box had its correct class but kept your scores: 0.7366". So your scores are already fairly well ranked (0.7366 vs 0.758, only 0.02 difference). The main loss is classification error (0.10).
+
+So the plan should focus almost entirely on fixing the class decision: pore→stain and deposit→stain confusions.
+
+Now let me think about what fundamentally hasn't been tried:
+
+1. **Different crop strategy**: e009 uses 4 scales. What about the *size* of the context around the detector box? Maybe for pores (which are small), a tighter crop is better; for larger defects, a wider one. The current pyramid has 1.25x to 3.5x. 
+
+2. **Feature-level ideas**: e010 tried attention in fusion head (rejected). What about not pooling spatially at all - using the full feature map? Or using a different fusion?
+
+3. **Training strategy**: The current model trains on GT boxes from crops.csv. What if we train with harder examples - only misclassified examples, or focus on the weak classes? But class-weighted loss was tried and hurt.
+
+4. **The actual domain issue**: Maybe the problem is that the classifier is trained on *high-resolution* crop data but the eval uses detector boxes at different resolutions? No...
+
+5. **What about the two-stage nature?** Stage 1 gives boxes. What if we *modify* the boxes (e.g., recenter them) before classification? The diagnostics show "stage-1 detector boxes are often offset or sized differently" - e001's idea. That was tried and rejected.
+
+6. **Different resolution entirely**: e011 tried 3x crop for high-res but got worse. What about training on GT boxes at different sizes matching the detector boxes better?
+
+Let me think about what's really unique and promising here. 
+
+Actually, wait. Let me re-read the diagnostics more carefully:
+
+"Share of those boxes with the right class, by defect size (area thirds): small 82%, medium 90%, large 92%"
+
+So smaller defects are harder - 82% vs 92%. But pores are small... The true pore boxes overlap only 63% correctly. And the "small" category at 82% includes all classes. Pore is 63% right overall. So pore detection in general is a problem.
+
+Let me think about what's different between pore and discontinuity:
+- Discontinuity: 95% right
+- Stain: 90% right
+- Deposit: 77% right
+- Pore: 63% right
+
+So the two that are hard are deposit and pore, both confusing to stain. And the "true" stain gets misclassified as deposit (43 times) - so deposit↔stain is a big confusion in both directions.
+
+What distinguishes them visually? I'd guess:
+- Pore: small void/holes
+- Deposit: raised material / extra weld
+- Stain: discoloration without geometry change
+
+The model at 160px might not have enough resolution to see the texture of pores vs deposits. What about increasing resolution significantly? e011 tried a dedicated high-res stream with 3x crop and it *hurt* (0.599). That's weird - maybe the implementation was broken, or the extra stream wasn't well integrated.
+
+Hmm, let me reconsider e011. The hypothesis: "The dominant error is pore (63%) and deposit (77%) misclassified as stain... I hypothesise this happens because the stage-1 detector boxes are systema[ttically offset]". The score was 0.599 - a crash-ish result.
+
+OK, what about something completely different: **training on negative examples / harder sampling**? Or **using the detector's own features**?
+
+Actually, let me think about "data" family being exhausted. What has it included?
+- e001: train on detector boxes (distribution match)
+- e013: same idea
+- The table's "data" row: 3 ideas, no new best
+- Also the history mentions "Detector boxes from the train split as extra training data" - accepted twice (+0.004)
+
+So the "data" family is basically exhausted (training data augmentation / sources).
+
+What about **loss function**? The table says "Focal loss" - 2 attempts, no gain. Class-weighted loss hurt. What about label smoothing? Not tried directly but mentioned as a general technique that can reduce information in class probabilities.
+
+What about **optimisation** techniques? Learning rate schedules etc. The current one uses warmup + cosine decay. 
+
+Actually, I want to reconsider the architecture family more carefully. e009 (4-scale pyramid + MLP) is the best so far at 0.6359. The e010 and e011 variations of it both failed.
+
+What's NOT in the history that could be an architecture change? Let me look at what was tried:
+- Cross-attention between crops (e007, e008) - rejected/not confirmed
+- MLP fusion head (e009) - best
+- Spatial attention / spatial structure (e010) - rejected
+- Dedicated high-res stream (e011) - rejected
+- Bigger backbones (e012 family?) - no gain
+
+What about **not using a shared backbone**? Or using **different backbones for different scales**? That's essentially the "bigger backbone" idea.
+
+Hmm, what about **a completely different approach to the problem**: instead of classifying the box, use the *detector box geometry* as a feature? The box size relative to the crop could indicate whether it's a pore (small) vs deposit (large) vs stain (irregular). This was "Box size and aspect ratio as an extra model input" - 4 attempts, never properly tested (2 crashes, 1 edit failure, 1 run at 0.629). So this family has potential but was buggy!
+
+Wait, that's interesting. The box size and aspect ratio could actually be very informative for distinguishing pore/deposit/stain:
+- A pore would typically be a small, roughly circular box
+- A deposit might be larger with irregular shape
+- A stain might be a large, flat region
+
+But "never properly tested" suggests it was close but had bugs. This is a legitimate feature that could help the classifier distinguish based on geometry + texture jointly. But 4 attempts with only 1 valid run at 0.629 (below 0.6359)...
+
+Hmm, what about a *different* idea: **using the full image context** rather than just crops? The detector box is centered on the defect but we might need surrounding context to disambiguate. But e013's wide view idea tried this...
+
+Actually, let me think about a really different angle: **the two-stage system could use stage-1 information directly**. What if instead of a separate classifier, we take the detector's features? No, stage 1 is fixed and gives only boxes + conf.
+
+Let me consider: what about **combining crops differently**? The current approach averages pooled features from 4 scales via MLP. What about weighting the scales dynamically per box (a "learned routing")? That's similar to e010's idea which was rejected.
+
+OK here's another thought - **focus on the hardest examples**. What about *hard example mining* or *focal-style loss for the classifier*? But focal loss was tried on dense detection and didn't help, and "class-weighted loss hurt classification every time it was tried".
+
+Hmm wait, actually let me re-read: "Class-weighted loss hurt classification every time it was tried." This is important. The weak classes are pore and deposit - weighting them higher hurts. That suggests the issue isn't sample imbalance (or at least, weighting doesn't fix it).
+
+What about the **stain class being dominant**? 663 stain boxes vs 76 pores... wait, those numbers in the confusion matrix are counts of detector boxes overlapping true defects per class:
+- pore: 76 total
+- deposit: 271 total  
+- discontinuity: 441 total
+- stain: 663 total
+
+These are *detector boxes* overlapping *true defects*, not the total number of ground truth boxes. So for mAP@0.5, each class contributes equally. Pore is 4 classes with 76 true-overlapping boxes... wait no, the confusion matrix counts detector boxes that overlap a true box by IoU>0.5, grouped by true class and chosen class.
+
+Hmm, so for the "pore" row, there are 76 detector boxes overlapping true pores. Of these, only 48 (63%) get the right answer. If we fix this to 90%+ right, how much does mAP@0.5 improve? Since mAP@0.5 per class is averaged, improving pore from 63% to higher would help substantially IF those boxes have high enough scores to be counted.
+
+Now - the key question remains: what changes the classification of these boxes?
+
+Let me think about the *texture* issue more carefully. Pore vs deposit vs stain at 160px crops. What if the issue is that the current crops are centered on the detector box but don't include enough context to see whether it's a pore (small feature) vs a stain (large feature)?
+
+Wait - actually, there's an important observation I keep coming back to: **pore→stain and deposit→stain**. Both confuse with stain. But *stain* also confuses with deposit (43 times). So the whole "pore/deposit/stain" triangle is the problem area.
+
+What could separate them? If I think about what these defects are in a weld bead:
+- Pore = small circular voids, probably show as dark spots in the image
+- Deposit = excess material, probably shows as elevated/rough texture  
+- Stain = color change only
+
+The classifier at 160px might be unable to resolve the fine texture of pores vs deposits. What if we use **higher resolution crops**? e011 tried a dedicated high-res stream but it failed (0.599). Maybe because:
+1. The high-res stream wasn't trained enough, or
+2. The extra complexity hurt the overall model, or
+3. There was a bug
+
+Actually, wait. Let me reconsider the *time budget*. The current run finishes at ~168s with 180s budget. The model is efficient (efficientnet_b0 + 4 crops). If we increase resolution to say 256px for all crops, that would slow it down substantially (memory and compute).
+
+What about **a different backbone** that handles high-res better? The available pretrained backbones include: convnext_atto/nano/pico, efficientnet_b0/b2, mobilenetv3_large_100, regnety_016, resnet18/26d/34/50, tf_efficientnetv2_b0.
+
+e012's family "Bigger or other backbone (EfficientNet-B2, ResNet-50, 2-3 model ensembles)" - no gain, best 5-seed 0.636. But that was for *bigger backbones at the same resolution*. 
+
+Hmm, let me think about a completely different angle: **what if the problem is the detector box quality for these classes**? The diagnostics say "stage-1 detector boxes... often offset or sized differently". What if for pore and deposit, the detector boxes are just bad (tight, missing part of the defect)? Then no classifier can fix it. But we're told to assume stage 2 has ~0.1 mAP of headroom from fixing classes.
+
+Actually wait - let me reconsider: the diagnostic says "mAP@0.5 if every box had its correct class but kept your scores: 0.7366". This is computed on *the same boxes with the same scores*. So the ranking within each class is already decent. The loss is purely in assigning the right class to the right boxes. So there IS a fixable classification error.
+
+But wait - there's a subtlety: when we say "if every box had its correct class", we're assuming the box *is* the defect. But some detector boxes might overlap a true defect of a different class (e.g., a box that overlaps a pore but is really about a deposit region). The "correct class" assignment per box assumes one ground truth class per box.
+
+Hmm OK let me think about what's actually the most promising *untried* idea.
+
+I want to focus on something I notice hasn't been properly tried: **training the classifier on the detector boxes themselves with their GT overlap labels** (e013 family) - this was "accepted twice (5-seed 0.6337 and 0.6342, about +0.004)". But e013's run scored 0.6168 at seed 0 and was rejected. Hmm, so it's close to the boundary.
+
+Wait, actually there's an interesting discrepancy: the history table says "Detector boxes from the train split as extra training data (IoU > 0.5 with a true box, labelled with its class)" was "accepted twice (5-seed 0.6337 and 0.6342, about +0.004)". But in the experiment history table, e013 scored 0.6168 at seed 0 and was rejected. And e001 scored 0.6276 at seed 0 and was rejected.
+
+So training on detector boxes has shown *small* gains (0.004) but not consistently. It's an exhausted family with marginal gains.
+
+OK, let me think about what could be a *big* gain that's been overlooked...
+
+**Idea: Use the stage-1 detector's own confidence properly.** The current score = conf × p(class). But wait - the detector conf is a measure of how much the box looks like *a defect*. What if instead of multiplying by class probability, we should use something smarter? No, the "scoring" family was exhausted (16 attempts, no gain).
+
+**Idea: Use the *relative* size of the box vs. expected size per class.** This could distinguish pore (small) from deposit (medium) from stain (large/irregular). But this requires knowing the true sizes - a chicken-and-egg problem... unless we use the GT distribution to learn expected sizes per class.
+
+Hmm wait, actually here's an interesting idea that hasn't been tried: **the *shape* of the crop content matters**. The current classifier only sees crops and uses them for classification. What if we add *positional encoding* or context about where in the image this is (e.g., the weld bead location)? Unlikely to help much.
+
+Let me reconsider from first principles. The 4-scale pyramid with an MLP head is the best architecture so far. e010 tried "spatial structure" within each crop and it failed. What if instead of discarding spatial info via GAP, we keep more? That's basically e010/e011's family.
+
+OK here's another thought: **what about the *number* of crops?** e009 uses 4 scales (1.25, 1.75, 2.5, 3.5). What if we use *more* or *different* scales? The "third very wide view" (+0.005) suggests the wider view helps pore. But e009 already includes a 3.5x scale...
+
+Hmm, what about **scale-specific models** - i.e., not sharing the backbone for all scales but using different backbones or at least different features? Or a *feature pyramid* (FPN-style) over the multi-scale features rather than just concat+MLP?
+
+Actually wait - let me reconsider something. The current model: `MultiScaleClassifier` with `num_scales=4`, `proj_dim=256`, `hidden=512`. It pools each scale's feature to a vector and concatenates. What about *not* pooling but keeping spatial resolution, then using a small CNN on the concatenated features? That's what e010 tried ("spatial structure within each crop" / "discards spatial structure"). Rejected.
+
+HmmThinking budget reached. Stop thinking now and write the reply in the required format.

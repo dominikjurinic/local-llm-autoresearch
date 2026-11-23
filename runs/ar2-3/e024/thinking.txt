@@ -1,0 +1,635 @@
+===== attempt 1 =====
+Let me analyze the current situation and think about what to try next.
+
+Current best: e016, 5-seed val mAP@0.5 = 0.6337
+Per-class: pore 0.524, deposit 0.626, discontinuity 0.779, stain 0.606
+
+Key observations:
+1. The ceiling for stage 2 is 0.758 (perfect classes on stage-1 boxes), and single-class scoring gets 0.755. So the detector boxes are good; the problem is classification.
+2. The baseline one-step detector gets 0.638 mAP@0.5 - we're at 0.6337, slightly below the baseline.
+3. Many scoring experiments have been rejected (e004, e008, e014, e022, e023) - all variations of score = conf × p[c] with modifications.
+4. Data experiments: training on detector boxes with background class (e002) got 0.5172 - much worse. Training on detector boxes overlapping GT (e005) got 0.6248. Adding detector boxes to GT (e015) got 0.6285.
+5. Architecture: ConvNeXt-Nano crashed (e006), tf_efficientnetv2_b0 got 0.6259 (e021).
+6. Augmentation: MixUp (e007) 0.6292, increased context (e009) 0.6309, increased jitter (e011) 0.6294.
+7. Loss: label smoothing (e010) 0.6254, focal loss (e012) 0.6209.
+8. TTA with horizontal flip (e013) was a new best at 0.6314.
+9. Oversampling pore/stain 2x (e016) is the current best at 0.6337.
+10. 3x oversampling (e018) was worse at 0.6200.
+11. Cutting reserve (e019) was worse at 0.6291.
+12. SGD (e020) was worse at 0.6242.
+
+What hasn't been tried yet:
+- The "background" class idea was tried in e002 (0.5172, very bad) and e005 (0.6248). The e002 version had a bug (crashed in e001, fixed in e002 but still bad). The e005 version trained on detector boxes overlapping GT instead of GT boxes - slightly worse.
+- Ensembling different architectures
+- Using low-res crops (e003 got 0.6251, rejected)
+- Different image sizes (e017 timed out at 224)
+- Different backbones: resnet18, resnet34, resnet50, resnet26d, regnety_016, mobilenetv3_large_100, convnext_atto, convnext_pico, efficientnet_b2
+
+Wait, let me think about what's most promising. The key insight from the research brief:
+- "stage-1 boxes with perfect classes (ceiling for stage 2): 0.758 mAP@0.5"
+- "stage-1 boxes scored as a single class 'defect': 0.755 mAP@0.5"
+- Current: 0.6337
+
+So we're losing a LOT of mAP just from classification errors. The classifier needs to be much better.
+
+The per-class scores show pore (0.524) and stain (0.606) are weak. Deposit (0.626) is also not great. Discontinuity (0.779) is the strongest.
+
+Let me think about what could help:
+
+1. **Ensembling**: We could train two different architectures and average their probabilities. But this doubles training time. With ~120s for training, we'd have ~60s per model. That might be too few steps.
+
+2. **Better training data**: The current approach uses GT crops with 2x oversampling of pore/stain. What about using the detector boxes from training (dets.csv train) that overlap GT, but with the GT class label? This was tried in e015 (0.6285) - slightly worse.
+
+3. **Different approach to the problem**: What if instead of trying to fix the classifier, we focus on the scoring? The scoring experiments have all been rejected. But what about a completely different scoring approach?
+
+4. **Training on both high and low res**: e003 tried this and got 0.6251. But that was without the 2x oversampling.
+
+5. **Using more training steps**: The current setup gets 387 steps in ~120s. What if we use a smaller/faster model to get more steps?
+
+6. **ConvNeXt-Pico or ConvNeXt-Atto**: These are smaller models that might train faster, allowing more steps. Or they might have better inductive biases.
+
+7. **ResNet50**: A different architecture family. Might complement EfficientNet.
+
+8. **Actually, let me reconsider the problem**. The key issue is:
+   - We have 4 classes: pore, deposit, discontinuity, stain
+   - Pore and stain are weak
+   - Stain is confused with deposit and background
+   - The detector includes false alarms (background boxes)
+
+What if we try a two-stage approach within stage 2:
+- First classify: defect vs background
+- Then classify: which defect type
+
+But this adds complexity and the background classification was bad before.
+
+Let me think about what's most likely to help given the constraints:
+
+Actually, looking at the experiment history more carefully:
+- e013 (TTA hflip) was a clear win: 0.6314 vs 0.6251 baseline
+- e016 (2x oversample pore/stain) was a clear win: 0.6337 vs 0.6314
+
+The TTA only uses horizontal flip. What about adding more TTA? Like vertical flip? Or rotation? The current code already does hflip at test time. Adding vflip would be easy.
+
+Wait, looking at the code more carefully:
+```python
+logits = (model(xt) + model(xt.flip(3)) + model(xw) + model(xw.flip(3))) / 4
+```
+
+This does original + horizontal flip for both tight and wide crops. What about adding vertical flip? That would be:
+```python
+logits = (model(xt) + model(xt.flip(3)) + model(xt.flip(2)) + model(xt.flip(2).flip(3)) + model(xw) + model(xw.flip(3)) + model(xw.flip(2)) + model(xw.flip(2).flip(3))) / 8
+```
+
+But this doubles the inference time. Currently prediction takes ~42s out of 65s reserve. Doubling would make it ~84s, which exceeds the reserve. We'd need to cut training time.
+
+Actually wait, let me re-read the log:
+```
+epoch 0: loss 0.6211, 141 steps, 68s
+epoch 1: loss 0.3060, 282 steps, 95s
+epoch 2: loss 0.2449, 387 steps, 115s
+done: 3 epochs, 387 steps, 53780 prediction rows, 157s total
+```
+
+So training takes 115s, prediction takes 157-115 = 42s. Total 157s out of 180s budget. Reserve is 65s, so training budget is 115s.
+
+If I add vflip to TTA, prediction would take ~84s, and we'd need to cut training to ~91s (180-84-5 safety). That's about 20% less training. Might hurt.
+
+Alternatively, what about just adding vflip without the combined flip (flip(2).flip(3))? That would be 6 views instead of 4:
+```python
+logits = (model(xt) + model(xt.flip(3)) + model(xt.flip(2)) + model(xw) + model(xw.flip(3)) + model(xw.flip(2))) / 6
+```
+
+That's 50% more inference, so ~63s for prediction. Training would need to be ~112s. That's only slightly less than current 115s.
+
+Hmm, but is vflip actually useful? For weld beads, the orientation might matter. A pore looks the same flipped, but a stain might have directional context. Actually, for weld beads, the bead runs in a specific direction, so vertical flip would change the context significantly. It might not be as useful as horizontal flip.
+
+Let me think of other ideas:
+
+**Idea: Use a smaller/faster model to get more training steps**
+- convnext_pico or convnext_atto are very small
+- More steps might help since the loss is still decreasing
+- But smaller models might have lower accuracy
+
+**Idea: Train on both high and low res with the 2x oversampling**
+- e003 tried low res without oversampling: 0.6251
+- With 2x oversampling of pore/stain, it might be different
+- More data might help the weak classes
+
+**Idea: Use a different backbone - ResNet50**
+- Different inductive bias
+- Might handle the texture differences better
+- e021 tried tf_efficientnetv2_b0: 0.6259 (worse)
+- But ResNet is a different family
+
+**Idea: Increase image size to 192 (compromise between 160 and 224)**
+- e017 timed out at 224
+- 192 might fit in the time budget
+- More spatial detail for small pores
+
+Let me check: at 160x160, training takes 115s for 387 steps. At 192x192, the compute per step would be (192/160)² = 1.44x more. So we'd get about 387/1.44 ≈ 269 steps. That's 30% fewer steps. And prediction would also be 1.44x slower: 42*1.44 ≈ 60s. Total: 115/1.44 + 60 ≈ 80 + 60 = 140s. That fits in 180s with margin.
+
+But 30% fewer steps might hurt. The loss was still decreasing: 0.62 → 0.31 → 0.24.
+
+**Idea: Use both high and low res training data**
+- This doubles the training data
+- e003 tried this without oversampling and got 0.6251 (vs 0.6251 baseline... wait, what was the baseline for e003?)
+- e003 was based on e000, which was the original starting point
+- The original starting point score isn't explicitly given, but e013 (TTA) was 0.6314 and was a "new best" over e000
+- So e000 was probably around 0.625-0.630
+
+Actually, let me reconsider. The most promising untried ideas seem to be:
+
+1. **Add low-res crops to training** (with the current 2x oversampling) - more data for weak classes
+2. **Try a different backbone** (ResNet50, RegNetY-016)
+3. **Increase image size to 192**
+4. **Add vertical flip to TTA**
+5. **Ensemble two models** (if time allows)
+
+Let me think about which is most likely to help...
+
+Actually, I just realized something. Let me look at the per-class scores again:
+- pore 0.524 (very weak)
+- deposit 0.626
+- discontinuity 0.779
+- stain 0.606
+
+And the reference numbers:
+- one-step 4-class: 0.638
+- stage-1 boxes with perfect classes: 0.758
+- stage-1 boxes as single class: 0.755
+
+The gap between 0.6337 and 0.758 is 0.124 mAP. That's a lot. The classifier is making many wrong class assignments.
+
+What if the issue is that the classifier is not discriminative enough? The two-crop approach (tight 1.5x + wide 2.5x) might not be giving enough information.
+
+Wait, what about using a 3rd crop at an intermediate context? Like 2.0x? That would give the model a middle-ground view. But this adds more inference time.
+
+Actually, let me think about this differently. The problem says:
+- "Pore and deposit are the weak classes; stain is often confused with deposit and background"
+- "A crop classifier given perfect boxes reaches macro-F1 ~0.87 with the starting recipe"
+
+So with perfect boxes, F1 is 0.87. But we're getting 0.6337 mAP vs a ceiling of 0.758. The gap is partly due to:
+1. Wrong class assignments (classifier errors)
+2. Poor ranking (scores not well calibrated)
+3. False alarms (background boxes getting high scores)
+
+The scoring experiments (e004, e008, e014, e022, e023) all tried to fix the ranking and all failed. The data experiments tried to fix the classifier and mostly failed or were slightly worse.
+
+What if we try a fundamentally different approach? Like:
+- Train a classifier that outputs 5 classes (4 defects + background)
+- Use the background probability to suppress false alarms
+- This was tried in e002 (0.5172) but that was a different implementation
+
+Wait, e002 was "Training the classifier on detector boxes (dets.csv train) labelled by IoU>0.5 overlap with GT crops, with an explicit background class for false alarms" and got 0.5172. That's much worse. But e005 was "Training the classifier on detector boxes (from dets.csv train split) that overlap true crops (IoU>0.5) instead of the true box coordinates" and got 0.6248. And e015 was "Adding detector boxes (dets.csv train) that overlap GT crops (IoU>0.5) to the GT training set" and got 0.6285.
+
+So the background class idea consistently hurts. The detector boxes that don't overlap GT are mostly background, and training on them as a separate class seems to confuse the model.
+
+Let me think about what else to try...
+
+**Idea: Use the detector confidence as a training signal**
+- High-conf detector boxes that overlap GT are more likely to be true positives
+- Low-conf boxes that don't overlap GT are more likely to be false alarms
+- We could weight the training examples by detector confidence
+- Or we could use the detector confidence as an additional input feature
+
+Actually, the detector confidence is already used in the scoring: score = conf × p[c]. But it's not used during training.
+
+**Idea: Train with a margin-based loss that considers the detector confidence**
+- Not straightforward to implement
+
+**Idea: Use a different augmentation strategy**
+- Color jitter (already have brightness)
+- Random erasing (cutout)
+- Gaussian blur
+- These might help with robustness
+
+**Idea: Use a learning rate warmup + cosine schedule with more epochs**
+- The current schedule is 5% warmup + cosine
+- With 3 epochs, that's not much
+- But we're limited by time
+
+Let me focus on what's most likely to give a measurable improvement:
+
+1. **Adding low-res crops**: This roughly doubles the training data. The weak classes (pore, stain) likely have fewer examples, so more data could help. e003 tried this without oversampling and got 0.6251 (which was on par with the baseline at the time). With the 2x oversampling, it might be different.
+
+Actually wait, let me re-examine e003. It was based on e000 (the original). The original e000 score isn't given explicitly, but e013 (TTA, based on e000) got 0.6314 and was called "new best". So e000 was probably around 0.625-0.628. e003 got 0.6251, which was "rejected" - so it was worse than e000.
+
+But e003 didn't have the 2x oversampling. The 2x oversampling (e016) improved things from 0.6314 to 0.6337. So combining low-res + 2x oversampling might be different.
+
+2. **Try ResNet50**: Different architecture, might handle the problem differently. But e021 (tf_efficientnetv2_b0) was worse.
+
+3. **Increase image size to 192**: More spatial detail. e017 (224) timed out. 192 might work.
+
+4. **Add more TTA**: Vertical flip. Easy to implement.
+
+Let me go with adding low-res crops to training. This is a data change that increases the training set size, which should help the weak classes. The hypothesis is that more diverse training examples (different resolutions, different lighting conditions at low res) will improve generalization, especially for pore and stain.
+
+Wait, but e003 already tried this and it was rejected. The issue is that low-res images might be noisier and the classifier might not handle them well. Also, the crops from low-res images are smaller in absolute pixels, so the defects might be harder to see.
+
+Let me think about this more carefully. The low-res images are probably a different resolution (maybe half?). The crops would be the same relative size but fewer absolute pixels. This could be:
+- Pro: more training examples, different appearance
+- Con: less detail, potentially noisier
+
+Given that e003 was rejected, I'm not confident this will help.
+
+Let me think about other options...
+
+**What about using a larger batch size?** Currently 64. If we increase to 128, we get fewer steps but each step is more stable. With AdamW, this might not help much.
+
+**What about using a different optimizer schedule?** The current one is 5% warmup + cosine. What about a step decay? Or a constant LR with a final decay?
+
+**What about using the detector confidence as a training weight?**
+- For GT crops, we don't have detector confidence
+- For detector boxes that overlap GT, we do
+- We could weight the loss by detector confidence for these examples
+- But this is complex and e015 (adding detector boxes) was slightly worse
+
+Let me reconsider the TTA idea. The current TTA is:
+```python
+logits = (model(xt) + model(xt.flip(3)) + model(xw) + model(xw.flip(3))) / 4
+```
+
+This is 4 forward passes per sample. Adding vertical flip would make it 8:
+```python
+logits = (model(xt) + model(xt.flip(3)) + model(xt.flip(2)) + model(xt.flip(2).flip(3)) + 
+          model(xw) + model(xw.flip(3)) + model(xw.flip(2)) + model(xw.flip(2).flip(3))) / 8
+```
+
+Prediction time would double from ~42s to ~84s. Training would need to be ~91s (180-84-5). That's 20% less training.
+
+Alternatively, just add vertical flip (not the combined flip):
+```python
+logits = (model(xt) + model(xt.flip(3)) + model(xt.flip(2)) + 
+          model(xw) + model(xw.flip(3)) + model(xw.flip(2))) / 6
+```
+
+This is 50% more inference: ~63s. Training would be ~112s. Only 3% less training.
+
+But is vertical flip useful? For weld beads, the bead typically runs in one direction. Vertical flip would change the "up" direction relative to the bead. This might not be a valid augmentation - a stain above the bead looks different from a stain below it.
+
+Actually, for classification purposes, the model should learn features that are invariant to orientation. But in practice, the training data might have a consistent orientation, and vertical flip might introduce noise.
+
+I think the safest bet is to try something that's clearly in the "more data" or "better model" direction.
+
+Let me try **using both high and low res crops for training, with the 2x oversampling**. The hypothesis is that the additional training examples from low-res images (which have different appearance characteristics) will improve generalization, especially for the weak pore and stain classes. The 2x oversampling ensures the weak classes still get enough representation.
+
+Actually, I just realized I should check: does the low-res data have the same number of boxes? If low-res has fewer boxes, the oversampling might not be as effective.
+
+Let me look at the data: "crops.csv labelled training boxes: id, res ("high"/"low"), image, x1, y1, x2, y2, img_w, img_h, cls"
+
+So each crop has a res field. The current code filters: `crops = [r for r in read_csv(...) if r["res"] in TRAIN_ON]` where `TRAIN_ON = ("high",)`.
+
+If I change to `TRAIN_ON = ("high", "low")`, I'd include both. The training set would be larger.
+
+But e003 already tried this and it was rejected (0.6251 vs baseline ~0.625-0.628). The issue might be that low-res crops are too noisy or the defects are too small to be useful.
+
+Let me think of another approach...
+
+**What about using a different context size for the tight crop?**
+Currently: TIGHT_CONTEXT = 1.5, CONTEXT = 2.5
+What if we try TIGHT_CONTEXT = 1.2 (tighter) or 2.0 (wider)?
+
+A tighter crop would focus more on the defect itself, which might help with pore (small holes) and stain (texture). A wider crop would give more context.
+
+e009 tried increasing CONTEXT from 2.5 to 3.5 and got 0.6309 (slightly worse than baseline). So wider context didn't help.
+
+What about tighter? TIGHT_CONTEXT = 1.2? This would give the model a closer view of the defect. For small pores, this might be important.
+
+Actually, let me think about this from a different angle. The problem states:
+- "Pore and deposit are the weak classes"
+- "stain is often confused with deposit and background"
+
+Pore: small holes in the weld. These are small, dark spots.
+Deposit: excess material. These are raised, lighter areas.
+Discontinuity: gaps or breaks in the weld.
+Stain: discoloration. Often confused with deposit.
+
+The key distinguishing features:
+- Pore: small, round, dark
+- Deposit: larger, raised, lighter
+- Stain: diffuse, discolored
+- Discontinuity: linear gap
+
+A tight crop (1.5x) might not show enough context to distinguish stain from deposit. A wider crop (2.5x) shows more context but the defect is a smaller fraction of the image.
+
+What if we use three crops: tight (1.2x), medium (2.0x), wide (3.0x)? This gives the model multiple scales of context. But this triples the inference time.
+
+Actually, the current setup already uses two crops (1.5x and 2.5x) through the same model, averaging logits. Adding a third crop would be 3 views × 2 (original + hflip) = 6 forward passes. Currently it's 2 × 2 = 4. So 50% more inference.
+
+Hmm, let me think about what's most likely to work...
+
+Actually, you know what, let me try something I haven't seen tried: **using a different backbone that's specifically good at fine-grained classification**. 
+
+Looking at the available models:
+- convnext_atto, convnext_nano, convnext_pico: ConvNeXt family
+- efficientnet_b0, efficientnet_b2: EfficientNet
+- mobilenetv3_large_100: MobileNet
+- regnety_016: RegNet
+- resnet18, resnet26d, resnet34, resnet50: ResNet
+- tf_efficientnetv2_b0: EfficientNetV2
+
+Tried: efficientnet_b0 (current), convnext_nano (crashed), tf_efficientnetv2_b0 (0.6259)
+
+Not tried: efficientnet_b2, resnet50, regnety_016, resnet26d, mobilenetv3_large_100, convnext_atto, convnext_pico
+
+**EfficientNet-B2** is a larger version of B0. It should be more accurate but slower. Let me estimate: B2 is about 2x the compute of B0. So training would be ~230s for the same steps, or ~193 steps in 115s. That's about half the steps. And prediction would be ~84s.
+
+Total: 115 + 84 = 199s > 180s. Too slow.
+
+What about **ResNet50**? It's a different architecture. Compute is similar to EfficientNet-B0 (maybe slightly more). Let's say 1.2x. Training: 387/1.2 ≈ 322 steps. Prediction: 42*1.2 ≈ 50s. Total: 115 + 50 = 165s. Fits.
+
+But e021 (tf_efficientnetv2_b0) was worse. Would ResNet50 be better? Hard to say. Different inductive bias (residual connections vs compound scaling).
+
+What about **RegNetY-016**? It's a small model, similar size to EfficientNet-B0. It might be slightly faster, allowing more steps.
+
+Actually, let me reconsider. The most impactful change would be one that addresses the root cause: the classifier is not discriminative enough for the weak classes.
+
+**New idea: Use a multi-scale input approach**
+Instead of two crops at fixed contexts (1.5x and 2.5x), use the same crop at two different resolutions. For example:
+- Crop at 1.5x context, resize to 160×160 (current tight)
+- Crop at 1.5x context, resize to 80×80, then pad to 160×160 (lower resolution view)
+
+This gives the model both a detailed view and a low-frequency view of the same region. The low-frequency view might help with stain (diffuse patterns) while the detailed view helps with pore (small holes).
+
+But this is complex to implement and might not help.
+
+Let me go with a simpler, more testable idea.
+
+**I'll try: Adding low-res crops to training (TRAIN_ON = ("high", "low"))**
+
+Wait, e003 already tried this and was rejected. Let me not repeat it.
+
+**I'll try: Using a 3x context for the wide crop AND a 1.2x context for the tight crop**
+
+No, e009 already tried wider context and it was worse.
+
+**I'll try: Using EfficientNet-B2 with a reduced training budget**
+
+Let me estimate more carefully. EfficientNet-B2 has 9M params vs B0's 4M. The FLOPs are about 2.4x. So:
+- Training: 387/2.4 ≈ 161 steps in 115s
+- Prediction: 42*2.4 ≈ 100s
+- Total: 115 + 100 = 215s > 180s
+
+Too slow. Would need to cut training to ~75s and prediction to ~100s. That's only ~100 steps of training. Probably not enough.
+
+**I'll try: Using ResNet50**
+
+ResNet50 has 25M params, about 4x the params of EfficientNet-B0. FLOPs are about 3.3x.
+- Training: 387/3.3 ≈ 117 steps
+- Prediction: 42*3.3 ≈ 139s
+- Total: 115 + 139 = 254s >> 180s
+
+Way too slow.
+
+**I'll try: Using RegNetY-016**
+
+RegNetY-016 has 0.9M params, much smaller than EfficientNet-B0 (4M). FLOPs are about 0.4x.
+- Training: 387/0.4 ≈ 967 steps (but limited by data size)
+- Actually, with 9084 training samples and batch size 64, that's 141 steps per epoch. So we'd get about 141*3 = 423 steps in 115s? No wait, the time per step would be 0.4x, so we'd get 387/0.4 ≈ 967 steps in 115s. But we only have 9084/64 ≈ 141 steps per epoch, so we'd do about 6.8 epochs.
+- Prediction: 42*0.4 ≈ 17s
+- Total: 115 + 17 = 132s. Fits with plenty of margin.
+
+But a 0.9M param model might not be accurate enough. The pretrained weights are from ImageNet, but the model is very small.
+
+Actually, for fine-tuning on a specific task, a smaller model might actually work better if it's not overfitting. But the pretrained features are less rich.
+
+Hmm, I'm going back and forth. Let me just pick the most promising option.
+
+**Decision: I'll try adding vertical flip to the TTA.**
+
+The hypothesis: The current TTA only uses horizontal flip. Adding vertical flip (and the 180° rotation = hflip+vflip) will further reduce prediction variance and improve classification accuracy, especially for the weak pore and stain classes. The additional 4 forward passes (from 4 to 8) will cost about 42s extra in prediction, but we can compensate by reducing the reserve slightly.
+
+Wait, but I need to be careful about the time budget. Let me recalculate:
+- Current: training 115s, prediction 42s, total 157s
+- With 8-view TTA: prediction would be 42*2 = 84s
+- New total: 115 + 84 = 199s > 180s
+
+Too slow! I need to cut training time.
+
+If I cut the reserve from 65s to 90s, training would be 180-90 = 90s. That's 22% less training.
+- Training: 387 * (90/115) ≈ 303 steps
+- Prediction: 84s
+- Total: 90 + 84 = 174s. Fits with 6s margin.
+
+But 22% less training might hurt. The loss was still decreasing.
+
+Alternatively, I could use 6-view TTA (add vflip but not the combined flip):
+```python
+logits = (model(xt) + model(xt.flip(3)) + model(xt.flip(2)) + 
+          model(xw) + model(xw.flip(3)) + model(xw.flip(2))) / 6
+```
+- Prediction: 42 * 6/4 = 63s
+- Training: 180 - 63 - 5 = 112s (only 3% less)
+- Total: 112 + 63 = 175s. Fits.
+
+This is more reasonable. But is vflip useful?
+
+Actually, for weld beads, the orientation matters. A weld bead runs in a specific direction. If the images are all oriented the same way (bead running left-to-right), then:
+- Horizontal flip: bead runs right-to-left. The defect features should be similar.
+- Vertical flip: the "top" of the bead becomes the "bottom". This might change the appearance of defects (e.g., a stain that's on the upper edge of the bead would now appear on the lower edge).
+
+So vflip might not be a valid augmentation. The model might learn orientation-specific features that vflip would disrupt.
+
+I think vflip is risky. Let me think of something else.
+
+**New idea: Use a different scoring function that's more aggressive about suppressing background**
+
+The current scoring is: score = conf × p[c]
+
+What if we use: score = conf × p[c] × (p[c] - p_bg)
+where p_bg is the maximum probability of a "background-like" class?
+
+But we don't have a background class. The 4 classes are all defects.
+
+What if we use: score = conf × p[c] × (1 - max(p) + p[c])
+This would boost the top class and suppress others. But e023 tried something similar and it was worse.
+
+What if we use: score = conf^0.5 × p[c]
+This would be less aggressive about suppressing low-conf boxes. But e022 tried conf² and it was worse.
+
+I'm running out of scoring ideas. They've all been tried and failed.
+
+**Let me try a completely different approach: train the classifier with a contrastive loss or triplet loss to better separate the classes.**
+
+No, this is too complex and the loss experiments (label smoothing, focal loss) have all been worse.
+
+**Let me try: Using a larger image size (192) with a smaller model (convnext_pico)**
+
+ConvNeXt-Pico has 0.2M params. Very fast. At 192×192:
+- Training: much faster per step, maybe 0.2x of EfficientNet-B0 at 160
+- So we'd get 387/0.2 ≈ 1935 steps in 115s? No, that's limited by data.
+- 9084/64 = 141 steps per epoch. At 0.2x time per step, each epoch takes 115/3 * 0.2 ≈ 7.7s. So we'd get about 15 epochs in 115s.
+- Prediction: 42 * (192/160)² * 0.2 ≈ 42 * 1.44 * 0.2 ≈ 12s
+- Total: 115 + 12 = 127s. Fits.
+
+But a 0.2M param model is very small. Even with ImageNet pretraining, it might not have enough capacity.
+
+Actually, convnext_pico is 0.2M params? Let me check. ConvNeXt-Pico has about 0.2M params. That's really small. It might not work well.
+
+**Let me try: Using a 3-crop approach with contexts 1.2, 2.0, 3.0**
+
+This gives the model three scales of context. The tight crop (1.2x) focuses on the defect, the medium (2.0x) gives some context, and the wide (3.0x) gives lots of context.
+
+Inference: 3 crops × 2 (original + hflip) = 6 forward passes. Currently 4. So 50% more.
+- Prediction: 42 * 6/4 = 63s
+- Training: 180 - 63 - 5 = 112s
+- Total: 112 + 63 = 175s. Fits.
+
+Training: The dataset would return 3 views instead of 2. The model would process all 3 and average logits.
+
+This is a reasonable experiment. The hypothesis is that the current 1.5x/2.5x contexts don't cover the right range: 1.5x might be too wide for small pores, and 2.5x might not give enough context for stain. Using 1.2/2.0/3.0 would give a more balanced multi-scale view.
+
+But this is a bigger change. Let me think about whether it's likely to help...
+
+Actually, I think the most promising untried idea is:
+
+**Use both high and low res training data, but only for the weak classes (pore and stain)**
+
+The idea: Low-res images have different appearance characteristics. Adding them for ALL classes might dilute the signal (as e003 showed). But adding them only for pore and stain (the weak classes) might provide beneficial diversity without hurting the stronger classes.
+
+Implementation:
+```python
+crops_high = [r for r in read_csv(...) if r["res"] == "high"]
+crops_low = [r for r in read_csv(...) if r["res"] == "low"]
+train_rows = list(crops_high) + [c for c in crops_high if c["cls"] in (0, 3)]  # 2x oversample weak from high
+train_rows += [c for c in crops_low if c["cls"] in (0, 3)]  # add low-res weak classes
+```
+
+This adds low-res examples only for pore and stain, which are the weak classes. The hypothesis is that the additional diversity in appearance (from low-res images) will help the classifier generalize better for these specific classes, without diluting the training signal for the stronger classes.
+
+This is a focused, testable change. Let me go with this.
+
+Wait, but I need to be careful. The low-res images might have very different pixel scales. The crops would be the same relative size but fewer absolute pixels. The make_crop function handles this by resizing to IMG_SIZE×IMG_SIZE, so the absolute pixel count doesn't matter. The content would just be lower resolution.
+
+Actually, this is a good idea. Let me formalize it:
+
+**Hypothesis**: Adding low-resolution training crops specifically for the weak classes (pore and stain) will improve their classification accuracy by providing additional appearance diversity (different lighting, resolution artifacts) without diluting the training signal for the stronger classes (deposit, discontinuity).
+
+**Implementation**:
+- Keep high-res crops for all classes (with 2x oversampling of pore/stain)
+- Add low-res crops only for pore (cls=0) and stain (cls=3)
+
+This is a small, focused change. Let me write the code.
+
+Current code:
+```python
+crops = [r for r in read_csv(os.path.join(args.data, "crops.csv")) if r["res"] in TRAIN_ON]
+train_rows = list(crops) + [c for c in crops if c["cls"] in (0, 3)]  # 2x oversample weak pore/stain
+```
+
+New code:
+```python
+all_crops = read_csv(os.path.join(args.data, "crops.csv"))
+crops = [r for r in all_crops if r["res"] in TRAIN_ON]
+crops_low_weak = [r for r in all_crops if r["res"] == "low" and r["cls"] in (0, 3)]
+train_rows = list(crops) + [c for c in crops if c["cls"] in (0, 3)] + crops_low_weak
+```
+
+And update the print statement.
+
+Let me also think about whether this could cause issues:
+- The low-res crops might have different img_w/img_h, but make_crop handles this correctly (it uses the actual image dimensions)
+- The low-res crops might be very small in absolute pixels, but make_crop resizes to IMG_SIZE
+- The class labels should be the same
+
+I think this is safe. Let me write the SEARCH/REPLACE blocks.
+
+Actually, wait. Let me reconsider. e003 added ALL low-res crops and it was rejected (0.6251). If adding ALL low-res crops doesn't help, would adding only weak-class low-res crops help? Maybe, because:
+1. The signal isn't diluted by strong-class low-res crops
+2. The weak classes get more diverse examples
+3. The strong classes still only see high-res (their best signal)
+
+But there's a risk: the low-res pore/stain crops might be too noisy and actually hurt. The pores might be too small to see at low res, and the stains might blend into the background.
+
+I think it's worth trying. The hypothesis is clear and the change is minimal.
+
+Let me also consider: should I add the low-res weak crops with 2x oversampling too? That is:
+```python
+train_rows = list(crops) + [c for c in crops if c["cls"] in (0, 3)] + crops_low_weak + [c for c in crops_low_weak if c["cls"] in (0, 3)]
+```
+No, that would be 4x oversampling of low-res weak, which is too much. Let me just add them once.
+
+Actually, the current 2x oversampling means: each high-res pore/stain crop appears twice in the training set. If I add low-res pore/stain crops once, the ratio would be:
+- High-res pore: 2x
+- High-res stain: 2x
+- Low-res pore: 1x
+- Low-res stain: 1x
+- High-res deposit: 1x
+- High-res discontinuity: 1x
+
+This seems reasonable. The weak classes get more total examples (3x vs 1x for strong classes), and the additional examples are from a different resolution.
+
+Let me finalize the change.
+
+Actually, I want to double-check: will the `needed` set for images include the low-res images? Let me look:
+```python
+needed = {r["image"] for r in crops} | {d["image"] for d in ev}
+```
+
+If I add low-res crops to train_rows but not to `crops`, the `needed` set won't include the low-res images. I need to update this.
+
+Let me restructure:
+```python
+all_crops = read_csv(os.path.join(args.data, "crops.csv"))
+crops = [r for r in all_crops if r["res"] in TRAIN_ON]
+crops_low_weak = [r for r in all_crops if r["res"] == "low" and r["cls"] in (0, 3)]
+train_rows = list(crops) + [c for c in crops if c["cls"] in (0, 3)] + crops_low_weak
+dets = read_csv(os.path.join(args.data, "dets.csv"))
+ev = [d for d in dets if d["split"] == "eval"]
+needed = {r["image"] for r in crops} | {r["image"] for r in crops_low_weak} | {d["image"] for d in ev}
+```
+
+And update the print:
+```python
+print(f"train {len(train_rows)} boxes ({len(crops)} GT high + {len(crops_low_weak)} low weak), eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
+```
+
+This looks good. Let me write the SEARCH/REPLACE blocks.
+
+SEARCH block 1:
+```
+    crops = [r for r in read_csv(os.path.join(args.data, "crops.csv")) if r["res"] in TRAIN_ON]
+    train_rows = list(crops) + [c for c in crops if c["cls"] in (0, 3)]  # 2x oversample weak pore/stain
+    dets = read_csv(os.path.join(args.data, "dets.csv"))
+    ev = [d for d in dets if d["split"] == "eval"]
+    needed = {r["image"] for r in crops} | {d["image"] for d in ev}
+```
+
+REPLACE block 1:
+```
+    all_crops = read_csv(os.path.join(args.data, "crops.csv"))
+    crops = [r for r in all_crops if r["res"] in TRAIN_ON]
+    crops_low_weak = [r for r in all_crops if r["res"] == "low" and r["cls"] in (0, 3)]
+    train_rows = list(crops) + [c for c in crops if c["cls"] in (0, 3)] + crops_low_weak
+    dets = read_csv(os.path.join(args.data, "dets.csv"))
+    ev = [d for d in dets if d["split"] == "eval"]
+    needed = {r["image"] for r in crops} | {r["image"] for r in crops_low_weak} | {d["image"] for d in ev}
+```
+
+SEARCH block 2:
+```
+    print(f"train {len(train_rows)} boxes ({len(crops)} GT, weak 2x), eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
+```
+
+REPLACE block 2:
+```
+    print(f"train {len(train_rows)} boxes ({len(crops)} GT high + {len(crops_low_weak)} low weak, weak 2x), eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
+```
+
+This looks correct. Let me verify the SEARCH blocks appear exactly once in the file.
+
+Looking at the file:
+- Line with `crops = [r for r in read_csv...` - yes, appears once
+- Line with `train_rows = list(crops) + ...` - yes, appears once
+- Line with `dets = read_csv...` - yes, appears once
+- Line with `ev = [d for d in dets...` - yes, appears once
+- Line with `needed = {r["image"] for r in crops}...` - yes, appears once
+- Line with `print(f"train {len(train_rows)}...` - yes, appears once
+
+Good. Let me finalize.
+
+Wait, one more thought: the low-res images might have different aspect ratios or sizes. The make_crop function uses `img.shape[:2]` to get the dimensions, so it should handle this correctly. The crops are defined in pixel coordinates relative to the image, so they should be correct.
+
+Also, I should make sure the low-res crops have valid coordinates. If the low-res image is smaller, the crop coordinates should be scaled accordingly. Since the crops.csv has x1, y1, x2, y2 in pixel coordinates for each image, and the image is loaded at its native resolution, this should be fine.
+
+I'm confident this is a safe change. Let me write the final answer.

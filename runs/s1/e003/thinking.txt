@@ -1,0 +1,883 @@
+===== attempt 1 =====
+Let me analyze the situation carefully.
+
+Current best: e000 with 5-seed val mAP@0.5 = 0.6288. Per-class AP: pore 0.502, deposit 0.624, discontinuity 0.780, stain 0.609.
+
+Diagnostics show:
+- The dominant error is wrong classes on boxes that overlap true defects (0.117 mAP loss from wrong classes).
+- Specifically pore-deposit and deposit-stain confusions.
+- Pore is the worst class at 63% right.
+- There's a gap to the perfect-classes ceiling of 0.7461 (vs current 0.6288): 0.117 from wrong classes, plus what your scores cost compared with detector conf (~0.005 or so).
+
+Key insight: The two-stage system's second stage needs to fix class assignment. The reference numbers tell us:
+- one-step 4-class baseline: 0.638
+- stage-1 boxes with perfect classes: 0.758 (ceiling)
+- stage-1 boxes scored as single class 'defect': 0.755
+
+Our current best is 0.6288, well below the one-step baseline (0.638) even though we have more information (perfect boxes from stage 1). The missing piece is class assignment quality.
+
+The earlier history shows:
+- Scoring changes (product rule etc.) didn't help much - but e001 crashed.
+- Architecture changes (IMG_SIZE 224) timed out, no result.
+
+Wait, let me think about what the key bottleneck is. The per-class diagnosis says:
+- pore: 63% right (worst)
+- deposit: 78% right
+- discontinuity: 96% right
+- stain: 88% right
+
+So pore and deposit are the major issues. The reference info says "Pore and deposit are the weak classes; stain is often confused with deposit."
+
+The earlier runs tried:
+- Third wide view (4x box) - accepted twice (+0.005), gain from pore class
+- Various backbones, resolutions, TTA, longer training - no gains
+- Class-weighted loss, focal loss, sampling - no gain
+
+Now, what hasn't been tried? Let me think about the fundamental structure.
+
+Key idea: The current approach trains a classifier on ground-truth boxes (perfect boxes) and then applies it to detector boxes at test time. But detector boxes are systematically worse than GT boxes (different quality, especially for small objects). There's a domain gap between training distribution (GT boxes) and test distribution (detector boxes). The earlier experiment "Detector boxes from train split as extra training data" was accepted twice (+0.004), which hints at this being relevant.
+
+Actually wait - let me reconsider. A much more promising approach might be to use the detector's own features or a cascade-style approach where we train on detector proposals with different IoU thresholds, matching the test-time box quality.
+
+Another big idea: the two-crop ensemble (1.5x + 2.5x) at 160px means each crop is only 160px. For small objects, the tight crop (1.5x) might be very small - maybe just a few pixels of the object. The problem says "Pore and deposit are the weak classes" and distinguishing them depends on fine texture.
+
+Actually, let me think about what's really limiting here. Let's look at the numbers:
+- Our score: 0.6288
+- One-step baseline: 0.638 (single class-agnostic detector with 4 classes)
+- Ceiling with perfect classes: 0.758
+
+The gap to ceiling is 0.129. Most of that is wrong-class errors (0.117 on boxes overlapping true defects). The remaining part is ranking/score issues.
+
+Key observations from diagnostics:
+- For small boxes, only 80% get the right class vs 93% for large. So small object classification is the bottleneck.
+- Pore is hardest at 63%.
+
+What could plausibly give a big gain? The fact that "detector boxes from train split" gave +0.004 twice suggests that training on detector proposals instead of GT boxes helps - because the classifier's crops should match the distribution of boxes it will see at test time (the detector's boxes are less tightly cropped than GT, and have more background).
+
+But actually, I think there's a bigger issue: the current system trains on ground truth boxes which are "perfect" but at test time uses detector boxes. Detector boxes for small objects tend to be noisy, misaligned, etc. The earlier accepted change (+0.004) used detector boxes from train as extra training data.
+
+But wait - the most important thing is that the loss is 0.117 mAP from wrong classes on overlapping boxes. That's huge. To fix this, we need better classification of small objects (pore/deposit).
+
+Let me think about what approach hasn't been tried and could matter:
+
+1. **Train on detector proposals at various IoU thresholds** - Cascade R-CNN style. The idea: the classifier should be trained on boxes that look like the test-time detector boxes, not on perfect GT boxes. The accepted experiment with +0.004 did this partially. But a cascade approach where we match box quality at train and test time is more principled.
+
+2. **Different resolution/crop strategy for small objects** - The 160px crop at 1.5x tight context may be too small for pores (which are small). Actually, the MIN_CROP = 16 ensures the crop is at least 16px. For a very small defect, the tight crop might be only 16-24 pixels of the image! That's tiny - a pore would be just a few pixels.
+
+Wait - actually for the tight crop, side = max(max(width, height) * 1.5, MIN_CROP). For a small object with width 20px, side = 30px, resized to 160px. The object then fills only 30/160 = 19% of the crop dimension. That's actually reasonable. But for a 5px pore: side = max(7.5, 16) = 16, so the object is ~5/16 = 31% of the crop. Hmm.
+
+Actually wait, there's a subtle issue. Let me think about the resize. The crops are resized to 160x160. For small objects, the effective resolution (object pixels) matters. If we want more detail on small objects, we should use higher resolution for those.
+
+3. **The biggest untried idea**: What about using the detector's own features at stage 2 instead of a crop classifier? Or what about making the second stage actually do better classification by using multi-scale crops *adapted to the object size* (not fixed contexts)?
+
+4. **A really different approach**: The problem says "the same errors are wrong types, not missed defects." The one-step detector gets 0.638 with 4 classes. Our two-stage system gets 0.6288. The two-stage system is *worse* than the one-step baseline! That's strange given we have perfect boxes. The issue must be that our classifier is worse than the one-step network at identifying small defects, or that the score combination hurts.
+
+Wait, actually, this is an important point. Let me reconsider: the one-step detector uses a full image (YOLOv7-tiny at high res), while our classifier only sees crops. For pore detection on small objects, the context might matter but the resolution of the crop matters more. A 160px crop of a small defect gives limited texture.
+
+Actually, hmm - what if we flip the approach? Instead of cropping to the box, what about using *larger* crops or even full-image features? No, that's too expensive.
+
+Let me think about the most promising untried direction given the budget:
+
+The key insight from "Lessons so far": 
+- scoring changes: no gain
+- architecture: timeout only
+
+What if the issue is that we're not training the classifier on enough relevant data? The current training uses 6052 GT boxes. What if we could get better training data by using detector boxes (which match test distribution) and training with IoU-based labels?
+
+Actually, wait. Let me re-read: "Detector boxes from the train split as extra training data (IoU > 0.5 with a true box, labelled with its class)" gave +0.004 twice. This was accepted. So it did help! But only +0.004.
+
+Hmm, but that experiment is in the history and accepted. The current best e000 doesn't include it though. Let me check... The current best (e000) has 0.6288 which is *lower* than the accepted runs at 0.6337 and 0.6342. So e000 is not actually the best! But wait, the "current best train.py" is labeled e000 with 0.6288. The history shows e001 crashed and e002 timed out. So maybe the accepted runs from earlier research (the 5 runs of 90 ideas) are not in this run's history - they were "earlier research runs on this same task" but the current session only has 2 experiments (e001, e002).
+
+Hmm wait, the table says "Five earlier 5-hour runs (90 ideas) started from this same train.py". And then "Experiment history (2 experiments so far)" shows e001 and e002. So the current session is starting fresh with 2 failed attempts, but we have knowledge from the historical families.
+
+The current best is e000 at 0.6288. The historically accepted "detector boxes as extra training data" gave +0.004 (5-seed 0.6337/0.6342). But those runs are not in the current session history and I can't re-run exactly the same thing (well, I could, but it's an earlier accepted idea).
+
+Hmm, actually the rule says: "Never repeat an experiment that is already in the history, even reworded, unless it crashed or had a bug that you are now fixing." The current session history only has e001 and e002. But the "earlier research runs" table lists families with results. Some of those were accepted ("accepted twice (5-seed 0.6337 and 0.6342, about +0.004)").
+
+Actually wait - I need to re-read. The instruction says: "Do not repeat a family marked 'no gain' unless you can say what is fundamentally different and why that should change the result." And "Never repeat an experiment that is already in the history, even reworded, unless it crashed or had a bug that you are now fixing."
+
+The earlier research runs table lists families with results. The family "Detector boxes from train split as extra training data" was accepted twice (+0.004). That's positive but small. Repeating it might work but the gains were modest.
+
+Now, let me think about what is fundamentally different and untried that could give a big gain.
+
+The diagnostics are very clear: the loss is in wrong-class assignment (0.117 mAP), mostly for pore (63% right) and deposit (78% right). Small boxes (80% right) vs large (93% right).
+
+Key untried idea: **Multi-scale crops per object size, or adaptive resolution**. For small objects, the crop at 1.5x context is tiny in absolute terms. But actually the issue is the *resize* to 160px - for a small object, it gets upscaled heavily, and for large objects it gets downscaled. What if we made the input resolution scale with the object size?
+
+Actually, a cleaner idea: **Train on detector boxes at various IoU thresholds** (cascade R-CNN approach), matching the test-time box quality. This is different from just adding extra training data - it's about matching the domain of training to test.
+
+Hmm wait, but let me think more carefully about what the biggest win could be.
+
+Actually, here's a thought that might be key: **The current classifier gets its training on GT boxes (tight, perfect centering) but at test time it sees detector boxes which are looser and noisier.** The earlier accepted change (+0.004) partially addressed this by adding detector boxes as extra data. But a better fix: train the classifier to be robust to box misalignment - i.e., use the same distribution of boxes as at test time for training.
+
+Actually, let me think about something else entirely. What if the key insight is that **the two-crop approach (1.5x tight + 2.5x wide) doesn't give enough resolution for small pores** and instead we should focus on what's actually distinguishing pore from deposit?
+
+Pore: a small void/porosity in the weld bead.
+Deposit: excess filler metal deposited irregularly.
+Discontinuity: crack or gap.
+Stain: discoloration without topographic change.
+
+Distinguishing pore from deposit requires fine texture - pores are dark voids, deposits are raised extra metal. For small objects at 160px input, the texture information is limited.
+
+What's untried and could give a big gain? **Higher resolution for small objects**. Specifically, instead of fixed 160px crops with fixed context ratios, we could:
+- Use larger base resolution (e.g., 224 or 320) but that timed out.
+- Use variable input sizes.
+
+But wait - the timeout on e002 was at 224px (only +5% in time). We have 180s budget, and e000 took 162s. A 224px run would take ~191s. What if we could make it fit?
+
+Actually, a smarter approach: **reduce training time to allow higher resolution at test**. Or use a smaller model for the heavy part.
+
+Hmm, but actually let me think about this differently. The biggest gap is 0.117 mAP from wrong classes on overlapping boxes. What single change could recover most of that?
+
+The reference numbers in the brief:
+- stage-1 boxes with perfect classes (ceiling): 0.758
+- stage-1 boxes scored as single class 'defect': 0.755
+- The one-step baseline: 0.638
+- Our current best: 0.6288
+
+Note that the "single class defect" score (0.755) is nearly as high as perfect classes (0.758). This means if we just got the ranking right and didn't care about exact class, we'd be at 0.755! The big win is not in perfect classification but in *ranking* - i.e., putting the right box-score combinations in the right order.
+
+Wait, that's a crucial insight! If the "single class defect" (i.e., all boxes scored as one class) gets 0.755 vs our 0.6288, then what we're losing is mostly about *how* we combine the detector confidence with the classifier probability - specifically, our product rule conf × p(c) might be hurting the ranking badly!
+
+Let me think about this. The "stage-1 boxes scored as a single class 'defect': 0.755 mAP@0.5" means: treat all boxes as one class, score each box by its detector conf (or something), and get 0.755. Our two-stage system gets 0.6288. The difference of 0.126 is huge!
+
+Hmm but wait - the "single class defect" reference might use different scoring than ours. Let me re-read: "stage-1 boxes scored as a single class 'defect': 0.755 mAP@0.5". And in the brief: "The score of each box is its detector conf."
+
+Hmm, so if we just output all boxes as one class with score = det conf, we get 0.755. But our system needs to predict 4 classes! How does that reference compute AP for 4 classes then? Oh - I think the reference means: take all boxes, treat them all as class 'defect' (one class), and the mAP over that single class is 0.755. Then when you split into 4 classes, each box needs to be assigned a specific class with a score, and if you assign the wrong class, you lose AP on that class.
+
+Actually wait, re-reading more carefully: "mAP@0.5 is computed per class and averaged." So if we treat all as one class, it's just 1 class mAP = 0.755. Our system needs 4-class mAP. The gap from 0.755 to our 0.6288 includes both class assignment errors AND the fact that within each of the 4 classes, we need proper ranking.
+
+The diagnostics say: "mAP@0.5 if every box had its correct class but kept your scores: 0.7461 (yours: 0.6288). The difference is what wrong classes cost; the remaining gap to the perfect-classes ceiling in the brief is what your scores cost compared with the detector's conf."
+
+So with correct classes + our scores: 0.7461. This means:
+- Our ranking (within class) is only slightly worse than det conf (gap 0.7461 vs 0.755 = 0.009).
+- Wrong class assignment costs 0.117 mAP.
+
+So the fix is almost entirely about getting the class right! The ranking is already fine. This is important: don't mess with scoring/ranking (all those "scoring" experiments were wasted), focus on classification accuracy.
+
+Now, the gap to ceiling: perfect classes + our scores = 0.7461 vs ceiling 0.758 = 0.012 (from scores being slightly worse than det conf). So we're close to the ceiling given correct classes!
+
+So the target is: improve class assignment accuracy on detector boxes that overlap true defects. Currently 0.63, 0.78, 0.96, 0.88 for pore/deposit/discontinuity/stain. The biggest gains are in pore and deposit.
+
+What's untried? Let me think about what the earlier runs did NOT try:
+
+1. **Training the classifier on detector proposals (not GT boxes)** - This was tried as extra data (+0.004) but maybe not done properly. Actually, a cascade R-CNN style approach where we train at IoU 0.5 and use that for test boxes would be more principled. But actually, wait - the current system already trains on GT boxes from crops.csv which ARE labeled with class. So training on detector proposals with overlapping GT labels would give a different distribution.
+
+Actually, the accepted change "Detector boxes from the train split as extra training data (IoU > 0.5 with a true box, labelled with its class)" gave +0.004. This is adding detector boxes as training data. But maybe it wasn't done well - e.g., maybe only IoU>0.5 boxes were used (the good ones), when we should also use lower-IoU boxes to train robustness to misalignment.
+
+2. **Using the detector's own features at stage 2** - Not tried. The YOLOv7-tiny already produces a feature map; if we had access to per-box ROIs from the stage-1 network, we could classify more efficiently. But we don't have stage-1 code access apparently.
+
+3. **Multi-scale object-adaptive crops** - e.g., for small objects use a larger context (4x) to get more pixels on the object; for large objects use smaller context. Actually, "Third, very wide view (4x the box)" was tried and gave +0.005 from pore class. But adding ~20s per run was close to the limit.
+
+4. **A two-crop classifier that uses the detector's own crop at test time** - i.e., instead of 1.5x + 2.5x, use a different combination.
+
+Hmm, let me think about what's fundamentally most important. The problem is small object classification (pores) and distinguishing visually similar classes (pore vs deposit). 
+
+A really promising idea: **Use the detector boxes' actual characteristics as input**. Detector boxes for small objects are often noisy. What if we train the classifier with box jittering/misalignment during training to match test time? This is essentially "augmentation" but targeted at box alignment - a family that was never tried!
+
+Actually, let me reconsider the whole thing. Here's a key observation: the current system uses two crops (1.5x tight and 2.5x wide) of the *box*, resized to 160px. The 1.5x tight crop for a small pore might be only 24-30px of image, upscaled to 160px. But wait - the object fills the crop. So for a small object, the crop IS the object at 160px resolution (mostly). That should be fine for detail!
+
+Hmm, but actually let me reconsider: for a *small* defect (say 15x15 px in the image), the tight crop side = max(15*1.5, 16) = 22.5 → 23px. So the object fills ~15/23 = 65% of the crop, resized to 160x160. The object is then ~104px in the 160px crop. That's plenty of resolution!
+
+So the issue isn't resolution per se. It's *what* the classifier sees - context matters. A pore on a weld bead looks different from a deposit? Actually, pores are small dark spots, deposits are raised material with different texture. The confusion between pore and deposit suggests the features needed to distinguish them (fine texture) aren't being captured well enough.
+
+Wait, actually - maybe the issue is the *crops* don't include enough of the surrounding weld bead context. The 1.5x tight crop barely includes any context. A deposit might look like a raised region with different texture, and needing to see the edges of the deposit relative to the bead would help.
+
+Hmm, but the earlier "third wide view (4x)" experiment was accepted twice for a pore gain. So more context helps!
+
+OK let me think about what's genuinely untried and high-potential:
+
+**Idea: Train on detector-box crops with alignment jitter matching test-time box quality.**
+Currently: train on GT boxes (perfectly aligned), test on detector boxes (noisy). At test time, the classifier sees crops centered on noisy detector box centers. The training distribution doesn't match.
+
+This is fundamentally different from all previous tries. All previous augmentation was image-level (flips, brightness, rotation) or crop-level context size. Box alignment jitter during training to match the detector's box noise at test time could be a big win. It directly targets "pore-deposit confusions on small boxes" because small objects are most sensitive to centering.
+
+Actually wait - let me reconsider whether this really addresses the pore/deposit issue. For a *small* defect, if the box is misaligned by even 5px, the crop might miss the defect entirely or include too much background. But we know that at test time, detector boxes overlap true defects by IoU > 0.5 (from the diagnostics). So they're not terrible.
+
+Hmm, let me think about this from another angle: **what if we could improve classification by using a better backbone?** The current model is EfficientNet-B0 at 160px. Earlier runs tried ResNet-50 and EfficientNet-B2 - no gain. So backbone isn't the issue.
+
+**What about data augmentation that specifically targets class-distinguishing features?** E.g., cutout/mosaic to force the classifier to use texture rather than context. Not tried directly on this task.
+
+Actually, here's another thought: **The two-crop averaging (1.5x + 2.5x) loses information.** A better approach might be a multi-scale pyramid of crops around each box, or using the *full image* features with ROI pooling. But we only have access to images and detector boxes - we can't run stage-1 ourselves (it's "fixed, already done").
+
+Hmm, actually wait. Let me re-read the contract: "Stage 1 (fixed, already done)". So stage-1 is already run. We just get dets.csv with detector boxes. We can't access stage-1 features.
+
+OK so what CAN we do? We can change the classifier and how it's trained. Let me focus on the training side since that's where most of the gains could be (classification accuracy).
+
+**Most promising untried idea: train the classifier on crops sampled from detector boxes with realistic misalignment.** This matches the test distribution. The "detector boxes as extra training data" experiment did something similar but perhaps incompletely.
+
+Actually, wait - I just realized something potentially crucial. Let me re-read the earlier accepted result: "Detector boxes from the train split as extra training data (IoU > 0.5 with a true box, labelled with its class)" gave +0.004. 
+
+Hmm, but that's only +0.004. Is there something fundamentally more aggressive we could do here?
+
+**What if we train ENTIRELY on detector-box crops instead of GT boxes?** At test time we classify detector boxes. If the classifier is trained on GT boxes (tight, perfectly centered), it sees a different distribution than at test time (detector boxes: looser, noisier). Training entirely on detector-box crops would match the test distribution exactly.
+
+But there's a catch: we only have 41879 eval boxes and the train split has some detector boxes. How many? The log says "train 6052 boxes" (from crops.csv) and "eval 41879 detections". The dets.csv has both train and eval splits. Let me think - the "detector boxes from the train split as extra training data" experiment used train-split detector boxes with IoU > 0.5 overlap with true boxes, labeled with their class. 
+
+Actually, I realize there might be a much better idea. Let me re-examine: what if we use the *tight* crop at a higher resolution or the *wide* crop more effectively?
+
+Hmm, let me step back and think about what's most likely to give a big gain (0.01+ mAP):
+
+The key loss is wrong class assignment on overlapping boxes. Pore (63%) and deposit (78%). 
+
+Actually, here's a thought: **What if the classifier needs to see more context because pore vs deposit distinction depends on global shape, not local texture?** For instance, a deposit is usually at the edge of a bead or has a specific shape; a pore is circular/void-like. A 1.5x tight crop cuts off context.
+
+The "third wide view (4x)" was accepted for pore gain. That supports the context idea! But adding more views costs ~20s and we're at 162s already (only 18s left for prediction).
+
+What if instead of adding more crops, we make the existing wide crop *wider* but compensate elsewhere? Or what if we use a different combination - like 2.5x + 4x instead of 1.5x + 2.5x?
+
+Actually, you know what? Let me think about the budget constraint more carefully. e000 took 162s total for 5 epochs/433 steps + training data loading. Prediction is at the end. The training takes ~145s (162-17). We have a 180s budget with 55s reserve.
+
+What's actually limiting our accuracy? Let me think about the training: 433 steps of 64 boxes each = ~27,600 boxes seen per epoch. With drop_last=True and shuffle... 6052 boxes / 64 = ~95 batches/epoch. 433 steps ≈ 4.5 epochs. So we're doing ~5 epochs. That's not a lot of training!
+
+Hmm wait, but the loss goes from 0.72 → 0.22 over 5 epochs, so it's converging. And the reference says earlier runs tried "longer training" - no gain (best 5-seed 0.6355 not confirmed). So more training isn't the answer either.
+
+Let me think about what would actually be a fundamentally different approach...
+
+**BIG IDEA: What if we use the detector's confidence differently?** No wait - we established that ranking is already fine (0.7461 vs 0.755). The issue is class assignment.
+
+**BIG IDEA 2: What if we ensemble multiple classifiers trained with different random seeds or different augmentations?** That's in the "architecture" family and didn't help (2-3 model ensembles gave no gain).
+
+**BIG IDEA 3: Use a two-stage classifier where the second stage re-ranks.** No, that's scoring.
+
+**BIG IDEA 4: The real issue might be that the crops at test time don't match training.** Let me quantify: at training, GT boxes are tightly centered on the defect (by annotation). At test, detector boxes may be offset. For a *small* defect (pore), a small offset changes the crop content dramatically. But actually, since the detector box overlaps the true box by IoU > 0.5 for most cases, the center is roughly right.
+
+Hmm, OK let me think about this from yet another angle. What's really hard about pore detection? A pore is a small dark void in the weld bead. It looks similar to... what exactly? Deposit (extra metal) and discontinuity (crack/gap). The confusion suggests that at 160px with only context, it's hard.
+
+Wait - actually let me reconsider the problem completely. What if the issue is that **the tight crop (1.5x) is too small for a pore**? Let me recalculate: For a small object of 20px width, tight crop side = 30px → resized to 160px. The pore occupies ~13% of the crop width. That's fine actually!
+
+But what about for *very* small pores (like 8px)? Tight crop side = max(12, 16) = 16. The pore is 50% of the crop! Then resized to 160px, it's ~80px. That should be fine too!
+
+So resolution isn't the issue for small objects. The issue must be *texture/feature* quality or *context*.
+
+OK here's my strongest untried hypothesis: **The classifier needs more context to distinguish pore from deposit**, and instead of just adding a wider crop (which was tried), we should use a *different strategy* for context: **a multi-scale pyramid around the box** (e.g., 1.5x, 2x, 3x crops, average features). This is different from just "third wide view" because it uses multiple scales adaptively.
+
+But actually, wait. Let me reconsider. The earlier experiment with a third wide view (4x) gave +0.005 - accepted twice. So more context helps. But it costs 20Thinking budget reached. Stop thinking now and write the reply in the required format.
+===== attempt 2 =====
+The user is right — I didn't include any SEARCH/REPLACE blocks in my previous response. Let me fix this and write the proper edit.
+
+Key considerations:
+1. Current best: e000 (0.6288 val mAP@0.5, 5-seed mean)
+2. The dominant error is wrong-class assignment on boxes overlapping true defects: pore 63% right, deposit 78% right
+3. Small boxes: 80% right vs large 93% right - strong size effect
+4. e002 (IMG_SIZE 160→224) timed out at 191s
+5. Budget constraint: need to stay under 180s with margin
+
+My idea: For small boxes, the tight crop is already tiny (e.g., a 32px box at 1.5x context → 48px side → 160px output). The problem is that small defects need more pixels relative to their content. Instead of just adding an extra branch which would complicate training, let me think about what's actually the most efficient change.
+
+Wait - actually, the simplest and most impactful change might be to just increase IMG_SIZE back to 224 but reduce other costs. But e002 timed out because 224 is ~78% more pixels than 160 (actually 224²/160² = 1.95x), so roughly double the compute per forward pass.
+
+Actually, let me reconsider:
+- IMG_SIZE 160 → 224: pixel count increases by (224/160)² = 1.953x ≈ 2x, but this affects the backbone input size... Actually for EfficientNet, the input image is resized to 224x224. The forward pass cost depends on the input size, but the bottleneck layers dominate. Roughly, a 224² input vs 160² is about 2x the FLOPs of the first layers, but for the deeper layers it's similar. e002 went from ~94 steps in 59s to... it got to epoch 3 in 125s (vs e000 reaching epoch 4 in 125s). So actually the per-step time roughly doubled or more.
+
+The issue with IMG_SIZE=224 is that it needs ~2x the training compute. 
+
+Better idea: instead of resizing to 224, keep the two-crop system but increase resolution only where it matters - for small boxes. But a simpler approach:
+
+Actually, let me think about this differently. The box-based problem:
+- Small defects (80% right) vs large (93% right) - the size effect is big
+- Pore 63%, deposit 78% - these are the hard classes
+- The tight crop is 1.5x context. For small boxes, the tight crop might be very small
+
+The key insight from the reference numbers: "mAP@0.5 if every box had its correct class but kept your scores: 0.7461 (yours: 0.6288)". So the wrong-class assignment costs 0.117. The remaining gap to 0.7461 is what the scores cost.
+
+Actually, a cleaner approach that addresses both small boxes and the budget: use a single crop at a higher resolution, but only for small boxes. Let me think about whether adding a third crop (detail branch) makes sense given time constraints.
+
+Actually, let me reconsider the most promising direction. The e002 timeout was due to IMG_SIZE=224 with the two-crop system → roughly 2x cost. What if instead of 224px, I do this:
+- Keep 160px for the tight crop
+- For small boxes (tight crop side ≤ 32px), also run an 80px... no wait, that's worse!
+
+No wait. Let me re-read my idea. The "detail" crop is 80px input at IMG_SIZE=80? No, SMALL_SIZE=80 means the detail crop output is 80x80. But the tight crop for a small box would be ~160px anyway. 
+
+Hmm, actually I need to think about this more carefully:
+- For a box of size 32px, tight crop = 32*1.5 = 48px → resized to 160x160. The defect fills only 48/160 = 30% of the image.
+- A detail crop at 80px would fill the same area with more relative pixels? No, it's still 48px content in 80px output vs 48px content in 160px output. The detail crop gives MORE pixels to the defect but loses context.
+
+Actually wait - for a tiny box like 20px: tight crop = 30px → resized to 160px. The defect is only 30/160 = 19% of the image. A detail crop at 80px would make the defect 30/80 = 37% of the image. More pixels per pixel of defect!
+
+But actually, this might not be enough. What if I just go to 224px but handle the small boxes? The issue is that a box with tight crop ~48px resized to 160px gives very little "fine texture" relative to the total image.
+
+OK let me think about the actual time budget. The current run takes 162s for 5 epochs/433 steps. At 224px it took 191s+ and was killed. So I need to be smarter.
+
+Better idea: Reduce the number of training boxes? No, more data is better.
+
+What about: since the main error is on small boxes (80% right vs 93% for large), and the pore class is hardest (63%), what if I make the model see small boxes at much higher resolution? The detail branch idea with SMALL_SIZE=80 might actually work well, and it's cheap because:
+1. Only ~30-40% of boxes are "small" (need to check)
+2. For non-small boxes, no extra cost
+
+But wait - there's a subtlety: at 80px resolution, the detail crop would lose the context. And 80px is quite low for a classifier. Maybe SMALL_SIZE should be bigger, like 160px? That would be equivalent to having three crops (1.5x tight, 2.5x wide, and 1.0x detail at same resolution) - but that's just the same as two crops for large boxes.
+
+Actually let me reconsider completely. What about:
+- For small boxes: tight crop resized to 160px + a second "detail" crop resized to 224px? No, too expensive.
+
+Hmm, what about this cleaner idea: instead of adding a third branch, use a pyramid/crop-stacking approach... no, too complex.
+
+Let me focus on what's most likely to work and be fast:
+1. Increase resolution for ALL boxes but reduce batch size/epochs? No, 2x cost is the problem.
+2. Add detail crop only for small boxes (cheap, targets the worst class)
+
+Actually, I realize there might be a much better idea. The "small" box definition matters. Let me look at the data again:
+- small: 80% right
+- medium: 91% right  
+- large: 93% right
+
+The gap between small and large is huge. Small boxes are defined by area thirds, so ~33% of boxes. For these, the tight crop (1.5x) at 160px might be too low-res relative to the defect size.
+
+A cleaner approach: instead of a separate "detail" model/branch, use two crops where the TIGHT_CONTEXT is larger for small boxes? That's complex.
+
+OK, let me go with the three-branch idea but make it efficient:
+- For ALL boxes: 160px tight + 160px wide (current)
+- Only for boxes where the tight crop side ≤ 32px: also a third "detail" crop at SMALL_SIZE=80
+
+Wait, I'm making this too complicated. Let me simplify to the core idea and fix my SEARCH/REPLACE block. The key issue was that I didn't write proper blocks. Let me redo this cleanly.
+
+Actually, I should reconsider whether to even use e002 as base with a fix. The task says "Work through these points in your thinking before you write the reply". 
+
+Let me think about what's the single most important thing:
+- Wrong classes cost 0.117 mAP
+- Small boxes are worst (80% right)
+- e002 (IMG_SIZE 224) timed out
+
+The fix should be: increase effective resolution for small boxes only, keeping the total compute manageable. My original idea was right, I just didn't format it correctly.
+
+Let me write the proper SEARCH/REPLACE blocks now. Actually, I realize I should also update the model code to handle three views and merge two heads. Let me be careful about time budget:
+- Current: ~433 steps in 162s (excluding 55s reserve), so ~107s of training per run
+- With detail branch for small boxes (~33% of boxes get 3 crops): the DataLoader becomes slower (crops take time), and forward pass needs 3 branches. This might slow things by ~30-50%.
+
+That's risky for the budget. Let me think about how to handle this:
+1. Precompute all crops once? The crop generation in __getitem__ is done on-the-fly. With 6052 training boxes and a DataLoader, each box is processed per epoch... Actually with drop_last=True and batch_size=64, we have ~95 batches per epoch.
+
+Actually, the key issue: if I add more crops, each __getitem__ becomes slower (more image loading/cropping), which means fewer steps per second. This could blow the budget again.
+
+Better approach: pre-crop everything into memory before training? That's what makes it fast for the forward pass. But the geometric jitter changes every epoch... so I'd need to recompute. Actually no - I could compute the base crops and do the jitter on the numpy arrays which is cheaper than PIL resize? Hmm, actually the current code already does everything in __getitem__.
+
+OK, let me just be careful. A cleaner idea that respects the budget:
+
+What if instead of adding a third branch, I simply use IMG_SIZE=224 for the tight crop and keep 160px... no wait, e002 timed out with both at 224? No - e002 only changed IMG_SIZE to 224. Both crops were 224x224 in e002.
+
+Let me reconsider: what if I keep one crop at a higher resolution and drop the wide crop? Like:
+- Tight crop at 160px (fine texture) + Wide crop at 320px... no, worse.
+
+Actually, you know what? Let me think about this differently. What is the most promising direction that addresses the root cause efficiently?
+
+The problem is pore-deposit confusion on small boxes. The two-crop system gives context but not enough detail for tiny defects. 
+
+What about: increase resolution of the TIGHT crop only to 256px, keep the wide crop at 160px? That's ~1.6x total compute vs 2x for e002. Hmm, still risky.
+
+Alternatively, what about using a different backbone that handles high-res better? No - timm has no such thing in the allowed list.
+
+OK let me think about the budget more carefully. The current run:
+- Loading: 13s (images) + ~5s (data prep?)
+- Training: ~107s for 433 steps
+- Prediction: ~10s
+
+The training time includes: DataLoader, forward/backward, and the two-crop generation. If I add a detail crop for small boxes:
+- Each small box gets one extra resize (80x80 → this is actually cheaper than 160x160!)
+- Actually, the resize to smaller size is CHEAPER. So the detail crop adds only ~30-50% of a crop's cost for small boxes.
+
+Wait, that's an important point! The current code creates two crops at IMG_SIZE=160 each. A detail crop at 80x80 would be cheaper than one of those. So the extra cost is: (extra_crop_cost + extra_forward_cost) which is less than one full forward pass.
+
+Actually, for the small boxes:
+- Forward cost with 3 branches vs 2 branches: ~1.5x per sample for that batch
+- But only ~33% of samples get 3 branches
+- DataLoader overhead increases by maybe 40% for those samples
+
+Hmm, this is getting complicated. Let me just propose the change and be conservative about time. If I keep the detail branch small (80px), it should be manageable. And I can reduce batch size slightly if needed.
+
+Actually, wait. Let me reconsider the whole thing. There's a cleaner idea that I think is better:
+
+**Idea: Use the wide crop as the "base" and make it bigger for small boxes.** No...
+
+**Idea 2: Train on all crops but combine them at higher resolution.** No...
+
+**Idea 3 (BEST): The two-crop system has redundant information. For large boxes, the tight crop already contains enough. The problem is ONLY small boxes. What if I simply increase IMG_SIZE to 224 for ALL boxes but also reduce the number of training epochs/boxes? No...**
+
+Actually, let me just do the straightforward thing: **Increase resolution to 224px for all boxes (like e002) but reduce the time cost by making it a single forward pass per view.** Wait, e002 already did that. It just timed out because the cost ~doubled.
+
+OK here's the thing - what if I reduce the wide crop to 192px instead of 224px? Then:
+- Tight: 224x224, Wide: 192x192
+- Average pixel increase vs current: (224² + 192²) / (160² + 160²) = (50176 + 36864) / 51200 = 1.68x
+- That's manageable within the budget (e002 was ~1.95x for both at 224).
+
+Hmm, but I don't think the resolution increase is what I should be focusing on. Let me reconsider what actually matters:
+
+The truth: "mAP@0.5 if every box had its correct class but kept your scores: 0.7461 (yours: 0.6288)." The wrong-class assignment is the biggest loss. But e001 said this costs ~0.012... no wait, e001's hypothesis was wrong. Let me re-read.
+
+Actually from the "Lessons so far" table, the current best is e000 at 0.6288. And the diagnostics show the class assignment error (wrong classes) costs ~0.117 mAP relative to having perfect classes with your scores (0.7461 vs 0.6288).
+
+So my main target should be improving the class assignment on boxes that overlap true defects. The pore-deposit confusion is key. 
+
+Let me think about what actually improves this:
+1. More context → for small boxes, context matters a lot
+2. More detail (higher resolution) → helps with fine texture differences
+
+Actually, here's a thought that might be better than either: **The two-crop system averages logits from 1.5x and 2.5x views.** What if the tight crop is too restrictive for small boxes (they're mostly background) and the wide crop is too big? 
+
+Wait, actually - there's a much simpler and potentially better idea I haven't considered: **what if I use the detector's bounding box more accurately?** The current crops are centered on the box with padding. For a tight box, the defect fills most of the crop but with context. Actually no.
+
+Let me go back to basics. The reference says:
+- "A crop classifier given perfect boxes reaches macro-F1 ~0.87 with the starting recipe (two-crop input)"
+
+So the two-crop input is already decent for classification (macro-F1 0.87). But it's only achieving that on PERFECT boxes. On detector boxes it's much worse. Why? Because detector boxes include:
+1. Wrong classes → can't fix with better classifier
+2. False alarms → these hurt recall
+3. Misplaced boxes → the classifier sees different content
+
+Hmm wait, but the diagnostics show the class assignment error is on "detector boxes that overlap a true defect by IoU > 0.5" - so these are GOOD boxes (overlapping real defects), just misclassified. This is a pure classification problem: given a cropped image of a defect, predict the right class. The two-crop classifier achieves ~0.87 macro-F1 on perfect boxes but much less here?
+
+Actually, the 63% pore-right, 78% deposit-right rates ARE the macro-F1 essentially (weighted by class). So where does the 0.87 come from? Let me re-read: "A crop classifier given perfect boxes reaches macro-F1 ~0.87 with the starting recipe (two-crop input)."
+
+Hmm, maybe the 0.87 is on a different metric or dataset split? Or maybe the two-crop classifier in that experiment was trained differently? I can't verify this without running.
+
+OK, let me focus on what's actionable:
+- Small boxes are hardest (80% vs 93%)
+- Pore and deposit are hard (63%, 78% vs 96%, 88%)
+- e002 with IMG_SIZE=224 timed out
+
+Given that, my plan: Increase the effective resolution for small boxes only. This targets the worst-performing category at minimal extra cost.
+
+Actually, I just realized something important about my earlier "detail" idea. Let me reconsider whether it's even right. For a small box of size 32px:
+- Tight crop (1.5x) = 48px → resized to 160px. The defect fills ~48/160 = 30% of the image.
+- If I add an 80px detail crop, the defect still fills 48/80 = 60% of the image. This gives MORE pixels per unit area but less context.
+
+The problem is that for a 48px crop resized to 160px, upsampling by ~3.3x doesn't actually give you more detail - it just makes the existing 48px features bigger. The real information content is still from the 48px original. So resizing to 224px would only help with the *upsampled* version's feature scale... Actually, this is an important point! 
+
+When you take a 48px crop and resize to 160px or 224px, the number of pixels representing the defect stays ~48x48. So increasing IMG_SIZE doesn't help for small boxes at all! The extra resolution just adds more background pixels.
+
+Wait, that's a crucial insight. Let me reconsider:
+- Small box: 32px actual size
+- Tight crop: 1.5x = 48px → the defect is ~48px in a 160px image
+- If I make the tight crop 3x instead of 1.5x: 96px → the defect fills 96/160 = 60% of the image
+- OR if I increase IMG_SIZE to 224 with 1.5x context: still only 48px of defect in 224px image
+
+So for small boxes, the solution is NOT increasing IMG_SIZE - it's making the crop tighter (or bigger!) relative to the box. Wait, "tighter" means smaller context? No...
+
+Actually, let me re-read the code:
+```python
+side = max(max(r["x2"] - r["x1"], r["y2"] - r["x1"]) * context, MIN_CROP)
+```
+For a 32px box with TIGHT_CONTEXT=1.5: side = 48px. This is the crop size BEFORE resizing to IMG_SIZE. The defect in the crop is ~32-48px (filling most of the 48px crop). Then it's resized to 160x160.
+
+So for small boxes, the tight crop ALREADY fills the image well - the issue is that after resizing to 160px, the defect is only ~32-48px out of 160px, meaning ~30% of the image pixels. 
+
+For LARGE boxes (say 200px), tight crop = 300px → resized to 160px. The defect fills the whole image.
+
+So actually, for large boxes, the defect is tiny relative to the image size when cropped at 1.5x... no wait, that's wrong too. Let me think again:
+- A box of 200px wide, tight crop = 300px side → resized to 160px → defect fills ~200/160 > 100% (clipped), so the whole image is mostly defect. Good - plenty of detail.
+- A box of 32px wide, tight crop = 48px side → resized to 160px → defect fills ~32/160 = 20% of the image. Bad - not enough pixels for the classifier.
+
+So the issue is: **for small boxes, the relative resolution is too low.** The fix should be to make the crop bigger relative to the box for small boxes! I.e., use a LARGE_CONTEXT for the tight crop on small boxes.
+
+But that's basically what the wide crop (2.5x) does... except for large boxes the wide crop already has enough detail.
+
+Hmm wait, so here's my real insight: **For small boxes, the "tight" crop is too small and the "wide" crop is too big.** What we want is a MEDIUM crop that fills the image well!
+
+So the fix might be: for small boxes (tight crop side < some threshold), use a bigger context for the tight crop (e.g., 2x or 3x) instead of 1.5x, and keep the wide crop at 2.5x. For large boxes, use 1.5x and 2.5x as before.
+
+Actually wait - that's still not efficient because for a small box, a 2.5x crop is already used as the "wide" crop. So for small boxes, we'd have two identical crops (both 2.5x)? That doesn't help.
+
+Hmm. OK so what if for small boxes I use:
+- Crop 1: tight at 1.5x context
+- Crop 2: medium at 3x context  
+- Crop 3: wide at 2.5x context? No, that's worse than 3x.
+
+Actually, the cleanest idea: **For small boxes, use three crops: 1.5x (tight), 2.5x (medium), 4x (wide).** But that's expensive and 4x might be too much context.
+
+Hmm, let me simplify. The real issue is: for small defects, the classifier needs ~30%+ of the image to be the defect to classify it well. 
+
+Alternative cleaner idea: **Increase the tight crop context from 1.5 to 2.0x for all boxes.** This makes the tight crop bigger (more context around the defect) which should help small boxes more than large ones, and costs almost nothing extra since I can just change one constant!
+
+Wait, but does that actually help? Let me think:
+- Small box (32px): tight 1.5x → 48px vs tight 2.0x → 64px. The defect fills 32/48 = 67% vs 32/64 = 50%. Actually MORE context helps the classifier see more of the defect and less background!
+- Large box (200px): tight 1.5x → 300px → 67% of image is defect. tight 2.0x → 400px → resized to 160px, defect fills the whole image either way.
+
+So for small boxes, increasing context makes the crop bigger relative to the image size after resizing... wait no. I'm confusing myself.
+
+OK let me be very careful:
+- The crop is cropped at `side` = box_size * context, then RESIZED to IMG_SIZE x IMG_SIZE (160x160).
+- So the content scales to fill the output regardless of original size. A 48px crop and a 300px crop both become 160x160. The difference is:
+  - 48px crop resized to 160: the defect (32px) becomes ~107px in the output? No wait - if you resize a 48x48 image to 160x160, every pixel gets upscaled by 3.33x. So a 32px defect becomes ~107px wide in the 160px output! It fills the image!
+  
+OH WAIT. That changes everything. If you crop a 48px region and resize to 160px, the defect inside it gets LARGER, not smaller. So for small boxes, the tight crop at 1.5x (48px side) when resized to 160px would make the ~32px defect become ~107px wide - filling most of the image!
+
+Hmm, so then why are small boxes harder? Let me reconsider... Maybe the issue is:
+1. The crop has padding/gray areas if the box is at the image edge (canvas with 114 fill)
+2. Or the small box definition is about area thirds and includes very small boxes that are hard to see even when cropped
+
+Actually, I think the real answer might be different: for a SMALL box in the detector, there's less context around it to disambiguate. Pore vs deposit might look similar up close but differ with more context. Also, "small" defects (1/3 of area) are harder because... hmm.
+
+Actually wait - I wonder if the "small" boxes in the diagnostics include cases where the detector box is smaller than the actual defect? If the detector's box is only 50% of the true defect and it's already tiny, then even with perfect cropping we see less of the defect.
+
+Let me re-read: "Share of those boxes with the right class, by defect size (area thirds): small 80%, medium 91%, large 93%". This is "defect size" - probably the true defect's area. So small TRUE defects have 80% accuracy vs large TRUE defects at 93%.
+
+The reason small true defects are harder:
+1. Less information (they literally have fewer pixels in the crop)
+2. More likely to be partially covered by padding
+3. The detector box might miss part of them
+
+If the true defect is 30px and the detector box is ~40px, the tight crop at 1.5x = 60px → resized to 160px. The defect fills ~30/60 = 50% of the cropped region, which becomes 85px of the 160px output. That's plenty!
+
+Hmm so why is it 80%? Maybe the noise in the image (weld bead texture) makes small features harder to distinguish when they're only ~30x30 pixels even after upsampling. The classifier needs enough pixels to learn fine texture distinctions between pore and deposit.
+
+OK, I think I'm overanalyzing this. Let me just propose a concrete, time-safe experiment. Given the evidence:
+- Small defects (small boxes) are hardest → 80% vs 93%
+- Pore (63%) and deposit (78%) are the hardest classes
+- e002's IMG_SIZE=224 idea timed out
+
+**Best idea**: Increase the tight crop context from 1.5 to 2.2x for ALL boxes (cheap: just change one constant). This gives small boxes more surrounding context, which should help distinguish pore/deposit/stain by giving more visual information per object without changing resolution. But wait - I said this costs nothing extra since it's the same IMG_SIZE...
+
+Hmm actually no! Increasing TIGHT_CONTEXT from 1.5 to 2.2x means:
+- The crop side is larger (more pixels around the box)
+- The defect is smaller relative to the crop
+- When resized to 160px, this should be fine computationally
+- But it reduces the defect size in the output image for small boxes! That makes them harder, not easier!
+
+I keep confusing myself. Let me just think about what "more pixels per defect" means:
+- If the true defect is ~40px and the tight crop is 60px (1.5x of 40px), resized to 160px → the defect fills ~107px of 160px in the output.
+- If the tight crop is 120px (3x of 40px), resized to 160px → the defect still fills ~107px of 160px in the output!
+
+No matter what context I use, after resizing to 160px, a defect of size X in a crop of side S fills (X/S)*160 px. The KEY is X (the actual defect size), not the context.
+
+So for small defects, increasing the context doesn't help because the output resolution is fixed at 160x160 and the defect gets upscaled to fill the image anyway!
+
+Hmm wait, that's only true if the crop is large enough to contain the whole defect. If the tight crop is SMALLER than the defect... Let me re-read: `side = max(max(box_w, box_h) * context, MIN_CROP)`. So for a box of 32px with context 1.5 → side=48px. The box (and presumably the defect inside it, since detector boxes should cover defects) fits in the 48px crop.
+
+So when resized to 160px, a 48px crop becomes 160px and whatever was inside gets upscaled proportionally. So a 32px defect → ~107px in the output. That's plenty!
+
+Then WHY are small boxes harder?! Maybe:
+1. The "small" box refers to the TRUE defect being small, but the detector box might be much bigger or smaller
+2. Or maybe small true defects mean the DETECTOR is less accurate at localizing them, so the crops are misaligned
+3. Or maybe there's more noise relative to signal for small features
+
+I think it's #2: for small true defects, the detector boxes are probably worse (less precise), so the crop might be off-center or too bigThinking budget reached. Stop thinking now and write the reply in the required format.
+===== attempt 3 =====
+I need to apply my edits carefully. Let me check what actually needs changing vs what I wrote incorrectly. The issue is I need to make sure each SEARCH block appears exactly once in the current file and the REPLACE makes sense.
+
+Let me look at the current best file more carefully and construct a proper diff.
+
+Key changes:
+1. Add SMALL_SIZE = 80 and MAX_TIGHT = 32 constants
+2. Add make_detail_crop function
+3. Change BoxDataset.__getitem__ to return 4 views when detail is needed (but the training loop currently unpacks xt, xw, y - I need to change that)
+4. Change training to use xt, xw, xd, y
+5. Change eval to handle detail
+
+Wait, I made errors in my previous reply:
+- The SEARCH blocks for the BoxDataset changes weren't correct
+- I changed the training loop but kept it unpacking 3 variables which will crash
+- I need to make sure all SEARCH texts appear exactly once in the file
+
+Let me be more careful. The dataset currently returns 2 views (tight + wide). I want to return either 2 or 3 views depending on whether detail is needed. That's problematic for a DataLoader. Better approach: have the dataset always return 3 views but only use the third when available? No, that won't work well since for non-small boxes, we'd need to know not to use it.
+
+Actually simpler approach: separate the small boxes into their own dataset or handle in the collate. But DataLoader needs consistent batch shapes.
+
+Alternative cleaner approach: Always produce 3 views but the detail view is computed on demand. For large boxes, I could set a flag. Actually let me restructure so the dataset returns (tight, wide) and separately (detail) where detail can be None or an empty tensor. But then collation fails.
+
+Better approach: Make the dataset always return 3 tensors, where for non-small boxes, the third view is a dummy (all ones or zeros). Then in training/eval, only average the three when it's real... but that changes the scoring logic.
+
+Actually simplest: two separate datasets/models? No, too complex.
+
+Let me reconsider. The cleanest approach: modify __getitem__ to return 3 views always, where for large boxes the third is a "null" view (e.g., all ones). Then in the loss and prediction, only use it if a mask says so. But I need to pass that mask through.
+
+Actually, let me simplify: since detail is needed only for small boxes, and the current code has `views = []` list, I can return `views[0], views[1], view2` where view2 is either the detail crop or a placeholder.
+
+Wait - actually the simplest and most robust approach given the constraints: 
+
+Option A: Return (tight, wide) for large boxes and (tight, wide, detail) for small boxes - but DataLoader needs consistent output format. I can use a custom collate function that pads to 3 views with dummy values.
+
+Actually let me reconsider the whole approach. Maybe simpler: since the detail branch is only needed for small boxes, and small boxes are the minority, I could:
+1. Train on all boxes with 2 views (tight + wide) - same as current best
+2. At inference, for small boxes, also run a separate model/branch? But we need training labels for the detail branch to learn.
+
+Hmm, but actually the problem is that in my previous edit I tried to change too much. Let me think about what's minimal:
+
+Actually, re-reading the current best code, it returns `views[0], views[1], r.get("cls", -1)` from __getitem__. I could make it return 4 items always when detail is used... no.
+
+OK here's a cleaner idea: I'll create a wrapper that handles the case. But actually the cleanest minimal edit is:
+
+In __getitem__, if detail is needed, return (tight, wide, detail, cls) else (tight, wide, None-ish, cls)?
+
+The DataLoader will fail on None. Let me use a custom collate_fn that pads the third view with zeros and also passes a mask. But I need to pass the mask through to the loss.
+
+Actually, you know what, let me simplify: I'll just have __getitem__ ALWAYS return 3 views (tight, wide, detail) where for large boxes the detail is a duplicate of the tight view (or a zero tensor). Then in the model, I average all three when detail_mask is True. But wait, if detail is a duplicate of tight for large boxes, then averaging gives the same result as using just one... but I need to distinguish which ones should use it.
+
+Hmm, actually here's an even simpler idea: since the goal is to help SMALL boxes get better detail, and the current code already averages tight + wide, I could simply ADD a third view that is always the tight crop at 160px? No wait...
+
+Let me re-think. What if instead of a separate branch, I just always use 3 views: tight(160) + wide(160) + detail for ALL boxes where detail = original box crop resized to 80? That way, every box gets the extra resolution, and the model learns to use it. Then at eval, I do the same. This avoids all the complexity of conditionally returning different numbers of views!
+
+Actually, that's a good simplification: always produce 3 views (tight@160, wide@160, detail@80). The detail view is centered on the box with side = max(min(w,h), MIN_CROP)*0.95 for tight context... wait no, I need to define what detail means.
+
+Let me reconsider: "detail" view should be a higher-resolution crop of the defect region itself (not context-extended). So:
+- Tight view: box expanded by 1.5x context, resized to 160
+- Wide view: box expanded by 2.5x context, resized to 160  
+- Detail view: the raw box region (or slightly expanded) at 80px resolution
+
+For all boxes. Then average logits from all three.
+
+This is simpler than conditional logic and gives small boxes extra pixels uniformly. Let me implement this.
+
+So __getitem__ returns (tight, wide, detail) always. The training loop unpacks xt, xw, xd, y. At eval, same.
+
+Wait, but the current code's __getitem__ returns 3 values: `views[0], views[1], r.get("cls", -1)`. If I add a third view, it becomes 4 values (3 views + cls). That's fine as long as I update the DataLoader handling and the unpacking.
+
+But wait - there's an issue with the current eval loop: `for xt, xw, _ in dl_ev:` unpacks only 3. If I always return 3 views + cls, I need to unpack 4 items.
+
+Let me write this carefully now.
+
+Actually, let me reconsider even further. The simplest edit that gives a clear benefit: make the "detail" view part of the standard pipeline for ALL boxes at both train and eval. This avoids any conditional logic in the dataset.
+
+Here's my plan:
+1. Add SMALL_SIZE = 80 constant
+2. Modify make_crop to always create a detail crop
+3. In __getitem__, return 4 values: (tight, wide, detail, cls)
+4. Update training loop to unpack xt, xw, xd, y and average all three logit outputs
+5. Update eval loop similarly
+
+This is cleaner than conditional logic. Let me write it properly.
+
+Actually wait - I realize the issue. If I always use 3 views including detail, then for large boxes this adds compute but might not help much. The key insight is that small boxes benefit most from extra resolution on the defect itself. So a conditional approach would be more efficient. But the conditional approach creates a DataLoader format problem.
+
+Actually, let me solve the conditional problem properly: I'll make __getitem__ always return 4 values where the detail view for large boxes is just a zero-filled tensor of shape (1, SMALL_SIZE, SMALL_SIZE) - no wait, that could hurt performance if the model learns to weight it. Actually zeros might be fine as long as the model learns that... hmm, risky.
+
+Better: use a custom collate function that returns batches and a mask. This is getting complex for a "simple edit".
+
+Let me go back to basics. The most robust and simple approach given the time budget: always produce 3 views (tight@160, wide@160, detail@80) for ALL boxes at train and eval. Compute cost: an extra 80x80 crop per box - that's roughly equivalent to adding a view between tight and wide in terms of compute (since 80² vs 160² = 0.25 of one view). So total compute increases by about 30-40% vs the current two-view setup, but less than the third view at 160px that was tried before.
+
+Actually wait - e003 already added a "third, very wide view (4x)" which cost +20s per run and got accepted (+0.005 mAP). So I have room for some extra compute.
+
+Let me estimate: current run is 162s with 2 views. Adding one more view at 80px (smaller than 160) might add ~15-20s. That should be OK if I keep RESERVE_S=55 or reduce it slightly. Actually let me check the timing: epoch 4 finished at 125s with 2 views, and prediction took ~37s. So total was 162s. Adding a view would add maybe 20-25s. Let me set RESERVE_S=45 to be safe.
+
+Actually, let me reconsider the design. The key question is: what does the "detail" view look like and what's its purpose?
+
+My proposal: detail view = the box itself (without context expansion) or slightly expanded, at SMALL_SIZE=80px resolution. This gives high-resolution texture of the defect for small boxes while large boxes still get the tight and wide views. Averaging all three logits.
+
+Wait, but if I use this for ALL boxes, then for large boxes, the detail view is redundant with the tight view (which already includes some context). Hmm. Actually for a 160px tight view of a large box, the box fills most of it anyway. So the detail view would be ~redundant for large boxes but still give extra pixels.
+
+Alternatively - and this might be better - I could make the detail view ONLY appear when the box is small (side <= MAX_TIGHT). To handle the DataLoader issue cleanly, I'll use a custom collate function that pads.
+
+Actually you know what? Let me just do it simply: always 3 views. For large boxes, the detail view is computed as min side * some factor, but it's still useful as a "high-res crop of the region". The benefit for small boxes is clear; for large boxes it's marginal but not harmful.
+
+Actually wait - I just realized something important from the history: "Third, very wide view (4x the box) next to the 1.5x and 2.5x crops, logits averaged | 3 | accepted twice (5-seed 0.6342 both, +0.005), gain almost entirely from the pore class". So a third crop that was tried got +0.005 on validation but only for pore. My change is different in kind: a high-resolution crop instead of another wide view.
+
+OK let me now write the actual code changes properly and carefully. I need to make sure each SEARCH block appears exactly once in the current file.
+
+Let me list the edits:
+1. Add SMALL_SIZE constant (in settings)
+2. Add make_detail_crop function after make_crop
+3. Modify __getitem__ to return 4 values (tight, wide, detail, cls) - need exact match
+4. Update training loop unpacking and loss computation
+5. Update eval loop unpacking
+
+Let me check the current file content again for exact text matching:
+
+Current relevant snippets:
+```python
+IMG_SIZE = 160
+CONTEXT = 2.5           # wide crop: side = CONTEXT * long side of the box
+TIGHT_CONTEXT = 1.5     # tight crop
+MIN_CROP = 16
+```
+
+For make_crop, the current code is:
+```python
+def make_crop(img, r, context, train):
+    h, w = img.shape[:2]
+    cx, cy = (r["x1"] + r["x2"]) / 2, (r["y1"] + r["y2"]) / 2
+    side = max(max(r["x2"] - r["x1"], r["y2"] - r["y1"]) * context, MIN_CROP)
+    if train:  # light geometric jitter
+        cx += random.uniform(-0.1, 0.1) * side
+        cy += random.uniform(-0.1, 0.1) * side
+        side *= random.uniform(0.85, 1.2)
+    s = max(2, int(round(side)))
+    x0, y0 = int(round(cx - s / 2)), int(round(cy - s / 2))
+    canvas = np.full((s, s, 3), 114, dtype=np.uint8)  # gray padding outside the image
+    sx0, sy0, sx1, sy1 = max(0, x0), max(0, y0), min(w, x0 + s), min(h, y0 + s)
+    if sx1 > sx0 and sy1 > sy0:
+        canvas[sy0 - y0:sy1 - y0, sx0 - x0:sx1 - x0] = img[sy0:sy1, sx0:sx1]
+    return np.asarray(Image.fromarray(canvas).resize((IMG_SIZE, IMG_SIZE), Image.BILINEAR), dtype=np.float32) / 255.0
+```
+
+For __getitem__:
+```python
+    def __getitem__(self, i):
+        r = self.rows[i]
+        img = self.images[r["image"]]
+        fh = fv = bright = 1.0
+        if self.train:  # same flips and brightness for both views
+            fh, fv, bright = random.random() < 0.5, random.random() < 0.5, random.uniform(0.8, 1.2)
+        views = []
+        for ctx in (TIGHT_CONTEXT, CONTEXT):
+            x = make_crop(img, r, ctx, self.train)
+            if fh:
+                x = x[:, ::-1]
+            if fv:
+                x = x[::-1, :]
+            if self.train:
+                x = np.clip(x * bright, 0, 1)
+            x = (x - MEAN) / STD
+            views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))
+        return views[0], views[1], r.get("cls", -1)
+```
+
+For training loop:
+```python
+    while not done:
+        tot, nb = 0.0, 0
+        for xt, xw, y in dl_tr:
+            frac = min(1.0, (time.time() - t_start) / budget)
+            f = frac / 0.05 if frac < 0.05 else 0.5 * (1 + math.cos(math.pi * (frac - 0.05) / 0.95))
+            for pg in opt.param_groups:
+                pg["lr"] = LR * max(f, 1e-3)
+            xt = xt.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            xw = xw.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            y = y.to(device, non_blocking=True)
+            with torch.autocast(**amp):
+                loss = crit((model(xt) + model(xw)) / 2, y)
+```
+
+For eval loop:
+```python
+    probs = []
+    with torch.no_grad(), torch.autocast(**amp):
+        for xt, xw, _ in dl_ev:
+            xt = xt.to(device).to(memory_format=torch.channels_last)
+            xw = xw.to(device).to(memory_format=torch.channels_last)
+            probs.append(torch.softmax(((model(xt) + model(xw)) / 2).float(), 1).cpu())
+```
+
+OK, now let me write the changes. I'll go with always-3-views for simplicity and robustness. Let me define:
+
+For ALL boxes: tight@160 (1.5x context), wide@160 (2.5x context), detail@80 (box itself at 80px).
+The detail view should be centered on the box with side = max(min(w,h), MIN_CROP) * 0.95 or something? Actually for consistency let me just use the box center and a fixed size.
+
+Wait, I want to reconsider: should detail always be included, or only for small boxes?
+
+Given the history shows that adding a third view helped (+0.005 on pore), and given that the "details" view is computationally cheap (80x80 = 6400 pixels vs 160x160=25600), including it for all boxes costs about +25% more compute in the model but I think there's enough margin.
+
+Actually, let me reconsider and go with conditional to be smarter:
+- For small boxes (tight side <= MAX_TIGHT): include detail
+- For large boxes: don't include detail
+
+But this breaks the DataLoader uniformity... unless I use a custom collate that handles it. 
+
+Hmm, actually there's another way: I can have __getitem__ return a variable-length tuple, and use a custom collate that pads. But then the training loop needs to know which ones are valid.
+
+You know what - simplicity wins here. Let me just always include 3 views. For large boxes, the detail view at 80px is essentially a "zoom" of the tight view region with less context, and it might actually help by giving higher resolution for ALL defect sizes (since the tight view at 160px downsamples the original box which might be larger than 160px).
+
+Wait, that's a good point! For a large box (say 200px in one dimension), the tight crop at 1.5x context would be ~300px then resized to 160px. The actual defect is being downsampled by 2x. A detail view at 80px of just the box region preserves the original resolution better for small boxes but for large boxes...
+
+Hmm actually let me think about this differently. What does "detail" mean? It should be a high-resolution crop of the defect region itself (not context-expanded). 
+
+Let me define:
+- Detail view side = max(min(w,h), MIN_CROP) * 0.95 at SMALL_SIZE=80 resolution, centered on box.
+
+For a box that's already small (say 32px), detail view = 32px region at 80px resolution (upsampled).
+For a box that's large (say 100px), detail view = 100px region at 80px resolution (slightly downsampled).
+
+This gives the model high-resolution texture of the defect region regardless of size, plus context from tight and wide views. That seems like a solid design.
+
+Actually wait - I just realized there might be an issue with how the current code handles small boxes. Let me check: MIN_CROP=16 means the tight crop is at least 16px (at 1.5x context) then resized to 160. For a very small box (say 2px), the tight crop is 3px at 160px resolution - the defect barely occupies any pixels. That's why small boxes are harder.
+
+So my detail view for small boxes = box region at 80px, which would be much better than the tiny 3px in the 160px image! This is exactly what we need.
+
+OK so let me finalize:
+- Add SMALL_SIZE=80 constant
+- Add detail crop function
+- In __getitem__, always return (tight, wide, detail, cls) - i.e., 4 values
+- Update training and eval loops to use all three
+
+Wait, I want to double-check: is there a risk that including a detail view for ALL boxes hurts? The detail view is at 80px while tight/wide are at 160px. The model sees it as just another crop - the averaging should handle it reasonably. And the empirical evidence (third wide view helped +0.005) suggests extra views help on average.
+
+Also I need to update RESERVE_S since we're adding compute. Let me check: current total was 162s with RESERVE_S=55. Adding ~30% more model compute in the forward pass during training (which is now dominated by the second view... wait actually let me think about what dominates).
+
+Current timing: epoch 4 at 125s, so training for 5 epochs took ~110s. Prediction took ~37s.
+If I add a detail view, model forward pass time increases by maybe 30-50% (since there are 3 views instead of 2, and the first two are the same as before). Actually the detail view at 80px should be faster than a 160px view... so maybe total increase is ~20-30%. So training time might go from 110s to ~140s. Plus prediction would go from 37s to ~50s. Total ~190s, which exceeds the 180s budget with RESERVE_S=55.
+
+So I should reduce RESERVE_S from 55 to maybe 40 to be safe. That gives a total of ~185s estimated, but let me be more conservative and use RESERVE_S=35 or so. Actually wait - the current run finished at 162s with 55s reserve. If I add ~30s compute, that's 192s > 180s. Let me set RESERVE_S=30 to be safe (so deadline-55 becomes deadline-30... wait no).
+
+Actually: t_end = deadline - RESERVE_S. Currently t_end is when training stops. Total was 162s, so the reserve of 55s means t_end = 180-55 = 125s, and we hit t_end at ~125s (epoch 4 ended at 125s). So training actually ran until 125s.
+
+If I add the detail view and estimate +30s of compute for training+prediction combined, then I should set RESERVE_S=60 to keep the same margin... no wait, that reduces training time.
+
+Let me recalculate: If total is now ~192s and budget is 180s, I'm over by 12s. So I need to reduce training time by 12s+. Setting RESERVE_S=70 would give t_end = 110s, meaning less training (fewer epochs).
+
+Hmm, actually the timing breakdown was:
+- Load: 13s
+- epoch 0: 59s (60s)
+- epoch 1: 77s (wait - these are cumulative!)
+
+No wait, looking at the log: "epoch 0: loss ..., 94 steps, 59s" means at end of epoch 0, 59s elapsed. "epoch 1: ... 77s" means at end of epoch 1, 77s elapsed. So each epoch takes ~18s after the first one (which took 59s including loading).
+
+Actually: epoch 0 ended at 59s. epoch 1 ended at 77s → epoch 1 took 18s. epoch 2: 95s → 18s. epoch 3: 114s → 19s. epoch 4: 125s → 11s. Then prediction until 162s = 37s.
+
+So total training time (epochs 0-4) ≈ 112s, prediction 37s, load 13s. Sum = 162s.
+
+If I add detail view: model forward increases by ~30% for both train and eval. Training was mostly model compute (the DataLoader overhead is probably small). So training might go from 112s to ~145s, prediction from 37s to ~50s. Total ~197s. That's over budget!
+
+To stay under 180s, I should reduce RESERVE_S from 55 to about 35, which would make t_end = 145s... but wait, that assumes training runs until t_end. If I set RESERVE_S=35, then t_end=145s and training stops at 145s, leaving only 35s for prediction - might be tight with 50s needed.
+
+Actually, let me reconsider the compute estimate. The detail view is at 80x80 vs 160x160 for the others. So it's about 1/4 the cost of one view. With 3 views instead of 2, total model compute = 1 + 1 + 0.25 = 2.25x base vs 2x base = +12.5% increase.
+
+So training: 112s → 126s. Prediction: 37s → 42s. Total: 185s. Still slightly over 180s with RESERVE_S=55 (t_end=125s, but training would need to stop at ~126s... very tight).
+
+Let me set RESERVE_S=30 to be safer (t_end=150s), leaving ~30s for prediction. But wait - with 3 views the eval might also slow down... I estimated +12.5% so let me double check: train had 5 epochs, each epoch is ~112/5 ≈ 22s → with 12.5% increase = 25s per epoch → total 128s. Eval prediction was 37s → 42s. Load 13s. Total = 128+42+13 = 183s. Still over!
+
+OK so I should either:
+1. Reduce RESERVE_S to make t_end earlier (but that reduces training time)
+2. Or accept that this might be slightly over budget
+
+Actually, let me reconsider the timing of epoch 0 vs others. Epoch 0 took 59s because it includes loading time (13s). So per-epoch time is: (162 - 13 - 37)/5 ≈ 12.4s/epoch. With 12.5% increase = ~14s/epoch → 5 epochs = 70s. Plus load 13s + eval 42s = 125s total. That's under 180s!
+
+Wait let me recount: epoch 0 ended at 59s (including load). epoch 1 ended at 77s → so epochs 0+1 took 77s. Actually the log says "epoch 0: ... 59s" and "epoch 1: ... 77s". So after epoch 0: 59s. After epoch 1: 77s. So epoch 1 alone took 18s.
+
+Hmm but wait - epoch 0 included the load time (13s) so the actual model time for epoch 0 was ~46s. But that seems inconsistent with later epochs taking 18s each... unless epoch 0 had additional warmup overhead.
+
+Actually looking more carefully: "epoch 0: loss 0.7217, 94 steps, 59s" - this means after epoch 0, 59s have elapsed. Then "epoch 1: ..., 188 steps, 77s" - after epoch 1, 77s. So epoch 1 took 77-59 = 18s. And epoch 0 took ~46s including loading (but actually it's the model time + DataLoader startup).
+
+Actually you know what, let me just be conservative and use RESERVE_S=30. With that:
+- t_end = 180 - 30 = 150s
+- Training runs until 150s
+- Given each epoch after the first takes ~18-20s (with 12.5% increase ≈ 20-22s), and epoch 0 with load is ~60s...
+
+Hmm this is getting complicated. Let me just estimate: if I reduce RESERVE_S to 30, that means training stops at 150s. Currently training stopped at 125s (epoch 4 ended). With the extra compute, I'd expect t_end hit around 150-160s which is similar epochs (~5-6).
+
+Actually, let me just set RESERVE_S=30 and accept the change. The safety margin of 30s should be adequate given my estimate of ~185s total with the extra view (which I think is conservative - probably more like 175s).
+
+Wait, actually I need to reconsider whether including detail for ALL boxes is the right design decision vs only small boxes. Let me think about the alternatives:
+
+Option 1 (all boxes): Simple, consistent DataLoader, no risk of format issues. Compute +12.5%.
+Option 2 (small boxes only): More efficient but requires custom collate handling. 
+
+Given that I'm at risk of timeout, and Option 1 is simpler/more robust, let me go with Option 1.
+
+Actually wait - one more consideration: the eval loop currently does `for xt, xw, _ in dl_ev:` which unpacks 3 values. If __getitem__ returns 4 values (tight, wide, detail, cls), then I need to update this to unpack 4 values. This is a small change.
+
+OK let me now write the actual SEARCH/REPLACE blocks carefully, ensuring each appears exactly once.
+
+Let me draft:
+
+Block 1: Settings - add SMALL_SIZE
+SEARCH:
+```
+IMG_SIZE = 160
+CONTEXT = 2.5           # wide crop: side = CONTEXT * long side of the box
+TIGHT_CONTEXT = 1.5     # tight crop
+MIN_CROP = 16
+```
+REPLACE:
+```
+IMG_SIZE = 160
+SMALL_SIZE = 80         # extra detail crop for small defects
+CONTEXT = 2.5           # wide crop: side = CONTEXT * long side of the box
+TIGHT_CONTEXT = 1.5     # tight crop
+MIN_CROP = 16
+```
+
+Block 2: Add make_detail_crop after make_crop
+SEARCH:
+```
+    return np.asarray(Image.fromarray(canvas).resize((IMG_SIZE, IMG_SIZE), Image.BILINEAR), dtype=np.float32) / 255.0
+```
+REPLACE:
+```
+    return np.asarray(Image.fromarray(canvas).resize((IMG_SIZE, IMG_SIZE), Image.BILINEThinking budget reached. Stop thinking now and write the reply in the required format.

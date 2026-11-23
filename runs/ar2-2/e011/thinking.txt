@@ -1,0 +1,338 @@
+===== attempt 1 =====
+Let me analyze the current situation carefully.
+
+Current best: e009 (5-seed val mAP@0.5 = 0.6387)
+- Architecture: single wide-crop (2.5×) EfficientNet-B0
+- Inference: TTA with horizontal flip
+- Training: GT crops (high + low) + matched detector boxes (IoU ≥ 0.5)
+- Scoring: conf × class_probability (4 rows per box)
+
+Per-class AP: pore 0.528, deposit 0.637, discontinuity 0.779, stain 0.611
+
+The ceiling is 0.758 mAP@0.5 (stage-1 boxes with perfect classes). So there's significant room for improvement.
+
+Key observations:
+1. Pore (0.528) and stain (0.611) are the weakest classes
+2. The classifier was trained on GT crops + matched detector boxes, but no background class
+3. Previous attempts: background class (e005) hurt, focal loss (e006) hurt, mixup (e007) hurt, prob² scoring (e004) hurt
+4. Single wide crop (e008) helped vs two-crop
+5. TTA (e009) helped slightly
+6. Smaller batch (e010) hurt
+
+What ideas are left?
+
+Let me think about what could help:
+
+1. **Scoring/ranking improvement**: The score is currently `conf * prob[c]`. The ranking matters for mAP. Maybe we can use a different scoring formula. But prob² was tried and failed. What about using `conf * prob[c] / (1 - bg_prob)`? No, we don't have a background class.
+
+2. **Architecture**: Try a different backbone. The list includes convnext_atto, convnext_nano, convnext_pico, efficientnet_b0, efficientnet_b2, mobilenetv3_large_100, regnety_016, resnet18, resnet26d, resnet34, resnet50, tf_efficientnetv2_b0. Currently using efficientnet_b0. Maybe efficientnet_b2 (larger) or convnext_nano? But larger models train slower. With the time budget, we might not get enough epochs.
+
+3. **Training data**: We're using GT crops + matched detector boxes. What about the unmatched detector boxes? They're false alarms. Adding them as a 5th class hurt (e005). But what if we use them differently - not as a class but as a data augmentation strategy?
+
+4. **Augmentation**: Current augmentations are: horizontal flip (50%), vertical flip (50%), brightness (0.8-1.2), geometric jitter in make_crop. What about color jitter, rotation, or other augmentations?
+
+5. **Inference**: Currently TTA with horizontal flip. What about vertical flip too? Or multi-scale TTA?
+
+6. **Scoring**: The current score is `conf * prob[c]`. What about using the max probability as a "confidence" multiplier? Or using a temperature-scaled softmax?
+
+7. **Training strategy**: What about training longer? The current budget allows ~2 epochs. What if we reduce the model size to train faster and get more epochs?
+
+8. **Data sampling**: Currently all training rows are used equally. What about oversampling the weak classes (pore, stain)?
+
+9. **Image resolution**: Currently IMG_SIZE = 160. What about 224 or 256?
+
+Let me think about what's most likely to help...
+
+The per-class APs show pore and stain are weak. The brief says "Pore and deposit are the weak classes; stain is often confused with deposit and background."
+
+Wait, actually the per-class numbers show: pore 0.528, deposit 0.637, discontinuity 0.779, stain 0.611. So pore is the weakest, then stain, then deposit, then discontinuity.
+
+Ideas I haven't tried:
+- **Oversampling weak classes**: Weight pore and stain samples more during training. This is different from class-weighted loss (which was tried and failed). Oversampling changes the distribution of what the model sees, not the loss function.
+- **Different backbone**: Try convnext_nano or efficientnet_b2
+- **Larger image size**: 224 instead of 160
+- **More TTA**: Add vertical flip
+- **Scoring with temperature**: Use temperature-scaled softmax to sharpen/soften probabilities
+
+Let me think about what's most promising...
+
+Actually, let me reconsider the scoring. The current score is `conf * prob[c]`. For mAP, what matters is:
+- True detections should score higher than false ones
+- Within a class, true detections should rank above false ones
+
+The `conf` from the detector is a fixed value. The `prob[c]` is the classifier's output. 
+
+What if we use `conf * prob[c] * (1 - max_other_prob)`? This would penalize boxes where the classifier is uncertain. But this is similar to prob² in effect...
+
+Actually, let me think about this differently. The issue is that false alarms (background boxes) get assigned some class by the classifier. If the classifier is confident about a wrong class for a background box, that's a false positive. The `conf` from the detector should help here - background boxes might have lower detector confidence. But the classifier doesn't know about "background."
+
+What about using the **margin** (max_prob - second_max_prob) as a confidence indicator? Or using `prob[c] / sum(probs)` (which is just prob[c] since they sum to 1)?
+
+Let me think about **oversampling weak classes**. This is a data/sampling change. The idea: pore and stain are underrepresented or harder to classify. By oversampling them, the model gets more exposure to these classes. This is different from class-weighted loss (which changes the loss function) - it changes the data distribution.
+
+Actually, let me look at the training data more carefully. We have:
+- 14128 GT crops (high + low res)
+- 12219 matched detector boxes
+- Total: 26347 boxes
+
+The class distribution might be imbalanced. If pore and stain are rarer, oversampling them could help.
+
+But wait - the brief says "Class-weighted loss hurt classification every time it was tried." Oversampling is a different mechanism but achieves a similar effect. It might also hurt. But it's worth trying since it's a different mechanism.
+
+Let me think about another angle: **the scoring formula**. 
+
+Currently: score = conf * prob[c]
+
+What if we use: score = conf^a * prob[c]^b for some a, b? We tried prob² (b=2) and it hurt. What about conf^0.5 * prob[c]? Or conf * prob[c]^0.5?
+
+Actually, the issue might be more subtle. Let me think about what mAP@0.5 actually measures:
+
+For each class c:
+- Sort all predictions of class c by score (descending)
+- For each prediction, check if it matches a ground truth of class c (IoU ≥ 0.5, not yet matched)
+- Compute precision-recall curve
+- AP = area under curve
+
+So the ranking within each class matters. A false positive of class c (a box that's actually background or another class) hurts the precision at high recall.
+
+The key insight: for a box that's actually a pore but the classifier says "stain" with high confidence, that's a false positive for stain AND a false negative for pore. The scoring needs to handle this.
+
+What if we use a **soft assignment** approach? Instead of one row per class, what if we weight the scores differently?
+
+Actually, we already output 4 rows per box (one per class). The scoring determines which class "wins" for each box in the ranking.
+
+Let me think about **training with a different strategy**. What about:
+- Training for more epochs by using a smaller/faster model
+- Using a learning rate schedule that's more aggressive
+- Using SGD instead of AdamW
+
+Actually, let me focus on something concrete. The current model trains for ~2 epochs. What if we try a smaller model (convnext_atto or convnext_pico) that trains faster, allowing more epochs? More training might help with the weak classes.
+
+Or what about **increasing IMG_SIZE to 224**? The current 160 might be too small for distinguishing pore from stain. But this would slow down training.
+
+Let me think about what's most likely to give a measurable improvement...
+
+Actually, I think **oversampling the weak classes** is a good idea. Here's why:
+1. It's a different mechanism from class-weighted loss (which failed)
+2. It directly addresses the weak pore and stain classes
+3. It's a focused change (just change the sampling in the DataLoader)
+4. It's in the "sampling" category
+
+The implementation: use a WeightedRandomSampler or manually create a weighted dataset. For pore and stain, sample them more frequently.
+
+But wait - I need to be careful. The DataLoader currently uses shuffle=True. To oversample, I'd need to either:
+1. Use WeightedRandomSampler
+2. Duplicate the weak class samples in the dataset
+3. Use a custom sampler
+
+Let me go with WeightedRandomSampler. I'll assign higher weights to pore and stain samples.
+
+Actually, let me reconsider. The brief says "Class-weighted loss hurt classification every time it was tried." Oversampling is functionally similar - it changes the effective class balance. It might also hurt. But the mechanism is different enough that it's worth trying.
+
+Hmm, but actually, let me think about a different angle. What about **the scoring formula**?
+
+Current: score = conf * prob[c]
+
+What if I try: score = conf * prob[c] / (1 + λ * (1 - prob[c]))? This would penalize low-confidence predictions more. But this is getting complicated.
+
+Or simpler: what about using **log(prob[c])** as a multiplier? No, that would make all scores negative.
+
+Let me think about **temperature scaling**. If I use a temperature T > 1 in the softmax (prob = exp(logit/T) / sum(exp(logit/T))), the probabilities become softer (closer to uniform). If T < 1, they become sharper. 
+
+Currently, the scoring is conf * prob[c]. If the classifier is uncertain (all probs ~0.25), then all 4 rows get similar scores, and the ranking is determined mostly by conf. If I use a temperature < 1, the max prob becomes higher and the others lower, which might help with ranking.
+
+But this is a bit of a shot in the dark. Let me think about what's most principled.
+
+Actually, I think the most promising untried idea is **oversampling weak classes via WeightedRandomSampler**. Let me go with that.
+
+Wait, actually, let me reconsider the whole picture. The current score is 0.6387 and the ceiling is 0.758. That's a gap of 0.12. The per-class APs are: pore 0.528, deposit 0.637, discontinuity 0.779, stain 0.611.
+
+If I could bring pore from 0.528 to 0.637 (matching deposit), that would add (0.637-0.528)/4 = 0.027 to the mean. If I could bring stain from 0.611 to 0.637, that adds 0.0065. Total potential: ~0.034. That's significant.
+
+What makes pore and stain hard?
+- Pore: small, round defects. Might be confused with background or stain.
+- Stain: "often confused with deposit and background"
+
+The classifier needs to distinguish these from background and from each other.
+
+Idea: **Use a larger input resolution (224 instead of 160)**. Pores are small features, and at 160x160, they might be too small to distinguish. At 224x224, there's more detail. This would slow training but might improve accuracy on small features.
+
+But wait, the time budget is tight. Currently we get ~2 epochs. With 224x224, we'd get maybe 1.5 epochs. That might not be enough.
+
+Let me think about **convnext_nano** or **tf_efficientnetv2_b0** as alternatives. These might have different inductive biases that help with small features.
+
+Actually, you know what, let me try something simpler and more targeted: **oversampling pore and stain in the training data**.
+
+Implementation:
+1. Count the number of samples per class
+2. Assign weights: pore and stain get higher weights
+3. Use WeightedRandomSampler
+
+Let me set the weights so that pore and stain are upsampled by a factor of ~1.5-2x relative to their current frequency.
+
+Actually, I realize I should check: do we know the class distribution? The training data has 14128 GT + 12219 matched det = 26347 boxes. The class distribution isn't given explicitly, but from the AP numbers, pore and stain seem to be the harder classes (not necessarily rarer).
+
+Let me just try a moderate oversampling: weight pore and stain by 1.5x.
+
+Here's my plan:
+- Category: sampling
+- Hypothesis: Oversampling pore and stain (the two weakest classes) during training will improve their classification accuracy by giving the model more exposure to these classes, without the negative effects of class-weighted loss.
+- Change: Add a WeightedRandomSampler that upweights pore and stain samples.
+
+Let me write the code:
+
+```python
+# After creating train_rows, compute class weights for oversampling
+from torch.utils.data import WeightedRandomSampler
+
+class_counts = defaultdict(int)
+for r in train_rows:
+    if r.get("cls", -1) >= 0:
+        class_counts[r["cls"]] += 1
+total = sum(class_counts.values())
+# Target: equal representation, but only boost pore (0) and stain (3)
+class_weights = []
+for r in train_rows:
+    c = r.get("cls", -1)
+    if c == 0 or c == 3:  # pore or stain
+        class_weights.append(total / (4 * class_counts[c]))  # boost to equal
+    elif c >= 0:
+        class_weights.append(total / (4 * class_counts[c]))  # normal
+    else:
+        class_weights.append(1.0)
+
+sampler = WeightedRandomSampler(class_weights, num_samples=len(train_rows), replacement=True, generator=g)
+```
+
+Wait, but this changes the effective distribution. If pore is rare (say 1000 samples) and stain is also rare (say 1500), while deposit and discontinuity are more common (say 6000 each), then:
+- Total = 26347
+- Pore weight = 26347 / (4 * 1000) = 6.6
+- Stain weight = 26347 / (4 * 1500) = 4.4
+- Deposit weight = 26347 / (4 * 6000) = 1.1
+- Discontinuity weight = 26347 / (4 * 6000) = 1.1
+
+This would heavily oversample pore and stain. Maybe too much. Let me use a milder approach:
+
+Instead of full equalization, let me use a square-root scaling:
+- weight = sqrt(target / actual) where target = total/4
+
+Or even simpler: just multiply pore and stain weights by 1.5.
+
+Actually, let me think about this more carefully. The WeightedRandomSampler with replacement=True and num_samples=len(train_rows) means each epoch has the same number of samples, but pore and stain are more likely to be selected.
+
+Let me use a moderate boost: weight = 1.5 for pore and stain, 1.0 for others.
+
+```python
+class_weights = []
+for r in train_rows:
+    c = r.get("cls", -1)
+    if c == 0 or c == 3:
+        class_weights.append(1.5)
+    else:
+        class_weights.append(1.0)
+
+sampler = WeightedRandomSampler(class_weights, num_samples=len(train_rows), replacement=True, generator=g)
+```
+
+And in the DataLoader, replace shuffle=True with sampler=sampler.
+
+Let me write the actual code changes:
+
+1. Add import for WeightedRandomSampler (it's in torch.utils.data, which is already imported)
+2. After creating train_rows, compute weights
+3. Create WeightedRandomSampler
+4. Use it in the DataLoader
+
+Let me look at the current DataLoader code:
+```python
+dl_tr = torch.utils.data.DataLoader(BoxDataset(train_rows, images, True), batch_size=BATCH_SIZE, shuffle=True,
+                                    num_workers=workers, pin_memory=True, drop_last=True,
+                                    persistent_workers=True, generator=g, worker_init_fn=worker_init)
+```
+
+I need to change `shuffle=True` to `sampler=sampler` (and remove shuffle since they're incompatible).
+
+Let me write the SEARCH/REPLACE blocks:
+
+Block 1: Add the WeightedRandomSampler creation after train_rows is defined.
+
+I'll insert it right before the DataLoader creation. Let me find a good anchor point.
+
+Looking at the code:
+```python
+    train_rows = crops + matched_dets
+    needed = {r["image"] for r in train_rows} | {d["image"] for d in ev}
+```
+
+I'll insert the sampler creation between these lines.
+
+Actually, I need to be more careful. Let me find the exact lines to search for.
+
+The relevant section:
+```python
+    train_rows = crops + matched_dets
+    needed = {r["image"] for r in train_rows} | {d["image"] for d in ev}
+    images = {p: np.asarray(Image.open(os.path.join(args.data, "images", p)).convert("RGB")) for p in needed}
+    print(f"train {len(train_rows)} boxes ({len(crops)} gt + {len(matched_dets)} det), eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
+
+    workers = min(8, os.cpu_count() or 2)
+
+    def worker_init(_):
+        s = torch.initial_seed() % 2**32
+        random.seed(s); np.random.seed(s)
+
+    g = torch.Generator().manual_seed(args.seed)
+    dl_tr = torch.utils.data.DataLoader(BoxDataset(train_rows, images, True), batch_size=BATCH_SIZE, shuffle=True,
+                                        num_workers=workers, pin_memory=True, drop_last=True,
+                                        persistent_workers=True, generator=g, worker_init_fn=worker_init)
+```
+
+I'll replace the DataLoader creation to use a WeightedRandomSampler.
+
+Let me write it:
+
+```python
+    g = torch.Generator().manual_seed(args.seed)
+    # Oversample pore (0) and stain (3) to address their lower AP
+    class_weights = [1.5 if r.get("cls", -1) in (0, 3) else 1.0 for r in train_rows]
+    sampler = torch.utils.data.WeightedRandomSampler(class_weights, num_samples=len(train_rows), replacement=True, generator=g)
+    dl_tr = torch.utils.data.DataLoader(BoxDataset(train_rows, images, True), batch_size=BATCH_SIZE, sampler=sampler,
+                                        num_workers=workers, pin_memory=True, drop_last=True,
+                                        persistent_workers=True, worker_init_fn=worker_init)
+```
+
+Wait, I need to check: does WeightedRandomSampler accept a generator? Let me check... Yes, it does: `torch.utils.data.WeightedRandomSampler(weights, num_samples=None, replacement=True, generator=None)`.
+
+But wait, there's a subtlety. The `g` generator is also used for the DataLoader's shuffle. If I'm using a sampler, I shouldn't also pass `generator=g` to the DataLoader (or it might conflict). Actually, looking at the PyTorch docs, when you pass a `sampler`, the `shuffle` parameter must be False (or not set). The `generator` parameter of DataLoader is only used when `shuffle=True`. So it should be fine to keep `generator=g` but it won't be used.
+
+Actually, let me remove `generator=g` from the DataLoader to be safe, since we're using a sampler.
+
+Let me finalize my changes:
+
+SEARCH:
+```
+    g = torch.Generator().manual_seed(args.seed)
+    dl_tr = torch.utils.data.DataLoader(BoxDataset(train_rows, images, True), batch_size=BATCH_SIZE, shuffle=True,
+                                        num_workers=workers, pin_memory=True, drop_last=True,
+                                        persistent_workers=True, generator=g, worker_init_fn=worker_init)
+```
+
+REPLACE:
+```
+    g = torch.Generator().manual_seed(args.seed)
+    class_weights = [1.5 if r.get("cls", -1) in (0, 3) else 1.0 for r in train_rows]
+    sampler = torch.utils.data.WeightedRandomSampler(class_weights, num_samples=len(train_rows), replacement=True, generator=g)
+    dl_tr = torch.utils.data.DataLoader(BoxDataset(train_rows, images, True), batch_size=BATCH_SIZE, sampler=sampler,
+                                        num_workers=workers, pin_memory=True, drop_last=True,
+                                        worker_init_fn=worker_init)
+```
+
+This is a focused change: only the sampling strategy changes. Everything else stays the same.
+
+Let me double-check the hypothesis:
+- Pore (AP 0.528) and stain (AP 0.611) are the weakest classes
+- Oversampling them gives the model more training examples of these classes
+- This is different from class-weighted loss (which changes the loss function) - it changes the data distribution
+- The 1.5x boost is moderate, not aggressive
+
+This seems like a reasonable experiment. Let me finalize.

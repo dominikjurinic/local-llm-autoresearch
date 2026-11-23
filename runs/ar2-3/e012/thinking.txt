@@ -1,0 +1,656 @@
+===== attempt 1 =====
+Let me analyze the situation carefully.
+
+Current best: e000 with 5-seed val mAP@0.5 = 0.6311
+
+Key observations from the experiment history:
+1. e001 (train on detector boxes with background class) crashed
+2. e002 (fixed e001) scored 0.5172 - much worse, rejected
+3. e003 (include low-res crops) scored 0.6251 - rejected
+4. e004 (square probability in score) scored 0.6161 - rejected
+5. e005 (train on detector boxes overlapping GT) scored 0.6248 - rejected
+6. e006 (ConvNeXt-Nano) scored 0.2901 - suspicious bug
+7. e007 (MixUp) scored 0.6326 seed-0, 0.6292 5-seed - not confirmed
+8. e008 (score × max prob) scored 0.6265 - rejected
+9. e009 (wider context 3.5×) scored 0.6342 seed-0, 0.6309 5-seed - not confirmed
+10. e010 (label smoothing) scored 0.6328 seed-0, 0.6254 5-seed - not confirmed
+11. e011 (more jitter) scored 0.6356 seed-0, 0.6294 5-seed - not confirmed
+
+So far, nothing has beaten the baseline of 0.6311. The per-class APs are: pore 0.506, deposit 0.630, discontinuity 0.780, stain 0.608.
+
+Key insights from the research brief:
+- The one-step 4-class detector baseline is 0.638 mAP@0.5
+- Stage-1 boxes with perfect classes (ceiling) is 0.758
+- Stage-1 boxes scored as single class 'defect' is 0.755
+- A crop classifier with perfect boxes reaches macro-F1 ~0.87
+- Pore and deposit are weak classes
+- Stain is often confused with deposit and background
+- Class-weighted loss hurt every time
+- Tuning hyperparameters alone helped little; changes of method helped more
+- The starting classifier was trained only on perfect boxes and has no notion of "not a defect"
+
+The key issue: The current approach trains on GT crops only. The eval boxes are detector boxes which may be slightly misplaced. The classifier doesn't know about "not a defect" (background).
+
+Let me think about what could actually help:
+
+1. **Training on detector boxes with background**: e001 crashed, e002 (fixed) scored 0.5172 which was terrible. e005 (train on detector boxes overlapping GT, IoU>0.5) scored 0.6248. So training on detector boxes alone doesn't seem to help much. But wait - e002 was terrible (0.5172) which might have been a different bug or approach. e005 was closer (0.6248) but still below baseline.
+
+2. **The scoring function**: The current score is `conf * p[c]`. The problem is that for background boxes, the classifier will still assign some probability to each class. If we could better distinguish "this is a defect" from "this is background", we could suppress false positives.
+
+3. **Key insight from the brief**: "Several rows per box (one per class) are allowed and often help." The current approach already writes 4 rows per box.
+
+4. **The ceiling is 0.758** with perfect classes on stage-1 boxes. The current is 0.6311. The gap is significant.
+
+Let me think about what's really going on. The mAP@0.5 per class rewards:
+(a) Right class on boxes that overlap a true defect
+(b) Good ranking: true detections should score higher than false ones
+
+The current approach:
+- Trains on GT crops (high-res only)
+- At eval, for each detector box, computes 4 class probabilities
+- Score = detector_conf * class_prob
+
+The problem: For background boxes (false alarms), the classifier still gives non-zero probabilities to all 4 classes. The detector conf might be low but not zero. So background boxes get some score.
+
+What if we add a "background" class to the training? This was tried in e001/e002 and e005. e002 was terrible (0.5172), e005 was 0.6248.
+
+Wait, let me re-read e005: "Training the classifier on detector boxes (from dets.csv train split) that overlap true crops (IoU>0.5) instead of the true box coordinates". So e005 only used overlapping boxes, no background. That's why it was close to baseline but slightly worse.
+
+e002 was the fixed version of e001 which included background. It scored 0.5172 which was terrible. Maybe there was still a bug, or maybe the background class approach just doesn't work well.
+
+Let me think differently. What about the **scoring function** more carefully?
+
+Current: score = conf * p[c]
+
+For a true defect box: conf is moderate-high, p[correct_class] is high → good score
+For a background box: conf might be low-moderate, p[any_class] is moderate (classifier doesn't know background) → still gets some score
+
+What if we use the **max probability** as a "defect confidence" multiplier? That was e008: conf * p[c] * max(p). Scored 0.6265, rejected.
+
+What about using **1 - max(p)** as a background indicator? If max(p) is low, the classifier is uncertain → likely background. So score = conf * p[c] * (1 - (1 - max(p))^k) for some k? Or score = conf * p[c] * max(p)^k?
+
+Actually e008 tried conf * p[c] * max(p) which is similar to conf * p[c] * max(p)^1. That was rejected.
+
+What about a different approach entirely? Let me think about what the **class-agnostic** nature means.
+
+Actually, wait. Let me re-read the brief more carefully:
+
+"stage-1 boxes scored as a single class 'defect': 0.755 mAP@0.5"
+
+This means if we just output one class per box with score = conf, we get 0.755. But we need 4 classes. The issue is that when we split into 4 classes, the ranking gets worse because now we're competing within each class.
+
+Actually no, mAP@0.5 for 4 classes means we compute AP separately for each class. A box predicted as class 0 only competes with other class-0 predictions. So the "single class defect" at 0.755 means all boxes are in one class and the ranking is good. When we split into 4 classes, each class has fewer positives and the ranking within each class matters.
+
+The key issue: For each class, we need to rank true detections of that class above false detections of that class. A false detection of class 0 is a box that's predicted as class 0 but doesn't overlap a true class-0 defect.
+
+So the scoring needs to:
+1. Assign the right class (affects which class's AP the box contributes to)
+2. Rank true detections high and false detections low within each class
+
+Current approach: score = conf * p[c]. This means for a given box, the class with highest p gets highest score. The ranking within a class is determined by conf * p[c].
+
+What if the problem is that conf is not very discriminative? The detector conf might be similar for true and false positives. Then p[c] is the main discriminative factor. But p[c] for the wrong class on a background box might still be non-trivial.
+
+Let me think about a different angle. What about **test-time augmentation**? At eval time, we could average predictions over multiple augmented versions of the crop (flips, etc.). This could make the probabilities more calibrated.
+
+Actually, let me look at the per-class performance again:
+- pore: 0.506 (worst)
+- deposit: 0.630
+- discontinuity: 0.780 (best)
+- stain: 0.608
+
+Pore is the weakest. Stain is confused with deposit and background.
+
+What about a **two-crop with different contexts**? Currently it's 1.5× and 2.5×. What if we use more views or different contexts?
+
+Actually, let me think about what hasn't been tried:
+- Test-time augmentation (TTA): average over flips at eval time
+- Different scoring functions
+- Using the detector conf differently
+- Ensemble of models
+- Different architectures (e006 was buggy)
+- Training on both high and low res (e003 was rejected)
+- More aggressive data augmentation
+
+Wait, I notice that e007 (MixUp) got 0.6326 seed-0 but 0.6292 5-seed. e009 (wider context) got 0.6342 seed-0 but 0.6309 5-seed. e010 (label smoothing) got 0.6328 seed-0 but 0.6254 5-seed. e011 (more jitter) got 0.6356 seed-0 but 0.6294 5-seed.
+
+None of these confirmed. The seed-0 scores are all slightly above or below 0.6311 but the 5-seed means are all below.
+
+Let me think about what could give a more substantial improvement.
+
+The brief says: "Tuning hyperparameters alone helped little in earlier experiments; changes of method helped more."
+
+And: "Class-weighted loss hurt classification every time it was tried."
+
+What about **focal loss**? Focal loss down-weights easy examples and focuses on hard ones. This could help with the weak classes (pore, stain) by making the model focus more on the harder examples. But it's similar to class-weighted loss which hurt...
+
+Actually, focal loss is different from class-weighted loss. Class-weighted loss multiplies the loss by a class-specific weight. Focal loss multiplies by (1-p)^gamma which depends on the model's confidence for that specific example. Focal loss is more adaptive.
+
+But the brief says class-weighted loss hurt. Focal loss might be different but it's in the same spirit. Let me think of something else.
+
+What about **the scoring function** more carefully? Let me think about what happens with the current scoring:
+
+For each eval box, we output 4 rows with scores conf * p[0], conf * p[1], conf * p[2], conf * p[3].
+
+The mAP@0.5 computation: For each class c, we look at all predictions with cls=c, sorted by score. A prediction is TP if it overlaps (IoU>0.5) a true defect of class c that hasn't been matched yet. Otherwise FP.
+
+The issue: A background box will have 4 predictions, one per class. Each of these could be an FP for its respective class. If the background box has p = [0.25, 0.25, 0.25, 0.25] and conf = 0.5, all 4 get score 0.125. These 4 FPs will appear in the ranking for each class.
+
+What if instead of outputting all 4 classes, we only output the top-1 or top-2 classes? This would reduce the number of FPs. But the brief says "Several rows per box (one per class) are allowed and often help."
+
+Hmm, but "often help" might mean that outputting multiple rows helps when the top class is wrong but the second-best is right. If we only output top-1, we miss those cases.
+
+What about outputting all 4 but with a **sharpened** distribution? Like p^2 / sum(p^2) or softmax with lower temperature? This would concentrate probability mass on the most likely class and reduce the scores of other classes.
+
+Wait, e004 tried p^2 (squaring) and it was rejected (0.6161). So sharpening the distribution made things worse.
+
+What about the opposite: **flattening** the distribution? Like p^0.5? This would make the scores more uniform across classes. Probably not helpful.
+
+Let me think about this differently. The key problem is:
+1. Wrong class assignments (affecting which class's AP the box contributes to)
+2. Poor ranking (true detections not ranked above false detections)
+
+For (1), the classifier needs to be more accurate. For (2), the scoring needs to be better.
+
+What about using **the detector's confidence** more cleverly? The detector conf might carry information about whether the box is a true defect or not. If true defects tend to have higher conf than false alarms, then conf is already helping with ranking. But if not, we might need to use it differently.
+
+Actually, what if we **subtract** something from the score for low-conf boxes? Like score = conf * p[c] - threshold? No, that would make some scores negative which is weird.
+
+What about **calibrating** the classifier? The classifier's probabilities might not be well-calibrated. Temperature scaling could help. But that's a hyperparameter tuning thing which "helped little."
+
+Let me think about **architecture changes**. e006 (ConvNeXt-Nano) was buggy (0.2901). What if we try a different architecture that's known to work well?
+
+Actually, what about using **two different backbones** and ensembling? Like EfficientNet-B0 + ResNet50? The brief mentions ensembling within the time budget as an idea.
+
+But training two models might take too long. Let me check the time budget. The current run takes 162s out of 180s. So we have about 18s of slack. Training two models would roughly double the training time, which would be too much.
+
+What about using a **smaller** model that trains faster, allowing more epochs? Like ResNet18 or ConvNeXt-Pico?
+
+Actually, the current model trains for about 5 epochs in ~150s. If we use a smaller model, we could train for more epochs. But would that help?
+
+Let me think about **data** more carefully. The current training uses 6052 high-res boxes. The eval has 41879 detections. The training:eval ratio is about 1:7 in terms of boxes, but the training boxes are GT (perfect) while eval boxes are detector boxes (imperfect).
+
+What if we **augment the training data** by creating synthetic background examples? Take crops from random locations in the images (not overlapping any GT box) and label them as background. This would give the model a notion of "not a defect."
+
+Wait, this is similar to what e001/e002 tried (training on detector boxes with background). But e002 was terrible (0.5172). Maybe the implementation was wrong.
+
+Actually, let me re-read e002: "The e001 crash was a trivial type bug (img_w/img_h left as strings by read_csv); fixing it lets us test the core idea—training on detector boxes with an explicit background class". Score was 0.5172. That's way below baseline. This suggests the approach itself is problematic, not just a bug.
+
+Why would adding a background class make things so much worse? Possible reasons:
+1. The background class dominates the training set (most detector boxes are false alarms), so the model learns to predict background for everything.
+2. The background crops look very different from defect crops, and the model doesn't generalize well.
+3. The 5-class output (4 defects + 1 background) dilutes the probability mass, making the defect class probabilities lower.
+
+Actually, reason 3 is interesting. If we add a background class, the softmax output is over 5 classes. The probabilities for each defect class will be lower (divided by 5 instead of 4). This would reduce all scores, potentially hurting the ranking.
+
+But more importantly, if the model learns to predict background for many boxes, the defect probabilities drop, and the ranking within each defect class gets worse.
+
+So maybe the background class approach is fundamentally problematic for this scoring setup.
+
+Let me think about another angle. What about **post-processing** the classifier output?
+
+Instead of using raw probabilities, what if we use a **log-odds** or **logit** based score? Like score = conf * exp(logit[c] - max(logit)) / sum(exp(logit) - max(logit))? That's just the softmax, so same thing.
+
+What about using the **difference** between the top-1 and top-2 class probabilities as a confidence measure? score = conf * p[c] * (p[c] - p[second_best])? This would suppress predictions where the model is uncertain between classes.
+
+Actually, that's similar to e008 (multiply by max(p)) but more targeted. Let me think...
+
+If p = [0.1, 0.7, 0.15, 0.05], then for class 1: score = conf * 0.7 * (0.7 - 0.15) = conf * 0.7 * 0.55 = conf * 0.385
+For class 2: score = conf * 0.15 * (0.15 - 0.7) = negative!
+
+That doesn't work. We'd need max(0, p[c] - p[second_best]).
+
+Hmm, this is getting complicated. Let me think about simpler approaches.
+
+What about **test-time augmentation**? At eval time, for each box, compute the crop in multiple augmented versions (horizontal flip, vertical flip, 90° rotation, etc.) and average the probabilities. This could make the predictions more robust.
+
+The current training already uses flips (fh, fv) and brightness. At eval time, we only use the original crop. If we add TTA at eval time, we could average over:
+- Original
+- Horizontal flip
+- Vertical flip
+- Both flips
+- 90° rotation
+- 180° rotation
+- 270° rotation
+
+But this would increase eval time. Currently eval takes about 37s (162-125=37s for the eval phase). With 8 TTA variants, it would be ~296s which is way over budget.
+
+What about just 2 TTA variants (original + horizontal flip)? That would double the eval time to ~74s, total ~199s. Still over budget.
+
+We'd need to reduce training time to make room. Or use a faster model.
+
+Actually, let me reconsider. The eval phase processes 41879 detections. With batch size 256, that's about 164 batches. Each batch takes about 0.22s (37s / 164). With 2 TTA variants, it would be ~74s. Total would be ~125 + 74 = 199s. Over budget.
+
+What if we reduce the training time? Currently training takes ~125s (from 13s to 125s). If we could reduce it to ~90s, we'd have 90 + 74 = 164s + 13s loading = 177s. Just barely within budget.
+
+But this is risky. Let me think of something else.
+
+What about a **simpler TTA**: just average the tight and wide crops differently? Currently they're averaged at the logit level: (model(xt) + model(xw)) / 2. What if we use a weighted average, giving more weight to the tight crop?
+
+Or what about using **both** the tight and wide crops as separate inputs to **different** models, and combining their outputs?
+
+Actually, let me step back and think about what the most impactful change would be.
+
+The per-class APs are:
+- pore: 0.506
+- deposit: 0.630
+- discontinuity: 0.780
+- stain: 0.608
+
+The weakest is pore (0.506). The brief says "Pore and deposit are the weak classes; stain is often confused with deposit and background."
+
+What if pore is weak because it's visually similar to other classes or to background? Or because there are fewer pore examples in the training set?
+
+Let me think about **class imbalance**. If pore has fewer examples than discontinuity, the model might not learn pore well. But class-weighted loss hurt, so that's not the answer.
+
+What about **data augmentation specific to pore**? Like, if pores are small circular defects, maybe we could augment them with circular masks? That's too specific and might not generalize.
+
+Let me think about the **scoring function** again. The current score is conf * p[c]. What if the detector conf is not very informative (i.e., true and false positives have similar conf)? Then the ranking is determined by p[c] alone. And p[c] for a background box might be similar to p[c] for a true box of a different class.
+
+What if we use **the ratio** p[c] / max(p) instead of p[c]? This normalizes by the max probability, so the top class always has score 1 (times conf) and other classes are scaled down. But this is similar to what we already have since the scores are relative within each class.
+
+Actually wait, the scores across different boxes are what matter for ranking. So for class c, we're ranking boxes by conf * p[c]. If box A has p = [0.1, 0.8, 0.05, 0.05] and box B has p = [0.2, 0.6, 0.1, 0.1], and both have conf = 0.5:
+- For class 0: A gets 0.05, B gets 0.10 → B ranks higher
+- For class 1: A gets 0.40, B gets 0.30 → A ranks higher
+
+This seems reasonable. The issue is that for background boxes, p might be [0.25, 0.25, 0.25, 0.25] and conf = 0.3, giving 0.075 for each class. These would rank below true detections (which have higher p for the correct class) but above very uncertain true detections.
+
+What if we could better separate true from false? The key insight is that the classifier was trained on GT crops, so it expects to see a defect in the crop. When it sees a background crop, it's out of distribution, and the probabilities might be unreliable.
+
+What about using the **entropy** of the probability distribution as a confidence measure? Low entropy = confident = likely true defect. High entropy = uncertain = likely background.
+
+score = conf * p[c] * exp(-H(p)) where H(p) is the entropy?
+
+Or score = conf * p[c] * (1 - H(p) / log(4))?
+
+This would suppress predictions where the model is uncertain. But it's similar to e008 (multiply by max(p)) which was rejected.
+
+Actually, e008 used max(p) which is a simpler measure of confidence. Entropy would be a more nuanced measure. But if e008 was rejected, entropy might also be rejected.
+
+Let me think about a completely different approach.
+
+What about **fine-tuning the detector** to be class-aware? No, the detector is fixed (stage 1).
+
+What about using **the spatial relationship** between boxes? If multiple boxes overlap, they might be the same defect. We could merge overlapping boxes and use the merged box for classification. But this is complex and might not help.
+
+What about **using the image context** more? The current crop is 2.5× the box size. What if we use an even larger context (like 5×) to capture more of the weld pattern? e009 tried 3.5× and it was "not confirmed" (0.6342 seed-0, 0.6309 5-seed). So wider context didn't clearly help.
+
+What about using **multiple scales** of the crop? Like 1×, 2×, 4×, 8×? This would give the model multi-scale information. But it would increase the number of forward passes.
+
+Actually, let me reconsider the problem from the mAP perspective.
+
+mAP@0.5 for class c:
+- All predictions with cls=c, sorted by score descending
+- For each prediction, if IoU > 0.5 with an unmatched GT of class c → TP, else FP
+- AP = average precision
+
+The key factors:
+1. **Class accuracy**: If a true defect of class c is predicted as class d, it's an FP for class c (missed) and potentially a TP for class d (if it overlaps a GT of class d, which it doesn't). So wrong class = FP for the true class and FP for the predicted class (unless there's a GT of the predicted class at that location).
+
+2. **Ranking**: Within class c, true detections should be ranked above false detections.
+
+For (1), we need better classification. For (2), we need better scoring.
+
+The current classifier achieves macro-F1 ~0.87 with perfect boxes. So class accuracy is decent but not perfect. The main issue might be the ranking.
+
+What if we **re-rank** the predictions using a second model? Like, use the first model to get initial scores, then use a second model (trained differently) to re-rank?
+
+This is essentially ensembling. But training two models might not fit in the time budget.
+
+What about using **the same model** with different input crops for ensemble? Like, use the tight crop, wide crop, and an intermediate crop (2×) and average the probabilities?
+
+Currently we use 1.5× and 2.5×. What if we add a third view at 2×? This would increase the number of forward passes by 50% during training and eval.
+
+Training: currently ~125s. With 3 views instead of 2, it would be ~187s. Too much.
+
+What about using 3 views only at eval time (TTA), while training with 2 views? The model would see 2 views during training but 3 at eval. This might not work well since the model isn't trained to see the third view.
+
+Hmm, let me think about this differently.
+
+What about **changing the loss function** to be more focused on ranking? Like, using a **triplet loss** or **contrastive loss** that directly optimizes the ranking of true vs false detections?
+
+But the current setup is a classification task (4 classes), not a ranking task. To use a ranking loss, we'd need to reformulate the problem.
+
+What about **focal loss**? It's a drop-in replacement for cross-entropy that down-weights easy examples. This could help the model focus on the harder examples (weak classes, confusing cases).
+
+The brief says "Class-weighted loss hurt classification every time it was tried." Focal loss is different from class-weighted loss. Focal loss is per-example (based on the model's confidence for that example), while class-weighted loss is per-class (fixed weight per class).
+
+Let me try focal loss. The hypothesis would be: focal loss (gamma=2) will improve mAP by making the model focus on hard examples (weak classes, confusing cases) rather than easy ones, improving the ranking of true detections above false alarms.
+
+Actually, I realize I should think about what's most likely to give a clear improvement. Let me look at the numbers again:
+
+- Baseline (e000): 0.6311
+- Best seed-0 so far: e011 at 0.6356 (but 5-seed mean 0.6294)
+- The 5-seed mean of e000 is 0.6311 with std 0.0025
+
+So we need a 5-seed mean > 0.6311 to beat the baseline. The seed-0 scores of "not confirmed" experiments were:
+- e007: 0.6326
+- e009: 0.6342
+- e010: 0.6328
+- e011: 0.6356
+
+These are all within 1-2 std of the baseline. None clearly beat it.
+
+I need a change that gives a more substantial improvement, not just noise-level changes.
+
+Let me think about what the **biggest lever** is. The ceiling is 0.758. We're at 0.631. The gap is 0.127.
+
+The one-step detector gets 0.638. So we're basically at the one-step detector level. The two-stage approach should be able to do much better (up to 0.758).
+
+The key difference between the one-step and two-stage approaches:
+- One-step: the detector outputs both box and class simultaneously
+- Two-stage: the detector outputs box (class-agnostic), then the classifier outputs class
+
+The one-step detector's class predictions are learned jointly with the box predictions. The two-stage classifier is learned independently.
+
+What if the issue is that the classifier doesn't have enough information to distinguish classes? The crop is 1.5×-2.5× the box size. Maybe the defect features are subtle and need more context or higher resolution.
+
+What about **increasing the image size**? Currently IMG_SIZE = 160. What if we use 224 or 256? This would give the model more spatial detail.
+
+But larger images mean more computation. Training time would increase. Let me estimate: 160→224 is (224/160)² = 1.96× more pixels. So training time would roughly double. Currently ~125s, would become ~250s. Way over budget.
+
+What about 192? (192/160)² = 1.44×. Training would be ~180s. Still too much.
+
+What about using a **faster model** with larger images? Like ResNet18 at 224? ResNet18 is much faster than EfficientNet-B0.
+
+Actually, let me check: EfficientNet-B0 at 160 vs ResNet18 at 224. Which is faster?
+
+EfficientNet-B0: ~0.4 GFLOPs, ~6M params
+ResNet18: ~1.8 GFLOPs, ~11M params
+
+ResNet18 is actually slower per image. So that doesn't help.
+
+What about ConvNeXt-Pico? It's very small (~0.5M params). But it might not have enough capacity.
+
+Let me think about this from a different angle. What if the issue is not the model capacity but the **training data quality**?
+
+The training data is 6052 high-res GT boxes. The eval data is 41879 detector boxes. The detector boxes are "slightly misplaced" relative to GT. The classifier is trained on perfect GT boxes but evaluated on imperfect detector boxes.
+
+e011 tried increasing the jitter to match the detector's misplacement. It got 0.6356 seed-0 but 0.6294 5-seed. Not confirmed.
+
+What if we need **even more** jitter? Or what if the jitter distribution is wrong (e.g., the detector's misplacement is not uniform but has a specific pattern)?
+
+Actually, let me think about what "slightly misplaced" means. The detector finds boxes that are close to but not exactly on the GT boxes. The misplacement could be:
+- Center offset: the box center is shifted from the GT center
+- Size error: the box size is different from the GT size
+- Shape error: the box aspect ratio is different
+
+The current jitter handles center offset and size. But not shape/aspect ratio.
+
+What if we add **aspect ratio jitter**? Like, independently jitter the width and height?
+
+Currently: side *= random.uniform(0.85, 1.2) (or 0.75-1.35 in e011). This jitters the size uniformly.
+
+What if we jitter width and height independently? Like:
+w *= random.uniform(0.85, 1.2)
+h *= random.uniform(0.85, 1.2)
+
+This would allow the box to become more or less square, matching the detector's potential aspect ratio errors.
+
+But this is a small change and might not make a big difference.
+
+Let me think about something more impactful.
+
+What about **using the detector's confidence in the training**? Currently, the training data is GT crops with class labels. The detector confidence is not used. What if we weight the training examples by the detector confidence? High-conf detector boxes are more likely to be true defects, so their GT labels are more reliable.
+
+But wait, the training data is from crops.csv which has GT labels, not detector boxes. The detector boxes are in dets.csv. We could join them: for each GT crop, find the overlapping detector box (IoU > 0.5) and use its conf as a weight.
+
+But this is complex and the benefit is unclear.
+
+Let me try a different approach. What about **using a siamese or contrastive setup** where the model learns to distinguish between different defect types and between defects and background?
+
+This is getting too complex. Let me focus on something simpler.
+
+What about **learning rate schedule**? The current schedule is 5% warmup + cosine decay. What if we use a different schedule? Like, longer warmup or no warmup?
+
+But "Tuning hyperparameters alone helped little in earlier experiments."
+
+OK let me think about what **method** changes haven't been tried:
+
+1. ✅ Training on detector boxes (e001, e002, e005) - didn't help
+2. ✅ Low-res crops (e003) - didn't help
+3. ✅ Score modifications (e004, e008) - didn't help
+4. ✅ Architecture change (e006) - buggy
+5. ✅ MixUp (e007) - not confirmed
+6. ✅ Wider context (e009) - not confirmed
+7. ✅ Label smoothing (e010) - not confirmed
+8. ✅ More jitter (e011) - not confirmed
+
+What hasn't been tried:
+- Focal loss
+- Test-time augmentation
+- Different scoring (e.g., using log-odds, or a learned scoring function)
+- Multi-scale input (3+ views)
+- Different backbone (non-buggy)
+- Data augmentation (RandAugment, CutOut, etc.)
+- Preprocessing changes (e.g., different normalization, color space)
+- Using both high and low res with different strategies
+- Ensemble of 2 models (if time allows)
+- Different optimizer (SGD with momentum vs AdamW)
+- Different batch size
+- Using the detector conf as an additional input feature
+
+Wait, **using the detector conf as an additional input feature**! Currently, the detector conf is only used in the scoring (score = conf * p[c]). What if we also feed it as an input to the classifier?
+
+The idea: the classifier could learn to use the detector confidence as a signal. High conf → more likely a true defect → be more confident in the class prediction. Low conf → more likely background → be less confident.
+
+How to implement: add the detector conf as an additional channel to the input image. So instead of 3 channels (RGB), we'd have 4 channels (RGB + conf). The conf channel would be a constant value across the image (the conf for that box).
+
+But the model expects 3 channels. We'd need to modify the first conv layer to accept 4 channels. This is a small change.
+
+Actually, this is interesting. The detector conf is a signal about whether the box is likely a true defect. If we feed it to the classifier, the classifier could learn to:
+- When conf is high: be confident in the class prediction
+- When conf is low: be less confident (lower probabilities)
+
+This could improve the ranking because low-conf boxes (likely background) would get lower scores.
+
+But wait, the training data is GT crops, not detector boxes. The GT crops don't have a detector conf. We'd need to either:
+1. Train on detector boxes (with their conf) - but this was tried and didn't work well
+2. Simulate the conf during training (e.g., random values) - this might not work
+3. Only use conf at eval time, not training - but then the model isn't trained to use it
+
+Option 3 is problematic because the model isn't trained to use the conf channel.
+
+Option 1 was tried (e005) and didn't help much.
+
+Hmm, what if we train on GT crops but add a random "conf" channel during training? This would teach the model to pay attention to the conf channel, and at eval time, the actual conf would be used. But the training confs would be random, so the model wouldn't learn the right relationship.
+
+This doesn't seem promising.
+
+Let me think about **focal loss** again. It's a simple change (replace CrossEntropyLoss with a focal loss implementation) and it's a different method from class-weighted loss.
+
+Focal loss: FL(p_t) = -(1-p_t)^gamma * log(p_t)
+
+Where p_t is the probability of the true class. For gamma=2, easy examples (high p_t) are down-weighted significantly, and hard examples (low p_t) are up-weighted.
+
+This could help with:
+- Weak classes (pore, stain) that are harder to classify
+- Confusing cases (stain vs deposit)
+- The ranking: by focusing on hard examples, the model becomes better at distinguishing true from false
+
+The hypothesis: focal loss (gamma=2) will improve mAP by making the model focus on hard-to-classify examples (weak classes, confusing cases), improving both class accuracy and the ranking of true detections above false alarms.
+
+This is a focused, testable change. Let me implement it.
+
+Actually wait, I should also consider: the brief says "Class-weighted loss hurt classification every time it was tried." Focal loss is in the same family as class-weighted loss (both re-weight the loss). If class-weighted loss consistently hurt, focal loss might too.
+
+But they're different: class-weighted loss uses fixed weights per class, while focal loss uses adaptive weights per example. The brief specifically says "class-weighted loss" not "re-weighted loss" in general. And focal loss has been shown to help in object detection (RetinaNet).
+
+I'll try focal loss with gamma=2. If it hurts, we'll know.
+
+Let me write the implementation:
+
+```python
+class FocalLoss(nn.Module):
+    def __init__(self, gamma=2.0, alpha=None):
+        super().__init__()
+        self.gamma = gamma
+        self.alpha = alpha  # None means no class weighting
+    
+    def forward(self, inputs, targets):
+        ce_loss = nn.functional.cross_entropy(inputs, targets, reduction='none')
+        pt = torch.exp(-ce_loss)
+        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
+        if self.alpha is not None:
+            alpha_t = self.alpha[targets]
+            focal_loss = alpha_t * focal_loss
+        return focal_loss.mean()
+```
+
+And replace `crit = nn.CrossEntropyLoss()` with `crit = FocalLoss(gamma=2.0)`.
+
+This is a clean, focused change. Let me go with this.
+
+Wait, actually I want to reconsider. Let me look at the per-class APs again:
+- pore: 0.506
+- deposit: 0.630
+- discontinuity: 0.780
+- stain: 0.608
+
+The average is 0.631. The weakest is pore at 0.506. If focal loss helps the weak classes, we'd expect pore to improve the most.
+
+But focal loss doesn't specifically target weak classes - it targets hard examples. If pore examples are harder to classify (lower p_t), they'd get more weight. This could help.
+
+OK, I'll go with focal loss. Let me write the SEARCH/REPLACE blocks.
+
+Actually, let me reconsider one more time. The experiment history shows that many small changes give seed-0 scores that are within noise of the baseline. To make a meaningful improvement, we need a change that addresses a fundamental issue.
+
+The fundamental issue: the classifier is trained on GT crops but evaluated on detector crops. The detector crops are slightly misplaced. The classifier doesn't know about background.
+
+The most impactful change would be to address the train/test distribution gap. But e001/e002/e005 tried training on detector boxes and didn't help.
+
+Wait, e002 scored 0.5172 which was terrible. That's not just "didn't help" - it was much worse. This suggests the implementation was still buggy or the approach is fundamentally flawed.
+
+e005 scored 0.6248 which is close to baseline. e005 only used overlapping detector boxes (no background). So training on detector boxes (without background) is roughly equivalent to training on GT boxes.
+
+This makes sense: if the detector boxes are "slightly misplaced," using them instead of GT boxes doesn't change much. The classifier sees similar crops either way.
+
+The background class (e002) made things much worse, probably because:
+1. The background class dominates the training set
+2. The 5-class softmax dilutes the defect probabilities
+3. The model learns to predict background for many defect crops (because some detector boxes that overlap GT are still "imperfect")
+
+So the background class approach is problematic. Let's not try it again.
+
+Given all this, I think focal loss is a reasonable next experiment. It's a different method from what's been tried, it's a simple change, and it could help with the weak classes.
+
+Let me also consider: what about **SGD with momentum** instead of AdamW? SGD is often better for generalization than Adam. But this is a hyperparameter change which "helped little."
+
+What about **increasing the number of training epochs** by using a faster model? If we use ConvNeXt-Pico (very small), we could train for more epochs. But the model might not have enough capacity.
+
+Actually, let me check the time budget more carefully. The current run:
+- Loading: 13s
+- Training: 125s (5 epochs, 421 steps)
+- Eval: 37s
+- Total: 162s
+- Budget: 180s
+- Reserve: 55s (so training budget is 180-55=125s)
+
+Wait, the reserve is 55s. So training is allowed to use up to 180-55=125s. The actual training took 125s (from 13s to 125s, that's 112s of training + 13s loading = 125s). Then eval takes 37s. Total 162s.
+
+If we could make training faster (e.g., by using a smaller model or larger batch size), we could train for more epochs or have more time for eval.
+
+What about **increasing the batch size**? Currently BATCH_SIZE = 64. What if we use 128? This would halve the number of steps per epoch, but each step would be slower (larger batch). Net effect on time per epoch: roughly the same (since we're doing the same total work). But we'd have fewer steps, so the learning rate schedule would need adjustment.
+
+Actually, with a larger batch, we'd need a higher learning rate to maintain the same effective learning rate. This is a hyperparameter change.
+
+Let me stick with focal loss. It's the most promising untried method.
+
+Let me write the code:
+
+```python
+class FocalLoss(nn.Module):
+    def __init__(self, gamma=2.0):
+        super().__init__()
+        self.gamma = gamma
+
+    def forward(self, inputs, targets):
+        ce = nn.functional.cross_entropy(inputs, targets, reduction='none')
+        pt = torch.exp(-ce)
+        return ((1 - pt) ** self.gamma * ce).mean()
+```
+
+And replace:
+```python
+crit = nn.CrossEntropyLoss()
+```
+with:
+```python
+crit = FocalLoss(gamma=2.0)
+```
+
+This is clean and focused. Let me finalize.
+
+Hmm, actually let me reconsider whether focal loss is the best choice. Let me think about what other method changes could be tried:
+
+1. **Focal loss** - re-weights examples, focuses on hard ones
+2. **Test-time augmentation** - average over multiple augmented views at eval
+3. **Multi-scale training** - use 3+ crop scales
+4. **Different backbone** - try a non-buggy architecture
+5. **CutOut/Random Erase** - data augmentation
+6. **Learning rate warmup + step decay** - different schedule
+7. **Using detector conf as input** - additional feature
+
+I think focal loss is the most straightforward and has a clear hypothesis. Let me go with it.
+
+Actually, one more thought: what about **using the log of the probability** in the score? Instead of score = conf * p[c], use score = conf * log(p[c] + eps)? This would make the score more sensitive to differences in probability. But log(0) is -inf, so we'd need to handle that. And the score could be negative, which is weird.
+
+Or score = conf * p[c] / (1 - p[c])? This is the log-odds (logit) in a different form. It would amplify the difference between high and low probabilities.
+
+But these are scoring changes, and e004 and e008 (scoring changes) were both rejected. So scoring changes might not be the way to go.
+
+Let me stick with focal loss.
+
+Final decision: **Focal loss with gamma=2.0**.
+
+Hypothesis: Focal loss (γ=2) will improve mAP by down-weighting easy-to-classify examples and focusing gradient updates on hard examples (weak pore/stain classes, confusing stain-vs-deposit cases), improving both class accuracy and the ranking of true detections above false alarms.
+
+Let me write the SEARCH/REPLACE blocks.
+
+I need to:
+1. Add the FocalLoss class
+2. Replace the CrossEntropyLoss with FocalLoss
+
+For the FocalLoss class, I'll add it after the BoxDataset class (before main()).
+
+For the replacement, I'll change the line `crit = nn.CrossEntropyLoss()` to `crit = FocalLoss(gamma=2.0)`.
+
+Let me write the exact SEARCH/REPLACE blocks.
+
+For adding FocalLoss, I'll search for the line before main():
+```
+def main():
+```
+
+And replace with:
+```
+class FocalLoss(nn.Module):
+    def __init__(self, gamma=2.0):
+        super().__init__()
+        self.gamma = gamma
+
+    def forward(self, inputs, targets):
+        ce = nn.functional.cross_entropy(inputs, targets, reduction='none')
+        pt = torch.exp(-ce)
+        return ((1 - pt) ** self.gamma * ce).mean()
+
+
+def main():
+```
+
+For replacing the loss:
+```
+    crit = nn.CrossEntropyLoss()
+```
+→
+```
+    crit = FocalLoss(gamma=2.0)
+```
+
+Let me verify these SEARCH strings appear exactly once in the file.
+
+Looking at the file:
+- `def main():` appears once (line with `def main():`)
+- `crit = nn.CrossEntropyLoss()` appears once
+
+Good. Let me write the final answer.

@@ -1,0 +1,413 @@
+===== attempt 1 =====
+Let me analyze the situation carefully.
+
+**Current state:**
+- Best: e000, 5-seed mean 0.6297 mAP@0.5
+- Per-class: pore 0.504, deposit 0.626, discontinuity 0.780, stain 0.609
+- Ceiling (perfect classes on stage-1 boxes): 0.758
+- Class-agnostic: 0.755
+- One-step baseline to beat: 0.638
+
+**History summary:**
+- e001 (data): crashed (NameError)
+- e002 (data): fix of e001, 0.5541 — rejected (worse)
+- e003 (inference): 4-view averaging (tight+wide, each with flip) — 0.6355 seed-0, 0.6301 5-seed — not confirmed (basically same as best)
+- e004 (scoring): emit only top-1 class per box — 0.5689 — rejected (much worse)
+- e005 (architecture): swap backbone — 0.6240 — rejected
+- e006 (data): train on low-res crops too — 0.6225 — rejected
+- e007 (scoring): square the class probability — 0.6192 — rejected
+
+**Key insights:**
+
+1. The gap is 0.630 vs 0.758 ceiling = 0.128. This is a ranking problem.
+
+2. Per-class AP: pore 0.504, stain 0.609 are weak. Discontinuity 0.780 is good.
+
+3. The crop classifier reaches macro-F1 ~0.87 with perfect boxes. Pore and deposit are weak classes; stain confused with deposit.
+
+4. Scoring experiments (e004, e007) both made things worse. e004 (top-1 only) was 0.5689 — much worse, confirming that emitting all 4 rows is important for the metric (because a box that's true for class c but gets a low p_c still needs to be in the class-c list). e007 (squaring) was 0.6192 — also worse.
+
+5. Architecture change (e005) didn't help. Data changes (e002, e006) didn't help. Inference (e003, 4-view) didn't confirm.
+
+**What hasn't been tried?**
+
+Let me think about what could actually move the needle:
+
+1. **The core problem**: The classifier needs to better distinguish pore vs deposit vs stain. The macro-F1 is 0.87, meaning ~13% of boxes get the wrong class. When a box gets the wrong class, it becomes a false positive in the wrong class's list and a false negative in the right class's list.
+
+2. **Training data quality**: The training uses "high" res crops only. The crops are from training images. Could there be label noise?
+
+3. **What about the classifier itself?** The current model is EfficientNet-B0 with two views (tight 1.5x + wide 2.5x). The pretrained weights are used. Training is ~432 steps over 5 epochs.
+
+4. **Key observation**: The per-class AP for pore is only 0.504. This is very weak. Pore is likely confused with other classes.
+
+**Ideas not yet tried:**
+
+a) **Better training**: More epochs / longer training. Currently 432 steps in ~130s. The budget is 180s with 55s reserve, so ~125s for training. Could we train longer? The log shows loss still decreasing (0.2180 at epoch 4). But we're limited by time.
+
+b) **Different loss function**: Label smoothing? Focal loss? The lessons say "Class-weighted loss hurt classification every time it was tried" — so class weighting is out. But what about focal loss or label smoothing?
+
+c) **Better augmentation**: The current augmentation is light (jitter, flip, brightness). Could stronger augmentation help?
+
+d) **Ensemble of models**: Train two different models and average their probabilities. This would use the budget differently.
+
+e) **Test-time augmentation (TTA)**: e003 tried 4 views and didn't confirm. But what about more aggressive TTA?
+
+f) **The crop context**: Currently tight=1.5x, wide=2.5x. What if we use different contexts?
+
+g) **Image resolution**: Currently IMG_SIZE=160. What about 224 (native for EfficientNet)?
+
+h) **The key insight I'm missing**: Let me re-read the problem.
+
+The scoring is: score = det_conf * p_class. The mAP depends on the ORDER of predictions within each class. 
+
+For a given class c, the predictions are all boxes with their score = det_conf * p_c. A box is a hit if it overlaps a true box of class c.
+
+The problem: a box that is truly class 0 (pore) but the classifier says p_1=0.7 (deposit) will have a high score in the deposit list (false positive there) and a low score in the pore list (might be ranked below true pore boxes).
+
+**What if we could improve the classifier's accuracy on the hard classes?**
+
+The macro-F1 is 0.87. If we could push it to 0.92, that would help significantly.
+
+**What about training with a better recipe?**
+
+Current: EfficientNet-B0, pretrained, 160x160, two views, AdamW lr=1e-3, wd=0.05, batch 64, ~432 steps.
+
+What if we:
+- Use a larger image size (224)?
+- Train for more steps (but time-limited)?
+- Use a different optimizer (SGD with momentum)?
+- Use cosine annealing with a better schedule?
+
+Wait, the current training is already time-limited. The issue is that we only get ~432 steps. That's not a lot for fine-tuning.
+
+**Actually, let me reconsider the problem structure.**
+
+The key insight from the reference numbers:
+- Stage-1 boxes with perfect classes: 0.758
+- Stage-1 boxes scored as single class: 0.755
+- Our current: 0.630
+
+The gap between 0.758 and 0.630 is 0.128. This is entirely due to wrong class assignments affecting the ranking.
+
+If the classifier had perfect accuracy, we'd get 0.758. With macro-F1 0.87, we're at 0.630.
+
+So improving the classifier accuracy is the key. But how?
+
+**Idea: Use the detector confidence more cleverly.**
+
+Currently: score = det_conf * p_c.
+
+What if some boxes have very low det_conf (likely false alarms)? For those boxes, the class assignment doesn't matter much (they're false positives regardless). For high-conf boxes, the class assignment matters a lot.
+
+But this is already captured by multiplying by det_conf.
+
+**Idea: Calibrate the classifier.**
+
+The classifier's probabilities might not be well-calibrated. If p_c is overconfident for some classes, the ranking could be off.
+
+But calibration would be a monotone transformation per class... wait, no. If we apply a per-class monotone transformation, it changes the relative ordering within a class only if the transformation is not the same for all boxes. Actually, a per-class monotone transformation of p_c would change the ordering of boxes within class c's list.
+
+Wait, let me think again. For class c, the score is det_conf * p_c. The ordering is determined by det_conf * p_c. If I apply a monotone function f_c to p_c, the new score is det_conf * f_c(p_c). This changes the ordering unless f_c is linear (or constant). So it's not a no-op.
+
+But e007 tried squaring p_c (f_c(x) = x^2) and it made things worse (0.6192 vs 0.630). So sharpening the probabilities hurt.
+
+**Idea: Temperature scaling.**
+
+Divide logits by a temperature T > 1 before softmax. This makes probabilities more uniform (less confident). This is different from squaring (which sharpens). Temperature scaling could help if the model is overconfident.
+
+But this is a scoring change, and scoring changes have been tried twice without success.
+
+**Idea: Better classifier through better training.**
+
+Let me think about what would actually improve the classifier:
+
+1. **More training data**: e006 tried adding low-res crops — didn't help.
+2. **Better augmentation**: Not tried yet!
+3. **Better model**: e005 tried a different backbone — didn't help.
+4. **Better training recipe**: Not really tried.
+
+**Augmentation** is a category that hasn't been explored! The current augmentation is:
+- Light geometric jitter (±10% center, 0.85-1.2 scale)
+- Random horizontal/vertical flip
+- Brightness 0.8-1.2
+
+What about:
+- Color jitter (hue, saturation, contrast)?
+- Random erasing?
+- More aggressive geometric transforms?
+- CutMix / Mixup?
+
+For weld defect classification, color information might be important (different defects have different color patterns). But the images are grayscale-ish (weld beads). Actually, the images are RGB but might be mostly grayscale.
+
+Wait, let me reconsider. The "augmentations" that would help a classifier:
+- **Mixup/CutMix**: These are known to improve classification accuracy significantly. They regularize the model and improve generalization.
+- **Stronger geometric augmentation**: The current jitter is light.
+
+**Mixup** is a strong candidate. It's well-known to improve top-1 accuracy by 1-2 points on ImageNet-scale tasks. For a 4-class problem with ~6000 training samples, it could help.
+
+But wait — the training is only 432 steps. Mixup might need more training to converge. But it also regularizes, so it might converge faster or to a better point.
+
+Actually, let me reconsider the time budget. We have:
+- Total: 180s
+- Reserve: 55s
+- Training budget: ~125s
+- Current: 13s loading + ~130s training + ~17s prediction = 162s
+
+So we have about 18s of slack. Not much.
+
+**What about reducing prediction time?** Currently prediction takes ~17s for 41879 detections with batch 256. That's fine.
+
+**What about the model?** EfficientNet-B0 at 160x160. What if we use 224x224? That would be (224/160)^2 = 1.96x more compute per sample. Training would be ~1.96x slower, so we'd get ~220 steps instead of 432. That might not be enough.
+
+**What about a smaller/faster model to get more steps?** regnety_016 or convnext_pico? But e005 tried a different backbone and it didn't help.
+
+**Let me focus on what's most likely to help:**
+
+The classifier's macro-F1 is 0.87. The main confusions are:
+- Pore (weak, AP 0.504)
+- Stain confused with deposit
+- Pore and deposit are weak classes
+
+To improve the classifier:
+1. **Mixup/CutMix**: Regularization, improves generalization. Untried.
+2. **Stronger augmentation**: Untried.
+3. **Longer training**: Limited by time.
+4. **Better architecture**: Tried, didn't help.
+
+I think **Mixup** is the most promising untried idea. It's a well-established technique that improves classification accuracy. It changes what the model learns from (soft labels instead of hard labels), which is a method change, not a hyperparameter tweak.
+
+Let me think about the implementation:
+- During training, for each batch, create mixed samples: x_mixed = λ * x_i + (1-λ) * x_j, y_mixed = λ * y_i + (1-λ) * y_j
+- λ ~ Beta(α, α) with α=0.4 or 1.0
+- Loss = CE(model(x_mixed), y_mixed)
+
+This requires modifying the training loop. The model sees mixed images and learns to predict mixed class distributions.
+
+For the two-view setup, we'd mix both views together (the tight and wide crops of the same sample should be mixed consistently).
+
+Actually, with two views, we need to be careful. The current loss is:
+```
+loss = crit((model(xt) + model(xw)) / 2, y)
+```
+
+With mixup, we'd mix the inputs and the targets:
+```
+# Mix batch
+lam = np.random.beta(alpha, alpha)
+idx = np.random.permutation(len(y))
+xt_mixed = lam * xt + (1-lam) * xt[idx]
+xw_mixed = lam * xw + (1-lam) * xw[idx]
+y_onehot = F.one_hot(y, 4).float()
+y_mixed = lam * y_onehot + (1-lam) * y_onehot[idx]
+loss = -(y_mixed * F.log_softmax((model(xt_mixed) + model(xw_mixed)) / 2, dim=1)).sum(1).mean()
+```
+
+This is a clean change. Let me estimate the effect:
+- Mixup typically improves top-1 accuracy by 1-2% on standard benchmarks
+- For our 4-class problem, this could translate to a meaningful mAP improvement
+- It's a method change (changes what the model learns), not a hyperparameter tweak
+
+The time cost is negligible (just a matrix multiply for mixing).
+
+**Expected gain**: If macro-F1 goes from 0.87 to 0.90, the mAP could go from 0.630 to maybe 0.66-0.68. That's a 0.03-0.05 gain, well above the 0.003 noise threshold.
+
+**Risk**: Mixup might not help if the problem is not overfitting but rather a fundamental limitation of the features. But it's worth trying.
+
+Let me also consider: should I use CutMix instead? CutMix is spatial mixing (cut a patch from one image and paste onto another). For crop-based classification, CutMix might be less natural because the spatial structure of the defect matters. Mixup (linear blending) is safer.
+
+Actually, for weld defects, the spatial pattern IS the signal. Mixup blends two different defects, creating an artificial "in-between" that doesn't exist in reality. This could either help (regularization) or hurt (the model learns to classify non-existent patterns).
+
+CutMix preserves the spatial structure of one defect while changing the background. This might be more appropriate.
+
+But let's go with Mixup first — it's simpler and more standard.
+
+**Implementation plan:**
+
+Modify the training loop to apply mixup:
+1. Generate λ ~ Beta(0.4, 0.4)
+2. Shuffle indices
+3. Mix both views: xt_mixed = λ*xt + (1-λ)*xt[perm], xw_mixed = λ*xw + (1-λ)*xw[perm]
+4. Compute soft targets: y_soft = λ*one_hot(y) + (1-λ)*one_hot(y[perm])
+5. Loss = cross-entropy with soft targets
+
+Let me write the code change.
+
+Current training loop:
+```python
+        for xt, xw, y in dl_tr:
+            frac = min(1.0, (time.time() - t_start) / budget)
+            f = frac / 0.05 if frac < 0.05 else 0.5 * (1 + math.cos(math.pi * (frac - 0.05) / 0.95))
+            for pg in opt.param_groups:
+                pg["lr"] = LR * max(f, 1e-3)
+            xt = xt.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            xw = xw.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            y = y.to(device, non_blocking=True)
+            with torch.autocast(**amp):
+                loss = crit((model(xt) + model(xw)) / 2, y)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+            tot += loss.item(); nb += 1; steps += 1
+            if time.time() >= t_end:
+                done = True
+                break
+```
+
+New training loop with mixup:
+```python
+        for xt, xw, y in dl_tr:
+            frac = min(1.0, (time.time() - t_start) / budget)
+            f = frac / 0.05 if frac < 0.05 else 0.5 * (1 + math.cos(math.pi * (frac - 0.05) / 0.95))
+            for pg in opt.param_groups:
+                pg["lr"] = LR * max(f, 1e-3)
+            xt = xt.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            xw = xw.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            y = y.to(device, non_blocking=True)
+            # Mixup
+            lam = float(np.random.beta(0.4, 0.4))
+            perm = torch.randperm(xt.size(0), device=xt.device)
+            xt_m = lam * xt + (1 - lam) * xt[perm]
+            xw_m = lam * xw + (1 - lam) * xw[perm]
+            y_oh = torch.nn.functional.one_hot(y, 4).float()
+            y_m = lam * y_oh + (1 - lam) * y_oh[perm]
+            with torch.autocast(**amp):
+                logits = (model(xt_m) + model(xw_m)) / 2
+                loss = -(y_m * torch.log_softmax(logits, dim=1)).sum(1).mean()
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+            tot += loss.item(); nb += 1; steps += 1
+            if time.time() >= t_end:
+                done = True
+                break
+```
+
+Wait, I need to be careful with the `crit` variable. It's `nn.CrossEntropyLoss()` which doesn't support soft targets directly. I need to use the manual computation.
+
+Also, I should consider: should mixup be applied to all batches, or only some? Standard practice is to apply it to all training batches. Let's do all.
+
+One concern: with mixup, the effective batch size in terms of "distinct" samples is halved (each sample is mixed with another). But since we're already at 432 steps, this shouldn't matter much.
+
+Let me also think about whether the seed handling is correct. The `np.random.beta` call uses the global numpy random state, which is seeded at the start. The `torch.randperm` uses the global torch random state. Both are seeded. Good.
+
+Actually wait — I need to double-check: in the worker_init_fn, the workers get their own seeds. But the mixup is done in the main process (after the data is loaded from the dataloader), so it uses the main process's random state. That's fine.
+
+Let me also consider: should I use `torch.randperm` or `np.random.permutation`? Since the data is already on GPU, `torch.randperm` on GPU is more efficient. But for a batch of 64, it doesn't matter.
+
+Let me finalize the edit. I'll replace the training loop's inner part.
+
+Actually, I realize I should also think about whether mixup could hurt. The main risk is that blending two different defect types creates an unrealistic image that the model can't learn from well. For example, blending a pore (small dark spots) with a stain (diffuse discoloration) creates a weird pattern.
+
+However, mixup is known to work well even in such cases because:
+1. It acts as a regularizer (the model can't overfit to specific patterns)
+2. The soft targets teach the model about class boundaries
+3. The effect is usually positive even when the mixed images are "unrealistic"
+
+I'll go with mixup. Let me write the edit.
+
+Let me look at the exact lines to replace:
+
+```python
+            xt = xt.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            xw = xw.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            y = y.to(device, non_blocking=True)
+            with torch.autocast(**amp):
+                loss = crit((model(xt) + model(xw)) / 2, y)
+            opt.zero_grad(set_to_none=True)
+```
+
+Replace with:
+```python
+            xt = xt.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            xw = xw.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            y = y.to(device, non_blocking=True)
+            lam = float(np.random.beta(0.4, 0.4))
+            perm = torch.randperm(xt.size(0), device=xt.device)
+            xt_m = lam * xt + (1.0 - lam) * xt[perm]
+            xw_m = lam * xw + (1.0 - lam) * xw[perm]
+            y_oh = torch.nn.functional.one_hot(y, 4).float()
+            y_m = lam * y_oh + (1.0 - lam) * y_oh[perm]
+            with torch.autocast(**amp):
+                logits = (model(xt_m) + model(xw_m)) / 2
+                loss = -(y_m * torch.log_softmax(logits.float(), dim=1)).sum(1).mean()
+            opt.zero_grad(set_to_none=True)
+```
+
+Wait, I need to be careful with autocast. Under bfloat16 autocast, the model outputs are in bfloat16. The `torch.log_softmax` on bfloat16 might have precision issues. Let me cast to float for the loss computation.
+
+Actually, `torch.log_softmax` should work fine with bfloat16 in recent PyTorch versions. But to be safe, I'll cast the logits to float for the loss computation.
+
+Hmm, but `y_m` is float32 and `logits` might be bfloat16. The multiplication `y_m * log_softmax(logits)` would upcast. Let me just make sure everything is consistent.
+
+Actually, let me simplify: compute the loss in float32.
+
+```python
+            with torch.autocast(**amp):
+                logits = (model(xt_m) + model(xw_m)) / 2
+            loss = -(y_m * torch.log_softmax(logits.float(), dim=1)).sum(1).mean()
+```
+
+This way, the forward pass is in bfloat16 (fast), but the loss computation is in float32 (accurate).
+
+Let me finalize.
+
+Actually, I want to double-check one thing: the `crit` variable is `nn.CrossEntropyLoss()`. I'm not using it anymore in the new code. That's fine — it's just unused. I could remove it, but it's not necessary for this edit.
+
+Let me write the final edit. I'll use a SEARCH/REPLACE block that covers the relevant lines.
+
+The SEARCH text should be:
+```
+            xt = xt.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            xw = xw.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            y = y.to(device, non_blocking=True)
+            with torch.autocast(**amp):
+                loss = crit((model(xt) + model(xw)) / 2, y)
+            opt.zero_grad(set_to_none=True)
+```
+
+The REPLACE text:
+```
+            xt = xt.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            xw = xw.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            y = y.to(device, non_blocking=True)
+            lam = float(np.random.beta(0.4, 0.4))
+            perm = torch.randperm(xt.size(0), device=xt.device)
+            xt_m = lam * xt + (1.0 - lam) * xt[perm]
+            xw_m = lam * xw + (1.0 - lam) * xw[perm]
+            y_oh = torch.nn.functional.one_hot(y, 4).float()
+            y_m = lam * y_oh + (1.0 - lam) * y_oh[perm]
+            with torch.autocast(**amp):
+                logits = (model(xt_m) + model(xw_m)) / 2
+            loss = -(y_m * torch.log_softmax(logits.float(), dim=1)).sum(1).mean()
+            opt.zero_grad(set_to_none=True)
+```
+
+This looks correct. Let me verify:
+1. `lam` is a scalar in [0,1]
+2. `perm` is a random permutation of batch indices
+3. `xt_m` and `xw_m` are mixed inputs
+4. `y_oh` is one-hot encoding of targets
+5. `y_m` is the mixed soft target
+6. Forward pass under autocast
+7. Loss computed in float32 with soft targets
+
+This should work. The time overhead is minimal (a few element-wise operations on small tensors).
+
+One more thought: should I also apply mixup to the evaluation? No — evaluation should be clean (no mixing). The current evaluation code doesn't mix, so that's fine.
+
+Let me also think about whether the `drop_last=True` in the training dataloader could cause issues with mixup. If the last batch has fewer than 2 samples, `torch.randperm` would still work (it would just permute the available indices). But with batch_size=64 and 6052 samples, the last batch would have 6052 % 64 = 6052 - 94*64 = 6052 - 6016 = 36 samples. That's fine.
+
+Actually wait, with `drop_last=True`, the last incomplete batch is dropped. So all batches have exactly 64 samples. No issue.
+
+I'm confident in this edit. Let me write the reply.
+
+Category: This is a training method change — it changes how the model is trained (soft labels via mixup). I'd categorize this as "loss" since it changes the loss function (from hard CE to soft CE with mixed targets). Or "augmentation" since mixup is a form of data augmentation. 
+
+Actually, mixup is typically categorized as an augmentation technique. Let me use "augmentation".
+
+Wait, the categories are: data, augmentation, architecture, loss, sampling, optimisation, inference, scoring, other.
+
+Mixup is a form of data augmentation (it creates new training examples by mixing). So "augmentation" is the right category.
+
+HYPOTHESIS: Apply mixup (α=0.4) during training, blending pairs of crop views with their corresponding soft class targets. This regularizes the classifier and improves its ability to distinguish the hard classes (pore, stain) by teaching the model about class boundaries rather than just memorizing hard labels. Unlike the scoring changes (e004, e007) that re-weighted probabilities post-hoc, mixup changes what the model learns, targeting the root cause of the 0.630 vs 0.758 gap (wrong class assignments on true boxes). Expected gain: 0.01–0.04 mAP if the classifier's macro-F1 improves from ~0.87 toward 0.90+.

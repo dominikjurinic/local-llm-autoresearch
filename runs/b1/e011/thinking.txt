@@ -1,0 +1,193 @@
+===== attempt 1 =====
+Let me carefully analyze the situation.
+
+**Current state:**
+- Best: e002, 5-seed mean 0.6337
+- Per-class: pore 0.515, deposit 0.627, discontinuity 0.781, stain 0.611
+- Ceiling (perfect classes on stage-1 boxes): 0.758
+- Baseline to beat (one-step 4-class): 0.638 — we're at 0.6337, just below it!
+
+**History analysis:**
+
+1. **data category** (5 ideas, 1 new best, 1 close):
+   - e001: crashed (numpy bug)
+   - e002: fixed the bug → new best 0.6337. Key insight: train on detector boxes (slightly misplaced) rather than GT boxes.
+   - e005: higher context crop? Let me re-read. "the weak classes (pore 0.515, stain 0.611) are the ones whose look depends on surrounding texture that a 160px downscale of a 1.5-2..." — seed-0 0.6366 but 5-seed mean 0.6315, not confirmed. So slightly worse on average.
+   - e009: background class for false alarms → 0.5984, rejected. Hmm, that was a big drop. Interesting — adding a background class hurt. Wait, but that changed the softmax to 5 classes and the scoring... actually the score is conf × p[c] for the 4 defect classes. If the model puts mass on background, the defect probabilities shrink, but within-class ordering is preserved (monotone). So why did it drop by 0.04? Possibly the model trained on background boxes (false alarms) got confused, or the 5-class softmax diluted the defect classes. Either way: rejected.
+   - e010: add low-res crops → 0.6331, rejected (within noise, slightly below).
+
+2. **architecture** (2 ideas):
+   - e003: crashed (NameError)
+   - e004: fixed it, tight crop at 224px → 0.6325, rejected. So higher-res tight crop didn't help.
+
+3. **augmentation** (1 idea):
+   - e006: more augmentation (probably color/photometric) → 0.6241, rejected.
+
+4. **scoring** (2 ideas):
+   - e007: timeout (probably tried something expensive like temperature calibration or a second model)
+   - e008: suspicious bug, 0.1692. The idea was to not multiply by detector conf... but 0.1692 is way too low to be "just reordering". Wait — if you drop the conf factor, the order within each class changes (conf × p vs p alone). That's a legitimate reorder and could hurt. But 0.1692 is "far below current best → usually a bug". Hmm. Actually wait: if score = p[c] only (no conf), within-class order is p alone. That's a monotone... no, not monotone with respect to conf×p. It's a different order. Could it drop AP from 0.63 to 0.17? That's a huge drop. Possibly the bug was something else. The harness flagged it as likely-bug. Either way, the lesson: the conf factor matters a lot (false alarms from stage 1 have high conf; but the conf is class-agnostic and the same for all 4 rows of a box, so within a class, conf × p vs p: the relative order across boxes of the same class changes because conf varies per box). Actually, since conf is the same for all 4 classes of a given box, multiplying by conf reorders boxes within a class by conf-weighted p. If high-conf boxes tend to be true defects (stage 1 is a decent detector: 0.755 class-agnostic mAP), then conf×p should be fine. The e008 crash result suggests dropping conf was catastrophic — or there was a bug. Either way, don't repeat.
+
+**What do we know about where the error is?**
+
+- Ceiling with perfect classes: 0.758. We're at 0.634. So 0.124 gap is class decision error (wrong class assigned to boxes that overlap GT, or ranking issues).
+- Actually wait: the ceiling keeps false alarms as class 0 with detector conf. So the ceiling already includes false-alarm errors (they're kept as class 0). The 0.758 → our 0.634 gap is purely from misclassification (wrong class on true boxes) plus ranking effects.
+- Per-class AP: pore 0.515, deposit 0.627, discontinuity 0.781, stain 0.611.
+- Pore is the weakest. Pore is tiny dark holes. Stain confused with deposit.
+
+**What hasn't been tried?**
+
+Let me think about the space:
+
+- Data: detector boxes (done, e002), background class (e009, hurt), low-res crops (e010, no gain), context changes (e005, not confirmed).
+- Architecture: 224px tight crop (e004, no gain). Bigger model? Not tried! We're using EfficientNet-B0. Available: efficientnet_b2, convnext_nano, tf_efficientnetv2_b0, resnet50, etc. A bigger/better backbone could improve classification. But budget: 424 steps at 160px in ~148s of training. EfficientNet-B2 is ~3.4x FLOPs of B0. Would slow down. Let me estimate: B0 at 160px does 285 steps in first ~83s (97-14). So ~0.29s/step. B2 would be ~3x slower: ~0.9s/step → ~160 steps in same time. Fewer steps but each step sees 64 samples = 10k samples vs 27k. Hmm, that's a big reduction in data seen. Could hurt. Alternative: keep B0 but...
+
+  Actually, what about using a bigger model with a smaller batch or fewer views? Or tf_efficientnetv2_b0 which is similar size to B0 but often better? That would keep speed similar.
+
+- The two-crop ensemble (tight + wide, logits averaged). What about 3 crops? More views = more compute.
+
+- **Loss**: class-weighted loss "hurt every time" (from "What is already known"). Label smoothing? Not explicitly tried. Focal loss? Not tried.
+
+- **Optimisation**: LR schedule is 5% warmup + cosine over time budget. LR=1e-3, AdamW, wd=0.05. Could try different LR. But "tuning hyperparameters alone helped little in earlier experiments; changes of method helped more."
+
+- **Inference**: TTA (test-time augmentation) — flip averaging. Not tried. At eval, we do 2 forward passes per box (tight+wide). With flip TTA: 4 passes. 41879 eval boxes × 2 views = 83758 forward passes currently. The log shows prediction takes from ~125s (end of epoch 1... wait, "done: 2 epochs, 424 steps, 54447 prediction rows, 162s total" and epoch 1 ended at 125s. So prediction took ~37s for 83758 images at 160px on GPU. With 4 views (flip TTA): ~74s. Total would be 125 + 74 = 199s > 180s budget. Too slow! Unless we reduce training time.
+
+  Hmm wait, let me recompute. t_start is after data loading (14s). Budget = deadline - RESERVE_S - t_start. RESERVE_S=55. So training runs until T0+180-55 = 125s. Indeed epoch 1 ended at 125s. Then prediction 125→162s = 37s. Reserve was 55s but prediction only took 37s. So we have ~18s of slack in the reserve!
+
+  So we could increase training time by reducing RESERVE_S from 55 to ~40, gaining ~15s of training. Or use that slack for TTA.
+
+  TTA with horizontal flip: 4 forward passes instead of 2 → prediction ~74s. 125 + 74 = 199 > 180. Not enough. Unless we reduce reserve to 40: training until 140s, prediction 74s → 214s. No.
+
+  What about TTA only on the tight crop (the more discriminative one)? 3 passes: tight, wide, tight-flipped. ~55s prediction. Training until 125 + 55 = 180. Cutting it close, no margin. Hmm.
+
+  Alternatively, reduce eval batch... no, batch doesn't change total FLOPs.
+
+  What about doing TTA but at lower resolution? No.
+
+  Actually, what about training with the flip already (we do random flips in training) — TTA flip at test time usually gives a small gain (0.005-0.01 in classification). But the budget is tight.
+
+  Let me reconsider: is there a way to make prediction cheaper? The eval set is 41879 boxes. Many boxes per image. We could deduplicate... no, we need predictions for each.
+
+  Hmm, what about using a smaller model for... no.
+
+- **Scoring**: e007 (timeout) and e008 (bug) both failed. What was e007? "Raw softmax..." — probably tried temperature scaling or using a different score function that required extra computation (timeout). e008 tried dropping conf (or changing the score) and got 0.1692 (bug or catastrophic).
+
+  Key insight about scoring: within a class, AP depends only on order. Current score = conf × p[c]. The conf is class-agnostic. For ranking within a class, conf × p orders boxes by conf-weighted probability. Since stage-1 conf correlates with "is this a real defect", keeping conf in the score helps rank true defects above false alarms. e008 suggests dropping conf was catastrophic (or bugged).
+
+  What scoring change could help? Class prior correction? If the classes are imbalanced, the softmax probabilities are biased. But within-class ordering is unaffected by a per-class constant multiplier. So prior correction doesn't change AP. Only changes between classes (which class a box is assigned to... no wait, mAP is computed per class independently! Each class's predictions are ranked separately. A box can be a prediction in multiple classes (one row per class). So "which class" doesn't matter for mAP — each class is scored independently on its own rows!
+
+  Wait, that's a crucial point. Let me re-read: "mAP@0.5 is computed per class and averaged. For one class, all predictions of that class are sorted by score; a prediction is a hit if it overlaps an unmatched true box of that class by IoU > 0.5."
+
+  So for class c, the predictions are all rows with cls=c, ranked by score. A row (box, c) is a TP if it overlaps a GT box of class c. So the "wrong class" error manifests as: a box that overlaps a GT pore gets rows in all 4 classes; in the pore ranking, it's a TP if it's ranked; in the deposit ranking, it's a FP. The per-class AP for pore depends on: (a) which pore-overlapping boxes have high pore-probability relative to other pore rows, (b) false alarm boxes' pore-probability relative to true pore boxes.
+
+  So improving classification (p[pore] high on pore boxes, low on non-pore boxes) directly improves pore AP. The within-class order is conf × p[c].
+
+  So the main lever is: make p[c] more discriminative. That's a model/data problem, not a scoring problem (scoring can only reorder within a class, and the current conf×p is probably near-optimal given p).
+
+  Hmm, but one thing: MIN_SCORE = 0.001. Rows below 0.001 are dropped. With 4 rows per box and 41879 boxes, we write 54447 rows (out of 167516 possible). So many rows are dropped. Dropping low-score rows is fine for mAP (they'd be at the bottom of the ranking anyway... well, unless a low-score row is a TP and dropping it loses a TP). Actually in mAP, a TP at the bottom still counts (it's a TP when reached). Dropping it means that GT box might not be matched by any prediction → recall loss. But with 4 rows per box, the dropped rows are the 3 lowest-prob classes; the highest-prob row almost always survives. So MIN_SCORE is mostly cosmetic. Not the lever.
+
+- **Sampling**: not tried! Category "sampling" is available. What could sampling mean here? The training set: 18271 boxes (6052 GT high-res + 12219 detector boxes). Class imbalance? If pore is rare, the model under-learns it. Class-balanced sampling (oversample rare classes) could help pore. This is different from class-weighted loss (which "hurt every time") — resampling changes the data distribution the model sees, not the loss weighting. Hmm, but is it fundamentally different? Class-weighted loss and class-balanced sampling both up-weight rare classes. The known result says class-weighted loss hurt. Sampling might behave differently (it's a data change, and the model sees more pore examples, which could help pore AP a lot: pore is 0.515, the weakest).
+
+  Actually wait — let me think about what's limiting pore. Pores are tiny dark holes. In a 160px crop of a 1.5× box, a pore (which is small) might be a few pixels. The model may not resolve it. Higher-res tight crop (e004) didn't help (0.6325 vs 0.6382 seed-0... wait e002 seed-0 was 0.6382, e004 was 0.6325 — that's a 0.006 drop, beyond noise? Seed noise is ±0.005. Hmm, 0.006 drop is borderline. Rejected anyway).
+
+  Let me think about the class distribution. I don't have it directly, but pore AP 0.515 is lowest. If pore is also the rarest class, oversampling would help. If pore is common but hard, oversampling wouldn't help much.
+
+  I don't know the class counts. But I could add a print of class counts... actually, I can compute it in the experiment itself and print it. But the experiment should be a real change.
+
+- **What about the detector-box training data?** e002 added detector boxes that overlap GT (12219 boxes) to the 6052 GT boxes. These detector boxes have the true class by overlap. Good. But what about detector boxes that overlap GT at IoU between 0.1 and 0.5? They're excluded. Could include them with their best-overlap class? That's a data change. But risky: boxes that only partially overlap might be ambiguous.
+
+- **What about using the detector conf as a training signal?** No, conf is class-agnostic.
+
+- **Bigger model**: let me think about this more carefully. The classification task: given a crop, classify 4 defect types. Macro-F1 ~0.87 with the starting recipe (from "What is already known"). So the classifier is decent but 13% of boxes are misclassified (roughly). A stronger backbone might push F1 to 0.90+, gaining maybe 0.02-0.03 mAP.
+
+  Budget: currently 424 steps × 64 = 27k samples in 111s (14→125s). ~0.26s/step for B0@160 with 2 views (2 forward + 1 backward per batch... actually 2 forward passes per batch since tight and wide are separate tensors through the same model). So per sample: 2 forwards + gradient.
+
+  EfficientNet-B2@160: ~3.4x compute of B0. ~0.9s/step → ~120 steps → 7.7k samples. That's a big drop in training data. With pretrained weights, fewer samples might still be OK, but 27k → 7.7k is a lot. Risky.
+
+  tf_efficientnetv2_b0@160: similar compute to B0 (slightly more, ~1.3x). ~0.34s/step → ~325 steps → 21k samples. That's reasonable! And EfficientNetV2-B0 often beats B0 on fine-grained tasks. This looks like a solid architecture experiment: swap MODEL to tf_efficientnetv2_b0, keep everything else. Expected: small gain if V2 is better.
+
+  But wait — is this "architecture" category, and have we exhausted it? Architecture has 2 ideas: e003 (crashed, never ran) and e004 (224px tight crop, rejected). So model swap hasn't been tried. Not exhausted.
+
+  Alternatively, convnext_nano@160: ~1.5x B0 compute. Also an option. But V2-B0 is the most natural upgrade.
+
+  Hmm, but "tuning hyperparameters alone helped little; changes of method helped more." A model swap is a method change. I think this is reasonable.
+
+  Actually, let me reconsider the budget more carefully. The log: epoch 0: 285 steps at 97s (from T0, includes 14s load → 83s for 285 steps = 0.29s/step). Epoch 1: 424 steps at 125s → 28s for 139 steps = 0.20s/step (warmer). So steady-state ~0.2s/step. V2-B0 at ~1.3-1.5x: ~0.28s/step → ~390 steps in 111s → 25k samples.
+
+  Prediction: 83758 forwards (2 views × 41879) in 37s = 0.44ms/forward. V2-B0: ~0.6ms → 50s. Total: 14 + 111 + 50 = 175s < 180. Tight but OK. To be safe, reduce RESERVE_S from 55 to 45: training until 135s, prediction 50s → 185s. No. Keep reserve at 55: training 14→125 (111s), prediction 125→175 (50s), total 175s, 5s margin. A bit thin. Hmm.
+
+  Alternatively, reduce BATCH_SIZE for V2? No, batch size doesn't change total FLOPs much (GPU utilization might change).
+
+  Or: use V2-B0 but only 1 view (drop the wide crop)? That changes the method... no, let's keep the 2 views.
+
+  Actually, maybe I'm overestimating. Let me think: is the prediction time really 37s? "epoch 1: loss 0.2468, 424 steps, 125s" then "done: ... 162s total". Yes, 37s for 83758 forwards at 160px. B2 would be ~3.4x = 126s → total 251s, way over. V2-B0 ~1.3x = 48s → total 177s. Tight.
+
+  Hmm, risky on time. If it times out, it's a wasted run. Let me think if there's a safer architecture option.
+
+  What about keeping B0 but increasing IMG_SIZE to 192 or 224 for both views? e004 tried 224 for tight only (rejected, 0.6325). e005 tried... what was e005? "the weak classes (pore 0.515, stain 0.611) are the ones whose look depends on surrounding texture that a 160px downscale of a 1.5-2.5x crop destroys" — probably increased CONTEXT or IMG_SIZE for the wide crop. Seed-0 0.6366, 5-seed 0.6315 — not confirmed (slightly worse). So resolution/context changes seem exhausted-ish (2 attempts, no gain).
+
+  So model swap to V2-B0 is the main untried architecture idea. Time risk: moderate. Let me estimate more conservatively. If V2-B0 is 1.5x slower: training 0.3s/step → 370 steps, prediction 55s → total 14+111+55 = 180. Exactly at budget → killed. Too risky!
+
+  To de-risk: reduce RESERVE_S to 40 (prediction actually takes 37s for B0; for V2-B0 ~50s; 40s reserve is not enough for V2-B0 prediction). Hmm.
+
+  Alternative: keep B0, and instead... let me think about other levers.
+
+**Let me reconsider the problem from the error analysis angle.**
+
+Per-class AP: pore 0.515, deposit 0.627, discontinuity 0.781, stain 0.611. Mean = 0.6335. ✓.
+
+Ceiling 0.758 (perfect classes, false alarms kept as class 0). So if we had perfect classes, pore AP would be... well, the ceiling's per-class numbers aren't given, but the mean is 0.758. The gap is 0.124.
+
+Where does the 0.124 come from?
+1. Misclassification: a box overlapping a GT pore is predicted as deposit → in pore ranking, that box's pore-row has low p[pore] → ranked low or the box isn't a TP for pore... wait, it IS a TP for pore if it overlaps a GT pore (IoU>0.5) regardless of score — it's just ranked lower. In mAP, a TP at rank k contributes to precision at that rank. If it's ranked below many FPs, precision is low when it's reached. So misclassification hurts by pushing TPs down the ranking (below FPs of the same class) — no wait, FPs of the same class are boxes that don't overlap any GT of that class. A pore box misclassified as deposit: its pore-row score = conf × p[pore] (low). Its deposit-row score = conf × p[deposit] (high) → FP for deposit (if it doesn't overlap a GT deposit). So it's a low-ranked TP for pore and a high-ranked FP for deposit. Both hurt.
+
+2. False alarms: stage-1 boxes that don't overlap any GT. In the ceiling, they're kept as class 0 (pore) with detector conf. So the ceiling already suffers from false alarms in pore (and only pore). Our system assigns them 4 rows with conf × p[c]. If the classifier learned to suppress false alarms (low probs), they'd be low-ranked in all 4 classes → less FP damage. e009 (background class) tried this and got 0.5984 — worse! Interesting. Why? Adding ~6000 background boxes (false alarms on training images) as a 5th class: the model learns to output p[bg] high on them, so p[defect] low → those rows drop in ranking → should help... but it hurt by 0.04. Maybe the background training distracted the model (the false alarms look like defects, so learning "this is background" conflicts with learning "this is a defect"), or the 5-class softmax diluted. Or maybe the background boxes were mostly in regions that look like stain/deposit and the model started suppressing those classes overall. Anyway, rejected — don't retry.
+
+So the main lever remains: better classification. Options:
+- Better model (V2-B0): untried, moderate time risk.
+- Better data: class-balanced sampling for pore (untried).
+- Better training: label smoothing, focal loss (loss category — "class-weighted loss hurt every time" but focal/smoothing are different).
+- Test-time: TTA (time risk).
+
+Let me think about **class-balanced sampling** more. If pore is rare, oversampling pore boxes would help pore AP. But I don't know the class distribution. Let me guess from the dataset: 18271 training boxes. Typical weld defect datasets: pores are common (small holes appear a lot), stains common, deposits less, discontinuities less. Actually in LoHi-WELD... I don't know. If pore is common but hard (tiny, low-res), oversampling won't help. If pore is rare, it will.
+
+Hmm, I could make the experiment self-diagnostic: print class counts. But the change should be a real hypothesis.
+
+Actually, wait. Let me reconsider. What's the single most promising untried lever?
+
+Let me re-read "What is already known":
+- "A crop classifier given perfect boxes reaches macro-F1 ~0.87 with the starting recipe (two-crop input). Pore and deposit are the weak classes; stain is often confused with deposit."
+- "Tuning hyperparameters alone helped little in earlier experiments; changes of method helped more."
+- "Class-weighted loss hurt classification every time it was tried."
+
+So the classifier's macro-F1 is ~0.87 → ~13% misclassification. To close the 0.124 gap, we need to reduce misclassification substantially.
+
+Ideas that change what the model sees/learns:
+1. **3-view input** (add a 3rd crop scale, e.g., 1.0x very tight)? More views = more compute. B0@160: 3 views = 1.5x forward FLOPs. Training: 0.3s/step → 370 steps. Prediction: 125k forwards → 56s. Total: 14+111+56 = 181. Over budget. Risky.
+
+2. **Model swap to V2-B0**: as computed, tight on time.
+
+3. **Class-balanced sampling**: no compute change. Safe on time. Effect size: depends on class imbalance. If pore is, say, 15% of boxes and we oversample to 30%, pore AP could gain 0.02-0.05. If pore is 40%, no gain. Risk: might hurt other classes (we see fewer of them per epoch... no, per step the batch is balanced, total steps same, so all classes seen proportionally... wait, if we sample with replacement to balance classes, total samples per epoch changes. With time-based training (fixed seconds), balanced sampling means the model sees more pore examples in the same time → pore improves, others might slightly degrade).
+
+4. **Focal loss**: targets hard examples. Pore boxes that are misclassified are hard examples; focal loss up-weights them. Different from class-weighted loss (which up-weights by class frequency). Focal loss is per-example based on confidence. Untried. Compute: negligible. Safe on time. Effect: usually small (0.005-0.01), but could be more if many hard examples.
+
+5. **Label smoothing**: CE with label smoothing 0.1. Usually small effect, can help or hurt.
+
+6. **Two-stage scoring refinement**: e.g., train a second model... no, too complex.
+
+7. **Use detector conf in training**: weight the loss by detector conf? Boxes with high conf are more likely real → trust their labels more. Hmm, interesting but the labels come from GT overlap so they're correct anyway.
+
+8. **Mixup / cutmix**: augmentation category. e006 (more augmentation) was rejected (0.6241). What was e006 exactly? "the current recipe only uses geometric jitter..." — probably added color jitter, rotation, etc. Mixup is different (interpolates between samples). But augmentation seems somewhat exhausted (1 attempt, rejected). The lesson says augmentation: 1 idea, 1 ran, 0 new best. Not exhausted by the "3 attempts" rule, but the one attempt hurt.
+
+Let me focus. The two most promising untried levers with decent expected effect:
+- **V2-B0 model swap** (expected +0.01 to +0.02 if V2 is better; time risk ~15-20% of timing out).
+- **Class-balanced sampling** (expected +0.01 to +0.03 if pore is rare; time safe; risk of hurting other classes).
+
+Hmm, actually, let me reconsider the time budget for V2-B0. Can I make it safer?
+
+Option: swap to V2-B0 AND reduce RESERVE_S to 45. Training until T0+180-45 = 135s (121s of training). Prediction for V2-B0 ~50s → total 14+121+50 = 185 > 180. No.
+
+Option: swap to V2-B0, keep RESERVE_S=55, and reduce IMG_SIZE to 144? That changes two things (model + resolution) — violates "one idea". No.
+
+Option: swap to V2-B0 only, keep everything else. If V2-B0@160 is ~1.3x B0: training 111s → ~85s worth... wait no. Training runs until the time limit (125s) regardless of step speed. So training time is fixed at 111s (14→125). Steps decrease but that's fine (pretrained model, cosine schedule over time). Prediction: 37s × 1.3 = 48s → total 125+48 = 173s, margin 7s. If 1.5x: 55.5s → 180.5s, timeout!
+
+The risk hinges on V2-B0's actual speed. tf_efficientnetv2_b0 at 160px: I'd estimate it's ~1.2-1.4x BThinking budget reached. Stop thinking now and write the reply in the required format.

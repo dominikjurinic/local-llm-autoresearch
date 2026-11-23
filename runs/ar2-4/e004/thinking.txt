@@ -1,0 +1,252 @@
+===== attempt 1 =====
+Let me analyze the situation.
+
+Current best: e001, 5-seed mean 0.6302. Per-class: pore 0.517, deposit 0.622, discontinuity 0.776, stain 0.605.
+
+Reference numbers:
+- One-step 4-class baseline: 0.638
+- Stage 1 boxes with perfect classes: 0.758
+- Class-agnostic: 0.755
+
+So the gap from 0.6302 to 0.755 is about 0.125, and most of it is the class decision on boxes that overlap real defects. The crop classifier with perfect boxes reaches macro-F1 ~0.87. So the remaining error is a mix of:
+1. Wrong class on boxes that overlap true defects (classification error).
+2. Ranking of false alarms against true detections (scoring).
+
+History:
+- e001: added low-res training data → new best 0.6302.
+- e002: single tight crop → crashed (bug).
+- e003: fixed the crash → 0.6247, rejected (worse than 0.6302). So the single tight crop is worse than the two-crop average. Good to know: the wide crop helps.
+
+Now, what to try next? Let me think about the error breakdown.
+
+Per-class: pore 0.517 is the weakest, then stain 0.605, deposit 0.622, discontinuity 0.776.
+
+Known: "Pore and deposit are the weak classes; stain is often confused with deposit."
+
+Ideas:
+
+1. **Scoring**: Currently score = detector conf × class probability. The class-agnostic score is 0.755, and the perfect-class ceiling is 0.758, interestingly, nearly the same. Wait, that's interesting: d2_class_agnostic (all boxes scored as a single class 'defect') is 0.755, and the perfect-class ceiling is 0.758. So the detector's boxes are essentially perfect at placement level; the loss from 0.755 to 0.630 is almost entirely due to class misassignment (wrong class → false positive for that class, and the true box is missed).
+
+Actually, wait — in the class-agnostic case, all boxes are scored as a single class 'defect'. But the mAP is computed over 4 classes… hmm, "if defect type didn't matter" — maybe they merged all classes into one. The 0.77 single-class number for the one-step detector. Anyway.
+
+Key insight: the gap between 0.630 and 0.758 is almost entirely class assignment. So improving the classifier's accuracy on boxes that overlap true defects is the main lever.
+
+2. **Classifier accuracy**: macro-F1 ~0.87 with the starting recipe. The weak classes are pore and deposit, and stain is confused with deposit.
+
+Ideas for improving classification:
+- Better model (e.g., convnext_nano, efficientnet_b2, resnet50). But budget: currently 428 steps in ~148s of training. A bigger model means fewer steps. EfficientNet-B2 is about 2× the compute of B0. Hmm.
+- Higher resolution: IMG_SIZE 160 → 224. Pores are small; a tight 1.5x crop at 160px may lose detail. Higher input resolution helps small defects. Cost: forward pass scales roughly quadratically with resolution. 224/160 = 1.4 → 1.96× cost per forward. Two views → ~2× step time → ~215 steps. Fewer steps but better features. Risky but potentially meaningful.
+- Data augmentation: currently light geometric jitter (center ±10%, scale 0.85-1.2), flip, brightness 0.8-1.2. Could add color jitter, stronger scale jitter, maybe cutout. But "tuning hyperparameters alone has brought little effect in past experiments; method changes have been more effective."
+- Class imbalance: class-weighted loss has hurt every time. So no.
+- **Use detector conf as a signal**: boxes that overlap true defects tend to have higher conf? Actually, in stage 1, conf is the detector's confidence. False alarms may have lower conf. Already using conf × prob.
+
+3. **Ensemble/multi-view**: The two-crop average helped (e003 shows single crop is worse). Could add a third view? That halves the step budget again. Probably not.
+
+4. **Test-time augmentation (TTA)**: at inference, average over flips (hflip, vflip, both). This doubles or quadruples inference cost. Inference is currently: 41879 boxes × 2 views / 256 batch = 326 batches × 2 forward passes. Total time 162s, training ~148s (from 14s load to ~162s; training is 14s to ~156s). Actually, epoch 1 ends at 125s… wait, "epoch 1: loss 0.3107, 428 steps, 125s" and done at 162s. Hmm, t_end = deadline - 55 = 180 - 55 = 125s (from T0? no, from t_start which is after load). Let me recompute: T0 is import start. Load is 14s. t_start ≈ T0+14 (plus data loader setup). t_end = deadline - 55 = T0 + 180 - 55 = T0+125. So the training budget is ~111s (from t_start at ~14s to 125s). Training ended at 125s (epoch 1 at 125s — that print is at 125s, and the loop checks time >= t_end after each step). Then inference from 125s to 162s = ~37s. Reserve is 55s, so 162 < 180, OK.
+
+TTA with 4 flip variants: inference 4× → ~148s inference → total ~273s > 180s. Too much. TTA with 2 views × 2 flips = 4 forwards per box, same problem. So TTA is infeasible unless we cut training. Not great.
+
+5. **Reduce inference cost to free time**: e.g., prediction batch 256 → 512, minor.
+
+6. **Better use of the wide crop**: The wide crop (2.5x) provides context. Pores vs deposit: pores are small round holes; deposit is excess material. Context may help.
+
+7. **Input resolution increase**: 160 → 192 or 224. Cost per forward ~ (192/160)² = 1.44 or (224/160)² = 1.96. Two views: step time 1.44-1.96×. Steps 428 → ~275-300. Inference 37s → ~53-73s. Total: training ~111s (unchanged, time-based) + inference 73s = 125+73 = 198s > 180. Too much at 224. At 192: inference ~53s → total ~178s. Cutting it close. Hmm, risky. And fewer steps too.
+
+Actually wait — inference time also scales with resolution. Let me estimate more carefully. Currently: 41879 boxes × 2 views = 83758 forwards, batch 256 → 327 batches. 37s → ~113ms/batch → ~0.345ms/forward. At 192: 1.44× → 0.5ms/forward → 53s. Total = 125 + 53 + write time (~2s) = ~180s. Too close to the 180 limit. The harness kills at the limit. Not safe.
+
+At 192 with reduced training? No, training is time-based, so it always runs until t_end.
+
+Alternative: reduce views to save time? e003 showed single crop is worse (0.6247 vs 0.6302, ~0.005 difference, within noise? seed std is 0.0069, so 0.0055 difference is within noise, but it was rejected on seed 0… actually, the harness says "if it beats the current best mean, re-run with more seeds." e003 seed 0 was 0.6247 < 0.6302, so rejected at seed 0. So we can't conclude the two-crop is strictly better, but it's not worth pursuing.)
+
+8. **Model change**: try a different architecture. Options: convnext_nano (~1.5× B0 compute?), efficientnet_b2 (~2×), resnet50 (~2-3×). With time-based training, a bigger model = fewer steps but better features. B0 with 428 steps gives 0.630. Hmm.
+
+Actually, let me think about what's fundamentally limiting. Classifier macro-F1 ~0.87 on perfect boxes. The weak classes are pore/deposit, stain/deposit confusion. This is a *classification* problem, not a data problem (we have 14k boxes). Options:
+- Higher input resolution (pores are small).
+- Better backbone.
+- More/better augmentation.
+- Fine-tuning strategy: longer training (budget-limited), lower LR, etc. "Tuning hyperparameters alone has brought little effect."
+
+9. **Score calibration**: score = conf × prob. The ranking within a class matters. For class c, predictions are sorted by conf × p_c. Boxes with high p_c but low conf rank low. Is that optimal? For mAP, within each class we want true positives ranked above false positives. conf is the detector's confidence — a good proxy for "is there a defect here." p_c is the class probability. The product is a reasonable joint score.
+
+But consider: for a given class c, false positives are boxes where the true class ≠ c (or no defect). Their p_c is low (ideally). True positives have high p_c. So ranking by p_c alone might be as good or better than conf × p_c? Actually, conf also correlates with "is there a defect here at all." A false-alarm box (no defect) with high conf and a p_c of, say, 0.3 (the model is unsure) would rank high with conf × p_c but low with p_c alone… hmm, both are similar.
+
+Actually, there's a subtle point: mAP@0.5 per class — a box that overlaps a true box of class c counts as a hit for class c only if predicted as class c. If predicted as the wrong class, it's a false positive for the predicted class AND a miss for the true class. So the best strategy is to predict the most likely correct class, and rank by the probability of being a true positive of that class.
+
+The product conf × p_c is the joint probability estimate. That's principled. Changing the ranking to, say, p_c^α × conf^β… that's a "scoring" tweak and likely within noise.
+
+10. **Multi-row predictions**: "multiple rows per box (one per class) are allowed." Currently we output one row per class (4 rows per box, 56470 rows for 41879 boxes… wait, 41879 × 4 = 167516, but only 56470 rows were written because of MIN_SCORE=0.001). Hmm, interesting: only ~1/3 of rows pass the 0.001 threshold. So many boxes have low conf (false alarms with low conf).
+
+Wait, actually, is outputting all 4 classes per box harmful? For a box whose true class is c, the rows for other classes are false positives for those classes, ranked by conf × p_wrong. If p_wrong is small, they rank low and barely affect AP (they only matter if they rank above true positives of that class… they dilute precision at the tail). Standard practice: output all classes, and the metric handles it. That's fine.
+
+11. **Use both crops differently**: e.g., tight crop for class decision, wide crop for "is there a defect here" (relevance). Then score = conf × p_relevant × p_class? That's a method change. The wide crop might be better at detecting "is there a defect here at all" (context), while the tight crop is better for class. Currently we average the logits of the two views, which mixes the signals.
+
+Hmm, that's an interesting idea: two-head or two-model approach. But with one model, we can't easily separate them. We could train the model on the wide crop for a binary "defect present" task… but we don't have negative boxes (boxes with no defect) in training. Actually, we can generate them: sample random locations in training images with no crop overlap → negative samples. Then the wide-crop model learns "defect present or not," giving a relevance score to re-rank false alarms.
+
+But wait — the ceiling analysis: class-agnostic is 0.755, perfect-class is 0.758. So false alarms barely matter! The class-agnostic score (all boxes kept, scored by conf) is 0.755 — nearly the same as the perfect-class case (0.758). So the ranking of false alarms against true detections is already nearly optimal with conf. The entire 0.125 gap is class misassignment. Therefore, investing in false-alarm re-ranking is a dead end. Focus on classification accuracy.
+
+This is a crucial insight from the reference numbers: **the loss is almost entirely in the class decision on boxes that overlap real defects.** So improve the classifier.
+
+12. **Improve the classifier**:
+   a. Higher resolution (pores are small). Budget risk.
+   b. Better backbone (convnext_nano, efficientnet_b2).
+   c. Stronger augmentation.
+   d. Train longer / different schedule.
+   e. Use more training data — already using both resolutions.
+   f. **Class-specific handling**: stain confused with deposit. Maybe stain looks different at a different scale?
+
+Let me think about (b): which model? Available: convnext_atto (smaller than nano), convnext_nano, convnext_pico, efficientnet_b0 (current), efficientnet_b2, mobilenetv3_large_100, regnety_016, resnet18, resnet26d, resnet34, resnet50, tf_efficientnetv2_b0.
+
+ConvNeXt nano: ~35 params vs B0's ~4M. Compute: ConvNeXt-nano is designed to be comparable to MobileNetV3-large (~60 GFLOPs vs 61). EfficientNet-B0 is ~39 GFLOPs (at 224). At 160, B0 is ~22 GFLOPs. ConvNeXt-nano at 160 is ~35×(160/224)² ≈ 18 GFLOPs? Hmm, ConvNeXt's cost scales quadratically with resolution. Actually, ConvNeXt-nano at 224 is ~60 GFLOPs? No wait. Let me recall: ConvNeXt-tiny is ~60 GFLOPs at 224? No — ConvNeXt-tiny is 28.6M params, ~50 GFLOPs? Hmm. ConvNeXt-nano: 15M params, 60 GFLOPs? I think nano is ~60 GFLOPs at 224… actually, I recall ConvNeXt-nano is ~60 GFLOPs, tiny is ~50? No.
+
+Let me recall from the timm docs: convnext_nano: params 15.0M, FLOPs 60.0M? No, that's too low. I think convnext_nano is ~60 GFLOPs at 224. EfficientNet-b0 is 39 GFLOPs at 224. So nano is ~1.5× B0's compute. With time-based training, steps drop by ~1.5× (428 → ~285). Inference also 1.5× (37 → 55s). Total: 125 + 55 = 180. Again too close!
+
+Hmm wait, let me recompute the current inference time. Total 162s, training ends at 125s (t_end). So inference + writing = 37s. For 1.5× model: inference ~55s → total 180s. No margin. Dangerous.
+
+EfficientNet-b2: ~80 GFLOPs at 224, ~2× B0. Inference ~74s → total 199s. No.
+
+tf_efficientnetv2_b0: ~218 GFLOPs? No, that's wrong. EfficientNetV2-S is 218 GFLOPs? No… EfficientNetV2-S: 22.6M params, 218 GFLOPs? Hmm, I think EfficientNetV2-S at 300 is ~218 GFLOPs? No wait, that's V2-L or something. Let me think: EfficientNetV2-S: 22.6M params, ~218 GFLOPs? I recall V2-S is 218 GFLOPs at 300px. At 160: 218 × (160/300)² ≈ 62 GFLOPs. That's ~1.6× B0 at 160 (22 GFLOPs). Similar to nano.
+
+regnety_016: 8.5M params, ~13 GFLOPs at 224 → at 160 ~6.5 GFLOPs. Cheaper than B0! More steps. But smaller capacity.
+
+resnet18: ~1.8 GFLOPs at 224? No, resnet18 is ~1.8 GFLOPs? ResNet18: 11.7M params, 1.8 GFLOPs? I think ResNet18 at 224 is ~1.8 GFLOPs… actually 1.82 GFLOPs? Hmm, that seems low but ResNet18 is indeed ~1.8 GFLOPs at 224 (some sources say 6.4 GFLOPs? no). Let me not rely on exact numbers.
+
+The point: with a fixed time budget, bigger model = fewer steps. The current 428 steps at B0 gives 0.630. Whether a bigger model with fewer steps wins is unclear. The known result "tuning hyperparameters alone has brought little effect; method changes have been more effective" suggests architecture changes are worth trying, but the budget constraint is real.
+
+Hmm, what about **IMG_SIZE increase with a cheaper model**? E.g., keep B0 but 192px: 1.44× cost → ~297 steps, inference ~53s → total ~178s. Too close to 180.
+
+192px with regnety_016 (cheaper)? regnety_016 at 160: ~6.5 GFLOPs? B0 at 160: ~22 GFLOPs. So regnety_016 is ~3.4× cheaper. At 192: 6.5 × 1.44 ≈ 9.4 GFLOPs → ~2.3× cheaper than B0@160 → ~980 steps. Inference: 37s × (9.4/22) ≈ 16s. Total ~141s. Comfortable. But is regnety_016 a good enough classifier? 8.5M params, decent ImageNet accuracy (~78%?). B0 is 4M params, ~78%. Comparable. Hmm, but "method change" — higher resolution with a comparable model might help pore detection (small defects).
+
+Actually, wait. Let me reconsider. What's the strongest lever? The classifier's F1 is 0.87 on perfect boxes. The weak classes are pore and deposit. Pores are small — resolution likely matters a lot for pores. Stain vs deposit confusion — maybe context (wide crop) matters there.
+
+Let me think about **IMG_SIZE 160 → 192 or 200** with B0. Budget: 1.44-1.56× step cost → ~275-300 steps (vs 428). Inference ~53-58s → total ~178-183s. Too risky.
+
+What about **IMG_SIZE 192 with convnext_pico or regnety_016**? Those are smaller. convnext_pico: 2.8M params, ~3.5 GFLOPs at 224? At 192: ~2.7 GFLOPs → ~8× cheaper than B0@160 → ~3400 steps. Inference ~5s. Total ~130s. Plenty of margin. But convnext_pico is tiny (2.8M params) — maybe too small? It's designed to be small but ImageNet-accurate (~75%?). Hmm.
+
+regnety_016: 8.5M params — closer to B0's 4M, actually 2× B0's params but fewer FLOPs (RegNet's efficiency). At 192px: ~9-10 GFLOPs vs B0@160's 22 → ~2.3× cheaper → ~980 steps. Inference ~16s. Total ~141s. Good margin. And regnety_016 is a solid model (ImageNet top-1 ~77-78%).
+
+Hmm, but honestly, I'm not sure resolution is the right lever vs. model capacity. Let me think about what's most likely to give ≥0.01 gain.
+
+Actually, let me reconsider the problem. 14128 training boxes, 4 classes. Class distribution? Pore is probably the most common (pores are the most frequent weld defect). The classifier's F1 0.87 means ~13% of boxes are misclassified. The weak classes are pore (0.517 AP) and stain (0.605).
+
+Wait, pore's AP is 0.517 — much lower than the classifier's per-class F1 would suggest. If the classifier's pore F1 is, say, 0.8, why is pore's AP only 0.517? Hmm. AP depends on ranking. For pore, predictions are ranked by conf × p_pore. If the detector's conf is low for pore boxes… or if there are many false pore predictions.
+
+Actually, let me think: the class-agnostic score is 0.755 (single class). If we split into 4 classes with perfect assignment, 0.758. So per-class placement is fine. The per-class AP loss comes from: (a) boxes of class c predicted as another class (miss for c, FP for the other), (b) false alarms predicted as class c (FP for c).
+
+Pore's AP 0.517: maybe pores are often misclassified as deposit or stain? Or pores have lower detector conf, so they rank low? Hmm, but with perfect classes it's 0.758 overall, so the ranking by conf is fine overall. Per-class with perfect classes would be: pore maybe ~0.7, deposit ~0.75, etc. Don't know.
+
+Let me think about what a "method change" that could give ≥0.01 looks like:
+
+Option A: **Higher input resolution** (192 or 200) — targets small-defect (pore) detail. Keep B0, maybe reduce to 1 view? No, 2 views are better. Budget risk at B0.
+
+Option B: **Different backbone** (convnext_nano or efficientnet_b2) — better features. Budget: fewer steps, inference longer.
+
+Option C: **Stronger augmentation** — e.g., add color jitter, stronger scale/rotation. Cheap, no budget change. But "tuning hyperparameters alone has brought little effect" — augmentation is a data/augmentation category, and it's a method-ish change. Moderate.
+
+Option D: **Two-stage scoring with a relevance head** — dead end per ceiling analysis (false alarms barely matter).
+
+Option E: **Train on more steps with a cheaper model** (regnety_016 or convnext_pico) — more optimizer steps in the budget. Currently 428 steps; is 428 enough? The loss curve: epoch 0 (220 steps) 0.5923, epoch 1 (208 more steps) 0.3107. Still dropping fast at the end (0.31 is high). So the model is undertrained! With a cheaper model, we get more steps → lower loss → better classification. This is a compelling argument: the training loss is still dropping rapidly, so more steps would help.
+
+Actually, that's a strong signal: final loss 0.31 is still high and dropping. If we could train 2-3× longer, the classifier would be better. A cheaper model (regnety_016 at 160: ~3× cheaper) → ~1200+ steps. Or even B0 with… no, B0's cost is fixed.
+
+Hmm wait, but is loss 0.31 "high"? With 4 classes, random is ln(4) = 1.39. 0.31 is decent but with class imbalance and hard samples, it might still be dropping. The per-epoch average: epoch 1's average loss is 0.3107 over 208 steps, and epoch 0 was 0.5923. If epoch 1's loss started at ~0.45 and ended at ~0.25, it's still dropping.
+
+So **more steps** is likely valuable. Ways to get more steps:
+1. Cheaper model (regnety_016, convnext_pico, resnet18).
+2. Lower resolution (160 → 128): 0.64× cost → ~670 steps. But lower resolution hurts pores. Bad trade.
+3. Single view: e003 showed it's worse (but within noise).
+4. Larger batch with fewer… no, steps = time / step time.
+
+Option: **regnety_016 at 160, 2 views**. Estimated ~2.5-3× cheaper than B0 → ~1100-1300 steps. Inference ~12-15s. Total ~140s. Margin OK.
+
+But is regnety_016's capacity enough? 8.5M params vs B0's 4M. Actually more params, fewer FLOPs. ImageNet top-1: regnety_016 ~77.9%? B0 ~78.1%. Comparable. So regnety_016 ≈ B0 in quality but ~3× faster. Seems like a clear win if my FLOPs estimate is right.
+
+Let me double-check regnety_016's FLOPs. RegNetY-0.16B: 0.16B = 160M MACs? "0.16" in RegNet naming is FLOPs in billions? RegNet naming: RegNetY-0.16 means ~0.16 GFLOPs? No… RegNetY-0.16: 8.5M params, 13.0 GFLOPs at 224? Hmm. RegNetX-0.02: 1.1M params, 3.1 GFLOPs. RegNetY-0.16: 8.5M params, 13.0 GFLOPs. Yes, I think RegNetY-0.16 is ~13 GFLOPs at 224. At 160: 13 × (160/224)² = 13 × 0.51 = 6.6 GFLOPs. B0 at 160: 39 × 0.51 = 20 GFLOPs. So ~3× cheaper.
+
+So with regnety_016: ~1280 steps, inference ~12s, total ~137s.
+
+Alternatively **convnext_pico**: 2.8M params, ~3.5 GFLOPs at 224 → 1.8 GFLOPs at 160 → ~11× cheaper → ~4700 steps. But 2.8M params is small; capacity might limit F1. Pico's ImageNet top-1 is ~74-75%? Weaker. Risky.
+
+**resnet18**: 11.7M params, 1.8 GFLOPs at 224?? No. ResNet18: 1.82 GFLOPs? I've seen "ResNet18: 1.8 GFLOPs" — hmm, actually I think ResNet18 at 224 is ~1.8 GFLOPs… let me sanity check: ResNet50 is ~3.8-4.1 GFLOPs at 224? Common number: ResNet50 = 3.85 GFLOPs? Hmm, I've also seen 4.1. ResNet18 = 1.82 GFLOPs. OK, so ResNet18 at 160: 0.93 GFLOPs → ~21× cheaper → ~9000 steps. But ResNet18's ImageNet is ~69-70%, much weaker than B0's 78%. Capacity too low for fine-grained weld defects? Probably worse.
+
+So regnety_016 seems the sweet spot: comparable accuracy to B0, ~3× faster.
+
+Hmm wait, but let me reconsider: is the bottleneck really number of steps? The model is pretrained; fine-tuning for 428 steps gives F1 0.87. More steps → maybe F1 0.89-0.90? That could translate to ~0.01-0.02 mAP. Plausible.
+
+But there's a risk: with 3× more steps and the same LR schedule (cosine over the time budget), the effective training is longer — the cosine schedule is time-based (frac = elapsed/budget), so more steps just means more updates at the scheduled LR. Fine.
+
+Also, should I worry that regnety_016's pretrained weights are available? Yes: "regnety_016" is in the list.
+
+Let me also consider **efficientnet_b2**: ~80 GFLOPs at 224 → 41 at 160 → 2× B0. ~215 steps, inference ~74s → total ~199s. Over budget. No.
+
+**convnext_nano**: ~60 GFLOPs at 224? → 30.6 at 160 → 1.5× B0 → ~285 steps, inference ~55s → total ~180s. No margin. No.
+
+So among bigger models, none fit. Among smaller models, regnety_016 is the best (comparable accuracy, 3× faster).
+
+Actually, wait — what about keeping B0 and reducing inference cost to free training time? Training is time-based until t_end = deadline - RESERVE. RESERVE=55 is for inference + writing. Inference currently takes 37s. If I could make inference faster (e.g., batch 512, or skip low-score boxes?), I could lower RESERVE to ~25 and get ~30s more training → ~100 more steps. Hmm, that's a "scoring/inference" tweak. But 100 steps vs. regnety's +850 steps. regnety_016 is much better.
+
+Alternatively, combine: regnety_016 + lower RESERVE? With regnety, inference is ~12s, so RESERVE could be 30. Training budget +25s → ~1500 steps. Marginal gain, adds complexity. Let me keep it simple: just swap the model.
+
+Hmm, one more consideration: with a 3× faster model, we get ~1280 steps at batch 64 = ~82k samples seen vs. current 27k. The dataset is 14128 boxes → 1 epoch = 220 steps. So 1280 steps ≈ 5.8 epochs. Currently 428 steps ≈ 1.94 epochs. 5.8 epochs with cosine decay — reasonable, not overfitting (loss was still dropping).
+
+Let me also double-check the step-time estimate. Currently: 220 steps in ~71s (14s to 85s) → 0.32s/step. That includes data loading (num_workers=8, persistent). If the model is 3× cheaper, compute per step drops, but data loading (crop creation in workers) stays the same. Hmm! The data pipeline: each sample creates 2 crops (resize to 160). That's CPU work in workers. If data loading is a significant fraction of step time, the speedup is less than 3×.
+
+Step time 0.32s for batch 64 = 2048 crops (2 views × 1024 images… wait, batch 64 = 64 boxes × 2 views = 128 crops per forward pair). Crop creation: PIL resize to 160, ~2-3ms each? With 8 workers, 128 crops / 8 = 16 per worker × 2.5ms = 40ms. GPU forward+backward for 128 images of B0@160: forward ~128 × 0.1ms = 13ms, backward ~26ms, plus optimizer. Total ~80-100ms on GPU. So data loading might be ~40% of step time. With regnety (3× faster GPU), the step is data-bound: maybe 0.32s → 0.18s? ~1.8× speedup → ~770 steps. Still ~1.8× more steps than now. Inference: 41879 boxes × 2 views / 256 = 327 batches; GPU forward per batch is faster but data loading dominates → inference maybe 25s instead of 12s. Total ~150s. Still fine.
+
+OK, so regnety_016 gives ~1.5-2.5× more steps. Worth trying.
+
+But wait — let me reconsider whether "more steps" is really the lever, vs. "better model features." The known result: "tuning hyperparameters alone has brought little effect in past experiments; method changes have been more effective." A model swap is an architecture change. And the undertrained signal (loss 0.31, still dropping) supports more steps.
+
+Alternatively, **IMG_SIZE 224 with regnety_016**: 13 GFLOPs at 224 (same as B0@160's 20? no: 13 vs 20, 1.5× cheaper) → ~285 steps, inference ~55s → total ~180s. No margin. No.
+
+IMG_SIZE 192 with regnety_016: 13 × (192/224)² = 9.4 GFLOPs → 2.1× cheaper than B0@160 → ~650 steps (if data-bound, maybe ~500), inference ~45s → total ~170s. Tight but OK? Hmm, 125 + 45 = 170, margin 10s. Risky if data loading is slow. And does 192 vs 160 resolution help enough to justify? Pores at 1.5× box: if the box is 30px, the crop is 45px → resized to 160 (upscale) or 192 (more upscale). Wait — the crop is resized to IMG_SIZE regardless. If the original crop region is small (45px), upscaling to 160 vs 192 doesn't add detail; it just interpolates more. Higher IMG_SIZE only helps when the crop region is large (e.g., wide 2.5× crop of a large box = 100+ px), giving more pixels to downsample to 192 vs 160. For small boxes, the tight crop is upscaled either way.
+
+Hmm, so resolution increase mainly helps the wide crop of large boxes. Pores are small → tight crop is upscaled → resolution increase doesn't help pores much! Interesting. So the resolution lever is weaker than I thought.
+
+That reinforces: **more optimizer steps with a faster model** is the play. regnety_016.
+
+Actually, wait. Let me reconsider the augmentation angle too. Current augmentation: center jitter ±10% of side, scale 0.85-1.2, flip, brightness 0.8-1.2. Missing: color jitter (hue/saturation), rotation, stronger scale. Weld images — color may matter (stain vs deposit have different colors). Adding color jitter could help generalization. But it's a modest change, likely <0.01. The model-swap has a clearer mechanism (undertrained signal).
+
+Let me also sanity-check the "more steps" hypothesis against e001: adding low-res data doubled the training set (from ~7k to 14k boxes) and improved 0.6302 (from e000's… e000's score? e001's seed 0 was 0.6354, 5-seed 0.6302. e000's score isn't shown, but e001 was "new best," so e000 < 0.6302). More data helped. More steps should similarly help.
+
+One concern: with a 3× faster model, we do ~6 epochs. Overfitting risk? The loss was still dropping at 2 epochs. With cosine LR decay to 1e-3×LR at the end, 6 epochs should be fine. Also, augmentation helps prevent overfitting.
+
+Decision: **swap MODEL from efficientnet_b0 to regnety_016**, keep everything else. Category: architecture.
+
+Hypothesis: the training loss is still dropping rapidly at the end of the budget (0.31, epoch 1), suggesting the classifier is undertrained; regnety_016 has comparable ImageNet accuracy to EfficientNet-B0 but ~3× fewer FLOPs, so the same wall-clock budget yields ~2-3× more optimizer steps and faster inference, improving classification accuracy (especially for the weak pore/deposit classes) and thus mAP. Expected gain ≥0.01. Different from e002/e003 (which reduced views to halve step cost and lost accuracy) because here we keep both views and gain steps by a faster backbone rather than fewer views.
+
+Wait, but I should double-check: is regnety_016 really faster than B0 on this GPU? B0@160: 20 GFLOPs per image (both views combined? no, per image). Let me redo: per forward of 128 images (batch 64 × 2 views): B0: 128 × 20 GFLOPs = 2.56 TFLOPs. With bf16 on a decent GPU (say 200 TFLOPs), ~13ms forward, ~26ms backward. Regnety_016@160: 128 × 6.6 = 0.85 TFLOPs → ~4ms forward, ~9ms backward. So GPU compute drops from ~40ms to ~15ms per step. If step time is 320ms, GPU is ~40ms → data/overhead is ~280ms?? That seems too data-bound. Hmm, 220 steps in 71s = 323ms/step. If GPU is 40ms, then 283ms is data+overhead. That's a lot. With num_workers=8 and persistent workers, crop creation: 64 boxes × 2 views = 128 crops per batch. Each crop: PIL ops (crop, pad, resize to 160, normalize) ~1-2ms → 128 × 1.5ms = 192ms per batch, / 8 workers = 24ms. Hmm, that's only 24ms. So where does the 283ms go?
+
+Maybe the GPU is slower than I assumed (small GPU, e.g., T4 or A10G). On a T4 (65 TFLOPs bf16? T4 is FP16 65 TFLOPs): B0 forward 2.56 TFLOPs / 65 = 39ms, backward 78ms → ~120ms GPU per step. Plus data ~24ms, overhead ~30ms → ~175ms. Still less than 323ms. Maybe the GPU is smaller (e.g., 1/4 of T4?). Or my FLOPs estimate is off. Anyway — the relative speedup between B0 and regnety should hold roughly (same GPU, 3× fewer FLOPs → ~3× faster GPU portion). If GPU is 40% of step time, total speedup ~1.6×; if 60%, ~2.3×. Either way, 1.5-2.5× more steps.
+
+Inference: currently 37s for 83758 forwards (2 views × 41879). With regnety, GPU portion drops 3×; data loading same. If inference is ~50% GPU, ~1.7× faster → ~22s. Total ~147s. Safe.
+
+OK, I'm fairly confident in regnety_016. Let me also consider: should I increase BATCH_SIZE to 128 or 256 to reduce overhead per step? With a faster model, larger batches → fewer, faster steps… actually, larger batch = more samples per step, but the step time also increases. Steps per second ≈ (batch / step time). If step time scales ~linearly with batch (GPU-bound), steps/sec is constant. If overhead-dominated, larger batch is better. But larger batch with the same LR may train worse. Let me keep batch 64 — one change at a time.
+
+Also, should I lower RESERVE_S since inference will be faster? Inference ~22s + writing ~2s → RESERVE 30 would be safe. That would add ~25s of training → ~15-25% more steps. Hmm, that's a second change. The rule says one idea per turn. But RESERVE is part of making the model swap safe… actually, RESERVE=55 is already more than enough (inference 22s + writing). Lowering it is an exploitation of the speedup, part of the same idea (get more steps). But it also adds risk if my inference estimate is wrong. If inference takes 40s instead of 22s and RESERVE=30, total = 125+40+… wait, t_end = deadline - RESERVE = 180-30 = 150. Training until 150s, then inference 40s → 190s > 180. Kill. So lowering RESERVE is risky if the estimate is off. Keep RESERVE=55. The model swap alone gives the step gain.
+
+Final decision: swap MODEL to regnety_016. Single-line change.
+
+Actually, hold on. Let me reconsider one more alternative: **convnext_atto** (3.3M params, ~11 GFLOPs at 224? → 5.6 at 160, similar to regnety). ConvNeXt architectures have been strong for fine-grained vision. convnext_atto: 3.3M params, ImageNet ~75%? Smaller than regnety_016 (8.5M, ~78%). regnety_016 has more capacity at similar speed. Stick with regnety_016.
+
+Or **resnet26d** (11.6M params, ~16 GFLOPs at 224 → 8.2 at 160, slightly slower than regnety, similar capacity). regnety_016 is faster. Stick with regnety_016.
+
+Let me write the edit:
+
+SEARCH:
+MODEL = "efficientnet_b0"
+=======
+MODEL = "regnety_016"
+
+That's the only change. Clean.
+
+Hypothesis (2-3 sentences): "The training loss is still dropping rapidly at the end of the budget (0.31 at step 428), so the classifier is undertrained rather than feature-limited. RegNetY-0.16 has comparable ImageNet accuracy to EfficientNet-B0 but ~3× fewer FLOPs, so the same wall-clock budget yields ~2-3× more optimizer steps and faster inference, improving class assignment on true defects (the main error source per the 0.755 class-agnostic vs. 0.630 current gap) — especially for the weak pore/deposit classes. Expected gain ≥0.01 mAP; unlike e002/e003, both views are kept and the step gain comes from a faster backbone rather than fewer views."
+
+Category: architecture.
+
+BASE: best.
+
+Let me double-check the SEARCH text appears exactly once: `MODEL = "efficientnet_b0"` — yes, only in the settings section.
+
+Budget arithmetic summary for the hypothesis: keep it concise.
+
+Let me finalize.

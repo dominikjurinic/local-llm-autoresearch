@@ -1,0 +1,112 @@
+--- e000/train.py
++++ e005/train.py
+@@ -67,4 +67,78 @@
+             r["cls"] = int(r["cls"])
+     return rows
++
++
++def iou(a, b):
++    ix1, iy1 = max(a["x1"], b["x1"]), max(a["y1"], b["y1"])
++    ix2, iy2 = min(a["x2"], b["x2"]), min(a["y2"], b["y2"])
++    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
++    inter = iw * ih
++    if inter <= 0:
++        return 0.0
++    ua = (a["x2"] - a["x1"]) * (a["y2"] - a["y1"]) + (b["x2"] - b["x1"]) * (b["y2"] - b["y1"]) - inter
++    return inter / ua
++
++
++def build_train_rows(crops, dets):
++    # Training examples are detector boxes (train split) labelled by overlap with a true box:
++    # keep a det box if its best IoU with any true box is >= 0.5, label = that box's class.
++    # IoU binning: bin 0 = [0.5, 0.7) (hard/misplaced), bin 1 = [0.7, 1.0] (easy).
++    by_img = {}
++    for r in crops:
++        if r["res"] in TRAIN_ON:
++            by_img.setdefault(r["image"], []).append(r)
++    rows = []
++    for d in dets:
++        if d["split"] != "train" or d["image"] not in by_img:
++            continue
++        best, biou = None, 0.0
++        for r in by_img[d["image"]]:
++            o = iou(d, r)
++            if o > biou:
++                best, biou = r, o
++        if best is None or biou < 0.5:
++            continue
++        e = dict(d)
++        e["cls"] = best["cls"]
++        e["iou"] = biou
++        e["bin"] = 0 if biou < 0.7 else 1
++        rows.append(e)
++    return rows
++
++
++class BinSampler(torch.utils.data.Sampler):
++    # Yields training indices batch by batch: each batch is half from IoU bin 0
++    # (0.5-0.7, hard/misplaced boxes) and half from bin 1 (0.7-1.0, easy), so hard
++    # boxes are sampled as often as easy ones. Batch order is shuffled per epoch.
++    def __init__(self, rows, batch_size, seed, n_epochs=30):
++        n_batches = max(1, len(rows) // batch_size)
++        self.orders = []
++        rng = random.Random(seed)
++        for _ in range(n_epochs):
++            bins = {0: [i for i, r in enumerate(rows) if r["bin"] == 0],
++                    1: [i for i, r in enumerate(rows) if r["bin"] == 1]}
++            for b in bins.values():
++                rng.shuffle(b)
++            batches = []
++            for _ in range(n_batches):
++                idx = []
++                for b in (0, 1):
++                    for _ in range(batch_size // 2):
++                        pool = bins[b]
++                        if not pool:
++                            pool = bins[1 - b]
++                        idx.append(pool.pop())
++                batches.append(idx)
++            rng.shuffle(batches)
++            self.orders.append([i for b in batches for i in b])
++        self.epoch = 0
++
++    def __iter__(self):
++        order = self.orders[self.epoch % len(self.orders)]
++        self.epoch += 1
++        return iter(order)
++
++    def __len__(self):
++        return len(self.orders[0])
+ 
+ 
+@@ -125,10 +199,13 @@
+     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+ 
+-    crops = [r for r in read_csv(os.path.join(args.data, "crops.csv")) if r["res"] in TRAIN_ON]
++    crops = read_csv(os.path.join(args.data, "crops.csv"))
+     dets = read_csv(os.path.join(args.data, "dets.csv"))
+     ev = [d for d in dets if d["split"] == "eval"]
+-    needed = {r["image"] for r in crops} | {d["image"] for d in ev}
++    tr_rows = build_train_rows(crops, dets)
++    needed = {r["image"] for r in tr_rows} | {d["image"] for d in ev}
+     images = {p: np.asarray(Image.open(os.path.join(args.data, "images", p)).convert("RGB")) for p in needed}
+-    print(f"train {len(crops)} boxes, eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
++    nb0 = sum(1 for r in tr_rows if r["bin"] == 0)
++    print(f"train {len(tr_rows)} detector boxes (bin0 {nb0}, bin1 {len(tr_rows) - nb0}), "
++          f"eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
+ 
+     workers = min(8, os.cpu_count() or 2)
+@@ -138,8 +215,9 @@
+         random.seed(s); np.random.seed(s)
+ 
+-    g = torch.Generator().manual_seed(args.seed)
+-    dl_tr = torch.utils.data.DataLoader(BoxDataset(crops, images, True), batch_size=BATCH_SIZE, shuffle=True,
+-                                        num_workers=workers, pin_memory=True, drop_last=True,
+-                                        persistent_workers=True, generator=g, worker_init_fn=worker_init)
++    ds_tr = BoxDataset(tr_rows, images, True)
++    dl_tr = torch.utils.data.DataLoader(ds_tr, batch_size=BATCH_SIZE,
++                                        sampler=BinSampler(tr_rows, BATCH_SIZE, args.seed),
++                                        num_workers=workers, pin_memory=True,
++                                        persistent_workers=True, worker_init_fn=worker_init)
+     dl_ev = torch.utils.data.DataLoader(BoxDataset(ev, images, False), batch_size=256, shuffle=False,
+                                         num_workers=workers, pin_memory=True)

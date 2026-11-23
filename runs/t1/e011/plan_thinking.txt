@@ -1,0 +1,283 @@
+Let me analyze the situation carefully.
+
+## Current state
+- Current best: e008 (5-seed val mAP@0.5 0.6327)
+- e010 (edit of e009, which added a third view with attention fusion) crashed due to a triton/gcc compilation error (environment issue, not really related to my change).
+
+## Diagnostics of the current best (e008):
+The key diagnostic: on detector boxes overlapping true defects by IoU > 0.5:
+- true pore: 47 right / 76 total = 62% correct (pore is very hard)
+- true deposit: 210 right / 272 = 77% correct
+- true discontinuity: 441 right / 460 = 96% correct
+- true stain: 547 right / 618 = 89% correct
+
+The error is clearly in **wrong class assignment on boxes that overlap real defects**. The "perfect classes" reference gives mAP 0.7433 (vs our 0.6327). That's a gap of ~0.11 mAP from wrong-class errors.
+
+Also interesting:
+- small boxes: 80% correct vs medium/large 91-92%. So size matters.
+- pore is the worst class at 62% correct, deposit 77%, stain 89%, discontinuity 96%.
+
+## What's been tried (from history):
+The key families that have been tried:
+1. **Score combination rules** (conf × p, margin, entropy, temperature, etc.): 16 attempts, no gain.
+2. **5th "background" class**: 9 attempts, no gain.
+3. **Detector boxes as extra training data**: accepted twice (+0.004), but small gains.
+4. **Third wide view (4x)**: 3 attempts, +0.005 (mostly pore), close to time limit.
+5. **Low-res crops**: no gain.
+6. **Bigger backbones / ensembles**: 8 attempts, best 0.636 (not confirmed).
+7. **Resolution and small-box handling**: 9 attempts, no gain.
+8. **Test-time augmentation**: 8 attempts, no gain.
+9. **Longer training**: 6 attempts, no gain.
+10. **Class-balanced sampling / class-weighted loss**: 4 attempts, no gain.
+11. **Training augmentation**: 5 attempts, no gain.
+12. **Focal loss**: 2 attempts, no gain.
+13. **Box size/aspect ratio as model input**: 4 attempts, never properly tested.
+
+The current best (e008) uses learnable per-class tight/wide fusion weights (logit_w). That got +0.004 over the fixed 50/50.
+
+e010 tried attention over 3 views - crashed (environment issue with triton/gcc, unrelated to the idea itself, but the third view was already tried in the "third wide view" family which only gave +0.005).
+
+## Key observations:
+- The remaining error is dominated by wrong class assignment on overlapping boxes (+0.11 mAP potential).
+- pore is especially hard (62%), deposit next (77%). Both are small-texture-dependent classes.
+- Discontinuity is nearly perfect (96%), so the "easy" part works.
+- The current model uses EfficientNet-B0 at 160px resolution with two crops (tight 1.5x, wide 2.5x).
+- Adding a third view gave only +0.005 mostly from pore and was close to the time limit.
+
+## Where is the error really?
+Let me think about what's left. The reference numbers:
+- one-step 4-class detector baseline: 0.638 (close to our 0.6327, but different setup)
+- stage-1 boxes with perfect classes: 0.758 (ceiling)
+- stage-1 boxes scored as single class 'defect': 0.755
+
+Our diagnostics say: mAP if every box had correct class = 0.7433, gap to our 0.6327 is what wrong classes cost. So the main bottleneck is classification accuracy of the overlapping boxes, especially pore (62%) and deposit (77%).
+
+The known facts:
+- Pore is small and texture-rich.
+- Deposit vs stain confusion (stain often confused with deposit).
+- The current model uses a single 160px resolution for both crops, with per-class learnable fusion of tight and wide logits.
+- e008's gain came from allowing different context per class.
+
+## What hasn't been tried?
+Looking at what's NOT in the history:
+- **Different training strategy for hard classes**: The loss is CrossEntropy over all 4 classes equally. Pore gets confused with deposit/stain.
+- **Multi-resolution input for the classifier**: Training on multiple resolutions so that small boxes get more resolution. This hasn't been tried properly! The "resolution and small-box handling" family tried 224px fixed, larger MIN_CROP, enlarged tight crops — but not training at *multiple* resolutions.
+- **Hard example mining / active sampling**: Focus training on pore/deposit failures.
+- **Different architecture for fusion**: e010's attention was similar to per-class weighting which e008 already did.
+- **Data augmentation specific to texture**: For pore vs deposit, texture matters. Maybe more aggressive color/texture augmentation? Already tried "stronger colour or geometry" - no gain.
+- **Using the detector conf differently**: Already tried extensively in family 1.
+- **Better use of the wide crop for stain/deposit separation**: The current per-class logit fusion might be the key. But e008 is the best we have.
+
+Wait — let me reconsider. What about **training on the actual test distribution**? A major insight: the model trains on `crops.csv` ground truth boxes, but at test time it classifies `dets.csv` detector boxes. The dets.csv boxes have different sizes, placement (slightly off), and conf scores. e009 tried using detector boxes as extra training data and got +0.004.
+
+Hmm, but the key insight from the diagnostics is that **pore** is especially hard. Let me think about why pore is hard:
+- Pore is a small defect with fine texture (looks like a tiny dark spot).
+- At 160px resolution with 1.5x tight crop, a small pore might be very small in the crop.
+- The detector boxes for pores may be slightly off or too tight/loose.
+
+What about **instance-specific resolution scaling**? Instead of fixed 160px for all crops, we could scale so that the defect fills more pixels. But the "resolution and small-box handling" family tried this (larger MIN_CROP, enlarged tight crops for small boxes) — no gain.
+
+Let me think differently. What's unique about the current setup?
+- e008 uses **per-class learnable fusion** of tight and wide logits. This is actually a pretty good idea and gave +0.005.
+- The bottleneck is classification accuracy, especially for pore and deposit.
+
+What if we think about **what information is in the wide vs tight crop**?
+- Tight (1.5x): fine texture, but may miss context.
+- Wide (2.5x): more context, e.g., around the bead edge, surrounding material.
+
+For **stain vs deposit**: stain is a discoloration around the weld, deposit is excess material. The wide crop has context about the bead shape/edge. For **pore**: texture only, tight crop matters.
+
+Actually wait — the current model already does per-class weighting between tight and wide. But it only uses ONE backbone forward for each view (i.e., two forward passes). What if we use **multiple tight crops at different scales**? Or better: what about using a **multi-scale feature pyramid** approach where small boxes get higher resolution?
+
+Hmm, let me think about the actual remaining error differently. The ceiling with perfect classes is 0.758, our best is 0.6327. That's a big gap. But the "mAP if every box had its correct class but kept your scores: 0.7433" — so our scoring loses 0.7433 - 0.6327 = 0.11 due to wrong classes. And there's still a gap of 0.758 - 0.7433 = 0.014 between "perfect classes, our scores" and the ceiling.
+
+So really:
+- Wrong class assignment costs ~0.11 mAP. This is the big win opportunity.
+- Ranking/scoring costs only ~0.014 mAP (difference between perfect-class-ours-scores and perfect-class-perfect-scores). Wait, actually let me re-read: "The difference is what wrong classes cost; the remaining gap to the perfect-classes ceiling in the brief is what your scores cost compared with the detector's conf."
+
+Hmm, so if we had perfect classes with our scores: 0.7433. And the ceiling (perfect classes + perfect scoring): 0.758. So the scoring/ranking part only costs 0.015 mAP. That's tiny!
+
+So the ENTIRE bottleneck is classification accuracy of overlapping boxes. ~0.11 mAP of error. That means:
+- The current best at 0.6327 → with perfect classes 0.7433 (gain of 0.11!).
+- The gap between our classifier and perfect classes is the whole story.
+
+So I need to improve the classifier accuracy on overlapping detector boxes, especially pore (62% correct) and deposit (77% correct).
+
+Now, why are these hard? The confusion matrix:
+- Pore (true): 47/76 = 62% right; misclassified as deposit 7, discontinuity 1, stain 20. So pore is often called stain! Interesting — 20 out of 29 wrong predictions are "stain". Wait that's a lot. Pore → stain confusion.
+- Deposit (true): 210/272 = 77% right; misclassified as deposit→stain 55, deposit→pore 3, deposit→discontinuity 3. So deposit is often called "stain" too!
+- Stain (true): 547/618 = 89% right; misclassified as pore 13, deposit 42, discontinuity 9.
+
+Interesting: both pore and deposit get confused with stain. And stain gets confused with deposit. The deposit/stain boundary is the main confusion region.
+
+So the core problem: **distinguishing deposit from stain** (and to a lesser extent pore from stain). These are the classes where context matters — stain is around the bead, deposit IS the bead material excess.
+
+Wait, but actually let me reconsider the "stain" class. Stain is often confused with deposit. Let's look at it: true deposit → 55 called stain (20%); true stain → 42 called deposit (7%). So deposit→stain is a much bigger problem than stain→deposit.
+
+Now, what information distinguishes them? From the background reading: "Context around an object can help separate classes that look alike up close". The wide crop has context. e008's per-class logit fusion already exploits this for some classes. But maybe the model doesn't have enough capacity to learn this properly, or the crops are not big enough.
+
+Actually wait — here's a thought. The current model does `w * base(xt) + (1-w) * base(xw)` where w is per-class sigmoid weight on **logits**. This is linear fusion of logits. Maybe a more expressive fusion is needed? Or maybe we need the wide crop to actually be bigger for certain classes?
+
+Let me look at what e010 tried: attention over 3 views (tight, wide 2.5x, very wide 4x). The idea of extra context was already partially validated by the "third wide view" family (+0.005 mostly pore). But e010 crashed.
+
+Actually, let me reconsider the problem completely. What's fundamentally different from earlier experiments?
+
+The history says: "Ideas that change what the model sees or learns from usually matter more than turning one more knob."
+
+What if we **train on the actual distribution of detector boxes** — i.e., not just extra training data, but matching the *visual* distribution at test time? The current model trains on crops.csv ground truth boxes (centered on the defect, exact boundaries). At test, it classifies dets.csv boxes which are:
+1. Slightly misplaced (YOLO proposals)
+2. Various IoUs with true boxes
+3. Different sizes
+
+e009 tried "detector boxes from train split as extra training data" and got +0.004. But that's a small change (IoU > 0.5 with a true box, labelled with its class). 
+
+Hmm, what if we think about the **pore class** specifically? Pore is 62% correct — by far the worst. Pore is small and texture-rich. What could make pore easier?
+- More resolution on small defects (but this family was tried)
+- Better features for fine texture (backbone changes, but bigger models didn't help)
+
+Actually, wait. Let me think about the *detector box* characteristics for pores vs true crop boxes. The diagnostic says "small 80%, medium 91%, large 92%" correct. So small boxes are much worse. But this is partly because pores are small. Hmm, but it's also because at 160px resolution, a small defect in the tight crop (1.5x) might be very tiny — like 30-40px across. A pore is maybe 10-20px in the original image. So the crop might contain a ~15-25px dark spot at 160px resolution, which is really small for a CNN to classify reliably.
+
+What if we **scale the tight crop by a factor proportional to the box size** so that smaller boxes get larger crops relative to their content? But "resolution and small-box handling" was tried (larger MIN_CROP, enlarged tight crops for small boxes) — no gain. Hmm, but that was 9 attempts in 3 runs. Maybe it wasn't done well.
+
+OK let me step back and think about what's the *biggest* remaining opportunity.
+
+The error is wrong-class assignment on overlapping boxes. The classes:
+- pore: 62% correct (worst)
+- deposit: 77% correct
+- stain: 89% correct
+- discontinuity: 96% correct
+
+The dominant error is pore and deposit. And the confusion pattern suggests context is key for deposit vs stain.
+
+What's a fundamentally different idea? **Training the classifier to be robust to the exact detector boxes at test time**, by generating training examples that mimic them. Specifically:
+- The current model trains on tight (1.5x) + wide (2.5x) crops of *ground-truth* boxes. 
+- At test, it classifies *detector* boxes. These detector boxes are less precise — sometimes IoU ~0.5-0.7 with the true defect, sometimes they include more background.
+
+What if we generate training data by **perturbing the ground truth boxes** to mimic detector boxes (slight shift, size jitter), and also train on the actual dets.csv "train" split boxes? That's what e009 did partially. But the key insight: the detector boxes at test are on *hidden eval images*. The dets.csv "train" rows are on training images with IoU > 0.5 to true boxes — these were used as extra training data in e009 (+0.004).
+
+Actually, I think there's a much more promising direction: **use the detector's own boxes as training targets**, but not just the IoU>0.5 ones. More importantly, **match the scale/size distribution**: train on the actual sizes that appear in dets.csv at test time.
+
+Hmm wait, let me reconsider the "small 80%" statistic. If small boxes are harder because they're smaller in the crop, maybe the real issue is **the tight crop isn't big enough for small defects**. Let's compute: a small defect has area in the lowest third. Say the image is ~2000x1500 (high res). A small defect might be 30x30px. With a 1.5x tight crop, the crop side is 45px. At IMG_SIZE=160, it gets upscaled to 160px — so the defect becomes ~170px... wait no. The crop is side=45px, then resized to 160px. So a 30px defect fills 160px. Hmm, that seems fine actually.
+
+Wait, let me re-read make_crop:
+```python
+side = max(max(r["x2"] - r["x1"], r["y2"] - r["y1"]) * context, MIN_CROP)
+```
+For a 30px defect with TIGHT_CONTEXT=1.5, side = 45px, then resized to 160px. So the defect fills most of the crop. That's not small at all!
+
+But for MIN_CROP=16: if the defect is tiny (e.g., 10px), side=16, resized to 160 → defect becomes ~180px? No wait — the crop is 16x16 then upscaled to 160x160. The defect fills most of it too.
+
+Hmm, so actually the resolution issue might not be about the tight crop being too small for small defects. Let me reconsider. Maybe the "small" classification statistic reflects something else: maybe small defects are just inherently harder to classify (finer texture) rather than a resolution problem.
+
+OK, so what's special about pore? Pores are tiny dark spots in the weld bead. They're hard to distinguish from noise, from deposit irregularities, etc. The confusion with stain is interesting — maybe because at 160px, a small pore looks like a dark spot on a lighter background, and a "stain" might be a discoloration. But actually... wait.
+
+Let me reconsider: is the problem that the model sees the right thing but just can't classify it? Or is the detection box for pores wrong (e.g., the detector misses pores or boxes them loosely)?
+
+The diagnostic only looks at boxes overlapping true defects by IoU>0.5 — so these are boxes the detector found that do cover a real defect. The classification fails on them.
+
+Hmm, let me think about what's the most promising *new* direction that isn't in the history:
+
+1. **Multi-resolution crops for training (instance-adaptive)**: Not tried properly.
+2. **Better fusion of tight/wide features**: e008 does logit-level linear fusion; attention over views was tried in e010. What about feature-level fusion?
+3. **Training on harder examples**: hard mining, focal loss (tried - no gain).
+4. **Matching test distribution better**: e009 tried detector boxes as training data (+0.004).
+5. **Post-hoc refinement of classes**: Not tried — like using a pairwise comparison or graph reasoning? Probably too fancy.
+6. **Better use of conf**: Already tried extensively (conf × p), the ranking only costs 0.015 mAP so it doesn't matter much.
+
+Hmm, what about this: the current model fuses logits with a per-class sigmoid weight. The tight and wide crops give *different* information for different classes. But there's a subtle issue: the **wide crop at 2.5x** includes background around the defect. For stain vs deposit, the wider context tells you whether the discoloration extends beyond the bead (stain) or is part of the material (deposit).
+
+What if instead of just fusing tight and wide logits, we also add a **context crop that's centered on the box but larger** — but only for classes that need it? That's what e008 partially does.
+
+OK actually, let me think about something more fundamental. The biggest class-specific gap is pore (62%) vs discontinuity (96%). Pore is a *texture* class. It needs high-resolution texture information. The current backbone is EfficientNet-B0 at 160px — the default training resolution for EfficientNet-B0 is 224px, and its features are best at that scale. At 160px, the effective resolution is lower than optimal.
+
+Wait, actually a really important thought: **the current model uses `IMG_SIZE = 160`** for both crops. The tight crop (1.5x) already contains the defect at high-ish resolution; the wide crop has the defect smaller. With 160px input, the tight crop's defect is large but the features are from a 160px-resized image — this is lower than the backbone's native 224px.
+
+What about **training at multiple resolutions** so the model learns scale-invariant features? Or **using the actual test-time box sizes to adapt the crop**?
+
+Hmm, actually, let me reconsider the whole approach. The reference numbers:
+- stage-1 boxes with perfect classes: 0.758
+- stage-1 boxes scored as single class 'defect': 0.755
+- our best: 0.6327
+
+And "mAP if every box had its correct class but kept your scores: 0.7433". So with perfect classes, we'd get 0.7433. That's a 0.11 gain from classification alone. The scoring part only costs 0.015 mAP (0.758 - 0.7433).
+
+Wait, that's interesting. If the ranking/scoring only matters for 0.015 mAP, then ALL of the effort should go into improving classification accuracy. And the current best already has reasonable scores. So:
+- Improve classifier → big win (0.11 potential)
+- Improve ranking → tiny win (0.015)
+
+But hold on — actually I wonder if that "mAP if every box had its correct class but kept your scores" calculation includes the per-class AP for all classes. Let me re-read: "mAP@0.5 if every box had its correct class but kept your scores: 0.7433 (yours: 0.6327). The difference is what wrong classes cost".
+
+Yes so:
+- Wrong class assignment costs: 0.11 mAP.
+- Ranking/scoring costs: 0.758 - 0.7433 = 0.015 mAP (at most).
+
+So the absolute priority is: **improve classification accuracy of the overlapping boxes**. This affects all classes but especially pore and deposit.
+
+Now, why is pore so hard? 62% correct. Let me think about what a pore looks like vs other classes:
+- Pore: tiny dark spot (void) in the weld bead. Very small texture feature.
+- Deposit: excess material, often raised, darker or lighter depending on lighting.
+- Discontinuity: crack/gap, linear features.
+- Stain: discoloration around the bead, often brownish/darker patch.
+
+Pore vs stain confusion (20 cases): maybe because at 160px, a small pore's dark spot looks like a small stain? Or the detector boxes for pores are loose and include surrounding material that looks like stain?
+
+Hmm, what if the issue with pore is **not the classifier but the data**? Are there enough pores in training? Pore might be rare. The history says "Class-balanced sampling or class-weighted loss: 4 attempts, no gain" — so maybe not a class imbalance issue per se.
+
+OK let me think about what would actually help pore classification:
+1. More texture resolution for the tight crop (but tried).
+2. Better features (but bigger backbones didn't help).
+3. More training data for pores specifically (hard mining).
+4. Different augmentation that preserves/enhances texture.
+
+Hmm, wait. Let me reconsider the architecture. e008's fusion: `w * base(xt) + (1-w) * base(xw)` where w is a per-class learnable 4-vector of sigmoid weights on **logits**. This means the model learns a per-class mixing of tight and wide logits. But both tight and wide are processed by the SAME backbone at the same resolution. The tight crop's defect fills more of the frame, the wide crop's defect is smaller but has context.
+
+Actually, here's a thought: **what if the tight crop should be larger for pore**? Because pore needs to see fine texture, but maybe also enough context to distinguish from stain? A 1.5x crop is very tight around the defect — no context at all. Maybe for pore, a slightly wider crop (like 2x) would help distinguish "pore in the bead" vs "stain near the bead".
+
+But wait — e010's third view was 4.0x which is bigger than what "third wide view (4x)" family tried. And the "third wide view" family already tried a 4x crop (+0.005, mostly pore). So context for pore helps a little.
+
+Hmm OK, let me think about a fundamentally different idea: **instance-specific fusion weights**. Currently, e008 has per-class weights (shared across all boxes). What if the weights were *per-box* or *per-image*, based on the box's characteristics (size, aspect ratio, detector conf)? For example, small boxes might need more tight-crop weight (fine texture), large boxes more wide-crop weight (context).
+
+That's an "architecture" change that hasn't been tried. The hypothesis: per-box adaptive fusion of tight/wide features based on box size and location would improve classification because different defects need different context — and the current per-class fixed weights are too coarse.
+
+But wait, e010's attention over 3 views is similar in spirit (per-class adaptive weighting), and it crashed. But a *per-box* adaptive mechanism is different from per-class.
+
+Hmm, actually, let me think about the budget arithmetic. The current run takes 162s total for 5 epochs/441 steps. Budget is 180s. So there's ~18s margin. If I add complexity that slows things down, I need to be careful.
+
+Actually, here's another thought. What about **test-time feature extraction with multiple crops and pooling**? Currently the model averages logits from two crops. At test time we could compute 3+ crops (tight, wide, wider) and fuse them — but that costs more compute. e010 tried this and crashed for env reasons (triton/gcc). The "third wide view" family got +0.005 mostly pore but was close to the time limit.
+
+Let me think about the biggest lever: **the classifier's accuracy on overlapping boxes**. The diagnostic says wrong classes cost 0.11 mAP. What could fix this at scale?
+
+The current model is an EfficientNet-B0 with per-class logit fusion of tight/wide crops. It trains on ground-truth boxes from crops.csv. 
+
+Hmm, here's a thought that might be really good: **train the classifier to predict the class from the actual detector box distribution**. The key mismatch: training on ground-truth boxes (precise, centered) vs testing on detector boxes (noisy, slightly off, different sizes). e009 tried using detector boxes as extra training data (+0.004), but maybe the *real* fix is to simulate detector boxes during training: perturb the ground-truth box centers and scales so the model sees what it will see at test time. This is a "distribution matching" idea that's more fundamental than just adding extra rows of data.
+
+Actually, here's an even better thought: **the current model trains on crops.csv boxes with fixed 1.5x/2.5x crops. At test time, the detector boxes have various IoUs and positions.** What if we train with *random* context crops (e.g., context sampled uniformly from 1.0x to 4.0x)? That would make the model robust to any box size/position, matching the test distribution better. This is fundamentally different from e009 (which added extra rows) and from "resolution and small-box handling" (which tried fixed changes).
+
+Hmm, but I need to check: does this help? The family "resolution and small-box handling (224 px, larger MIN_CROP, enlarged tight crops for small boxes)" was 9 attempts with no gain. But randomizing the context scale during training is different — it's about robustness, not just resolution.
+
+Actually, wait. Let me reconsider the problem once more. 
+
+The most striking diagnostic: **pore at 62% correct**. That's terrible. What if pore is hard because there aren't enough pores in the training data, or because they're systematically harder (tiny)? If pore is rare, maybe I should oversample it. But "class-balanced sampling" was tried with no gain...
+
+Hmm, but hold on. Let me reconsider what "62%" means. Out of 76 true-pore boxes overlapping a detector box:
+- 47 right (pore)
+- 7 deposit
+- 1 discontinuity  
+- 20 stain
+- 1 no row
+
+So pore is most often confused with **stain** (20/29 wrong = 69% of errors). And deposit is confused with stain (55 cases, where true deposit → 55 called stain). 
+
+This suggests: the model thinks many small dark features are "stain" rather than "pore". Stain is a discoloration — maybe larger area, different texture. The key distinction might be **size** (pores are tiny spots, stains are larger patches) or **location** (pores are inside the bead, stains are around it).
+
+The current model fuses tight and wide crops with per-class weights. For a small pore in the tight crop, the features look like "tiny dark spot". In the wide crop, the same tiny spot is smaller relative to the background. Hmm.
+
+Actually — here's an important thought: what if the **tight crop doesn't include enough context for pores**? A 1.5x crop is *very* tight around the defect. For a pore, you want to see whether it's inside the bead material (pore) or near the edge (could be stain). Maybe the tight crop should be wider for small defects?
+
+Wait, I keep going in circles. Let me try to think about what's genuinely new and high-value:
+
+**Idea: Per-box adaptive crop contexts based on box size/position.**
+
+The core idea: instead of fixed 1.5x/2.5x crops for all boxes, use **box-size-adaptive context**: small boxes get tighter/more magnified tight crops and wider wide crops; large boxes get the standard. Plus per-class learnable fusion at the feature level (not just logit level).
+
+Actually no wait. Let me think about something much more basic and potentially high-value: **the current model fuses logits from two crops of different sizes, but both are resized to 160px.** The tight crop's defect fills ~most of the 160px frame; the wide crop's defect is smaller. What if we processThinking budget reached. Stop thinking now and write the reply in the required format.

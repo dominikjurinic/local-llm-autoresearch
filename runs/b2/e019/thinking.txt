@@ -1,0 +1,236 @@
+===== attempt 1 =====
+Let me think carefully about what's going on.
+
+Current state:
+- Best: e000 baseline, 5-seed mean 0.6288 (seed-0: probably around 0.6288).
+- 18 experiments, almost all rejected. Categories exhausted: data (7), architecture (3), scoring (4), inference (1), augmentation (1), sampling (1), optimisation (1).
+
+Key observations:
+1. The gap to the perfect-class ceiling (0.758) is about 0.13. The class-agnostic ceiling is 0.755. So the detector boxes are good; the problem is class assignment.
+2. All attempts to improve the classifier (more data, bigger backbone, higher resolution, TTA, mixup, re-scoring, ensembles) failed or timed out.
+3. e011 (scoring): "misclassified true boxes enter the wrong class's ranking" — 0.6315 on seed-0, 0.6267 on 5 seeds, not confirmed. Close but not confirmed.
+4. e017 (data): background class — 0.6288 on seed-0, "not confirmed" (equal to best? seed-0 score 0.6288, 5-seed mean 0.6288 — same as best). Not confirmed.
+5. e018 (scoring): emit only argmax class with score = detector conf when p > 0.5 — 0.5546, rejected. This is informative: dropping rows (not emitting all 4 classes) hurts. Interesting.
+
+Wait — e018's result is very informative. Emitting only the argmax class with score = conf (i.e., ignoring p_c for ranking) gives 0.5546. So the p_c factor in the score matters. If we emit 1 row per box with score = conf * p_c... hmm.
+
+Let me think about the metric. mAP@0.5 per class. For each class, predictions are sorted by score; a prediction is a hit if it overlaps an unmatched GT box of that class with IoU > 0.5.
+
+Key insight: for a true box of class c, if we emit all 4 rows (one per class), the row for class c will be a hit (assuming IoU > 0.5 with the GT). Its rank in class c's list is determined by score = conf * p_c. The other 3 rows pollute the other classes' lists as potential FPs (though they can only be hits if they overlap a GT of that other class — possible for overlapping boxes, but rare).
+
+For a false-alarm box (no GT overlap), all 4 rows are FPs in their respective classes, with scores conf * p_c.
+
+The damage from misclassification: a true deposit box that the classifier calls pore (p_pore high) — the pore row has high score and is a FP in the pore list (if it doesn't overlap a pore GT), and the deposit row has low score, so it's ranked low in the deposit list. This hurts both pore AP (FP) and deposit AP (pushed down).
+
+So the "class confusion damage" is fundamental: to fix it we need better p_c estimates. All attempts to improve the classifier failed. Hmm.
+
+But wait — what about the ranking of FPs vs TPs? In the class-agnostic ceiling (0.755), all boxes score by conf and are counted as one class. In the perfect-class ceiling (0.758), FPs are kept as class 0 with detector conf. So in the perfect-class world, FPs pollute only the pore class's ranking with score = conf. In our world, FPs pollute all 4 classes with score = conf * p_c.
+
+Hmm, but the perfect-class ceiling keeps FPs only as class 0. If we could emit FPs only as class 0 (or the class with least damage)... but we don't know which boxes are FPs. The classifier's p_c is the only signal.
+
+Actually wait — there's a subtle scoring trick. The metric only cares about the order of predictions within each class. Rows for a given box: if we emit all 4 rows for every box, then in class c's list, every box appears with score conf * p_c.
+
+Alternative: emit only the top-k row per box (say argmax and maybe 2nd) with scores conf * p_c. This reduces pollution of the non-argmax classes. e018 tried emitting only the argmax row with score = conf (dropping p_c) → 0.5546. That's much worse, so dropping p_c is bad. But what about emitting only the argmax row with score = conf * p_argmax? Or emitting the top-2 rows?
+
+Hmm, actually let me think about why e018 was so bad. If we emit only the argmax row with score = conf:
+- For a true box of class c where argmax = c: hit in class c, ranked by conf. Same as the class-agnostic ceiling within that class.
+- For a true box of class c where argmax = d ≠ c: FP in class d, ranked by conf (high!). And the class c row is missing entirely → the true box never gets a hit in class c. This is fatal: every misclassified true box becomes a complete miss in its true class AND a high-ranked FP in the wrong class.
+
+Whereas with all 4 rows scored by conf * p_c: the true box's true-class row exists with score conf * p_c (which may be low but exists), and the wrong-class rows have score conf * p_wrong. The hit in the true class is preserved (just ranked lower), and the FP in the wrong class is also ranked by conf * p_wrong.
+
+So the all-rows scheme is robust. The gain from better scoring would come from better p_c.
+
+Now, what else can we do? Let me think about the error decomposition:
+
+Our score: 0.6288. Perfect class: 0.758. Difference 0.129.
+
+Per class: pore 0.496, deposit 0.629, discontinuity 0.780, stain 0.609.
+
+What are the per-class numbers in the perfect-class ceiling? Not given directly. Hmm.
+
+Ideas tried and failed:
+- More data (low-res): failed
+- Bigger backbone: failed
+- Higher resolution: failed
+- TTA: failed
+- Mixup: failed
+- Domain adaptation (train on detector boxes): failed
+- Re-weighting / class-balanced sampling: failed
+- Background class: not confirmed (equal to best)
+- Scoring changes: mostly failed; e011 close but not confirmed (0.6315 on seed-0, 0.6267 on 5 seeds — hmm, that's actually below best 0.6288 on 5 seeds? Wait, e011's 5-seed mean 0.6267 < 0.6288, so it was not confirmed. Its seed-0 was 0.6315.)
+
+What is e011's change? "Misclassified true boxes enter the wrong class's ranking at score conf·p_wrong..." — I don't have the full diff but it's a scoring change. 5-seed mean 0.6267, slightly below best.
+
+Hmm, so what's left? Let me think about the problem from another angle.
+
+The classifier's macro-F1 is about 0.87 on perfect boxes. The gap from 0.87 to 1.0 in classification accuracy corresponds to about 0.13 mAP loss. To get a big gain we need to substantially improve classification. All single-model improvements failed. Why?
+
+Possibilities:
+1. The crop is the bottleneck: the classifier sees a 160px crop; the defects are small and texture-based. Higher resolution failed (e003, 0.6197). Hmm.
+2. The training labels are the bottleneck: crops.csv boxes are GT boxes; maybe the boxes are noisy?
+3. The model can't distinguish pore vs stain vs deposit from the crop alone — maybe context matters (weld bead orientation, position along the bead).
+
+Wait, actually, let me reconsider. What about using the detector boxes' confidence as a feature? No, that's for scoring.
+
+What about using both crops differently — e.g., concatenate features? The current model averages the logits of two views. What about training two separate heads, or using a different combination?
+
+Hmm, but architecture is "exhausted" (3 ideas, 0 new bests). Though the rule says don't propose another variant unless fundamentally different.
+
+Let me think about what's fundamentally different that hasn't been tried:
+
+1. **Multi-scale / multi-crop ensemble at inference**: tried TTA (e007) — failed.
+
+2. **Training on detector boxes with pseudo-labels / self-training**: e004 tried training on detector boxes (train/test distribution mismatch) — 0.6277, failed. Hmm, what exactly did e004 do? "The classifier is trained on GT crop boxes but at test time it's fed detector boxes... train/test input distribution mismatch" — probably trained on detector boxes labeled by overlap. Failed.
+
+3. **Two-head / joint model that sees both crops simultaneously** (early fusion): the current model runs the same backbone on two crops and averages logits. Concatenating the two crops (e.g., stacking them into one image, or concatenating features) could let the model compare tight vs wide context. Is this fundamentally different from TTA? TTA averages over augmentations; this is a different input representation. Hmm, but is it "architecture"? Yes. Architecture is exhausted... but the rule says "do not propose another variant unless you can say what's fundamentally different." Early fusion of two views is arguably different from swapping the backbone (e002) or ensembling (e012/e013).
+
+4. **Better use of the wide crop**: the wide crop at 2.5x context shows the weld bead context. Maybe the defects have different appearances depending on where they are on the bead.
+
+5. **Score calibration**: the p_c values are overconfident (closed-set). e018 showed that dropping p_c is fatal. What about temperature scaling / calibration on a validation-like set? But we don't have eval labels. We can calibrate on train-split detector boxes (dets.csv has "train" boxes whose true class can be found by overlap with crops.csv). That's a legitimate use of training labels.
+
+Actually wait — this is interesting. We have train-split detector boxes with ground-truth class (by overlap). We can evaluate the classifier on them and calibrate the scores. But calibration that's a monotonic transform per class doesn't change the order... unless it's non-monotonic across classes? No wait — the order within a class is what matters, and a per-class monotonic transform preserves it. So calibration can't help the metric directly... unless we combine scores across classes in a non-monotonic way, e.g., score_c = conf * p_c / sum(p) — that's already normalized. Or score_c = conf * p_c * w_c with per-class weights w_c — that's a per-class constant multiplier, which preserves order within a class! So it can't help.
+
+Hmm wait, is that right? Per-class constant multiplier: within class c, all scores are multiplied by w_c — order preserved. So per-class weights can't change AP. Right.
+
+What CAN change AP:
+- Changing which rows are emitted (per-box, per-class decisions based on p and conf).
+- Changing p_c itself (better classifier).
+- Changing the score in a way that reorders within a class: e.g., score = conf * p_c * f(conf) where f depends on conf — this reorders within a class because different boxes have different conf. E.g., score = p_c (drop conf) — tried in e018 (with argmax only) and bad. score = p_c * g(conf) with g non-monotonic? Hmm.
+
+Actually wait, let me think more carefully about the interaction between conf and p_c.
+
+In the perfect-class ceiling, FPs are kept as class 0 with score = conf. So in the pore list, FPs are ranked purely by conf, mixed with true pore boxes ranked by conf. AP is 0.758 overall.
+
+In our system, in class c's list: true boxes of class c (score conf * p_c), FPs (score conf * p_c), and misclassified boxes from other classes (score conf * p_c).
+
+The p_c factor helps rank true boxes above FPs (the classifier assigns high p_c to true boxes of class c and low p_c to FPs... on average). But it also reorders true boxes among themselves (a true pore box with p_pore = 0.4 is ranked below a true pore box with p_pore = 0.9, regardless of conf).
+
+Hmm, what if we used score = conf * max(p_c, something)? No...
+
+Let me think about e011 again. Its hypothesis: "misclassified true boxes (e.g., a deposit the classifier calls pore) enter the wrong class's ranking at score conf·p_wrong, where [presumably p_wrong is high], polluting it...". Its seed-0 was 0.6315, 5-seed 0.6267. Not confirmed. I don't know the exact change. It might have been something like score = conf * p_c * (1 - p_wrong_max) or emitting only rows above a threshold.
+
+OK, another angle: **the problem might be in the training data quality / augmentation of the weak classes**.
+
+Pore is weakest (0.496). Pore = fine-grained texture of small holes. The crop is resized to 160px. If the original crop is small (say 40px), upscaling to 160 destroys detail... but e003 tried IMG_SIZE 224 and it was worse (0.6197). Hmm, wait — e003 raised IMG_SIZE to 224. That makes the crop bigger (more detail if the source has it) but also reduces effective training (fewer steps? no, same steps, slower per step). Actually with 224px the per-step time goes up, so fewer steps in the budget. And the result was worse.
+
+What about **not resizing small crops** — i.e., keeping native resolution? Probably similar to e003.
+
+Let me think about **what the classifier actually sees**. The tight crop is 1.5x the box, the wide crop is 2.5x. Both resized to 160. The model averages logits.
+
+Hmm, what about training with **label smoothing**? Not in the history. Loss category: only "class-weighted loss" is mentioned as having been tried (in the "known" section: "class-weighted loss hurt classification every time it was tried" — that's from before this history). Label smoothing is a different loss tweak... but "tuning hyperparameters alone helped little in prior experiments; method changes helped more." Label smoothing is a knob. Probably small effect. Risky.
+
+What about **training longer with a smaller/faster model to get more steps**? e010 (optimisation, "undertrained") crashed/buggy (0.4363, suspicious). What was e010's change? "Training loss is still dropping sharply when training stops... undertrained" — maybe increased LR or changed the schedule. It crashed or had a bug (0.4363 = suspicious). The optimisation category has 1 idea, 1 buggy. So optimisation isn't exhausted, but the buggy result means we don't know if more training helps.
+
+Hmm, wait. Let me recompute the budget. Total 180s (probably T=180; log shows 163s total). Load 13s. Reserve 55s. Training budget = 180 - 55 - 13 ≈ 112s → 435 steps. Step time ≈ 0.257s. Prediction: 41879 boxes at batch 256 → 164 batches × 2 forward passes (tight + wide) at 160px... prediction took about 48s (163 - 115).
+
+What if we train a smaller model (convnext_pico or regnety_016) with more steps? e002 tried a bigger backbone (failed). Smaller backbone = more steps. But a smaller backbone probably classifies worse. Hmm.
+
+What about **reducing the two-view cost**: instead of two separate forward passes (tight + wide through the same backbone), concatenate the two crops into one image (e.g., 160x320 or a 2x2 grid) and do one forward pass. That halves the forward cost → roughly doubles the number of training steps, and halves prediction time. The model sees both views simultaneously (early fusion). This is a method change (what the model sees), not a knob. It's in the architecture category though. Is it "fundamentally different" from prior architecture attempts? e002: bigger backbone (capacity). e012/e013: ensemble. Early fusion of two views is different from all of these: it changes the input representation, halves compute per sample, and lets the model directly compare tight and wide context.
+
+But wait — does it really help? The logit-averaging two-view approach already uses both views. Early fusion lets the model weight the views differently per sample and see cross-view features. Plausible but uncertain. And it halves compute → 2x steps → better training. The compute savings are concrete.
+
+Actually, hmm, wait. Let me reconsider. There might be a simpler, higher-value idea.
+
+**The 300-rows-per-image cap.** "At most the top 300 highest-scoring rows per image count." We emit 4 rows per box; there are 41879 eval detections over 1022 images... wait, that's the number of images for train+eval combined. How many eval images? Not stated. If an image has more than 300 boxes, the low-scoring rows get dropped. Since we emit 4 rows per box, an image with 75+ boxes hits the cap. Detections per image: 41879 total eval dets. If ~500 eval images, that's ~84 boxes/image → 336 rows/image > 300 cap. So the cap is active! The lowest-scoring rows (mostly low-conf FPs, or true boxes with low p_c) get dropped.
+
+Hmm, but which rows get dropped? The lowest-scoring rows per image. True boxes with low p_c (misclassified) get dropped from their true class's list → complete miss. That's bad. But the cap applies to the top 300 by score; if we emit 4 rows per box, the cap drops the weakest rows.
+
+Can we exploit the cap? If we emit only 1 row per box (argmax), an image with 300+ boxes drops the lowest-conf boxes entirely. That's e018's direction (which was bad, but it also dropped p_c).
+
+Hmm, OK. Let me think about the biggest lever.
+
+Actually, let me reconsider the problem. The reference numbers:
+- One-step 4-class detector: 0.638 (the paper's YOLOv7-tiny, the baseline to beat).
+- Stage-1 class-agnostic: 0.755.
+- Stage-1 perfect class: 0.758.
+- Our stage 2: 0.6288.
+
+Wait, the one-step detector is 0.638 and we're at 0.6288 — we're below the baseline! The stage-1 detector alone (class-agnostic, scored as one class) is 0.755. So stage 1 is much better than the paper's one-step detector. Our job: classify the boxes.
+
+The gap 0.758 → 0.6288 = 0.129 is class confusion. The classifier's macro-F1 is 0.87 on perfect boxes. To close most of the gap we need macro-F1 ~0.97+. That's a big jump. All attempts failed...
+
+Unless the issue is something else. Let me think: maybe the classifier's F1 on the actual detector boxes (with noise, misplacement) is much lower than 0.87 on perfect boxes. e004 tried training on detector boxes — failed (0.6277).
+
+Hmm, what about **using the box confidence as a training signal**? No.
+
+What about **a different crop strategy**: instead of centering on the box, use the box's aspect ratio? Or crop by the box itself (1.0x) + wider? The tight crop is 1.5x.
+
+What about **adding a third view** (e.g., a very wide 4x context)? That doubles compute... no, adds a third forward. Budget: prediction is 48s for 2 views; 3 views = 72s; total training budget shrinks. Risky but doable? Reserve 55s covers prediction... actual reserve is fixed at 55s; if prediction takes 72s we overrun. We'd need to reduce RESERVE_S. Total 180s: load 13s, train X, predict 72s, write ~5s. X ≈ 90s. Currently training is 112s. So ~20% fewer steps. Hmm.
+
+But would a wider context help? Stain vs deposit confusion: stain is often confused with deposit. Stains might be distinguishable by their position on the weld (e.g., along the bead edge vs on top). A wider context showing the bead geometry could help. This is a "what the model sees" change. But it's also a "data" category... and data is exhausted (7 ideas). Hmm, the category is just a label; the rule is about not repeating experiments. A third wider view is new. But is the effect likely ≥0.01? Uncertain.
+
+Let me think about **what specifically distinguishes pore, deposit, discontinuity, stain**:
+- Pore: small holes, fine texture.
+- Deposit: extra material, raised.
+- Discontinuity: gap in the bead.
+- Stain: discoloration, flat.
+
+The classifier confuses stain with deposit, and pore is weak overall.
+
+**Idea: train the model to predict from the tight crop only, but with a higher effective resolution for small boxes.** Hmm, e003 tried 224px.
+
+**Idea: per-class crop scaling** — pore needs detail (smaller context, higher relative resolution), stain needs context (wider). A model that sees both already has both.
+
+**Idea: pseudo-labeling / self-training on eval boxes.** We can't use eval labels, but we can use train-split detector boxes (labeled by overlap). Self-training: train on GT crops → predict train dets → keep high-confidence pseudo-labels → retrain on both. This is a method change (what the model learns from). The train dets have the same distribution as eval dets (misplaced boxes, FPs). e004 already trained on detector boxes — but probably with hard labels from overlap (including mislabeled FPs as class 0?). Let me guess: e004's hypothesis was about train/test distribution mismatch; probably added train dets with labels from GT overlap. Result 0.6277, failed.
+
+Hmm, so training on detector boxes didn't help. Self-training with soft pseudo-labels is different but in the same spirit. Risky.
+
+**Idea: distillation / knowledge from the one-step detector?** We don't have the one-step detector's predictions. No.
+
+**Idea: use the detector's conf in the score more cleverly.** The score is conf * p_c. What if the ranking within a class should be dominated by p_c, with conf as a tiebreaker? E.g., score = p_c^a * conf^b. e018 (argmax only, score=conf) was bad. What about score = p_c (pure)? That's a monotonic... no wait, score = p_c reorders within a class relative to conf * p_c. Has that been tried? e005: "p_c is a noisy ranking signal that can push true boxes below confident FPs" — 0.6049, failed. I don't know e005's exact change. e011: scoring, close. e018: argmax only with conf, bad.
+
+Hmm, scoring is exhausted (4 ideas).
+
+**Idea: reduce FP pollution by gating rows with conf.** FPs from the detector have various confs. If we drop rows with conf < threshold, we drop FPs but also true boxes with low conf. In the perfect-class ceiling, FPs are kept with score = conf — they're ranked by conf and AP is still 0.758, so FPs at low conf don't hurt much (they're at the bottom). Dropping them should be fine or slightly helpful. But the current score conf * p_c already pushes low-conf FPs to the bottom. Dropping them only helps if they're above the true boxes' rank... they're at the bottom, so dropping them barely changes anything. Small effect.
+
+**Idea: the real lever might be training quality / steps.** Let me look at the log again: 5 epochs, 435 steps, loss 0.22 at the end, still dropping. The model is undertrained. e010 tried to fix undertraining and crashed (buggy). What was e010's change? I don't have the diff. "Training loss is still dropping sharply when training stops (0.244 -> 0.220 in the last epoch), so the classifier is undertrained within the fixed budget" — probably raised LR or removed the cosine floor. It produced 0.4363 — suspicious bug. Maybe it broke something.
+
+The safe way to train more: **halve the per-step cost**. Options:
+- One view instead of two (drop the wide crop): halves forward cost → ~2x steps. But we lose context information. The two-crop recipe is the "starting recipe" that reaches 0.87 macro-F1. Dropping a view is risky.
+- Concatenate the two views into one image (early fusion): one forward pass per sample → ~2x steps, and the model sees both views. This keeps all the information while doubling the training. And at inference, one forward per box instead of two → prediction time halves (48s → 24s), freeing more training time.
+
+This is attractive: strictly more compute for the same information content. The only risk is that early fusion is worse than logit-averaging (the model has to learn to use both halves of the image). But with 2x the steps, it should at least match.
+
+How to concatenate? Options:
+- Stack vertically: 160x320 image → resize to 224x224? That changes the aspect ratio and effective resolution. Hmm.
+- 2x2 grid: tight, wide, tight, wide (or tight, wide, blank, blank) → 224x224.
+- Simplest: put the tight crop in the top half and the wide crop in the bottom half of a 160x320 canvas, then resize to 160x160? That squashes both to 80px each — loses detail. No good.
+- Better: keep 224x224 input: tight in top-left 112x112, wide in top-right 112x112, bottom half... or tight top-left, wide bottom-left?
+
+Hmm, actually the cleanest is: a 2x2 grid where each cell is 112x112: [tight, wide; tight, wide] or [tight, wide; wide, tight]. The model sees each view at 112px (vs 160px separately). Slight resolution loss per view, but one forward pass.
+
+Alternatively, use a 224x224 canvas: tight crop centered in the top half (224x112), wide in the bottom half (224x112). Each view is 224 wide × 112 tall. Aspect ratio distortion (the crops are square, so 224x112 = 2:1 stretch). Ugly.
+
+The 2x2 grid of 112px cells is cleanest: each cell is a square 112x112 view. Total 224x224.
+
+Compute: EfficientNet-B0 at 224 vs 160: FLOPs scale as ~ (224/160)^2 = 1.96x. So one 224 forward ≈ two 160 forwards. No savings! Ha.
+
+So to get savings, the combined image must be ≤160x160: a 2x2 grid of 80px cells. 80px per view — that's a big resolution drop per view (160→80). Pore detail is lost. Probably bad.
+
+Alternatively, keep the two separate forward passes but use a cheaper backbone... no.
+
+Hmm, OK, so the compute angle is not obviously winnable.
+
+Let me reconsider. What about **improving the crop itself**? The crop is centered on the box center with side = context * max(box dims). Jitter during training: center ±10% of side, side 0.85-1.2x.
+
+What if the detector boxes are systematically offset (e.g., the detector's boxes are biased)? Training on detector boxes (e004) failed, so probably not a big issue.
+
+**What about the padding color?** Gray 114. Probably fine.
+
+**What about normalisation / colour?** Weld images are... probably fine.
+
+Let me step back and think about the metric again. Is there a scoring scheme that exploits the structure better?
+
+Current: emit 4 rows per box, score = conf * p_c.
+
+Consider a true box of class c. It contributes:
+- A hit candidate in class c at score conf * p_c.
+- FP candidates in the other 3 classes at score conf * p_{c'}.
+
+Consider a FP box: FP candidates in all 4 classes at score conf * p_c.
+
+The AP damage from misclassification: for a true box of class c with p_c < p_d (d ≠ c), the box's row in class d is a high-scoring FP, and the row in class c is a low-scoring hit. Both are bad.
+
+Now here's a thought: **what if we emit rows only for classes where p_c exceeds a threshold, or only the top-2 classes?** e018 emitted only the argmax (top-1) with score = conf → 0.5546 (bad, because it dropped p_c and dropped the true-class row for misclassified boxes). But top-1 with score = conf * p_argmax, or top-2 with score = conf * p_c, might reduce FP pollution in the non-top classes while keeping the true-class row (usually in the top-2).
+
+Hmm wait, but is that right? ForThinking budget reached. Stop thinking now and write the reply in the required format.

@@ -1,0 +1,609 @@
+===== attempt 1 =====
+Let me analyze the current situation:
+
+1. Current best is e016 with 5-seed mean 0.6411
+2. The most recent experiment e025 (SGD) was a bug - score 0.4765, way below best
+3. We've tried many things already:
+   - Data: detector boxes (e002, e003), background class (e001, e005)
+   - Augmentation: mixup (e007)
+   - Architecture: single crop (e008), B2 (e013), ConvNeXt-Nano (e015), tf_efficientnetv2_b0 (e021), MobileNetV3 (e022), IMG_SIZE 224 (e016), IMG_SIZE 192 (e018)
+   - Loss: focal (e006), label smoothing (e023)
+   - Sampling: weighted sampler (e011), upweighting det boxes (e024)
+   - Optimisation: batch 32 (e010), LR doubling (e017), min LR (e020), SGD (e025 - bug)
+   - Inference: TTA hflip (e009), TTA vflip (e012)
+   - Scoring: prob² (e004), max prob (e014), margin (e019)
+
+Let me think about what hasn't been tried yet and could help:
+
+Key observations:
+- Per-class AP: pore 0.537, deposit 0.635, discontinuity 0.780, stain 0.612
+- Pore and stain are the weak classes
+- The model is undertrained (only ~2 epochs, 660 steps)
+- The ceiling is 0.758, we're at 0.6411
+- Stage-1 boxes scored as single class: 0.755
+
+What ideas remain?
+1. **Two-crop input** - e008 switched from two-crop to single wide crop. But e016 is based on e009 which is based on e008 (single crop). Wait, let me re-read...
+
+Actually looking at the code, the current best (e016) uses:
+- `make_crop(img, r, CONTEXT, self.train)` - only ONE crop with CONTEXT=2.5
+- The docstring mentions "two-crop" but the code only does one crop
+
+Wait, let me re-read the code more carefully. In `BoxDataset.__getitem__`:
+```python
+x = make_crop(img, r, CONTEXT, self.train)
+```
+
+That's only one crop. The docstring says "two-crop" but the actual implementation after e008 is single wide-crop.
+
+So the two-crop approach was abandoned in e008 for speed. But maybe we could try a different approach.
+
+2. **Training on detector boxes with background** - e001 and e005 tried this and it hurt. But maybe a different formulation?
+
+3. **Ensemble** - The brief mentions "ensembling within the time budget". We could train two models (e.g., different architectures or different seeds) and average their predictions. But with the time budget, this is tricky.
+
+4. **Test-time augmentation with more views** - e012 tried vflip and it hurt. What about slight rotation?
+
+5. **Using the detector confidence more cleverly** - The current score is `conf * prob[c]`. What about `conf^a * prob[c]^b` for different a, b?
+
+6. **Multi-scale inference** - Run the model at different input sizes and average.
+
+7. **Training with the actual detector box distribution** - The key insight from the brief: "train the classifier on detector boxes from the training images (dets.csv split 'train'), labelled by overlap with the true boxes in crops.csv, including a 'background' class for false alarms"
+
+But e001 and e005 tried background and it hurt. However, e002 (adding matched detector boxes without background) helped. What if we add background but with a different scoring approach?
+
+Wait, let me reconsider. e005 added background as a 5th class and multiplied by (1-prob_bg). That gave 0.6039. e001 trained on detector boxes with background instead of GT crops, giving 0.5691. Both hurt.
+
+8. **Different approach to the scoring** - What about using the detector confidence as a separate signal? The detector confidence might correlate with whether it's a true defect. If we could learn a mapping from (conf, class_probs) to a better score...
+
+9. **Two models: one for detection confidence, one for classification** - Train a binary classifier (defect vs background) on the detector boxes, then use its output to modulate the class scores.
+
+Actually, wait. Let me think about what's most likely to help given the constraints:
+
+- We're at 0.6411, ceiling is 0.758
+- Pore (0.537) and stain (0.612) are weak
+- The model is undertrained (2 epochs)
+- We've tried many things
+
+Let me think about what could give a meaningful boost:
+
+**Idea: Train on detector boxes with a binary "is defect" head + 4-class head**
+
+Instead of adding background as a 5th class (which hurt), use a multi-task approach:
+- Head 1: 4-class classification (pore, deposit, discontinuity, stain) - only on matched boxes
+- Head 2: Binary defect/background - on all detector boxes
+
+Then score = conf * prob_class * prob_defect
+
+But this is complex and might not help given that e005 already showed background hurts.
+
+**Idea: Use a larger model with knowledge distillation or more epochs**
+
+Actually, the most promising untried idea might be:
+
+**Two-crop input (revisit)**: The original two-crop approach (tight 1.5x + wide 2.5x) was abandoned in e008 for speed. But e016 increased IMG_SIZE to 224, which made each forward pass more expensive. What if we go back to two-crop but at a smaller size, or use a smaller model?
+
+Wait, actually the two-crop approach was in the ORIGINAL code (e000), and e008 removed it. The current code only does one crop. Let me verify by looking at the code again...
+
+Yes, the current code only does:
+```python
+x = make_crop(img, r, CONTEXT, self.train)
+```
+
+One crop. The two-crop was removed in e008.
+
+But the brief says: "A crop classifier given perfect boxes reaches macro-F1 ~0.87 with the starting recipe (two-crop input)."
+
+So two-crop was better for classification accuracy. The tradeoff was speed. With IMG_SIZE=224, each forward pass is more expensive.
+
+Hmm, but e008 showed that single crop + more epochs was better than two-crop + fewer epochs. So the speed was more important.
+
+**Idea: Use a smaller IMG_SIZE with two crops**
+
+What if we use IMG_SIZE=160 (or 192) with two crops? That would give:
+- Two crops at 160: 2 * (160/224)² ≈ 0.51x the cost of one crop at 224
+- So roughly 2x more steps than current, with two-crop benefit
+
+Actually wait, e018 tried IMG_SIZE=192 and got 0.6387 (worse than 0.6423 for 224). So smaller size alone didn't help.
+
+**Idea: Use the detector confidence as a training signal**
+
+The detector confidence might contain information about whether a box is a true defect. What if we:
+1. Use detector boxes for training (as in e002)
+2. But also use the confidence to weight the loss (higher conf = more weight)
+
+Actually, this is a form of sample weighting that hasn't been tried.
+
+**Idea: CutMix or Random Erase augmentation**
+
+We've tried mixup (e007, rejected). What about CutMix or Random Erase? These are different from mixup.
+
+Actually, let me think about what's most likely to give a >0.005 improvement...
+
+**Idea: Ensemble of two models with different architectures**
+
+Train two models (e.g., EfficientNet-B0 and a different one) and average their class probabilities. This is a well-known technique that often gives 1-3% improvement.
+
+But the time budget is tight. Currently we use ~125s for training and ~40s for inference. If we train two models, we'd halve the training time for each.
+
+Actually, looking at the time budget: 180s total, 55s reserve for prediction. So ~125s for training. With two models, each gets ~62s, which is about 1 epoch each instead of 2. That might not be enough.
+
+**Idea: Use a different scoring formula**
+
+Current: `score = conf * prob[c]`
+
+What about: `score = conf * prob[c] / (1 - prob_bg)` where prob_bg is estimated somehow?
+
+Or: `score = conf^0.5 * prob[c]` (reduce the influence of detector confidence)
+
+Actually, the detector confidence is a fixed signal from stage 1. The question is whether multiplying by it helps or hurts the ranking.
+
+Let me think about this differently. The mAP@0.5 scores per class. For each class, we need:
+1. True positives to have high scores
+2. False positives to have low scores
+3. The ranking within true positives to be good
+
+The detector confidence is the same for all classes of a given box. So it doesn't affect the relative ranking of classes within a box. It only affects the ranking of boxes relative to each other.
+
+If the detector confidence is well-calibrated (higher conf = more likely true defect), then multiplying by it should help. If it's poorly calibrated, it might hurt.
+
+**Idea: Train a separate binary classifier for defect/background, use it to modulate scores**
+
+This is different from e005 (which added background as a 5th class). Here we'd:
+1. Train the 4-class model as usual (on matched boxes + GT crops)
+2. Train a separate binary classifier (defect vs background) on all detector boxes
+3. Score = conf * prob_class * prob_defect
+
+The binary classifier would be a simple model (maybe even logistic regression on features). But this requires training a second model, which takes time.
+
+Actually, a simpler version: use the max class probability as a proxy for "is defect". If max_prob is high, it's likely a defect. If low, it's likely background.
+
+But e014 tried multiplying by max_prob and it hurt (0.6320).
+
+**Idea: Use a temperature-scaled softmax**
+
+Instead of `score = conf * prob[c]`, use `score = conf * softmax(logits / T)[c]` where T > 1 makes the probabilities more uniform (less peaked). This could help with ranking.
+
+But this is similar to what e004 tried (prob²) and e014 (max_prob).
+
+**Idea: Train with a longer warmup or different schedule**
+
+e017 tried doubling LR (hurt), e020 tried raising min LR (hurt). What about a different warmup fraction?
+
+Actually, let me look at the training more carefully:
+- 660 steps total, ~2 epochs
+- Loss goes from 0.52 to 0.29
+- The model is clearly undertrained
+
+The main bottleneck is training time. What if we:
+1. Reduce the number of training samples (e.g., subsample GT crops)
+2. Use a smaller batch size for more steps
+3. Use a more efficient model
+
+e010 tried batch 32 (hurt). e022 tried MobileNetV3 (hurt). 
+
+**Idea: Use a learning rate warmup with a longer fraction**
+
+Currently 5% warmup. What about 10% or 20%? With only 660 steps, 5% is ~33 steps. A longer warmup might help avoid early instability.
+
+But this is a minor change and unlikely to give >0.005 improvement.
+
+**Idea: Use a different data augmentation strategy**
+
+Currently: horizontal flip (50%), vertical flip (50%), brightness (0.8-1.2), geometric jitter in make_crop.
+
+What about:
+- Color jitter (hue, saturation)
+- Random erasing
+- Gaussian blur
+
+These are cheap augmentations that don't affect training time much.
+
+**Idea: Use the low-res crops more effectively**
+
+e003 added low-res GT crops and it helped (new best). The current code uses both high and low res. What about:
+- Training primarily on low-res (since the detector operates at low res)
+- Or using a different augmentation for low-res vs high-res
+
+Actually, the detector operates on the full image, not crops. The "low-res" in crops.csv might refer to the resolution of the source image.
+
+**Let me reconsider the problem from first principles:**
+
+The key insight from the brief: "stage-1 boxes with perfect classes (ceiling for stage 2): 0.758 mAP@0.5"
+
+So if we had perfect class labels, we'd get 0.758. We're at 0.6411. The gap is 0.117.
+
+The errors come from:
+1. Wrong class assignment (the main issue)
+2. False alarms being scored too high
+3. True defects being scored too low
+
+For (1), we need better classification. For (2) and (3), we need better scoring.
+
+The per-class APs: pore 0.537, deposit 0.635, discontinuity 0.780, stain 0.612.
+
+Pore is the weakest. What makes pore hard?
+- Pores are small, circular holes
+- They might be confused with stains (small dark spots)
+- They might be confused with background (small dark spots that aren't defects)
+
+Stain is second weakest:
+- Stains are often confused with deposit (per the brief)
+- Stains might be confused with background
+
+**Idea: Class-specific augmentation**
+
+For pore: add more small circular patterns, or use cutout to create pore-like patterns
+For stain: add more irregular dark patterns
+
+But this is hard to implement effectively.
+
+**Idea: Use a two-stage scoring approach**
+
+1. First, use the classifier to get class probabilities
+2. Then, use a separate model (or simple heuristic) to estimate "is this a defect at all?"
+3. Combine: score = defect_prob * class_prob * conf
+
+The "defect_prob" could come from:
+- The max class probability (tried in e014, hurt)
+- A separate binary classifier
+- The detector confidence (already used)
+
+**Idea: Use the detector confidence differently**
+
+Instead of `score = conf * prob[c]`, what about:
+- `score = prob[c]` (ignore detector conf entirely)
+- `score = conf^0.5 * prob[c]` (reduce conf influence)
+- `score = conf * prob[c] / sum(prob)` (normalize)
+
+Actually, `conf * prob[c]` is already normalized since sum(prob) = 1.
+
+What about `score = (conf + prob[c]) / 2`? This gives equal weight to detector conf and class probability.
+
+Or `score = conf * (0.5 + 0.5 * prob[c])`? This ensures the score is at least 0.5 * conf.
+
+Hmm, these are all scoring changes. Let me think about whether any of these would help.
+
+The key question: does the detector confidence correlate with whether a box is a true defect?
+
+If yes, then higher conf should boost true defects and suppress false alarms. The current `conf * prob[c]` does this.
+
+If no, then conf is noise and we should ignore it.
+
+Given that the detector is YOLOv7-tiny and achieves 0.69 mAP on the original 4-class task, the confidence is probably somewhat informative but noisy.
+
+**Idea: Calibrate the detector confidence**
+
+Fit a simple calibration (e.g., Platt scaling or histogram binning) on the training detector boxes to map raw conf to a calibrated "is defect" probability. Then use the calibrated conf in the score.
+
+This is a data-driven approach that could help if the raw conf is miscalibrated.
+
+Implementation:
+1. For each training detector box, compute whether it's a true defect (IoU >= 0.5 with any GT box)
+2. Fit a calibration: map conf to P(defect | conf)
+3. At inference, use calibrated_conf * prob[c] instead of conf * prob[c]
+
+This is a scoring change that's cheap to implement and could help.
+
+Actually, let me think about this more carefully. The calibration would be:
+- For each bin of conf values, compute the fraction of boxes that are true defects
+- At inference, look up the calibrated probability
+
+This is a form of histogram calibration. It's simple and could help.
+
+But wait, the detector confidence is already a probability estimate (or at least a score). If it's well-calibrated, this won't help. If it's miscalibrated, it could.
+
+Let me think about what's most likely to give a meaningful improvement...
+
+**Idea: Use a different model architecture that's faster**
+
+The current model is EfficientNet-B0 at 224x224. What about:
+- EfficientNet-B0 at 192x192 (tried in e018, hurt)
+- RegNetY-016 (smaller, faster)
+- ResNet18 (simple, fast)
+
+Wait, e018 tried 192 and got 0.6387 vs 0.6423 for 224. So 224 is better.
+
+What about using a smaller model at 224? Like ResNet18 or RegNetY-016?
+
+ResNet18 has ~11M params but is much faster than EfficientNet-B0 (4M params but deeper). Actually, EfficientNet-B0 has 4M params and ~390M FLOPs at 224. ResNet18 has 11M params and ~1800M FLOPs at 224. So ResNet18 is actually slower.
+
+RegNetY-016 has ~9M params and ~130M FLOPs at 224. That's much faster!
+
+But e015 tried ConvNeXt-Nano (5M params) and it hurt (0.5833). So smaller models don't necessarily help.
+
+**Idea: Use a two-model ensemble with the same architecture but different seeds**
+
+Train two EfficientNet-B0 models with different random seeds and average their predictions. This is a simple ensemble that often gives 1-2% improvement.
+
+Time budget: ~125s for training. Two models would each get ~62s, which is about 1 epoch each. Currently we get 2 epochs. So each model would be less trained, but the ensemble might still help.
+
+Actually, looking at the time more carefully:
+- Loading: 17s
+- Training: ~108s (125s - 17s)
+- Inference: ~40s (165s - 125s)
+
+Wait, the log says:
+- 17s for loading
+- 94s for epoch 0 (411 steps)
+- 125s for epoch 1 (660 steps total, so 32s for epoch 1)
+- 165s total
+
+So training takes about 108s (125-17), inference takes about 40s (165-125).
+
+If we train two models, each gets ~54s of training, which is about 0.5 epoch each. That's probably too little.
+
+Unless we reduce the number of training samples. If we subsample to 50% of training data, each model could get 1 epoch in 54s.
+
+This is getting complicated. Let me think of a simpler idea.
+
+**Idea: Use a learning rate schedule that doesn't decay to near-zero**
+
+e020 tried raising the min LR multiplier from 1e-3 to 0.1 and it hurt (0.6363). So the cosine decay is probably fine.
+
+**Idea: Use a different loss function**
+
+e006 tried focal loss (hurt). e023 tried label smoothing (hurt). What about:
+- Cross-entropy with temperature (soft labels)
+- KL divergence with a target distribution
+
+These are similar to what's been tried.
+
+**Idea: Use a different training strategy - train for more epochs on a subset**
+
+Instead of training on all 26347 boxes for 2 epochs, train on a subset (e.g., 10000 boxes) for 5 epochs. This might give better convergence on the most informative samples.
+
+But this is a form of sampling that's similar to e011 and e024.
+
+**Let me reconsider the problem.**
+
+The most impactful untried ideas seem to be:
+1. **Ensemble** (two models, average predictions) - but time budget is tight
+2. **Calibrated detector confidence** - cheap to implement, could help with ranking
+3. **Two-crop input at smaller size** - revisit the original approach
+4. **Different scoring formula** - but many have been tried
+
+I think the **calibrated detector confidence** is the most promising untried idea. It's:
+- Cheap to implement (no extra training)
+- Directly addresses the ranking component of mAP
+- Different from all previous experiments
+- Could help if the detector confidence is miscalibrated
+
+Let me design this:
+
+1. During training data preparation, for each training detector box, compute:
+   - `is_defect = (best_iou >= 0.5)` (already computed)
+   - `conf` (the detector confidence)
+
+2. Fit a calibration:
+   - Bin the conf values into, say, 20 bins
+   - For each bin, compute the fraction of boxes that are defects
+   - Store this as a lookup table
+
+3. At inference:
+   - For each eval box, look up the calibrated probability based on its conf
+   - Use `score = calibrated_conf * prob[c]` instead of `conf * prob[c]`
+
+This is a scoring change. Let me implement it.
+
+Actually, a simpler approach: use a monotone calibration. Fit a logistic regression: `logit(P(defect)) = a * conf + b`. Then `P(defect) = sigmoid(a * conf + b)`.
+
+Even simpler: just use the empirical CDF. For each conf value, compute the fraction of training boxes with conf <= this value that are defects.
+
+Let me go with the histogram approach:
+1. Bin conf into 20 bins
+2. For each bin, compute P(defect | bin)
+3. At inference, use this calibrated probability
+
+This is simple and effective. Let me implement it.
+
+Wait, but there's a subtlety. The detector confidence might not be well-calibrated in a simple way. The relationship between conf and P(defect) might be complex. A histogram approach with 20 bins should capture this.
+
+Let me also consider: what if the calibration is the identity (i.e., conf is already well-calibrated)? Then this change would have no effect. But if conf is miscalibrated (e.g., too high for false alarms), the calibration would help.
+
+Given that the detector is YOLOv7-tiny (a relatively weak detector), I suspect the confidence is somewhat miscalibrated. The calibration should help.
+
+Let me implement this.
+
+Actually, I realize there's another approach that might be even better: **use the detector confidence as a feature in the scoring, but learn the relationship from training data**.
+
+Specifically:
+1. For each training detector box, we know:
+   - `conf` (detector confidence)
+   - `is_defect` (whether it matches a GT box)
+   - `true_class` (if it's a defect)
+
+2. We could fit a simple model: `score = f(conf, class_probs)` that maximizes the ranking of true defects over false alarms.
+
+But this is more complex. Let me stick with the histogram calibration.
+
+Here's my plan:
+
+```python
+# After computing matched_dets, fit a calibration
+# For training detector boxes, we have d["conf"] and d["cls"] (or -1 for background)
+# Compute P(defect | conf) using histogram binning
+
+# In the scoring:
+# Instead of s = d["conf"] * float(p[c])
+# Use s = calibrated_conf * float(p[c])
+```
+
+Let me write the code.
+
+Actually, I want to be more careful. Let me think about what exactly to calibrate.
+
+The detector confidence `conf` is a score from 0 to 1 (or maybe unbounded). For each training detector box, we know whether it's a true defect (IoU >= 0.5 with GT). So we can compute:
+
+```python
+# Collect all training det boxes with their conf and is_defect
+det_confs = []
+det_labels = []
+for d in train_dets:
+    det_confs.append(d["conf"])
+    det_labels.append(1 if d["cls"] >= 0 else 0)  # cls >= 0 means matched
+
+# Fit histogram calibration
+n_bins = 20
+bin_edges = np.linspace(0, 1, n_bins + 1)  # assuming conf is in [0, 1]
+calibrated = np.zeros(n_bins)
+for i in range(n_bins):
+    mask = (np.array(det_confs) >= bin_edges[i]) & (np.array(det_confs) < bin_edges[i+1])
+    if mask.sum() > 0:
+        calibrated[i] = np.mean(np.array(det_labels)[mask])
+    else:
+        calibrated[i] = 0.5  # default
+```
+
+Then at inference:
+```python
+conf_val = d["conf"]
+bin_idx = min(int(conf_val * n_bins), n_bins - 1)
+cal_conf = calibrated[bin_idx]
+s = cal_conf * float(p[c])
+```
+
+This is a clean, simple change. Let me implement it.
+
+Wait, I need to check: is the detector confidence in [0, 1]? YOLO typically outputs confidence in [0, 1] after sigmoid. Let me assume so.
+
+Also, I should handle the edge case where conf might be outside [0, 1].
+
+Let me write the full implementation:
+
+```python
+# After the matching loop, before creating the dataset:
+# Fit histogram calibration for detector confidence
+det_confs = np.array([d["conf"] for d in train_dets])
+det_is_defect = np.array([1.0 if d.get("cls", -1) >= 0 else 0.0 for d in train_dets])
+n_cal_bins = 20
+cal_min, cal_max = max(0.0, float(np.min(det_confs))), min(1.0, float(np.max(det_confs)))
+if cal_max <= cal_min:
+    cal_max = cal_min + 1e-6
+cal_edges = np.linspace(cal_min, cal_max, n_cal_bins + 1)
+cal_table = np.full(n_cal_bins, 0.5, dtype=np.float32)
+for i in range(n_cal_bins):
+    mask = (det_confs >= cal_edges[i]) & (det_confs < cal_edges[i + 1])
+    if mask.sum() > 0:
+        cal_table[i] = float(np.mean(det_is_defect[mask]))
+
+def calibrate_conf(c):
+    c = max(cal_min, min(cal_max - 1e-9, c))
+    idx = min(int((c - cal_min) / (cal_max - cal_min) * n_cal_bins), n_cal_bins - 1)
+    return cal_table[idx]
+```
+
+Then in the scoring:
+```python
+s = calibrate_conf(d["conf"]) * float(p[c])
+```
+
+This replaces `d["conf"]` with `calibrate_conf(d["conf"])`.
+
+Let me check: this is a scoring change. The category is "scoring".
+
+Hypothesis: Calibrating the detector confidence using the empirical defect rate per confidence bin (from training detector boxes) will improve mAP by better reflecting the true probability that a box is a defect, improving the ranking of true detections over false alarms.
+
+This is a focused, testable change. Let me write the SEARCH/REPLACE blocks.
+
+I need to:
+1. Add the calibration fitting code after the matching loop
+2. Add the calibrate_conf function
+3. Change the scoring to use calibrated confidence
+
+Let me find the exact lines to modify.
+
+Looking at the code:
+
+After the matching loop:
+```python
+    train_rows = crops + matched_dets
+```
+
+I'll add the calibration code before this line.
+
+And in the scoring:
+```python
+                s = d["conf"] * float(p[c])
+```
+
+I'll change this to use calibrated confidence.
+
+Let me write the blocks:
+
+Block 1: Add calibration fitting after the matching loop
+```
+SEARCH:
+    train_rows = crops + matched_dets
+=======
+    # Fit histogram calibration for detector confidence
+    det_confs = np.array([d["conf"] for d in train_dets])
+    det_is_defect = np.array([1.0 if d.get("cls", -1) >= 0 else 0.0 for d in train_dets])
+    n_cal_bins = 20
+    cal_min, cal_max = float(np.min(det_confs)), float(np.max(det_confs))
+    if cal_max <= cal_min:
+        cal_max = cal_min + 1e-6
+    cal_edges = np.linspace(cal_min, cal_max, n_cal_bins + 1)
+    cal_table = np.full(n_cal_bins, 0.5, dtype=np.float32)
+    for i in range(n_cal_bins):
+        mask = (det_confs >= cal_edges[i]) & (det_confs < cal_edges[i + 1])
+        if mask.sum() > 0:
+            cal_table[i] = float(np.mean(det_is_defect[mask]))
+    def calibrate_conf(c):
+        c = max(cal_min, min(cal_max - 1e-9, c))
+        idx = min(int((c - cal_min) / (cal_max - cal_min) * n_cal_bins), n_cal_bins - 1)
+        return cal_table[idx]
+    train_rows = crops + matched_dets
+>>>>>>> REPLACE
+```
+
+Block 2: Change the scoring
+```
+SEARCH:
+                s = d["conf"] * float(p[c])
+=======
+                s = calibrate_conf(d["conf"]) * float(p[c])
+>>>>>>> REPLACE
+```
+
+Wait, I need to make sure the SEARCH text appears exactly once. Let me check.
+
+`train_rows = crops + matched_dets` - this appears once in the file.
+
+`s = d["conf"] * float(p[c])` - this appears once in the file.
+
+Good. Let me finalize.
+
+Actually, I want to double-check the logic. The `det_is_defect` array: for each training det box, if it was matched (cls >= 0), it's a defect. Otherwise, it's background.
+
+In the matching loop:
+```python
+    for d in train_dets:
+        best_iou, best_cls = 0.0, -1
+        ...
+        if best_iou >= 0.5:
+            d["cls"] = best_cls
+            matched_dets.append(d)
+```
+
+So matched dets have `d["cls"] >= 0`, and unmatched dets don't have `d["cls"]` set (or it's not set). Wait, actually `d["cls"]` is only set if `best_iou >= 0.5`. For unmatched dets, `d["cls"]` is not set.
+
+So `d.get("cls", -1) >= 0` should work: matched dets have cls >= 0, unmatched dets don't have cls set (so get returns -1).
+
+Yes, this is correct.
+
+Let me also think about whether the calibration could hurt. If the detector confidence is already well-calibrated, the calibration would be approximately the identity, and the change would have minimal effect. If the confidence is miscalibrated (e.g., too high for false alarms), the calibration would correct it and improve ranking.
+
+The risk is if the calibration overfits to the training data. With 20 bins and ~12000 training det boxes, each bin has ~600 samples, which should be enough for stable estimates.
+
+I think this is a good experiment. Let me finalize.
+
+One more thought: should I also print the calibration table for debugging? That would be helpful.
+
+```python
+    print(f"calibration: min={cal_min:.3f}, max={cal_max:.3f}, table={cal_table[:5]}...", flush=True)
+```
+
+Yes, let me add that.
+
+Let me write the final version.

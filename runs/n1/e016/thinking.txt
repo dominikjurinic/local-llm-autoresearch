@@ -1,0 +1,448 @@
+===== attempt 1 =====
+Let me analyze the situation carefully.
+
+Current best: e000 with 0.6318 mAP@0.5 (5-seed mean)
+Per-class APs: pore 0.478, deposit 0.649, discontinuity 0.789, stain 0.610
+
+The main weakness is pore (0.478) and stain (0.610). Pore is confused with stain/deposit (60% right, 20% stain, 6% deposit). Stain is confused with deposit (86% right, 9% deposit, 3% pore).
+
+Key reference numbers:
+- One-step 4-class detector (baseline to beat): 0.638
+- Stage-1 boxes with perfect classes (ceiling): 0.758
+- Stage-1 boxes scored as single class 'defect': 0.755
+
+My current score is 0.6318, below the baseline 0.638. The gap to perfect classes is 0.7530 - 0.6318 = 0.1212, which is the cost of wrong classes.
+
+Looking at the experiment history:
+- Architecture ideas (9 attempts): 0 new best, 6 close but not confirmed, 3 crashed → EXHAUSTED
+- Data ideas (3 attempts): 0 new best, 3 close but not confirmed → EXHAUSTED
+- Optimisation (2 attempts): both suspicious/buggy
+- Inference (1 attempt): crashed
+
+The "close but not confirmed" ones include:
+- e001: box metadata (log-area, aspect ratio) - 0.6363
+- e002: detector boxes as training data - 0.6389
+- e003: third wide view (4x) - 0.6455
+- e004: box metadata (different impl) - 0.6355
+- e009: detector boxes as training data (different impl) - 0.6403
+- e010: 2-of-3 random sampling with 3.5x view - 0.6493
+- e012: detector boxes + 3.5x wide view - 0.6454
+
+The best unconfirmed was e010 at 0.6493 (5-seed), which combined detector-box training with a third wide view using 2-of-3 random sampling.
+
+But wait - e010 got 0.6493 5-seed mean, which would beat the current best of 0.6318 by ~0.0175. The harness says "not confirmed" - meaning it didn't pass the stricter acceptance rule (gain above seed noise AND validation image noise).
+
+The pore class is the main weakness (AP 0.478). The third wide view helps pore specifically. Detector-box training helps with distribution shift.
+
+Let me think about what hasn't been tried properly:
+1. EMA - crashed due to bugs, but the idea is sound
+2. Combining the two best unconfirmed ideas (detector-box training + third wide view) more carefully
+3. Better handling of the pore class specifically
+4. Test-time augmentation (but earlier runs said no gain)
+5. Different backbone - but earlier runs said no gain due to fewer steps
+6. The "background class" idea - tried 9 times, no gain
+7. Fewer score rows - tried 16 times, no gain
+
+Wait, e012 already combined detector boxes + 3.5x wide view and got 0.6454 (not confirmed). e010 did 2-of-3 sampling with 3.5x view and got 0.6493.
+
+The key issue might be that these ideas are close but the validation noise prevents confirmation. I need something with a larger effect size.
+
+Looking at the diagnostics: "mAP@0.5 if every box had its correct class but kept your scores: 0.7530 (yours: 0.6318). The difference is what wrong classes cost; the remaining gap to the perfect-classes ceiling in the brief is what your scores cost compared with the detector's conf."
+
+So 0.7530 is with my scores but perfect classes. The ceiling with detector conf is 0.758. So my scoring (det_conf * class_prob) loses only 0.005 vs using detector conf directly. The main loss is wrong classes (0.1212).
+
+The confusion matrix shows:
+- Pore: 60% right, 20% stain, 6% deposit
+- Stain: 86% right, 9% deposit, 3% pore
+- Deposit: 77% right, 20% stain
+- Discontinuity: 97% right
+
+Pore is the main problem. It's small and round. Stain is larger and irregular. Deposit is elongated.
+
+Ideas that could help pore specifically:
+1. Higher resolution for small boxes
+2. More context for small boxes
+3. Specialized loss for pore
+4. Ensemble specifically for pore
+
+But earlier runs tried resolution (224px) and larger crops - no gain.
+
+What about the EMA idea? It crashed twice due to bugs. But EMA is a solid technique. The bug in e014 was CPU-GPU transfer every step. In e015 they fixed it to be GPU-only but still got 0.4410 - that's a massive drop, likely a different bug.
+
+Let me check the e015 code again... They copy EMA weights to model at the end. But they start EMA after 10% of training. The loss curves look similar to baseline. But the score dropped to 0.44. That suggests the EMA weights are corrupted or the copy is wrong.
+
+Actually, looking at e015: they do `p.copy_(ema_p)` which copies ema_p INTO p. That should be correct. But maybe the EMA update is wrong? They do `ema_p.mul_(ema_decay).add_(p.detach(), alpha=1 - ema_decay)`. That's correct: ema = decay * ema + (1-decay) * p.
+
+Wait, they start EMA after `ema_start_frac = 0.1` (10% of training time). But `frac` is the fraction of training time elapsed. At the beginning, frac is small, so they don't update EMA. That seems fine.
+
+But the score is 0.44 vs 0.63. Something is very wrong. Maybe the EMA parameters are not on the right device? They're created as `[p.detach().clone() for p in model.parameters()]` - these should be on the same device as model parameters.
+
+Actually, wait - in e014 they had CPU transfers. In e015 they claim "GPU-only, no CPU transfers". But the log shows similar training time (165s vs 162s), so that's not the issue.
+
+The prediction rows: 68702 vs 53606. That's more predictions. But the score is lower.
+
+Hmm, maybe the EMA model is worse because it's averaging early bad weights? With only ~430 steps, 10% is 43 steps. EMA with decay 0.999 over ~400 steps... the effective window is about 1000 steps, so it's barely moving.
+
+Actually, with decay 0.999 and 400 updates, the weight of the initial model is 0.999^400 ≈ 0.67. So the EMA is still 67% initial weights! That's the bug. They need much higher decay or to start EMA later, or use a different schedule.
+
+For short training, EMA decay should be lower (like 0.99 or 0.995) or they should use a warmup period where decay increases.
+
+But the harness says "Likely-bug results so far (do not repeat these without fixing the cause): e014, e015". So I should not repeat EMA without fixing.
+
+What about combining the two best unconfirmed ideas more carefully? e010 got 0.6493 with detector-box training + 3.5x view + 2-of-3 sampling. e012 got 0.6454 with detector-box training + 3.5x view (but different implementation?).
+
+Let me look at e010's approach: "Using 2-of-3 random sampling during training keeps compute similar to two views." So they have 3 views (tight, medium, wide) but only use 2 randomly per sample.
+
+e012: "Two previously confirmed ideas address complementary problems: (1) training on detector boxes from train split, (2) extra-wide view for small defects."
+
+The fact that multiple runs got ~0.645-0.649 suggests there's real signal here, but the validation noise prevents confirmation.
+
+The current acceptance rule: "gain above the seed noise only" was the old rule. New rule: "gain above the seed noise AND the noise from the particular validation images. A gain that comes from a handful of images, or from one small class, usually does not hold on other images."
+
+So the pore-driven gains (which is a small class) might not confirm because they're concentrated on one class.
+
+But wait - pore AP is 0.478, which is very low. Improving it should help mAP since mAP averages over classes. If pore goes from 0.478 to 0.55, that's +0.072 on one class, +0.018 on mAP. That should be detectable.
+
+Unless the validation set has very few pore instances? Let me check the confusion matrix: true pore has 25+4+0+12+0 = 41 instances. That's not tiny.
+
+Let me think of a different approach. The problem says "Ideas outside these families have not been tried." What families haven't been tried?
+
+From the list:
+- Fewer/reweighted score rows (16 attempts)
+- 5th background class (9)
+- Detector boxes as training data (6)
+- Third wide view (3)
+- Low-res crops (4)
+- Bigger backbone/ensembles (8)
+- Resolution/small-box handling (9)
+- TTA (8)
+- Longer training (6)
+- Class-balanced sampling/weighted loss (4)
+- Training augmentation (5)
+- Focal loss (2)
+- Box size/aspect as input (4 - never properly tested)
+
+The box size/aspect ratio as extra input was never properly tested (2 crashes, 1 edit failure, 1 run at 0.629). This is the "box metadata" idea that e001, e004, e007, e008 tried but with different implementations. e001 got 0.6363, e004 got 0.6355, e008 got 0.6343 - all not confirmed.
+
+But e001's hypothesis was: "The classifier receives crops resized to 160×160, losing absolute defect size and aspect ratio—cues that help separate pore (small, round) from stain (larger, irregular) and deposit (elongated). I will add log-area and a..." (cut off).
+
+This makes sense! Pore is small, stain is larger, deposit is elongated. The crop resize loses this info. Adding it as extra features to the classifier head could help.
+
+The crashes in e007/e008 were due to `img_w`, `img_h` not being converted to float in `read_csv`. e008 fixed it and ran but got 0.6343 (not confirmed).
+
+Maybe the implementation was suboptimal. How was the metadata added? Probably concatenated to the backbone features before the final classifier.
+
+Let me think of a cleaner implementation: add a small MLP that takes the backbone features + box metadata (log relative area, aspect ratio) and outputs class logits.
+
+But the harness says architecture is EXHAUSTED with 3+ ideas, no new best. And box metadata was tried 4 times (e001, e004, e007, e008).
+
+What about the "background class" idea? Tried 9 times, no gain.
+
+What about test-time augmentation? Tried 8 times, no gain.
+
+What about longer training? Tried 6 times, best 0.6355 not confirmed.
+
+What about different backbone? Tried 8 times, best 0.636 not confirmed.
+
+The only family with "accepted twice" is detector boxes as training data (+0.004) and third wide view (+0.005). But neither confirmed under new rules.
+
+Wait, the brief says: "Those runs used a looser acceptance rule (gain above the seed noise only). Some of their 'accepted' changes would not pass today's rule, which also counts the noise from the particular validation images."
+
+So the +0.004 and +0.005 gains are real but may not be robust across validation images.
+
+I need an idea with a larger effect size. What could give >0.01 gain?
+
+Looking at the gap: current 0.6318, baseline to beat 0.638, ceiling 0.758. There's 0.126 headroom.
+
+The main loss is wrong classes (0.1212). Pore is 60% accurate. If I can get pore to 80%, that's +0.2 on pore AP, +0.05 on mAP. But pore is only 41 instances in the confusion matrix (maybe more in full val).
+
+Another angle: the scoring. Currently score = det_conf * class_prob. The brief says: "mAP@0.5 if every box had its correct class but kept your scores: 0.7530 (yours: 0.6318). The difference is what wrong classes cost; the remaining gap to the perfect-classes ceiling in the brief is what your scores cost compared with the detector's conf."
+
+Perfect-classes ceiling is 0.758. My scores with perfect classes give 0.753. So my scoring loses only 0.005 vs detector conf. The scoring is fine.
+
+The problem is classification accuracy.
+
+What about using the detector confidence as a feature? The detector conf might correlate with box quality. But the classifier already sees the crop.
+
+What about training the classifier on detector boxes with their IoU to ground truth as a soft label? Or using the detector conf to weight the loss?
+
+Actually, the detector boxes from train split have IoU with true boxes. We could use that.
+
+But e002 and e009 tried detector boxes as training data and got ~0.639-0.640.
+
+What about a completely different approach: instead of classifying each crop independently, use a model that sees multiple crops of the same image? But that's complex.
+
+What about the fact that the two views (tight and wide) are averaged at the logit level? Maybe they should be concatenated and processed by a small fusion network?
+
+Or: use a larger model for the wide view only, since it has more context?
+
+But compute budget is tight.
+
+Let me re-read the budget: 180 seconds total. Current: 13s load, ~112s training (433 steps), ~37s prediction. Reserve 55s.
+
+Training time per step: ~112/433 ≈ 0.26s/step.
+
+If I add a third view, training time per step increases ~50% (3 views vs 2), so steps drop to ~290. e003 and e010 tried this.
+
+e010 used 2-of-3 sampling to keep compute similar. That got 0.6493.
+
+What if I do 2-of-3 sampling but with a better third view? Or what if I use the third view only at test time?
+
+Test-time only third view: no training compute cost, only inference. But the model wouldn't be trained on it.
+
+What about: train with two views, but at test time use three views (the third being a wider crop)? The model would see the third view for the first time at test - not ideal.
+
+But wait, the two views share the same backbone. The wide view (2.5x) is already quite wide. The third view in e003 was 4x.
+
+Another idea: the pore class is small. What if I use a higher resolution for small boxes only? Like, if box area < threshold, crop at higher resolution (e.g., 224 instead of 160)? But that adds complexity.
+
+Or: use a feature pyramid / multi-scale features from the backbone? But efficientnet_b0 doesn't easily give that.
+
+What about using a different backbone that's faster, allowing more steps or higher resolution? But earlier runs said bigger backbones reduce steps and don't help.
+
+Wait, the current model is efficientnet_b0 at 160x160. What about efficientnetv2_b0? It's in the allowed list. It's designed for smaller resolutions and faster training.
+
+But changing backbone is architecture, which is "EXHAUSTED".
+
+Let me think about the "box size and aspect ratio as extra model input" family - it says "never properly tested: 2 crashes, 1 edit failure, 1 run at 0.629". So only one successful run at 0.629 (below baseline). But e001, e004, e008 got 0.634-0.636. Those are architecture experiments that added metadata.
+
+The harness categorized e001, e004, e007, e008 as "architecture". And says architecture is EXHAUSTED with 9 ideas, 0 new best.
+
+But the box metadata idea is conceptually sound - pore is small, stain is large, deposit is elongated. The resize to 160x160 loses this. Why didn't it work better?
+
+Maybe the metadata wasn't used effectively. Just concatenating to the final features might not be enough. Or the MLP head needs to be larger.
+
+Or maybe the metadata needs to be normalized properly.
+
+Let me think of a novel idea not in the families:
+
+1. **Label smoothing** - tried? Not in the list. But the brief says "Label smoothing improves calibration in some settings but can reduce the information in class probabilities that ranking metrics use." So probably not.
+
+2. **Mixup/CutMix** - "Training augmentation (rotation, mixup, stronger colour or geometry)" - 5 attempts, no gain.
+
+3. **Focal loss** - 2 attempts, no gain.
+
+4. **Ensemble** - "Bigger or other backbone (EfficientNet-B2, ResNet-50, 2-3 model ensembles)" - 8 attempts, no gain.
+
+5. **SWA (Stochastic Weight Averaging)** - not tried! The brief mentions it: "Cheaper variants: snapshot ensembles from one training run (Huang et al., 2017), weight averaging along the trajectory (SWA, Izmailov et al., 2018)". EMA is similar but SWA averages weights at the end of training with a high learning rate.
+
+SWA could work well with the cosine decay schedule. It's different from EMA - SWA collects weights at the end of training when LR is cycled or high.
+
+But the current schedule is cosine decay to near zero. SWA typically uses a constant high LR or cyclic LR at the end.
+
+With the time budget, we could do: train normally for 80% of time, then cycle LR and average weights for last 20%.
+
+But this is "optimisation" category, which has 2 attempts (both EMA bugs). Not exhausted.
+
+However, the harness says "Likely-bug results so far (do not repeat these without fixing the cause): e014, e015". So optimisation attempts have been buggy.
+
+But SWA is different from EMA. It's simpler: just average model weights at certain steps.
+
+Let me think: current training runs ~5 epochs, 433 steps. If I save the model every epoch after epoch 2, and average them, that's SWA.
+
+But would it help? SWA typically needs a learning rate schedule that doesn't decay to zero, or a cyclic LR at the end.
+
+Another idea: **Knowledge distillation from a larger model** - but no larger model available.
+
+**Self-distillation / label refinement** - use the model's own predictions on detector boxes as soft labels for retraining? But that's semi-supervised.
+
+**Using the detector confidence as a prior** - the classifier outputs p(class|crop). The detector conf is p(defect|box). We want p(class|box) = p(class|crop) * p(defect|box) / p(defect|crop)... not straightforward.
+
+Wait, the current score is det_conf * class_prob. This assumes class_prob is p(class|defect, crop). But the classifier is trained on true defects, so it learns p(class|defect, crop). The detector conf is p(defect|box). So the product is p(class|defect, crop) * p(defect|box). If crop ≈ box, this is approximately p(class|box). But for false alarms, p(defect|box) is low, so score is low. This seems correct.
+
+What about calibrating the classifier's probabilities? Temperature scaling? But the brief says "Temperature scaling and other calibration methods fix probability levels, not rankings". And AP depends only on ranking.
+
+Unless the ranking within a class is improved by calibration? No, monotonic transformation preserves ranking.
+
+But the product det_conf * class_prob: if class_prob is miscalibrated, the product's ranking could be suboptimal. For example, if class_prob is overconfident on wrong classes, it could rank a false alarm high.
+
+But the main issue is wrong classes, not ranking within class.
+
+Let me look at the confusion matrix again:
+- Pore: 60% right. 20% stain, 6% deposit.
+- Stain: 86% right. 9% deposit, 3% pore.
+- Deposit: 77% right. 20% stain.
+- Discontinuity: 97% right.
+
+Pore-stain and stain-deposit are the main confusions.
+
+Pore vs stain: pore is small, round; stain is larger, irregular. The wide view should help distinguish (stain has more context).
+
+Deposit vs stain: deposit is elongated, stain is irregular. Aspect ratio should help.
+
+So box metadata (size, aspect) should help both.
+
+Why didn't it work in e001/e004/e008? Maybe implementation issue.
+
+Let me design a clean box metadata implementation:
+
+1. In `read_csv`, also convert `img_w`, `img_h` to float.
+2. In `BoxDataset.__getitem__`, compute box features: log relative area, aspect ratio.
+3. Pass these to the model.
+4. Model: backbone -> features -> concat with box features -> classifier head.
+
+The model currently uses `timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)`. This replaces the classifier head. I need to modify the head to accept extra features.
+
+For efficientnet_b0, the classifier is `model.classifier` (a Linear layer). I can replace it with a custom head that takes (features + metadata) -> classes.
+
+This is a focused change. Let me check if this has been tried properly. e008 fixed the CSV bug and ran, got 0.6343. But maybe the head was too simple or metadata not normalized.
+
+What if I normalize the metadata by training statistics? And use a small MLP (e.g., 2-layer) to process metadata before concatenating?
+
+Or: use the metadata to modulate the features (FiLM style)?
+
+But that's more complex.
+
+Simpler: just concatenate normalized metadata to the pooled features, then a Linear layer.
+
+Let me calculate the metadata:
+- Box area = (x2-x1)*(y2-y1)
+- Image area = img_w * img_h
+- Relative area = box_area / image_area
+- Log relative area = log(relative_area)
+- Aspect ratio = (x2-x1) / (y2-y1) (or log of it)
+
+Normalize these by training set mean/std.
+
+This is a clean implementation. The previous attempts might have had bugs or suboptimal normalization.
+
+But the harness says architecture is EXHAUSTED. However, the box metadata idea was only partially tested (4 attempts, 3 crashed/failed, 1 ran at 0.629, and 3 others in architecture category got 0.634-0.636). The "1 run at 0.629" might be a different implementation.
+
+Actually, looking at the table: "Box size and aspect ratio as an extra model input | 4 | never properly tested: 2 crashes (wrong attribute name), 1 edit failure, 1 run at 0.629"
+
+And separately, e001, e004, e007, e008 are listed as architecture experiments with scores 0.6363, 0.6355, crashed, 0.6343. These might be the same idea but categorized differently.
+
+The harness says "architecture | 9 | 6 | 0 | 6 | 3 | EXHAUSTED? (3+ ideas, no new best)". So 9 architecture ideas, 6 ran, 0 new best, 6 close but not confirmed, 3 crashed.
+
+The box metadata idea might be considered exhausted.
+
+What about **data augmentation** specifically for pore? Like, oversample pore boxes? But class-balanced sampling was tried (4 attempts, no gain).
+
+What about **hard negative mining**? The detector boxes include false alarms. If we train on detector boxes (which include false alarms), the classifier learns to recognize background. But the background class idea was tried 9 times and failed.
+
+Wait, the background class idea was: "5th 'background' class from detector false alarms (scores times 1 - p_bg)". That's different from just training on detector boxes with 4 classes.
+
+Training on detector boxes with 4 classes (using IoU to assign labels) was tried in e002, e009, e012 and got ~0.639-0.645.
+
+What if we combine: train on detector boxes, but also add a background class for boxes with IoU < 0.3 with any true box? And at test time, suppress boxes with high background probability.
+
+But the background class family was tried 9 times and failed.
+
+Another idea: **two-stage classification within stage 2**. First classify pore vs non-pore (since pore is the hardest), then classify the rest. But that's complex.
+
+**Focal loss for pore class specifically** - weight the loss for pore higher. But class-weighted loss was tried and hurt every time.
+
+Wait: "Class-weighted loss hurt classification every time it was tried." So that's out.
+
+What about **changing the crop strategy for pore**? For small boxes (likely pore), use a tighter crop or higher resolution?
+
+The tight crop is 1.5x, wide is 2.5x. For a small pore, 1.5x might be too tight (just the pore), 2.5x gives context. But both are resized to 160x160, so the pore becomes tiny in the wide crop.
+
+What if for small boxes, we use a larger IMG_SIZE? Or we don't resize as aggressively?
+
+But the model expects fixed input size.
+
+What about **test-time crop ensembling**? For each eval box, use multiple crops (e.g., tight, medium, wide, and jittered versions) and average predictions. This is TTA, which was tried 8 times with no gain. But maybe only for small boxes?
+
+The brief says TTA was tried 8 times, best 5-seed 0.631, 8 views timed out.
+
+But that was general TTA. What about targeted TTA for pore-sized boxes?
+
+Let me think about the time budget. Current prediction: ~37s for 41879 detections with 2 views. That's ~0.88ms per detection per view. Adding a third view for all would be ~55s, still within reserve (55s). But training would be slower.
+
+If I add a third view only at test time for small boxes, prediction time increases slightly.
+
+But the model isn't trained on the third view.
+
+What if I train with 2 views, but the wide view is sometimes 2.5x and sometimes 4x (randomly)? That's like data augmentation.
+
+Or: use a random context between 1.5x and 4x for the second view? But the two views are fixed as tight and wide.
+
+Another idea: **the classifier head**. Currently it's a single Linear layer on top of averaged logits from two views. What if the two views are processed by separate small heads, then combined? Or concatenated features?
+
+The current code: `(model(xt) + model(xw)) / 2` - averages logits. This means the backbone is shared, and the classifier head is shared. The features from tight and wide views are mixed in the backbone.
+
+What if we use two separate backbones? Too expensive.
+
+What if we use a small fusion module: concat features from both views -> small MLP -> logits?
+
+For efficientnet_b0, the features before classifier are 1280-dim. Concat would be 2560 -> MLP -> 4. Adds some params but negligible compute.
+
+This is architecture, but a specific fusion idea not tried.
+
+But architecture is "EXHAUSTED".
+
+Let me reconsider the **EMA/SWA** idea. The previous attempts had bugs. But if I implement SWA correctly, it's a standard technique that often helps. The harness says "do not repeat these without fixing the cause". But SWA is different from EMA.
+
+SWA implementation:
+- Train normally for most of the time.
+- In the last phase (e.g., last 20% of steps), use a constant or cyclic high LR, and average the model weights.
+- Use the averaged weights for inference.
+
+With 433 steps, last 80 steps. But the LR schedule is cosine decay to near zero. For SWA, we need to increase LR again.
+
+Alternative: **just average the last N checkpoints** without changing LR. This is "model averaging" or "polyak averaging" but at the end.
+
+The current code saves no checkpoints. I could save model state every epoch after epoch 2, then average them at the end.
+
+This is simple, low risk, and different from EMA.
+
+But would it help? With cosine decay, the last epochs have very low LR, so the model barely moves. Averaging them would be similar to the last model.
+
+Better: in the last phase, increase LR (e.g., to 0.5*LR) for a few epochs, save each epoch, average.
+
+But this adds complexity and time.
+
+Given the time, maybe I should go with the **box metadata** idea but with a cleaner, more robust implementation that addresses why previous attempts didn't confirm.
+
+Key improvements:
+1. Proper normalization of metadata using training set statistics.
+2. A small MLP to process metadata before concatenation (not just raw concat).
+3. Use both log-area and aspect ratio.
+4. Ensure it works for both training and eval.
+
+This is a focused change. The hypothesis: pore/stain/deposit confusion is largely due to lost size/aspect information from resizing; adding this back as metadata allows the classifier to use it, especially for pore (small) vs stain (large) and deposit (elongated).
+
+Expected gain: pore AP from 0.478 to ~0.55+, mAP +0.015-0.02.
+
+This differs from e001/e004/e008 by: better normalization, MLP processing, and fixing the CSV bug that caused crashes.
+
+Let me write the change.
+
+First, I need to modify `read_csv` to also convert `img_w` and `img_h` to float.
+
+Then, in `BoxDataset.__init__`, compute metadata statistics (mean, std) for training set.
+
+In `__getitem__`, compute metadata for each box, normalize, return with views.
+
+Modify the model to accept metadata and have a custom head.
+
+The model creation: instead of `timm.create_model(..., num_classes=4)`, create with `num_classes=0` to get features, then add custom head.
+
+Let me check timm's efficientnet_b0: `model.classifier` is the final Linear. `model.num_features` is 1280.
+
+So:
+```python
+model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=0)
+# model.forward_features(x) gives features, then model.forward_head(features) gives logits
+# But with num_classes=0, forward_head is identity? Let me check.
+```
+
+Actually, with `num_classes=0`, the classifier is removed, and `forward` returns features. Then I can add my own head.
+
+But the current code uses `model(xt)` which calls `forward`. With `num_classes=0`, it returns features.
+
+So I need a wrapper model that takes (image, metadata) -> logits.
+
+Let me design the change carefully.
+
+This is a significant change but focused. Let me write the SEARCH/REPLACE blocks.
+
+I'll need to change:
+1. `read_csv` - add img_w, img_h conversion
+2. `BoxDataset` - compute and return metadata
+3. Model creation - custom model with metadata head
+4. Training loop - pass metadata to model
+5. Inference - pass metadata to model
+
+Let me start.

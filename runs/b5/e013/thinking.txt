@@ -1,0 +1,155 @@
+===== attempt 1 =====
+Let me think about the current state.
+
+Current best: e012, 5-seed mean 0.6342. Per-class: pore 0.536, deposit 0.616, discontinuity 0.778, stain 0.606.
+
+Reference values:
+- One-step baseline: 0.638 (we're at 0.6342, just below it)
+- Ceiling (perfect class): 0.758
+- Class-agnostic: 0.755
+
+So the gap to the ceiling is about 0.124. The remaining error is class assignment.
+
+History:
+- e001 (data): train on detector boxes — rejected (0.6264)
+- e002 (data): add low-res — not confirmed (0.6261)
+- e003 (data): background class — rejected (0.5935)
+- e004 (scoring): temperature 0.5 — rejected (0.6119)
+- e005 (arch): 224px — not confirmed (0.6251)
+- e006 (aug): rotation — rejected (0.6246)
+- e007 (arch): some architecture change (probably a larger model or something) — rejected (0.6231)
+- e008 (inference): H-flip TTA — not confirmed (5-seed 0.6306)
+- e009 (arch): efficientnet_b2 — not confirmed (0.6231)
+- e010 (sampling): class-balanced sampling — not confirmed (0.6276)
+- e011 (inference): V-flip TTA (8 views) — timeout
+- e012 (arch): 3rd view (4x wide crop) — new best (0.6342)
+
+Lessons:
+- data: exhausted (3 ideas, no new best)
+- scoring: 1 idea, failed
+- architecture: 4 ideas, 1 new best (e012), 2 close-but-not-confirmed (e005, e009)
+- augmentation: 1 idea, failed
+- inference: 2 ideas, 0 new best, 1 close (e008), 1 timeout (e011)
+- sampling: 1 idea, close but not confirmed
+
+So what's left? The main error is class assignment. Per-class: pore 0.536 is the weakest, then stain 0.606, deposit 0.616.
+
+Ideas tried:
+- Different backbones (b2) — no
+- Higher resolution 224 — no
+- Temperature — no
+- Class-balanced sampling — no
+- Class-weighted loss — mentioned as "tried every time and it hurt" (known from "what's already known")
+- TTA (H-flip) — close but not confirmed; V-flip TTA timed out
+- 3rd wider view — worked (e012)
+
+What hasn't been tried yet?
+
+1. **Finer training / longer training**: currently 4 epochs, 291 steps in about 110s of training. The model is trained with LR 1e-3 cosine. Maybe the model is undertrained? Loss went 0.72 → 0.26. With EfficientNet-B0 at 160px, 291 steps might be a bit few. But the budget is fixed at 180s. Hmm, actually the budget T is given by the harness; the log shows 183s total for a 180s budget? Wait: "done: 4 epochs, 291 steps, 54985 prediction rows, 183s total" — hmm, 183s total but the budget is 180s? Actually the default is --seconds 180, but the harness may pass a different T. The log shows 183s total, so T is probably around 200s or more. Actually, it's killed at the limit; 183s total means T > 183. Probably T=200 or 240. Hard to know exactly. RESERVE_S=55 keeps 55s free for prediction. Prediction took 183-125 = 58s? Wait, epoch 3 ended at 125s, done at 183s, so prediction + write took about 58s. Hmm, that exceeds the 55s reserve slightly, but it finished.
+
+Actually wait — with 3 views, prediction is 3 forward passes per box. e011 (8-view TTA) timed out. So prediction time is a real constraint.
+
+2. **Reduce prediction cost to enable TTA**: e008 (H-flip TTA, 4 views) was "close but not confirmed" at 5-seed 0.6306 — actually below e012's 0.6342. Hmm, but e008 was based on e000 (2 views). If I combine e008's flip TTA with e012's 3 views, that's 6 views at inference. e011 was 8 views (2 views × 4 flips) and timed out. With 3 views × 2 flips = 6 views, prediction cost is 6/3 = 2x current. Current prediction is about 58s; 2x would be about 116s, total about 240s — probably over budget. Unless I cut training time.
+
+Hmm, wait. Let me reconsider: how much time is available? The log shows 183s total and the run succeeded. If T were 180, it would have been killed. So T > 183. The harness command is `--seconds T`. Probably T = 200 or 240. If T=200, we only have about 17s of margin. If T=240, we have about 57s.
+
+Actually, the docstring says the default is 180 but the harness passes T. e011 timed out: 8 views vs 2 views = 4x prediction. e000's prediction was probably about 29s (2 views); e011 would be about 116s prediction + about 125s training = 241s > T. So T is somewhere between 183 and 241. Probably 200 or 240.
+
+To be safe, I should assume T is around 200 (margin of about 17s) — risky. Or 240.
+
+3. **Better use of training time**: currently 291 steps in about 111s (from 14s load to 125s). Training step time is about 0.38s/step. With 3 views, each step does 3 forward+backward passes. If I drop the 3rd view at training time and use it only at inference... no, that changes the training distribution.
+
+Actually, a cleaner idea: **train with 2 views (fast) but use 3 views at inference**? The model was trained to average logits over views; the 3rd view is just another input distribution. But e012 showed that training with the 3rd view helped (new best). Hmm, e012's gain might partly come from the extra training signal (more data views = more augmentation). Hard to separate.
+
+4. **The pore class is the weakest (0.536)**. Pores are small bright/dark spots. Maybe pore needs a tighter crop or higher effective resolution. Idea: per-class view weighting? Or a separate head?
+
+5. **Score calibration / rank fusion**: the score is conf × p_c. The metric only cares about per-class ranking. For each class c, the ranking is by conf × p_c. Since conf is fixed, the ranking is by p_c within each class. So the per-class AP depends only on the ordering of p_c across boxes of that class (and which boxes are TP vs FP — but the box set is fixed, and whether a box overlaps a GT depends on IoU>0.5, which is fixed regardless of class assignment... wait, no).
+
+Wait, actually there's a subtlety: mAP@0.5 per class: predictions of class c are sorted by score; a prediction is a hit if it overlaps an unmatched GT box of class c. The box set is fixed (stage 1). For class c, the set of boxes that overlap a GT of class c is fixed. The order is by score = conf × p_c (monotone in p_c). So per-class AP depends only on the ordering of p_c across boxes. Changing the score function (e.g., temperature) changes the ordering of p_c across boxes (temperature sharpens: boxes with p_c near 1 vs boxes with p_c near 0.5 — the order can change). e004 tried temperature 0.5 and it hurt.
+
+But here's a key insight: **the per-class order is by p_c alone**. So to improve AP for class c, I want boxes that overlap a GT of class c to have higher p_c than boxes that don't. The model's p_c ordering is what matters.
+
+6. **Multi-label / per-class independent scoring**: instead of softmax (which forces probabilities to sum to 1), use per-class sigmoid scores trained with BCE. This decouples the classes: a box can be "somewhat pore and somewhat deposit". For ranking purposes, per-class sigmoid scores might rank better than softmax probabilities, because softmax couples the classes (high p_deposit forces low p_pore). Hmm, but this is a "loss" category change. Class-weighted loss hurt; but sigmoid BCE with focal or per-class weighting is different... risky, and the "loss" category hasn't been tried yet (class weighting was tried in "previous experiments" per the brief, and hurt).
+
+7. **Ensemble of two differently-trained models**: e.g., train one model for 3 views, and... no, budget.
+
+8. **Reduce training time to free up inference time for TTA**: the training loop runs until deadline - RESERVE_S. If I reduce RESERVE_S... no, the reserve is for prediction. Actually, the training loop adapts: it trains until t_end = deadline - RESERVE_S. So training automatically uses all available time. The issue is total = training + prediction. Prediction is about 58s with 3 views. If T=200, training gets 200-55=145s → training ends at about 145s, prediction 58s → total 203 > 200, killed. Hmm, but e012 finished at 183s, so T≥184. If T=200: training ends at 145, prediction 58 → 203, timeout. But e012 finished fine at 183s. So T must be ≥184, and if T were 200, e012 would have been 145+58=203 → killed. It wasn't. So T ≥ 203? Or prediction was faster than my estimate.
+
+Let me recompute: e012 seed 0: epoch 3 ended at 125s (that's when the time budget for training was exhausted: t_end = deadline - 55). So deadline = 125 + 55 = 180?? But total is 183s. So T ≥ 183. If T were exactly 180, it would have been killed at 180. So T > 183. If T=185, margin is 2s. If T=200, training should have continued until 145s (20 more steps), but it stopped at 125s. So T is between 183 and about 185. Hmm wait: t_end = deadline - 55. Training stopped at 125s (the "epoch 3" line printed at 125s, then "done ... 183s"). The training loop breaks when time.time() >= t_end. So t_end ≈ 125 (roughly, between the last step and the print). So deadline ≈ 180. But total 183 > 180 → killed?? No, it finished and printed "done". So deadline > 183. Therefore t_end > 128. So training stopped at 125 because... hmm, the loop breaks at step granularity: it checks after each step. If t_end = 129, the step at 125.5 continues, the next step at 125.9 < 129 continues... it should continue until about 129. The epoch 3 print shows 125s. The print happens after the inner loop ends. So t_end is between about 125 and 125.4 (the next step would have pushed past it). So deadline is between about 180 and 180.4. But total = 183s > deadline?? Contradiction — unless the harness's T is greater than the printed total... no, the print says 183s total and the run succeeded, so T ≥ 183.
+
+Hmm, wait. Maybe I'm misreading: "epoch 3: loss 0.2593, 291 steps, 125s" — 125s from T0. Then prediction runs, done at 183s. So prediction took 58s. deadline = t_end + 55, and training broke at t_end. If the break happened just after 125s, then deadline ≈ 180. But then the run would be killed at 180 < 183. So that can't be. Therefore t_end must be ≥ 128 (so deadline ≥ 183). Why did training stop at 125 then? Because the check `if time.time() >= t_end` happens after a step; if t_end = 128, a step starting at 125.5 finishes at about 125.9, check 125.9 < 128 → continue; next step finishes at 126.3... it should print at about 128. The print shows 125s (integer truncation). So t_end is between 125 and 125.999 → deadline is between 180 and 181. And total 183 > 181 → should have been killed.
+
+Unless... the "125s" is truncated from 125.9 and deadline = 180.9, total 183 > 180.9 → killed. Contradiction again.
+
+Hmm, maybe the harness's T is larger and the RESERVE logic is different... let me re-read the code: `deadline = T0 + args.seconds`, `t_end = deadline - RESERVE_S`. The training loop breaks when time.time() >= t_end. Then prediction. Total = T0 to end.
+
+For the run to finish at 183s: T ≥ 183. For training to stop at about 125-126s: t_end ≈ 125-126 → T ≈ 180-181. These are incompatible. So my reading of the log must be wrong. Maybe "epoch 3: ... 125s" means the epoch print happened at 125s, but the break happened later? No — the break is inside the step loop, then the print.
+
+Or: the harness passed --seconds 180 (the default) and the run was actually killed at 180, but the "done" line was printed before 180? The done line says 183s total. That's printed at the end. If it was printed at 183s and T=180, it would have been killed.
+
+Or the harness's T is 240 or 300 and... then t_end = 185/245, training should have continued past 125s. It didn't.
+
+Wait — maybe I should recheck: is the training budget `max(1.0, t_end - t_start)` and the LR schedule uses frac? The break condition is the only stopper. Hmm.
+
+Or the log lines: "epoch 3: loss 0.2593, 291 steps, 125s" — maybe 125s is time.time() - T0 at print, and the break happened at t_end = 125.x. If T = 180.5, deadline = 180.5, total 183 → killed at 180.5. But the harness shows the result as a valid score (e012 got a 5-seed mean), so it wasn't killed.
+
+I think the resolution is this: the harness's T is probably 200 or 240, and the "125s" in the log is... hmm, no.
+
+Actually, wait. Let me recount the steps: 94 steps in epoch 0 (14s to 68s → 54s for 94 steps → 0.57s/step including data loading in the first epoch), then 94 steps in 27s (0.29s/step), 94 steps in 26s, 9 steps in 4s. Total 291 steps in 111s → average 0.38s/step.
+
+If T were 240: t_end = 185, training would run to about 185s → about 485 steps. The log shows 291 steps at 125s. So T is not 240.
+
+So T ≈ 180-181, but the run finished at 183s?? That's impossible unless the kill is slightly lenient (e.g., the harness checks at intervals, or allows a small overrun). Maybe the harness kills at T but with a grace period, or the "seconds" limit is checked after the process exits... actually, maybe the harness runs with T=180 and the kill signal arrives at 180, but the process had already finished writing preds.csv by 180 and the final print happened at 183 before the kill took effect? The "done" print is the last line after writing preds.csv. If preds.csv was complete by 180 and the print at 183 was just cosmetic... possible! The kill might be SIGKILL at T; if the file is complete, the harness might still score it? But e011 was counted as a timeout. Hmm, e011 was 8 views: prediction about 4x... e000's prediction was about 29s (2 views). e011: training same about 125s (2 views), prediction about 116s → 241s. If T=180, killed at 180, preds.csv incomplete → timeout.
+
+So it's plausible that T = 180 (the default) and e012 squeaked by: preds.csv written by about 180, final print at 183 after the kill window? Risky. Actually more likely: the harness's T is a bit larger, say 190 or 200, and... no, the training would have continued.
+
+Hmm, actually, wait. Let me re-read: "epoch 3: loss 0.2593, 291 steps, 125s". What if the training loop finished epoch 3 naturally (all 94 batches) at 125s, and then the while loop checked `done`? No, done is only set by the time check. After the inner loop finishes, it prints, epoch += 1, and loops back; the next epoch's first step checks time and breaks. The print happens after the inner loop. If the break happened on the first step of epoch 4, the "epoch 3" print would show the time at that point (about 125.5). And t_end could be 125.5+ → T = 180.5.
+
+OK, the bottom line is: T is about 180-185, and e012 finished at 183s with a very thin margin. I must treat the budget as about 180s with almost no slack. Any change that increases prediction time is dangerous. e011 (4x prediction) timed out, consistent with T≈180-190: e011 total ≈ 125 + 116 = 241 > T.
+
+Hmm wait, but if T=180 and e012 finished at 183, then T≥183. And e011's total is about 241 > T. Consistent with T in [183, 241). Let me estimate e000's prediction time: 2 views, 41879 boxes, batch 256 → 164 batches × 2 forward passes. e012: 3 views → 164 × 3 = 492 forward batches in 58s → about 0.118s/batch. e000: 328 → about 39s. e011: 8 views → 1312 → about 155s; + training 125s = 280s. So T < 280. And T ≥ 183. So T ∈ [183, 280). Probably 240 (a common choice) or 200.
+
+If T=200: e012's t_end = 145 → training should have run to 145s (about 345 steps), but it stopped at 125s. Inconsistent. So T is not 200. If T=240: t_end=185, training to 185s. Inconsistent. So T ∈ [183, about 186]. The training stopped at about 125.x → t_end ≈ 125.x → T ≈ 180.x. But T ≥ 183 (e012 finished at 183). So T ∈ [183, 186] or so. Very tight! The run has about 0-3s of margin.
+
+Whoa, OK. So I should treat T ≈ 183-185 with zero margin. e012's prediction took 58s and training 125s. Actually, if T=184: t_end = 129, training stops at about 129 (not 125)... the log says 125. Truncation: 125.9 prints as 125. t_end could be 125.99 → T = 180.99 < 183. Contradiction with finishing at 183.
+
+Unless the "183s total" print happened after the harness's kill grace... I'll stop trying to resolve this exactly. Practical conclusion: the budget is about 180-185s, e012 used 183s, margin is about 0-2s. I must not increase total time, and ideally decrease it.
+
+So inference TTA is dangerous unless I cut training time. Can I cut training time? Training is 125s for 291 steps. If I halve the training (e.g., train for fewer seconds), I free up time for TTA. But is the model undertrained? Loss 0.26 at the end, still decreasing (0.2753 → 0.2593 over 9 steps... that's a small epoch). Validation mAP is 0.6342. The model might benefit from more training, or it might be saturated.
+
+Alternative: **reduce prediction cost by using fewer views at inference**. E.g., train with 3 views but use only 2 at inference (drop the 4x view)? That probably loses e012's gain.
+
+Alternative: **faster backbone at inference**: no, the model is the model.
+
+Let me think about what would actually improve mAP.
+
+The remaining gap: 0.758 - 0.6342 = 0.124. All class assignment error. Per-class AP: pore 0.536, stain 0.606, deposit 0.616, disc 0.778.
+
+Key insight from the metric analysis: per-class AP depends only on the ordering of p_c across boxes. The model outputs 4 coupled probabilities.
+
+Ideas not yet tried:
+
+A. **Per-class sigmoid heads (decoupled scores)**: replace softmax+CE with 4 sigmoid outputs + BCE. This decouples the ranking: p_c is no longer forced down by other classes. For boxes that are "pore-ish but also deposit-ish", sigmoid gives both high scores, which could hurt (a box overlapping a pore GT gets a high deposit score too → more deposit FPs). Hmm, both directions are possible. This is a "loss" change. Class-weighted loss hurt, but plain multi-label BCE is different. Risky but untried. Expected effect: unclear, maybe ±0.01.
+
+B. **Train longer / better schedule**: the model has only seen 291 steps. EfficientNet-B0 fine-tuning typically needs thousands of steps. With LR 1e-3 cosine over about 4 epochs... the model might be undertrained. But the budget limits total time. If I cut prediction cost, I can train longer. How to cut prediction cost?
+   - Batch size 256 → 512 (less overhead, same FLOPs, maybe 10-20% faster).
+   - Use torch.compile? Risky with time.
+   - Reduce eval views: the 4x view (WIDE2) — is it needed at inference? e012's gain might come partly from training signal. I could test "train with 3 views, infer with 2" — that's a test of where the gain came from, and frees 1/3 of prediction time (58s → about 39s, saving 19s). If the score holds, I can then add H-flip TTA (4 views at inference: tight/wide × 2 flips = 4 views, same cost as 3 views! 58s). That's clever: swap the 4x view for flip TTA at inference. But that's two changes... actually it's one coherent idea: "replace the 3rd inference view with horizontal-flip TTA of the two main views". Hmm, but e008 (flip TTA with 2 views, 4 inference views) was close-but-not-confirmed at 0.6306 (5-seed) — that was with 2-view training. Now with 3-view training, 2-view inference with flips...
+
+   Actually simpler: keep 3 views at inference and add flips → 6 views → prediction 116s → total about 241s > T. No.
+
+   So: inference with 4 views (tight, wide, tight-flip, wide-flip) = 4/3 × 58 = 77s prediction. Total = 125 + 77 = 202 > T (about 184). No. Unless I cut training.
+
+   If I cut RESERVE and train for less time? The training loop trains until t_end = deadline - RESERVE_S. If I set RESERVE_S = 80, training ends at about 104s (about 250 steps), then 77s prediction → total about 181s. Fits in T≈184! And the question is whether losing about 40 steps of training hurts more than the TTA gain. e008's flip TTA with 2 views: seed 0 0.6367 vs e000's 0.6288 → +0.008 on seed 0, 5-seed 0.6306 vs e000's 5-seed... e000's 5-seed mean? e008's 5-seed mean 0.6306 was "not confirmed" — meaning it didn't beat the then-best (e000's 5-seed mean was probably about 0.6288 or so). Hmm, e010's seed 0 was 0.6288. e000's 5-seed mean is unknown but probably about 0.629. So e008's TTA gain was about +0.001-0.002 over 5 seeds — marginal, within noise. So flip TTA is probably not worth it.
+
+C. **The pore class (0.536) is the weakest.** Pores are small round spots; the tight crop (1.5x) should capture them. Maybe pore needs a tighter crop (1.2x) or the model needs to see the box interior more precisely. Idea: add a 4th view that's a very tight crop (1.0x, the box itself)? That increases inference cost (4 views = 77s) — doesn't fit the budget. Or replace the 4x view with a 1.0x view (3 views total, same cost). The 4x view helped stain/deposit context (e012's gain). Replacing it loses that. Hmm.
+
+D. **Use the detector's conf to reweight training**: no, the training labels come from crops.csv.
+
+E. **Train the classifier on both high and low res** — tried (e002, not confirmed).
+
+F. **Better optimizer / LR**: LR 1e-3 AdamW for 291 steps. Maybe a higher LR (3e-3) trains faster to a better place in fewer steps? Or a lower weight decay? "Optimisation" category is untried! The brief says "tuning hyperparameters alone helped little in previous experiments" — but that was in the original research, and the harness history here shows no optimisation experiments. Hmm, "tuning hyperparameters alone helped little" is listed under "what's already known". So LR tuning is probably a dead end.
+
+G. **Freeze the backbone, train only the head** — no, fine-tuning is better.
+
+H. **Use a stronger pretrained backbone that's still fast**: e009 tried b2 (not confirmed, 0.6231 — actually worse). The available timThinking budget reached. Stop thinking now and write the reply in the required format.

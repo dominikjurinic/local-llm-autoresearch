@@ -1,0 +1,140 @@
+--- e009/train.py
++++ e014/train.py
+@@ -45,5 +45,5 @@
+ PRETRAINED = True
+ IMG_SIZE = 160
+-SCALES = (1.25, 1.75, 2.5, 3.5)  # multi-scale crop pyramid
++SCALES = (1.25, 1.75, 2.5)  # multi-scale crop pyramid (3.5x dropped to make a 2-seed ensemble fit the budget)
+ MIN_CROP = 16
+ TRAIN_ON = ("high",)    # resolutions of crops.csv used for training
+@@ -51,5 +51,6 @@
+ LR = 1e-3
+ WEIGHT_DECAY = 0.05
+-RESERVE_S = 85          # seconds kept free for prediction and writing (4 crops ≈ 2x pred time)
++ENSEMBLE_SEEDS = 2      # independently seeded classifiers, softmax averaged at inference
++RESERVE_S = 120         # seconds kept free for 2-seed prediction + writing (3 crops x 2 seeds)
+ MIN_SCORE = 0.001       # rows below this score are not written
+ MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+@@ -162,53 +163,68 @@
+         random.seed(s); np.random.seed(s)
+ 
+-    g = torch.Generator().manual_seed(args.seed)
+-    dl_tr = torch.utils.data.DataLoader(BoxDataset(crops, images, True), batch_size=BATCH_SIZE, shuffle=True,
+-                                        num_workers=workers, pin_memory=True, drop_last=True,
+-                                        persistent_workers=True, generator=g, worker_init_fn=worker_init)
++    amp = dict(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda")
++    n_seeds = ENSEMBLE_SEEDS
++    t_train_start = time.time()
++    t_train_end = deadline - RESERVE_S
++    train_budget = max(1.0, t_train_end - t_train_start)
++    per_seed_budget = train_budget / n_seeds
++
++    models = []
++    for k in range(n_seeds):
++        s = args.seed + k
++        random.seed(s); np.random.seed(s); torch.manual_seed(s)
++        g = torch.Generator().manual_seed(s)
++        dl_tr = torch.utils.data.DataLoader(BoxDataset(crops, images, True), batch_size=BATCH_SIZE, shuffle=True,
++                                            num_workers=workers, pin_memory=True, drop_last=True,
++                                            persistent_workers=True, generator=g, worker_init_fn=worker_init)
++        backbone = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=None)
++        model = MultiScaleClassifier(backbone, num_scales=len(SCALES))
++        model = model.to(device).to(memory_format=torch.channels_last)
++        crit = nn.CrossEntropyLoss()
++        opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
++        # Train this member until its share of the training budget is used: 5% warm-up, then cosine decay.
++        t_start = time.time()
++        t_end = t_train_start + (k + 1) * per_seed_budget
++        budget = max(1.0, t_end - t_start)
++        steps, epoch, done = 0, 0, False
++        model.train()
++        while not done:
++            tot, nb = 0.0, 0
++            for views, y in dl_tr:
++                frac = min(1.0, (time.time() - t_start) / budget)
++                f = frac / 0.05 if frac < 0.05 else 0.5 * (1 + math.cos(math.pi * (frac - 0.05) / 0.95))
++                for pg in opt.param_groups:
++                    pg["lr"] = LR * max(f, 1e-3)
++                views = [v.to(device, non_blocking=True).to(memory_format=torch.channels_last) for v in views]
++                y = y.to(device, non_blocking=True)
++                with torch.autocast(**amp):
++                    loss = crit(model(views), y)
++                opt.zero_grad(set_to_none=True)
++                loss.backward()
++                opt.step()
++                tot += loss.item(); nb += 1; steps += 1
++                if time.time() >= t_end:
++                    done = True
++                    break
++            print(f"seed {s} epoch {epoch}: loss {tot / max(nb, 1):.4f}, {steps} steps, {time.time() - T0:.0f}s", flush=True)
++            epoch += 1
++        model.eval()
++        models.append(model)
++        print(f"seed {s}: {epoch} epochs, {steps} steps trained ({time.time() - T0:.0f}s)", flush=True)
++
++    # Classify every eval detection with each member; average softmax probabilities; score = detector conf x avg prob.
+     dl_ev = torch.utils.data.DataLoader(BoxDataset(ev, images, False), batch_size=256, shuffle=False,
+                                         num_workers=workers, pin_memory=True)
+-
+-    backbone = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=None)
+-    model = MultiScaleClassifier(backbone, num_scales=len(SCALES))
+-    model = model.to(device).to(memory_format=torch.channels_last)
+-    crit = nn.CrossEntropyLoss()
+-    opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+-    amp = dict(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda")
+-
+-    # Train until the budget minus the reserve is used up: 5% warm-up, then cosine decay.
+-    t_start = time.time()
+-    t_end = deadline - RESERVE_S
+-    budget = max(1.0, t_end - t_start)
+-    steps, epoch, done = 0, 0, False
+-    model.train()
+-    while not done:
+-        tot, nb = 0.0, 0
+-        for views, y in dl_tr:
+-            frac = min(1.0, (time.time() - t_start) / budget)
+-            f = frac / 0.05 if frac < 0.05 else 0.5 * (1 + math.cos(math.pi * (frac - 0.05) / 0.95))
+-            for pg in opt.param_groups:
+-                pg["lr"] = LR * max(f, 1e-3)
+-            views = [v.to(device, non_blocking=True).to(memory_format=torch.channels_last) for v in views]
+-            y = y.to(device, non_blocking=True)
+-            with torch.autocast(**amp):
+-                loss = crit(model(views), y)
+-            opt.zero_grad(set_to_none=True)
+-            loss.backward()
+-            opt.step()
+-            tot += loss.item(); nb += 1; steps += 1
+-            if time.time() >= t_end:
+-                done = True
+-                break
+-        print(f"epoch {epoch}: loss {tot / max(nb, 1):.4f}, {steps} steps, {time.time() - T0:.0f}s", flush=True)
+-        epoch += 1
+-
+-    # Classify every eval detection; one prediction per class with score = detector conf x class probability.
+-    model.eval()
+-    probs = []
+-    with torch.no_grad(), torch.autocast(**amp):
+-        for views, _ in dl_ev:
+-            views = [v.to(device).to(memory_format=torch.channels_last) for v in views]
+-            probs.append(torch.softmax(model(views).float(), 1).cpu())
+-    probs = torch.cat(probs).numpy()
++    acc = torch.zeros(len(ev), 4)
++    for m in models:
++        m.eval()
++        ptr = 0
++        with torch.no_grad(), torch.autocast(**amp):
++            for views, _ in dl_ev:
++                views = [v.to(device).to(memory_format=torch.channels_last) for v in views]
++                p = torch.softmax(m(views).float(), 1).cpu()
++                acc[ptr:ptr + len(p)] += p
++                ptr += len(p)
++    probs = (acc / len(models)).numpy()
+     os.makedirs(args.out, exist_ok=True)
+     n = 0
+@@ -221,5 +237,5 @@
+                 if s > MIN_SCORE:
+                     w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+-    print(f"done: {epoch} epochs, {steps} steps, {n} prediction rows, {time.time() - T0:.0f}s total", flush=True)
++    print(f"done: {n_seeds} seeds ensembled, {n} prediction rows, {time.time() - T0:.0f}s total", flush=True)
+ 
+ 

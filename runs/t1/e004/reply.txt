@@ -1,0 +1,136 @@
+===== attempt 1 (394s) =====
+BASE: best
+CATEGORY: architecture
+HYPOTHESIS: The dominant error is wrong class assignment on detector boxes that overlap true defects (perfect-class mAP is 0.7461 vs our 0.6288). Averaging two independently-seeded EfficientNet-B0 models reduces variance on the hard pore/deposit/stain cases while keeping per-step cost identical. This is the same idea as the crashed e003 but rebuilt on the current best (e000), which has no TIGHT_WEIGHT / TIGHT_IMG_SIZE, so the two views are combined as (model(xt)+model(xw))/2 as before. Minimal fixes vs the lead's plan: (1) e003's real crash was the accumulator `torch.zeros_like(xt[:,0:1])` having shape [B,1,160,160] instead of [B,4]; I accumulate a proper [B,4] tensor. (2) Because prediction now does 2 models x 2 views = 4 forward passes (about double the ~37 s the single model needed), RESERVE_S is raised 55->95 so the run still finishes inside the budget; this shrinks training to ~2 models x ~150 steps, and I reuse one persistent dataloader (diversity comes from per-model torch re-seeding plus continued shuffle/augmentation state) to avoid paying worker spin-up twice.
+<<<<<<< SEARCH
+RESERVE_S = 55          # seconds kept free for prediction and writing
+MIN_SCORE = 0.001       # rows below this score are not written
+MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+=======
+RESERVE_S = 95          # seconds kept free for 2-model prediction and writing
+MIN_SCORE = 0.001       # rows below this score are not written
+N_MODELS = 2            # ensemble: two independently-seeded models, logits averaged
+MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    g = torch.Generator().manual_seed(args.seed)
+    dl_tr = torch.utils.data.DataLoader(BoxDataset(crops, images, True), batch_size=BATCH_SIZE, shuffle=True,
+                                        num_workers=workers, pin_memory=True, drop_last=True,
+                                        persistent_workers=True, generator=g, worker_init_fn=worker_init)
+    dl_ev = torch.utils.data.DataLoader(BoxDataset(ev, images, False), batch_size=256, shuffle=False,
+                                        num_workers=workers, pin_memory=True)
+
+    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
+    model = model.to(device).to(memory_format=torch.channels_last)
+    crit = nn.CrossEntropyLoss()
+    opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    amp = dict(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda")
+
+    # Train until the budget minus the reserve is used up: 5% warm-up, then cosine decay.
+    t_start = time.time()
+    t_end = deadline - RESERVE_S
+    budget = max(1.0, t_end - t_start)
+    steps, epoch, done = 0, 0, False
+    model.train()
+    while not done:
+        tot, nb = 0.0, 0
+        for xt, xw, y in dl_tr:
+            frac = min(1.0, (time.time() - t_start) / budget)
+            f = frac / 0.05 if frac < 0.05 else 0.5 * (1 + math.cos(math.pi * (frac - 0.05) / 0.95))
+            for pg in opt.param_groups:
+                pg["lr"] = LR * max(f, 1e-3)
+            xt = xt.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            xw = xw.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            y = y.to(device, non_blocking=True)
+            with torch.autocast(**amp):
+                loss = crit((model(xt) + model(xw)) / 2, y)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+            tot += loss.item(); nb += 1; steps += 1
+            if time.time() >= t_end:
+                done = True
+                break
+        print(f"epoch {epoch}: loss {tot / max(nb, 1):.4f}, {steps} steps, {time.time() - T0:.0f}s", flush=True)
+        epoch += 1
+
+    # Classify every eval detection; one prediction per class with score = detector conf x class probability.
+    model.eval()
+    probs = []
+    with torch.no_grad(), torch.autocast(**amp):
+        for xt, xw, _ in dl_ev:
+            xt = xt.to(device).to(memory_format=torch.channels_last)
+            xw = xw.to(device).to(memory_format=torch.channels_last)
+            probs.append(torch.softmax(((model(xt) + model(xw)) / 2).float(), 1).cpu())
+    probs = torch.cat(probs).numpy()
+=======
+    g = torch.Generator().manual_seed(args.seed)
+    dl_tr = torch.utils.data.DataLoader(BoxDataset(crops, images, True), batch_size=BATCH_SIZE, shuffle=True,
+                                        num_workers=workers, pin_memory=True, drop_last=True,
+                                        persistent_workers=True, generator=g, worker_init_fn=worker_init)
+    dl_ev = torch.utils.data.DataLoader(BoxDataset(ev, images, False), batch_size=256, shuffle=False,
+                                        num_workers=workers, pin_memory=True)
+
+    crit = nn.CrossEntropyLoss()
+    amp = dict(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda")
+
+    # Train N_MODELS independently-seeded models in sequence, each for 1/N of the budget:
+    # 5% warm-up then cosine decay within each model's window. One persistent dataloader is reused
+    # (the shuffle/augmentation state keeps advancing, giving each model a different data order).
+    t_start = time.time()
+    t_end = deadline - RESERVE_S
+    total_budget = max(1.0, t_end - t_start)
+    per_model = total_budget / N_MODELS
+    steps, epoch = 0, 0
+    models = []
+    for m in range(N_MODELS):
+        s = args.seed + 101 * m
+        random.seed(s); np.random.seed(s); torch.manual_seed(s)
+        model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
+        model = model.to(device).to(memory_format=torch.channels_last)
+        opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+        m_start = t_start + m * per_model
+        m_end = t_start + (m + 1) * per_model
+        budget = max(1.0, m_end - m_start)
+        done = False
+        model.train()
+        while not done:
+            tot, nb = 0.0, 0
+            for xt, xw, y in dl_tr:
+                frac = min(1.0, (time.time() - m_start) / budget)
+                f = frac / 0.05 if frac < 0.05 else 0.5 * (1 + math.cos(math.pi * (frac - 0.05) / 0.95))
+                for pg in opt.param_groups:
+                    pg["lr"] = LR * max(f, 1e-3)
+                xt = xt.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+                xw = xw.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+                y = y.to(device, non_blocking=True)
+                with torch.autocast(**amp):
+                    loss = crit((model(xt) + model(xw)) / 2, y)
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+                opt.step()
+                tot += loss.item(); nb += 1; steps += 1
+                if time.time() >= m_end:
+                    done = True
+                    break
+            print(f"model {m} epoch {epoch}: loss {tot / max(nb, 1):.4f}, {steps} steps, {time.time() - T0:.0f}s", flush=True)
+            epoch += 1
+        model.eval()
+        models.append(model)
+
+    # Classify every eval detection; average the N models' two-view logits, softmax,
+    # one prediction per class with score = detector conf x class probability.
+    probs = []
+    with torch.no_grad(), torch.autocast(**amp):
+        for xt, xw, _ in dl_ev:
+            xt = xt.to(device).to(memory_format=torch.channels_last)
+            xw = xw.to(device).to(memory_format=torch.channels_last)
+            l = torch.zeros(xt.shape[0], 4, device=xt.device)
+            for model in models:
+                l = l + (model(xt) + model(xw)) / 2
+            l = l / len(models)
+            probs.append(torch.softmax(l.float(), 1).cpu())
+    probs = torch.cat(probs).numpy()
+>>>>>>> REPLACE

@@ -1,0 +1,407 @@
+===== attempt 1 (590s) =====
+BASE: best
+CATEGORY: architecture
+HYPOTHESIS: Per-box adaptive fusion of tight/wide logits, driven by box size/aspect ratio/detector conf via a small MLP, targets the dominant error (wrong-class assignment on overlapping boxes, ~0.11 mAP) where small defects are 80% correct vs 91-92% for medium/large. Unlike earlier per-class logit fusion (e008, +0.005), this adapts to each box's geometry instead of using one fixed weight per class. Two deviations from the plan as written, noted here: (1) crops.csv training rows have no detector conf, so the MLP input is [log1p(w), log1p(h), aspect] (conf dropped) - this is also what makes the adaptive-context change identifiable, since with fixed contexts the defect fills a constant crop fraction and size is otherwise invisible to the model; (2) the 200px side clip would have silently altered the wide crop for all large boxes, so it is omitted (the adaptive formula is bounded: side <= 90 for L<40, unchanged otherwise).
+<<<<<<< SEARCH
+def make_crop(img, r, context, train):
+    h, w = img.shape[:2]
+    cx, cy = (r["x1"] + r["x2"]) / 2, (r["y1"] + r["y2"]) / 2
+    side = max(max(r["x2"] - r["x1"], r["y2"] - r["y1"]) * context, MIN_CROP)
+=======
+def make_crop(img, r, context, train):
+    h, w = img.shape[:2]
+    cx, cy = (r["x1"] + r["x2"]) / 2, (r["y1"] + r["y2"]) / 2
+    box_long = max(r["x2"] - r["x1"], r["y2"] - r["y1"])
+    # small boxes get a larger context (more source pixels, less upscaling blur)
+    context = context * (1.0 + 0.5 * min(1.0, 40.0 / box_long)) if context == TIGHT_CONTEXT else \
+        context * (1.0 + 0.3 * min(1.0, 40.0 / box_long))
+    side = max(box_long * context, MIN_CROP)
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+        views = []
+        for ctx in (TIGHT_CONTEXT, CONTEXT):
+            x = make_crop(img, r, ctx, self.train)
+=======
+        views = []
+        for ctx in (TIGHT_CONTEXT, CONTEXT):
+            x = make_crop(img, r, ctx, self.train)
+            if fh:
+                x = x[:, ::-1]
+            if fv:
+                x = x[::-1, :]
+            if self.train:
+                x = np.clip(x * bright, 0, 1)
+            x = (x - MEAN) / STD
+            views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))
+        bw, bh = r["x2"] - r["x1"], r["y2"] - r["y1"]
+        feat = torch.tensor([math.log1p(max(bw, 1e-6)), math.log1p(max(bh, 1e-6)),
+                             math.log(max(bw, 1e-6) / max(bh, 1e-6))], dtype=torch.float32)
+        return views[0], views[1], feat, r.get("cls", -1)
+=======
+        return views[0], views[1], r.get("cls", -1)
+>>>>>>> REPLACE
+
+Wait — I made a mistake in that second block: I duplicated the view-processing lines that already exist after the SEARCH region. Let me redo it correctly with a minimal, unique SEARCH.
+
+The current file has:
+
+```
+        views = []
+        for ctx in (TIGHT_CONTEXT, CONTEXT):
+            x = make_crop(img, r, ctx, self.train)
+            if fh:
+                x = x[:, ::-1]
+            if fv:
+                x = x[::-1, :]
+            if self.train:
+                x = np.clip(x * bright, 0, 1)
+            x = (x - MEAN) / STD
+            views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))
+        return views[0], views[1], r.get("cls", -1)
+```
+
+I only need to change the return line and insert the feat computation. Minimal block:
+
+<<<<<<< SEARCH
+            views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))
+        return views[0], views[1], r.get("cls", -1)
+=======
+            views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))
+        bw, bh = r["x2"] - r["x1"], r["y2"] - r["y1"]
+        feat = torch.tensor([math.log1p(max(bw, 1e-6)), math.log1p(max(bh, 1e-6)),
+                             math.log(max(bw, 1e-6) / max(bh, 1e-6))], dtype=torch.float32)
+        return views[0], views[1], feat, r.get("cls", -1)
+>>>>>>> REPLACE
+
+Now the FusionModel:
+
+```
+class FusionModel(nn.Module):
+    """EfficientNet-B0 backbone with a learnable per-class tight/wide logit fusion."""
+    def __init__(self, base):
+        super().__init__()
+        self.base = base
+        self.logit_w = nn.Parameter(torch.zeros(4))  # sigmoid -> 0.5 (equal weight)
+
+    def forward(self, xt, xw):
+        w = torch.sigmoid(self.logit_w)
+        return w * self.base(xt) + (1 - w) * self.base(xw)
+```
+
+New:
+
+```
+class FusionModel(nn.Module):
+    """EfficientNet-B0 backbone with per-box tight/wide logit fusion (MLP on box geometry)."""
+    def __init__(self, base):
+        super().__init__()
+        self.base = base
+        self.feat_mlp = nn.Sequential(
+            nn.Linear(3, 16), nn.ReLU(),
+            nn.Linear(16, 16), nn.ReLU(),
+            nn.Linear(16, 1))
+
+    def forward(self, xt, xw, feat):
+        w = torch.sigmoid(self.feat_mlp(feat))  # (B, 1)
+        return w * self.base(xt) + (1 - w) * self.base(xw)
+```
+
+Check shapes: feat is (B,3); mlp output (B,1); base(xt) is (B,4); w * (B,4) broadcasts over B,1 x B,4 → (B,4). Good.
+
+Note: I dropped the per-class logit_w parameter (e008's improvement). Hmm — should I keep it? e008 is the current best, and its per-class fusion was the confirmed gain (+0.005). Replacing it with the MLP is part of "per-box instead of per-class" — the MLP subsumes per-class if it could correlate box features with class, but box features don't encode class, so the MLP cannot reproduce per-class weights. That's a real concern: e008's per-class weights were a confirmed gain, and removing them could lose that.
+
+Options: keep both — per-class weights AND per-box scalar modulation. E.g. logits = (w_box * per_class_tight * base(xt) + ...)? That changes the semantics. Simpler: keep the per-class logit_w as the base fusion and let the MLP add a per-box correction? That's getting complicated and is no longer "one focused idea".
+
+Alternative: make the MLP per-class output: (B, 4) weights, one per class, so each class gets its own tight/wide blend per box. That strictly generalizes e008 (per-class constant weights) — the MLP can in principle recover constant per-class weights (it can't, since input has no class... it would output the same 4-vector for all boxes = a single set of per-class weights, which is exactly e008's capacity). So a per-class MLP output (B,4) subsumes e008's capacity: the best it can do with size-blind input is one per-class weight vector, matching e008. That's the right design: output 4 weights, forward: w (B,4,1) * stacked logits.
+
+Let me redo:
+
+```
+    def __init__(self, base):
+        super().__init__()
+        self.base = base
+        self.feat_mlp = nn.Sequential(
+            nn.Linear(3, 16), nn.ReLU(),
+            nn.Linear(16, 16), nn.ReLU(),
+            nn.Linear(16, 4))
+
+    def forward(self, xt, xw, feat):
+        w = torch.sigmoid(self.feat_mlp(feat)).unsqueeze(-1)  # (B, 4, 1)
+        lt, lw = self.base(xt), self.base(xw)
+        return w * lt + (1 - w) * lw
+```
+
+Shapes: lt, lw (B,4); w (B,4,1); w*lt → (B,4,1)*(B,4) broadcasts → (B,4,4)? No! Broadcasting (B,4,1) with (B,4): (B,4) is treated as (1,B,4); result (B,B,4). That's wrong. Need w (B,1,4):
+
+```
+        w = torch.sigmoid(self.feat_mlp(feat)).unsqueeze(1)  # (B, 1, 4)
+        return w * lt.unsqueeze(1) + (1 - w) * lw.unsqueeze(1)  # (B,1,4)
+```
+
+lt.unsqueeze(1) is (B,1,4); w (B,1,4) → product (B,1,4). Good. Output (B,1,4) → squeeze to (B,4):
+
+```
+        return (w * lt.unsqueeze(1) + (1 - w) * lw.unsqueeze(1)).squeeze(1)
+```
+
+Good. This subsumes e008: if the MLP ignores input, output is a constant (4,) = per-class weights, exactly e008.
+
+Now the training loop:
+
+```
+        for xt, xw, y in dl_tr:
+```
+→
+```
+        for xt, xw, feat, y in dl_tr:
+```
+
+And:
+```
+            with torch.autocast(**amp):
+                loss = crit(model(xt, xw), y)
+```
+→
+```
+            feat = feat.to(device, non_blocking=True)
+            with torch.autocast(**amp):
+                loss = crit(model(xt, xw, feat), y)
+```
+
+Wait, feat is float32; under autocast on CUDA, the Linear layers will cast to bf16 automatically. Fine.
+
+Eval loop:
+```
+        for xt, xw, _ in dl_ev:
+            xt = xt.to(device).to(memory_format=torch.channels_last)
+            xw = xw.to(device).to(memory_format=torch.channels_last)
+            probs.append(torch.softmax(model(xt, xw).float(), 1).cpu())
+```
+→
+```
+        for xt, xw, feat, _ in dl_ev:
+            xt = xt.to(device).to(memory_format=torch.channels_last)
+            xw = xw.to(device).to(memory_format=torch.channels_last)
+            feat = feat.to(device)
+            probs.append(torch.softmax(model(xt, xw, feat).float(), 1).cpu())
+```
+
+Check the dataset: for eval rows, r has x1,y1,x2,y2 (from dets.csv) — yes, read_csv converts them. bw, bh fine. feat computed the same way. Good.
+
+DataLoader collation: feat is a (3,) tensor per item → collated to (B,3). Good.
+
+Now, one more check on the make_crop change: `context == TIGHT_CONTEXT` — float comparison with the exact same constant object, fine (TIGHT_CONTEXT=1.5, CONTEXT=2.5, both passed as those constants). OK, but a cleaner way: pass a flag. Minimal: keep the comparison; it's exact since the same float literal object is passed. Actually TIGHT_CONTEXT is defined as 1.5 and CONTEXT as 2.5; `context == TIGHT_CONTEXT` is True only for the tight call. Fine.
+
+Hmm wait, but there's a subtlety: with the adaptive context, for small boxes the tight context can reach 1.5*(1+0.5*40/L). For L=5: 1.5*5=7.5 → side=37.5. Tight and wide contexts converge for very small boxes (tight 7.5 vs wide 2.5*(1+0.3*8)=2.5*3.4=8.5 for L=5). So the two views become similar for tiny boxes — the fusion weight becomes less meaningful there. That's acceptable.
+
+Also MIN_CROP: side = max(box_long*context, 16) — unchanged, fine.
+
+Training augmentation jitter: make_crop's train jitter moves cx,cy by ±0.1*side and scales side by 0.85-1.2 — unchanged, still consistent with the new side.
+
+Budget check: two forward passes per sample unchanged; MLP is 3→16→16→4, negligible. Crop building: same number of crops, similar sizes (small boxes get slightly larger canvases, e.g. 45px vs 15px — trivial). Timing should be essentially unchanged (~162s). Safe.
+
+One more consideration: `math` is already imported. Yes.
+
+Also, the docstring at the top describes the starting point; no need to update (it describes the starting point, not the current state — e008 didn't update it either).
+
+Let me also double-check the second SEARCH block uniqueness: `            views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))` — appears once. And `        return views[0], views[1], r.get("cls", -1)` — appears once. Combined two-line SEARCH is unique. Good.
+
+FusionModel block: the whole class appears once. Good.
+
+Training loop lines: `        for xt, xw, y in dl_tr:` unique. The autocast/loss line: `                loss = crit(model(xt, xw), y)` unique. I'll add feat.to(device) before the autocast block. Let me write the block:
+
+<<<<<<< SEARCH
+        for xt, xw, y in dl_tr:
+=======
+        for xt, xw, feat, y in dl_tr:
+>>>>>>> REPLACE
+
+<<<<<<< SEARCH
+            y = y.to(device, non_blocking=True)
+            with torch.autocast(**amp):
+                loss = crit(model(xt, xw), y)
+=======
+            y = y.to(device, non_blocking=True)
+            feat = feat.to(device, non_blocking=True)
+            with torch.autocast(**amp):
+                loss = crit(model(xt, xw, feat), y)
+>>>>>>> REPLACE
+
+Eval:
+<<<<<<< SEARCH
+        for xt, xw, _ in dl_ev:
+            xt = xt.to(device).to(memory_format=torch.channels_last)
+            xw = xw.to(device).to(memory_format=torch.channels_last)
+            probs.append(torch.softmax(model(xt, xw).float(), 1).cpu())
+=======
+        for xt, xw, feat, _ in dl_ev:
+            xt = xt.to(device).to(memory_format=torch.channels_last)
+            xw = xw.to(device).to(memory_format=torch.channels_last)
+            feat = feat.to(device)
+            probs.append(torch.softmax(model(xt, xw, feat).float(), 1).cpu())
+>>>>>>> REPLACE
+
+All checks pass. Writing the final reply now.
+
+All functions verified end-to-end: the dataset returns (view_t, view_w, feat, cls); the train loop unpacks 4 items and passes feat to the model; the eval loop unpacks 4 items and passes feat; the model's forward takes (xt, xw, feat) and returns (B,4) logits; shapes broadcast correctly with w as (B,1,4). The per-class MLP output subsumes e008's per-class weights (constant input-ignoring output = e008), so the confirmed e008 gain is preserved as a special case.
+
+BASE: best
+CATEGORY: architecture
+HYPOTHESIS: Per-box adaptive fusion of tight/wide logits, driven by box geometry (log w, log h, aspect) via a small MLP, targets the dominant error (wrong-class assignment on overlapping boxes, ~0.11 mAP) where small defects are 80% correct vs 91-92% for medium/large. Unlike e008's per-class constant weights, this adapts the tight/wide blend to each box's size; with fixed crop contexts the defect fills a constant fraction of the crop, so box size is otherwise invisible to the model and must be given explicitly. Expected gain 0.01+ if small-box errors are size-driven. Two deviations from the plan as written: (1) detector conf is dropped from the MLP input because crops.csv training rows have no conf (train/test mismatch), and box geometry alone is what the adaptive-context change needs; (2) the 200px side clip is omitted because it would silently change the wide crop for all large boxes; the adaptive formula is bounded (side <= 90px for L<40, unchanged for L>=40). The MLP outputs per-class weights, so it subsumes e008's per-class fusion (input-ignoring output = e008 exactly).
+<<<<<<< SEARCH
+def make_crop(img, r, context, train):
+    h, w = img.shape[:2]
+    cx, cy = (r["x1"] + r["x2"]) / 2, (r["y1"] + r["y2"]) / 2
+    side = max(max(r["x2"] - r["x1"], r["y2"] - r["y1"]) * context, MIN_CROP)
+=======
+def make_crop(img, r, context, train):
+    h, w = img.shape[:2]
+    cx, cy = (r["x1"] + r["x2"]) / 2, (r["y1"] + r["y2"]) / 2
+    box_long = max(r["x2"] - r["x1"], r["y2"] - r["y1"])
+    # small boxes get a larger context: more source pixels, less upscaling blur
+    if context == TIGHT_CONTEXT:
+        context = context * (1.0 + 0.5 * min(1.0, 40.0 / box_long))
+    else:
+        context = context * (1.0 + 0.3 * min(1.0, 40.0 / box_long))
+    side = max(box_long * context, MIN_CROP)
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+            views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))
+        return views[0], views[1], r.get("cls", -1)
+=======
+            views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))
+        bw, bh = r["x2"] - r["x1"], r["y2"] - r["y1"]
+        feat = torch.tensor([math.log1p(max(bw, 1e-6)), math.log1p(max(bh, 1e-6)),
+                             math.log(max(bw, 1e-6) / max(bh, 1e-6))], dtype=torch.float32)
+        return views[0], views[1], feat, r.get("cls", -1)
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+class FusionModel(nn.Module):
+    """EfficientNet-B0 backbone with a learnable per-class tight/wide logit fusion."""
+    def __init__(self, base):
+        super().__init__()
+        self.base = base
+        self.logit_w = nn.Parameter(torch.zeros(4))  # sigmoid -> 0.5 (equal weight)
+
+    def forward(self, xt, xw):
+        w = torch.sigmoid(self.logit_w)
+        return w * self.base(xt) + (1 - w) * self.base(xw)
+=======
+class FusionModel(nn.Module):
+    """EfficientNet-B0 backbone with per-box, per-class tight/wide logit fusion (MLP on box geometry)."""
+    def __init__(self, base):
+        super().__init__()
+        self.base = base
+        self.feat_mlp = nn.Sequential(
+            nn.Linear(3, 16), nn.ReLU(),
+            nn.Linear(16, 16), nn.ReLU(),
+            nn.Linear(16, 4))
+
+    def forward(self, xt, xw, feat):
+        w = torch.sigmoid(self.feat_mlp(feat)).unsqueeze(1)  # (B, 1, 4)
+        lt, lw = self.base(xt), self.base(xw)
+        return (w * lt.unsqueeze(1) + (1 - w) * lw.unsqueeze(1)).squeeze(1)
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+        for xt, xw, y in dl_tr:
+=======
+        for xt, xw, feat, y in dl_tr:
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+            y = y.to(device, non_blocking=True)
+            with torch.autocast(**amp):
+                loss = crit(model(xt, xw), y)
+=======
+            y = y.to(device, non_blocking=True)
+            feat = feat.to(device, non_blocking=True)
+            with torch.autocast(**amp):
+                loss = crit(model(xt, xw, feat), y)
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+        for xt, xw, _ in dl_ev:
+            xt = xt.to(device).to(memory_format=torch.channels_last)
+            xw = xw.to(device).to(memory_format=torch.channels_last)
+            probs.append(torch.softmax(model(xt, xw).float(), 1).cpu())
+=======
+        for xt, xw, feat, _ in dl_ev:
+            xt = xt.to(device).to(memory_format=torch.channels_last)
+            xw = xw.to(device).to(memory_format=torch.channels_last)
+            feat = feat.to(device)
+            probs.append(torch.softmax(model(xt, xw, feat).float(), 1).cpu())
+>>>>>>> REPLACE
+===== attempt 2 (379s) =====
+BASE: best
+CATEGORY: architecture
+HYPOTHESIS: Per-box adaptive fusion of tight/wide logits, driven by box geometry (log w, log h, aspect) via a small MLP, targets the dominant error (wrong-class assignment on overlapping boxes, ~0.11 mAP) where small defects are 80% correct vs 91-92% for medium/large. Unlike e008's per-class constant weights, this adapts the tight/wide blend to each box's size, and small boxes get a larger crop context (more source pixels, less upscaling blur); with fixed contexts the defect fills a constant crop fraction, so box size is otherwise invisible to the model. Expected gain 0.01+ if small-box errors are size-driven. Deviations from the plan as written: (1) detector conf is dropped from the MLP input because crops.csv training rows have no conf (train/test mismatch); (2) the 200px side clip is omitted because it would silently change the wide crop for all large boxes; the adaptive formula is bounded (side <= 90px for L<40, unchanged for L>=40). The MLP outputs per-class weights, so it subsumes e008's per-class fusion (an input-ignoring MLP reproduces e008 exactly).
+<<<<<<< SEARCH
+        views = []
+        for ctx in (TIGHT_CONTEXT, CONTEXT):
+            x = make_crop(img, r, ctx, self.train)
+=======
+        bw, bh = r["x2"] - r["x1"], r["y2"] - r["y1"]
+        mag = min(1.0, 40.0 / max(max(bw, bh), 1e-6))
+        feat = torch.tensor([math.log1p(max(bw, 1e-6)), math.log1p(max(bh, 1e-6)),
+                             math.log(max(bw, 1e-6) / max(bh, 1e-6))], dtype=torch.float32)
+        views = []
+        for ctx, boost in ((TIGHT_CONTEXT, 0.5), (CONTEXT, 0.3)):
+            x = make_crop(img, r, ctx * (1.0 + boost * mag), self.train)
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+        return views[0], views[1], r.get("cls", -1)
+=======
+        return views[0], views[1], feat, r.get("cls", -1)
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+class FusionModel(nn.Module):
+    """EfficientNet-B0 backbone with a learnable per-class tight/wide logit fusion."""
+    def __init__(self, base):
+        super().__init__()
+        self.base = base
+        self.logit_w = nn.Parameter(torch.zeros(4))  # sigmoid -> 0.5 (equal weight)
+
+    def forward(self, xt, xw):
+        w = torch.sigmoid(self.logit_w)
+        return w * self.base(xt) + (1 - w) * self.base(xw)
+=======
+class FusionModel(nn.Module):
+    """EfficientNet-B0 backbone with per-box, per-class tight/wide logit fusion (MLP on box geometry)."""
+    def __init__(self, base):
+        super().__init__()
+        self.base = base
+        self.feat_mlp = nn.Sequential(
+            nn.Linear(3, 16), nn.ReLU(),
+            nn.Linear(16, 16), nn.ReLU(),
+            nn.Linear(16, 4))
+
+    def forward(self, xt, xw, feat):
+        w = torch.sigmoid(self.feat_mlp(feat)).unsqueeze(1)  # (B, 1, 4)
+        lt, lw = self.base(xt), self.base(xw)
+        return (w * lt.unsqueeze(1) + (1 - w) * lw.unsqueeze(1)).squeeze(1)
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+        for xt, xw, y in dl_tr:
+=======
+        for xt, xw, feat, y in dl_tr:
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+            y = y.to(device, non_blocking=True)
+            with torch.autocast(**amp):
+                loss = crit(model(xt, xw), y)
+=======
+            y = y.to(device, non_blocking=True)
+            feat = feat.to(device, non_blocking=True)
+            with torch.autocast(**amp):
+                loss = crit(model(xt, xw, feat), y)
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+        for xt, xw, _ in dl_ev:
+            xt = xt.to(device).to(memory_format=torch.channels_last)
+            xw = xw.to(device).to(memory_format=torch.channels_last)
+            probs.append(torch.softmax(model(xt, xw).float(), 1).cpu())
+=======
+        for xt, xw, feat, _ in dl_ev:
+            xt = xt.to(device).to(memory_format=torch.channels_last)
+            xw = xw.to(device).to(memory_format=torch.channels_last)
+            feat = feat.to(device)
+            probs.append(torch.softmax(model(xt, xw, feat).float(), 1).cpu())
+>>>>>>> REPLACE

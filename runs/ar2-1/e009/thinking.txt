@@ -1,0 +1,112 @@
+===== attempt 1 =====
+Let me analyze the current situation:
+
+1. Current best: e008 with 5-seed mean 0.6314 mAP@0.5
+2. Per-class: pore 0.505, deposit 0.630, discontinuity 0.782, stain 0.609
+3. The model is still learning at the end (loss decreasing)
+4. We have ~130s for training, ~50s reserve for prediction
+
+Key observations:
+- Pore (0.505) and stain (0.609) are the weak classes
+- The model trains on true crops only (no background class)
+- Training on detector boxes (e001, e004) didn't help
+- Focal loss (e006) and label smoothing (e007) didn't help
+- TTA helped (e005)
+- More training time helped (e008)
+
+What haven't we tried?
+- Different architecture (e003 was suspicious/bug)
+- Different scoring function (e.g., not just conf * prob, but conf^alpha * prob^beta)
+- Using the background probability to suppress scores (tried in e001 but as full background class)
+- More aggressive TTA (vertical flip, both flips)
+- Different learning rate schedule
+- Training on both high and low res (e002 was rejected but only marginally)
+- Using a different backbone (e003 was buggy)
+- Ensemble of two models
+- Using the detector confidence more cleverly in scoring
+
+Let me think about what could help most:
+
+The scoring is currently: score = detector_conf * class_probability
+
+Ideas:
+1. **Scoring: Use conf^alpha * prob^beta** - The detector confidence and classifier probability might need different weighting. If detector conf is noisy, reducing its power might help ranking. Or if classifier is more reliable, increasing its power.
+
+2. **Scoring: Subtract a background penalty** - Since we don't have a background class, maybe we can use the max probability as a proxy. If the classifier is uncertain (all probs ~0.25), the box is likely background. We could multiply by (max_prob - 0.25) / 0.75 or similar.
+
+3. **Architecture: Try a different backbone** - e003 was buggy. Let me try regnety_016 or convnext_nano properly.
+
+4. **Training: Use both high and low res** - e002 was 0.6209 vs 0.6372 for e005. But that was before the reserve reduction. Maybe with more training time it would help?
+
+5. **Scoring: Use conf * max_prob * class_prob** - This would suppress uncertain predictions more.
+
+6. **Data: Use class-weighted sampling** - Not class-weighted loss (which hurt), but oversampling the weak classes (pore, stain).
+
+Let me think about what's most promising:
+
+The per-class breakdown shows pore (0.505) is very weak. Stain (0.609) is also weak. Discontinuity (0.782) is good.
+
+The scoring function is `conf * prob[c]`. The issue is that for false alarms, the detector conf might be low but not zero, and the classifier might give moderate probabilities to all classes. 
+
+One idea: **Use the classifier's uncertainty as a suppression factor**. If the classifier is uncertain (entropy high), the box is likely background. We could multiply by something like `max_prob` or `(max_prob - uniform_prob)` to suppress uncertain predictions.
+
+Actually, let me think about this differently. The score is `conf * prob[c]`. For a true defect of class c, we want high score. For a false alarm, we want low score. The problem is that for false alarms, the classifier might still give moderate probabilities (since it was never trained on background).
+
+What if we use: `conf * prob[c] * max(prob)` ? This would suppress cases where the classifier is uncertain (all probs near 0.25). For confident predictions, max(prob) is close to 1, so it doesn't change much.
+
+Or: `conf * prob[c] ** 2` - this would make the classifier more selective.
+
+Or: `conf ** 0.5 * prob[c]` - reduce the influence of detector conf.
+
+Let me try the scoring change: `conf * prob[c] * max(prob)` as a way to suppress uncertain predictions. This is a simple change that doesn't require retraining.
+
+Actually wait - let me reconsider. The issue is that we're writing 4 rows per box (one per class). The harness picks the top 300 per image. So the ranking within an image matters a lot.
+
+If I use `conf * prob[c] * max(prob)`, then for a box where the classifier is uncertain (all probs ~0.25), the scores would be conf * 0.25 * 0.25 = conf * 0.0625. For a confident box (one prob = 0.8), the score would be conf * 0.8 * 0.8 = conf * 0.64. This creates a 10x difference, which should help ranking.
+
+But wait, this might be too aggressive. Let me think of a milder version: `conf * prob[c] * (max_prob ** 0.5)` or just `conf * prob[c] * max_prob`.
+
+Actually, the simplest and most principled approach: since we don't have a background class, the classifier's total probability mass is always 1. But if the model is uncertain, all 4 classes get ~0.25. The "background-ness" of a prediction can be measured by how close the distribution is to uniform. A good measure is `max_prob - 0.25` (ranging from 0 to 0.75). Normalized: `(max_prob - 0.25) / 0.75`.
+
+So score = `conf * prob[c] * ((max_prob - 0.25) / 0.75)`
+
+This would:
+- For very confident predictions (max_prob ≈ 1): multiplier ≈ 1.0 (no change)
+- For uncertain predictions (max_prob ≈ 0.25): multiplier ≈ 0.0 (suppressed)
+- For moderate confidence (max_prob ≈ 0.5): multiplier ≈ 0.33
+
+This seems like a reasonable scoring change. Let me go with this.
+
+Actually, let me reconsider. The problem statement says "stage-1 boxes scored as a single class 'defect': 0.755 mAP@0.5". This means the detector boxes themselves are quite good (0.755 as single class). The 4-class baseline is 0.638. So the issue is purely classification accuracy and ranking.
+
+The ceiling with perfect classes is 0.758. We're at 0.631. So we're losing about 0.127 mAP from imperfect classification.
+
+Let me think about what would help most:
+1. Better classification accuracy → better per-class AP
+2. Better ranking → better AP (since AP depends on precision-recall curve)
+
+For ranking, the key insight is: within an image, the top 300 rows count. If we have 41879 eval detections across 1022 images, that's about 41 per image on average. With 4 classes each, that's 164 rows per image. So the 300 limit is rarely hit (164 < 300). Wait, that means all rows count? Let me re-read: "Per image at most the 300 highest-scoring rows count."
+
+So if there are fewer than 300 rows per image, all count. With ~41 detections per image × 4 classes = ~164 rows, we're under the limit. So the 300 limit doesn't actually matter much.
+
+This means the ranking within an image matters less than I thought. What matters more is:
+- Getting the right class (classification accuracy)
+- Getting the score right relative to other boxes (for the precision-recall curve)
+
+Actually, for mAP, what matters is: for each class, the detections are ranked by score, and we compute the precision-recall curve. So a true detection of class 0 should score higher than a false detection of class 0 (i.e., a box that doesn't overlap a true class-0 defect).
+
+The score for a box being class c is: `conf * prob[c]`. For a true class-c defect, we want this high. For a box that's actually background or a different class, we want this low.
+
+The issue: for a box that's actually class 1 (deposit) but we're scoring it as class 0 (pore), the score is `conf * prob_pore`. If the classifier correctly identifies it as deposit (prob_deposit high, prob_pore low), then the class-0 score is low. Good.
+
+But for a background box, the classifier might give prob_pore = 0.3, prob_deposit = 0.3, prob_disc = 0.2, prob_stain = 0.2. Then all class scores are conf * 0.2 to conf * 0.3, which might be higher than a true defect where the classifier is less confident (e.g., prob_pore = 0.4 for a true pore).
+
+So the scoring change to suppress uncertain predictions makes sense. Let me go with multiplying by max_prob (simpler than the normalized version).
+
+Actually, let me think about this more carefully. The current score is `conf * prob[c]`. The problem is that for background boxes, the classifier still gives non-trivial probabilities to all classes. If I multiply by max_prob, I'm essentially saying "the more confident the classifier is about ANY class, the more I trust all its class scores." This makes sense because a confident classifier is more likely to be correct.
+
+Let me go with: `score = conf * prob[c] * max(prob)`
+
+This is a simple, principled change. For confident predictions (max_prob ≈ 0.8-1.0), it barely changes anything. For uncertain predictions (max_prob ≈ 0.25-0.4), it significantly reduces scores.
+
+Let me write this up.

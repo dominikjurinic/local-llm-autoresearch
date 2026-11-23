@@ -1,0 +1,66 @@
+--- e001/train.py
++++ e002/train.py
+@@ -111,5 +111,6 @@
+             x = (x - MEAN) / STD
+             views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))
+-        return views[0], views[1], r.get("cls", -1)
++        g = (np.array(box_geom(r)) - G_MEAN) / G_STD
++        return views[0], views[1], torch.from_numpy(g), r.get("cls", -1)
+ 
+ 
+@@ -171,9 +172,27 @@
+                                         num_workers=workers, pin_memory=True)
+ 
++    # Per-box geometry (log width/height/aspect/area, image-normalised) standardised on the
++    # train boxes: a class-discriminative signal the pixel-only classifier never had.
++    def box_geom(r):
++        w = max(r["x2"] - r["x1"], 1e-6)
++        h = max(r["y2"] - r["y1"], 1e-6)
++        iw, ih = max(r.get("img_w", 1.0), 1.0), max(r.get("img_h", 1.0), 1.0)
++        return [math.log(w / iw), math.log(h / ih), math.log(w / h), math.log((w * h) / (iw * ih))]
++
++    tr_geom = np.array([box_geom(r) for r in crops], dtype=np.float32)
++    G_MEAN, G_STD = tr_geom.mean(0), np.maximum(tr_geom.std(0), 1e-6)
++
+     model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
++    feat_dim = model.num_features
++    model.classifier = nn.Sequential(
++        nn.Linear(feat_dim + 4, feat_dim), nn.ReLU(), nn.Dropout(0.2), nn.Linear(feat_dim, 4))
+     model = model.to(device).to(memory_format=torch.channels_last)
+     crit = nn.CrossEntropyLoss()
+     opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+     amp = dict(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda")
++
++    def forward_both(xt, xw, gfeat):
++        feat = (model.forward_features(xt) + model.forward_features(xw)) / 2
++        return model.classifier(torch.cat([feat, gfeat], dim=1))
+ 
+     # Train until the budget minus the reserve is used up: 5% warm-up, then cosine decay.
+@@ -185,5 +204,5 @@
+     while not done:
+         tot, nb = 0.0, 0
+-        for xt, xw, y in dl_tr:
++        for xt, xw, gfeat, y in dl_tr:
+             frac = min(1.0, (time.time() - t_start) / budget)
+             f = frac / 0.05 if frac < 0.05 else 0.5 * (1 + math.cos(math.pi * (frac - 0.05) / 0.95))
+@@ -193,6 +212,7 @@
+             xw = xw.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+             y = y.to(device, non_blocking=True)
++            gfeat = gfeat.to(device, non_blocking=True)
+             with torch.autocast(**amp):
+-                loss = crit((model(xt) + model(xw)) / 2, y)
++                loss = crit(forward_both(xt, xw, gfeat), y)
+             opt.zero_grad(set_to_none=True)
+             loss.backward()
+@@ -209,8 +229,9 @@
+     probs = []
+     with torch.no_grad(), torch.autocast(**amp):
+-        for xt, xw, _ in dl_ev:
++        for xt, xw, gfeat, _ in dl_ev:
+             xt = xt.to(device).to(memory_format=torch.channels_last)
+             xw = xw.to(device).to(memory_format=torch.channels_last)
+-            probs.append(torch.softmax(((model(xt) + model(xw)) / 2).float(), 1).cpu())
++            gfeat = gfeat.to(device)
++            probs.append(torch.softmax(forward_both(xt, xw, gfeat).float(), 1).cpu())
+     probs = torch.cat(probs).numpy()
+     os.makedirs(args.out, exist_ok=True)

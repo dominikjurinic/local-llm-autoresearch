@@ -1,0 +1,266 @@
+Let me analyze the current situation carefully.
+
+## Current state
+- Best seed-0: 0.6288 (5-seed mean)
+- Baseline one-step 4-class detector: 0.638 (to beat, but this is the paper's number on validation)
+- Stage-1 boxes with perfect classes (ceiling): 0.758 mAP@0.5
+- Stage-1 boxes scored as single class 'defect': 0.755
+- Our current: 0.6288
+
+## Diagnostics of the current best (validation)
+
+The confusion matrix on detector boxes that overlap true defects by IoU > 0.5:
+
+```
+true \ pred   pore  deposit disconti    stain  no row
+true pore       48        6        1       20        1   (63% right)
+true deposit     2      210        2       55        1   (78% right)
+true discontinuity 1      2        443       14        1   (96% right)
+true stain      15       46        9      540        4   (88% right)
+```
+
+So the error is in **class assignment**: mAP would improve to 0.7461 if every box had its correct class (keeping current scores). The difference between our 0.6288 and 0.7461 is the cost of wrong classes.
+
+But also important: "the remaining gap to the perfect-classes ceiling in the brief is what your scores cost compared with the detector's conf" — the perfect-classes ceiling from the brief is 0.758 vs our 0.7461. So the class assignment fix gets us to 0.7461, and then we're still at 0.012 below the "perfect classes + your scores" ceiling, which is the gap due to ranking/scores.
+
+The main loss: **class assignment on boxes that overlap real defects**. Specifically:
+- pore: only 63% right — the weakest. Pores confused with stain (20) and deposit (6).
+- deposit: 78% right — confused with stain (55). Stain and deposit are confused!
+- discontinuity: 96% right — mostly fine.
+- stain: 88% right — confused with deposit (46).
+
+So the dominant error is **deposit vs stain confusion** (55 + 46 = 101 boxes total, roughly symmetric), followed by pore (weak at 63%, confused with stain 20).
+
+Given the reference numbers:
+- A crop classifier given perfect boxes reaches macro-F1 ~0.87 with the starting recipe.
+- The current two-crop input has pore and deposit as weak classes; stain is often confused with deposit.
+
+So the key bottleneck is **the classifier's accuracy on hard classes**, especially pore (weak) and deposit/stain confusion.
+
+## What has been tried
+
+From the earlier history:
+1. **Fewer/re-weighted score rows**: 16 attempts — no gain. AP depends only on order within class. Low wrong-class rows cost little; removing rows loses recall.
+2. **5th "background" class from detector false alarms**: 9 attempts — no gain.
+3. **Detector boxes from train split as extra training data**: 6 attempts — accepted twice (+0.004), rejected 3 times. Marginal.
+4. **Third wide view (4x box) + averaging**: 3 attempts — accepted twice (+0.005), gain mostly from pore class; adds ~20s.
+5. **Low-resolution crops added to training**: 4 attempts — no gain.
+6. **Bigger/other backbone**: 8 attempts — no gain, best 0.636 unconfirmed. Fewer steps fit.
+7. **Resolution and small-box handling**: 9 attempts — no gain, best 0.634 unconfirmed, 2 crashes.
+8. **Test-time augmentation (flips)**: 8 attempts — no gain. 8 views timed out.
+9. **Longer training**: 6 attempts — no gain, best 0.6355 unconfirmed; 2 bugs where timing probe ate time.
+10. **Class-balanced sampling / class-weighted loss**: 4 attempts — no gain (class-weighted loss hurt every time).
+11. **Training augmentation (rotation, mixup, stronger colour/geometry)**: 5 attempts — no gain.
+12. **Focal loss**: 2 attempts — no gain.
+13. **Box size and aspect ratio as extra model input**: 4 attempts — never properly tested, crashes.
+
+Also e001-e004 from this run:
+- e001: bigger models — bug (0.4438)
+- e002: raise tight crop to 224px — not confirmed
+- e003: combine conf and p differently — crashed
+- e004: 2-model ensemble — rejected (0.5704 seed-0, way below)
+
+Wait, e004's seed-0 score was 0.5704? That's way below the current best of 0.6288. The history says "rejected". So the ensemble idea failed badly at seed 0. Interesting — maybe because each model only got 1/4 of the budget (per_model = total_budget/N_MODELS), so they were severely undertrained? Let me check: base e000 ran 5 epochs, 433 steps in ~162s total with RESERVE_S=55. With N_MODELS=2, each model got half the budget → ~216 steps ≈ 2.5 epochs. And seed-0 gave 0.5704. That's a big drop — undertrained models. Also the ensemble averaging in logits then softmax... The reference literature says ensembles are reliable, but only if each member is well-trained.
+
+So e004 failed likely because of severe under-training (each model got half the budget). A proper 2-model ensemble with the same per-model budget would need to double the time budget, which we may not have. Actually the budget is fixed at T=180s. We could train 2 models with the same steps each by reducing... no, the total wall time is what matters.
+
+Actually wait — let's reconsider. The harness says e004: "rejected" with seed-0 score 0.5704. That's a suspiciously low score. It suggests a bug or severe under-training. With 2 models each getting half budget, each model gets ~216 steps instead of 433 — but that shouldn't drop the score to 0.57. Hmm, unless there was a crash issue with the seed or... The base e000 at 162s total had 433 steps in training. With N_MODELS=2 and RESERVE_S=95 (giving each model ~45s each), each model would get fewer steps — about 216? Actually with the same code but halved budget, each model gets half the steps. So each model is roughly at "epoch 2-3" instead of epoch 4-5. The drop from 0.6288 to 0.5704 seems large for that.
+
+Hmm, but actually maybe the bug is in how I read e004's result: "0.5704 | - | rejected". So it was never confirmed to be a 5-seed mean. The rejection means it didn't beat the current best. Possibly it crashed or just underperformed due to under-training.
+
+Let me think about what matters now.
+
+## Where the error is
+
+The diagnostic is very clear:
+1. **Class assignment on overlapping boxes is the dominant error** (0.6288 → 0.7461 if classes were perfect).
+2. Within that, deposit↔stain confusion is huge (55/230 true deposits misclassified as stain; 46/600 true stains misclassified as deposit). Pore is also weak (37% of errors).
+3. Discontinuity is already at 96%.
+
+The diagnostic also tells us:
+- Boxes with right class on overlap set, by defect size: small 80%, medium 91%, large 93%. So small boxes are harder — but we can't easily change stage 1 boxes.
+- True defects that no detector box overlaps: 74 (stage 1 limitation, cannot be fixed).
+
+So the remaining fixable error is **the classifier's class decision**. The reference numbers say a crop classifier given perfect boxes reaches macro-F1 ~0.87 with the starting recipe. Our current mAP is 0.6288 vs the ceiling of 0.758 (with perfect classes). If we could get the classifier to near-perfect on all boxes, we'd approach the 0.746-0.758 range.
+
+## Key insight: what should I change?
+
+The main loss is class assignment, especially deposit↔stain and pore. The "two-crop" (1.5x tight + 2.5x wide) EfficientNet-B0 at 160px is the current architecture. Earlier experiments tried:
+- Bigger backbones (no gain, fewer steps)
+- Higher resolution (not confirmed)
+- Extra wide view (accepted, +0.005 from pore class)
+- Ensembles (failed due to under-training)
+
+What hasn't been tried that could plausibly give a large gain?
+
+The most promising directions:
+1. **Improve the classifier's accuracy on hard classes** — this is where the biggest loss is. Ideas not yet tried:
+   - Change the training recipe to specifically target the confusion: e.g., harder mining, different cropping strategy for hard examples
+   - Use the "perfect boxes" info more aggressively
+   
+2. **Use a better backbone that isn't bigger but better suited** — but we've tried EfficientNet-B2, ResNet-50 without gain.
+
+3. **Better use of the two-crop design**: The current design averages 1.5x tight + 2.5x wide crops at 160px. The extra wide view experiment (+0.005) suggests context helps pore. But this added ~20s and is close to the time limit.
+
+4. **The most interesting unexplored direction**: Train the classifier on the *detector's own boxes* (IoU > 0.5 with true boxes, labelled by class). This was tried earlier ("Detector boxes from the train split as extra training data"): accepted twice (+0.004), rejected 3 times at seed 0 (0.626-0.628). That's a marginal improvement and it was "accepted" under a looser rule. But actually, this matches the R-CNN paradigm: train the second stage on first-stage proposals. This is very plausible for matching the test-time distribution — at test time we're classifying detector boxes, not perfect boxes. The earlier experiments accepted this only marginally (+0.004).
+
+Wait, but I need to be careful. Let me re-read the "detector boxes from train split" entry:
+- 6 attempts: "accepted twice (5-seed 0.6337 and 0.6342, about +0.004); rejected 3 times at seed 0 (0.626-0.628); 1 crash in the IoU code"
+- Under the current stricter acceptance rule, this might not pass.
+
+Hmm. Let me think more carefully about what could give a *large* gain.
+
+## The key number: 0.7461 vs 0.6288
+
+If every box that overlaps a true defect got its correct class, we'd be at 0.7461. That's +0.1173! This is the dominant loss. But wait — that assumes the perfect-class boxes keep our scores. The reference numbers say "stage-1 boxes with perfect classes (ceiling): 0.758". So there's an additional ~0.012 gap between "perfect classes + current scores" and "perfect classes + detector conf" (the single-class detector gets 0.755, so maybe our scores are slightly worse than detector conf in ranking).
+
+So the target is:
+- Class assignment fix: +0.117 (to 0.746)
+- Ranking/score fix: +0.012 (to 0.758)
+
+Total potential: ~+0.13!
+
+Given that, the right strategy is to attack the **class assignment** problem as hard as possible. The most promising approach given constraints:
+
+The reference "a crop classifier given perfect boxes reaches macro-F1 ~0.87 with the starting recipe" — this suggests that if we could train on perfect boxes (the ground-truth crops from crops.csv, which is what we're already doing), the classifier would be quite accurate. Our current 0.6345 at e002 seed-0 was close to the base... wait no, e002's result was "not confirmed". The starting point (two-crop) gives 0.629-0.630.
+
+Hmm, let me think about what makes pore and deposit-stain hard:
+- Pore: 63% right. Pores are small defects. The tight crop 1.5x might be too small to see the context of a tiny pore. Stain confusion (20).
+- Deposit vs stain: 78%/88% right. These look similar up close — texture differences. A wider view or better resolution might help.
+
+Actually, let me reconsider e002's change: "Raising the tight crop to 224px while keeping the wide crop at 160px" — this got seed-0 0.6345 but 5-seed mean 0.6228 (not confirmed). The 5-seed mean was *worse* than base! So it's a no-win.
+
+## What about the training data approach?
+
+The earlier "detector boxes from train split as extra training data" (+0.004) is marginal. But what if we combine it with something else? Actually, I recall this is like "Cascade R-CNN": train the classifier at the IoU threshold where boxes exist. The detector boxes overlap ground truth by varying amounts; the current training uses perfect crops.csv boxes.
+
+Hmm wait — actually there's a much more interesting observation. The training data in `crops.csv` has "res" field ("high"/"low"). TRAIN_ON = ("high",). So we only use high-res crops for training. What if we included low-res too? That might help the model generalize across resolutions. But that wasn't tried... Actually wait, was it? Let me check the history: no mention of resolution mixing.
+
+But that's a minor change and unlikely to give 0.01+.
+
+## The real opportunity: improve classifier quality on hard examples
+
+Let me think about what could move the needle on the class assignment problem substantially:
+
+### Idea A: Hard example mining / focal loss for the classifier
+Focal loss was tried (2 attempts, no gain). Class-weighted loss was tried (4 attempts, no gain — hurt every time). So focusing on hard examples via loss function changes hasn't worked.
+
+### Idea B: Better two-crop design
+The current design: tight 1.5x + wide 2.5x at 160px, averaged. The extra wide view experiment added a 4x crop and got +0.005 (mostly pore). But it's close to the time limit and adds ~20s. A bigger change here might be to use the *perfect boxes* (from crops.csv) as an additional training view — i.e., train on both the detector-box crops and the ground-truth box crops. The earlier "detector boxes from train split" experiment only added extra *training data*, not a new architecture.
+
+### Idea C: Train the classifier specifically to predict classes of detector boxes, at different IoU thresholds
+Cascade R-CNN idea: the boxes at test time have varying quality (IoU with GT). If we train a cascade of classifiers at increasing IoU thresholds... this is basically e003 (which crashed).
+
+### Idea D: Better use of the wide crop — context for texture
+The deposit-stain confusion is fundamentally about fine texture. The reference says "Distinguishing visually similar classes usually depends on fine texture; input resolution and how much of the crop the object fills both matter." The current design uses 160px. Maybe we can afford to increase resolution since the model is small (EfficientNet-B0)?
+
+Actually, wait. Let me reconsider the time budget. Current run: 162s total for base e000 with 433 steps. Budget T=180s with RESERVE_S=55 → training time ~107s. The model is efficient (EfficientNet-B0, 160px, 2 crops per box).
+
+### Idea E: Multi-class confusion-specific approach
+The deposit-stain confusion is a known problem in weld defect detection. One idea that could help: **train a separate classifier for the "deposit vs stain" confusion** — i.e., a coarse-to-fine approach. But this adds complexity and might not be testable within budget.
+
+### Idea F: Improve the tight crop resolution for texture
+Actually, I want to reconsider something. The current best uses IMG_SIZE=160. What if we train at higher resolution? EfficientNet-B0 is fast enough. The e002 experiment raised the *tight crop* to 224px but kept wide at 160px and got mixed results (seed-0 improved, mean didn't confirm). But there's a subtlety: in e002, only the tight crop was raised to 224, while the model input remained... let me think. The model probably had IMG_SIZE=160 for both crops but the tight crop was bigger (224px side → resized to 160). Hmm, no — if IMG_SIZE=160 and tight crop is 224px, then the tight crop would be resized *down* to 160. That's what happened: "Raising the tight crop to 224px while keeping the wide crop at 160px gives the clue" — actually wait, let me re-read e002's hypothesis:
+
+"The current two-crop model is limited by resolution on the tight crop, which hurts fine texture discrimination for pore and deposit/stain. Raising the tight crop to 224px while keeping the wide crop at 160px gives the cl..." (text cut off)
+
+So e002 raised the tight crop to 224px side but IMG_SIZE was probably 160? That means both crops are resized to 160x160 anyway. The tight crop being larger just means less context loss... no, if it's resized to 160, it has the same resolution as before, just slightly different content. So e002 didn't actually increase the model's resolution! It was essentially a "tighter crop" change that should be equivalent or better for texture. But the 5-seed mean was worse (0.6228).
+
+Hmm, I think I need to reconsider. If e002 raised the tight crop to 224px and IMG_SIZE stayed at 160, then both views are still 160px. The only difference is the crop content. The result was not confirmed (mean worse than base). So a tighter crop didn't help much — maybe because at 160px it's still low-res for texture.
+
+**A real resolution increase could be the key.** But earlier experiments tried "resolution and small-box handling (224 px...)" and got no gain (best 5-seed 0.634, not confirmed). So higher resolution at 224px didn't help either!
+
+Wait, that history entry says: "Resolution and small-box handling (224 px, larger MIN_CROP, enlarged tight crops for small boxes) | 9 | no gain: best 5-seed 0.634 (not confirmed); 2 crashes". So 224px resolution was tried and didn't confirm. And e002 also tried 224px tight crop.
+
+OK so higher resolution at the model input isn't the answer (or at least, not confirmed).
+
+### Idea G: Use more of the "perfect class" info from crops.csv — the key difference
+
+Wait. Let me re-read the setup. We're already training on `crops.csv` boxes which are *labelled ground truth* boxes with the perfect classes. That's what gives us macro-F1 ~0.87 reference for a crop classifier on perfect boxes.
+
+So we're already using the ideal training data! The gap between our 0.6288 and the perfect-classes ceiling of 0.7461 is where our *scores* hurt, plus imperfect classification. Hmm, actually no — let me re-read:
+
+"mAP@0.5 if every box had its correct class but kept your scores: 0.7461 (yours: 0.6288). The difference is what wrong classes cost; the remaining gap to the perfect-classes ceiling in the brief is what your scores cost compared with the detector's conf."
+
+So:
+- Our current score: 0.6288
+- If classes were correct (but scores unchanged): 0.7461 (+0.117)
+- Perfect classes + perfect scores (ceiling): 0.758 (+0.012 more)
+
+So the dominant loss is class assignment. And within that, what about "the remaining gap to the perfect-classes ceiling... what your scores cost compared with the detector's conf"? That's only +0.012. So our ranking of true detections vs false alarms is mostly OK (because we use detector conf, which ranks well).
+
+Wait, but actually there's a subtlety: "mAP@0.5 if every box had its correct class but kept your scores" — this means the *same* score values, just with the correct class label. Since mAP is per-class, changing the class of a prediction moves it to another class's ranking. If a prediction was misclassified as "stain" and the correct class is "deposit", then keeping its score but moving it to "deposit" class ranking helps deposit.
+
+So the +0.117 from perfect classes means our classifier's accuracy on overlapping boxes is the big win. And the remaining 0.012 gap vs ceiling (0.758) is about score ranking — e003 tried to change the conf × p combination and crashed, but the reference says "stage-1 boxes scored as a single class 'defect': 0.755" vs our... wait, that's interesting!
+
+The one-step detector scored as single class gets 0.755 on validation. Our two-stage with perfect classes gets 0.758 (perfect classes + perfect scores presumably). So the ceiling is 0.758.
+
+Our current: 0.6288.
+If classes were right: 0.7461.
+Ceiling: 0.758.
+So we're at 0.6288/0.758 = 83% of the ceiling.
+
+The biggest win is class assignment (+0.117). If I can improve classification accuracy, even partially, that's a big gain. The reference says "A crop classifier given perfect boxes reaches macro-F1 ~0.87 with the starting recipe". Let's see what our current classifier achieves:
+
+From the confusion matrix on overlap boxes:
+- pore: 63% right (but wait, only 76 true pores overlap detector boxes... 48+6+1+20+1 = 76)
+- deposit: 78% right (215 total: 2+210+2+55+1)
+- discontinuity: 96% right (461 total)
+- stain: 88% right (613 total)
+
+Weighted by class counts, overall accuracy on the overlap set is roughly (48+210+443+540)/(76+215+461+613) = 1241/1365 = 91%. But macro-F1 would be ~0.81 ((63+78+96+88)/4 = 81.25).
+
+The reference says a crop classifier given perfect boxes reaches macro-F1 ~0.87. So we're at ~0.81 vs ~0.87 — only 0.06 short on macro-F1. But in mAP terms, the difference is +0.117! That's because in mAP@0.5, recall of each class matters, and our classes are imbalanced (stain is dominant: 613 overlap boxes vs pore's 76).
+
+Hmm wait, actually let me think about this differently. The confusion matrix only counts boxes that overlap true defects by IoU > 0.5 — these are "true detection" boxes. But the mAP also includes false alarm ranking within each class (the detector conf ranks them, and we keep our score ordering). The reference says "stage-1 boxes scored as a single class 'defect': 0.755" — with perfect classes at 0.758, that's only -0.003! So even if all boxes were the same class, the mAP is 0.755, nearly the same as perfect classes (0.758). That means the *ranking* of true detections vs false alarms within a class matters little compared to the class assignment itself...
+
+Hmm wait, that doesn't quite add up. Let me re-read: "stage-1 boxes with perfect classes (ceiling for stage 2): 0.758 mAP@0.5" — "every detector box that overlaps a true defect (IoU > 0.5) gets the correct class; every other box (false alarms) is KEPT, as class 0, with its detector conf."
+
+So in the ceiling scenario, false alarms are kept as class 0 with their detector conf. And our current approach also keeps false alarms (with score = conf × p[c]). The mAP for each class counts detections that overlap *true boxes of that class* by IoU > 0.5 and are unmatched. So false alarms in a class hurt recall only by being ranked above true detections.
+
+OK so the dominant issue remains class assignment.
+
+Let me now think about which direction to pursue, given the history is exhausted in many ways.
+
+## Direction analysis
+
+The most promising untried ideas that could give a large gain:
+
+### 1. Improve classifier accuracy on the hard classes (pore, deposit/stain)
+This is the #1 loss. The reference says we're at macro-F1 ~0.81 vs ~0.87 for a perfect-box classifier. So there's ~0.06 macro-F1 room even with perfect boxes. But our *current* classifier might be worse than 0.87 because it's trained on perfect boxes... wait no, we train on perfect boxes!
+
+Hold on. Let me re-read. "A crop classifier given perfect boxes reaches macro-F1 ~0.87 with the starting recipe." The starting recipe is what we have (two-crop EfficientNet-B0). And *we* are already doing that — training on crops.csv perfect boxes. So our current classifier should be at macro-F1 ~0.87 if it were trained properly! But the confusion matrix shows 91% accuracy on the overlap set with macro-F1 ~0.81 (weighted average of per-class right rates... let me compute properly: per-class: pore 63%, deposit 78%, discontinuity 96%, stain 88%. Mean = (0.63+0.78+0.96+0.88)/4 = 0.8125).
+
+So we're at ~0.81 macro-F1 vs ~0.87 for the reference classifier. That's only 0.06 short — but in mAP terms, this translates to +0.117! Why? Because mAP is sensitive to per-class recall and our classes are imbalanced.
+
+Hmm, actually wait. Let me reconsider. The confusion matrix counts boxes where the chosen class (highest-scoring row) was computed. But the mAP@0.5 calculation uses *all* rows for a class ranked by score, not just the chosen one. So the "chosen class" confusion matrix doesn't directly give classification accuracy per class for mAP purposes.
+
+But the key point stands: improving classification accuracy on the hard classes should move the needle substantially.
+
+### 2. What hasn't been tried that could improve classifier quality?
+
+Looking at the earlier history, they tried:
+- Bigger backbones (no gain)
+- Higher resolution (not confirmed / no gain)
+- Extra wide view (small gain +0.005)
+- Ensembles (failed — undertrained)
+- Focal loss (no gain)
+- Class-weighted loss (hurt)
+- Training augmentation (no gain)
+- Class-balanced sampling (no gain)
+- Detector boxes as extra training data (small gain +0.004)
+
+What could move the needle on the hard classes?
+
+**Idea H: Change the crop composition — instead of 1.5x tight + 2.5x wide, use different crops.** The third-wide-view experiment (+0.005) showed context helps pore. What if we change to a *different* combination? Like tight (1.2x) + medium (2x) + wide (3x)? Or what about the *perfect boxes* from crops.csv as an extra view?
+
+Actually, here's a thought: **train on the perfect ground-truth box crops as one of the two views.** Currently both views are made from the *detector* boxes. If we make one view from the detector box and one from the *ground truth* box (which is larger/better aligned), the model gets better-aligned examples at training time. But wait — at test time, we only have detector boxes. So the classifier would be trained on perfect-box crops but tested on detector-box crops. That's the distribution mismatch.
+
+Hmm, but actually — the "detector boxes from train split as extra training data" experiment (accepted +0.004) was about matching the test distribution: use detector boxes that overlap GT as *training examples* with GT labels. This matches Cascade R-CNN's approach of training the second stage on first-stage proposals.
+
+Let me think about what would be fundamentally different from what's been tried...
+
+### Idea I: Multi-scale training at test time
+The reference says "several views at different scales can be combined (multi-scale or multi-crop inputs), at a proportional compute cost." The third-wide-view experiment (+0.005) did this. But it added ~20s and is close to the limit.
+
+Actually, wait. Let me look at the time budget more carefully. Base run: 162s total with RESERVE_S=55. So training was ~107s. The budget is 180s. So we have ~23s of headroom... no wait, RESERVE_S=55 means training endsThinking budget reached. Stop thinking now and write the reply in the required format.

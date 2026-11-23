@@ -1,0 +1,409 @@
+===== attempt 1 =====
+Let me analyze the situation carefully.
+
+Current best: e000 with 5-seed val mAP@0.5 = 0.6311
+Per-class: pore 0.506, deposit 0.630, discontinuity 0.780, stain 0.608
+
+Key observations from the experiment history:
+1. e002 (training on detector boxes with background class): 0.5172 - rejected. This was a big drop, suggesting the background class approach hurt.
+2. e003 (low-res crops): 0.6251 - rejected
+3. e004 (p² scoring): 0.6161 - rejected
+4. e005 (train on detector boxes without background): 0.6248 - rejected
+5. e006 (ConvNeXt-Nano): 0.2901 - suspicious bug
+6. e007 (MixUp): 0.6326 seed-0, 0.6292 5-seed - not confirmed
+7. e008 (max prob scoring): 0.6265 - rejected
+8. e009 (wider context 3.5x): 0.6342 seed-0, 0.6309 5-seed - not confirmed
+9. e010 (label smoothing): 0.6328 seed-0, 0.6254 5-seed - not confirmed
+10. e011 (more jitter): 0.6356 seed-0, 0.6294 5-seed - not confirmed
+11. e012 (focal loss): 0.6209 - rejected
+
+So most experiments have been rejected or not confirmed. The current best is still e000 at 0.6311.
+
+Let me think about what could actually help here. The key insight from the research brief:
+- "stage-1 boxes with perfect classes (ceiling for stage 2): 0.758 mAP@0.5"
+- "stage-1 boxes scored as a single class 'defect': 0.755 mAP@0.5"
+- The one-step 4-class detector baseline: 0.638 mAP@0.5
+
+So the ceiling is 0.758, and we're at 0.6311. The gap is 0.127. The fact that a single class gets 0.755 means the detector boxes are good - the issue is classification accuracy.
+
+Key insight: "mAP@0.5 rewards, per class: (a) the right class on boxes that overlap a true defect, and (b) good ranking: true detections should score higher than false ones."
+
+The current approach gives 4 rows per box (one per class) with score = conf * p[c]. This means for each box, we're outputting all 4 classes with their respective scores. The mAP calculation will pick the top-scoring class for each box.
+
+Wait, let me re-read: "one or more rows per eval box (several rows with different classes for the same box are allowed; leaving a box out drops it). Per image at most the 300 highest-scoring rows count."
+
+So for each box, we can output multiple class predictions. The scoring is like a normal detector - mAP@0.5 over 4 classes. Each row is a (box, class, score) triple. For mAP, a detection is a TP if it matches a GT of the same class with IoU > 0.5.
+
+The key question is: what's the best strategy for scoring?
+
+Current: score = conf * p[c] for each class c. This means if the classifier is confident about class 0 (pore), that row gets a high score, and the other 3 rows get lower scores. All 4 rows are written out.
+
+One thing I notice: e004 tried p² and it hurt. e008 tried multiplying by max(p) and it hurt. So the scoring function is already pretty good.
+
+Let me think about what else could help:
+
+1. **Test-time augmentation (TTA)**: At inference time, average predictions over multiple augmentations (horizontal flip, vertical flip, different scales). This could improve classification accuracy without changing training.
+
+2. **Ensemble**: Train multiple models and average their predictions. But this uses more time.
+
+3. **Better training data**: The current training uses only high-res crops. e003 tried adding low-res and it slightly hurt. Training on detector boxes (e002, e005) hurt.
+
+4. **Architecture**: e006 (ConvNeXt-Nano) had a bug. Let me think about what architecture might work better.
+
+5. **Inference strategy**: Instead of outputting all 4 classes per box, maybe only output the top-1 or top-2 classes? Or use a different scoring formula?
+
+Actually, wait. Let me think more carefully about the mAP calculation. 
+
+For mAP@0.5:
+- All predictions across all images are ranked by score
+- For each prediction, it's a TP if it matches an unmatched GT of the same class with IoU > 0.5
+- Otherwise it's a FP
+
+The key insight: if we output 4 rows per box, we're creating 4 "detections" per box. If the box overlaps a GT of class 0, then the class-0 row is a TP and the other 3 rows are FPs (they don't match any GT of their class at that location). This dilutes the AP for each class.
+
+Actually wait, that's not quite right. For mAP, each class is scored independently. For class 0, we look at all class-0 predictions ranked by score. A class-0 prediction is TP if it matches an unmatched class-0 GT with IoU > 0.5. The class-1, 2, 3 predictions don't affect class 0's AP.
+
+But the issue is: if a box overlaps a class-0 GT, the class-0 prediction is a TP. But if the same box also has a class-1 prediction (with lower score), that class-1 prediction is a FP for class 1 (assuming no class-1 GT at that location). This adds FPs to class 1's ranking, which hurts class 1's AP.
+
+So outputting all 4 classes per box adds 3 FPs per true detection to the other classes. This is a significant source of FPs!
+
+What if we only output the top-1 class per box? Then each box contributes exactly 1 prediction. If it's the right class, it's a TP; if wrong, it's a FP. No extra FPs for other classes.
+
+But wait, the brief says "Several rows per box (one per class) are allowed and often help." So the harness designers think multiple rows help. Let me think about why...
+
+Actually, I think the reason multiple rows help is for the ranking. Consider a box that overlaps a class-0 GT. If we output:
+- class 0: score 0.8
+- class 1: score 0.1
+- class 2: score 0.05
+- class 3: score 0.05
+
+For class 0's AP, the 0.8 score ranks it high → TP. Good.
+For class 1's AP, the 0.1 score is very low → it's a FP but at the bottom of the ranking → minimal impact.
+
+If we only output the top-1:
+- class 0: score 0.8
+
+For class 0's AP, same. For class 1's AP, no prediction at all → no FP. This seems better!
+
+But what if the classifier is wrong? Box overlaps class-0 GT but classifier says class 1:
+- Top-1 only: class 1: score 0.8 → FP for class 1, and class 0 gets no prediction → missed detection
+- All 4: class 1: 0.8 (FP for class 1), class 0: 0.1 (TP for class 0 but low ranking), class 2: 0.05 (FP), class 3: 0.05 (FP)
+
+In the all-4 case, class 0 still gets a TP (albeit low-ranked), but classes 1, 2, 3 get extra FPs.
+
+Hmm, this is complex. Let me think about what the optimal strategy is.
+
+Actually, I think the key issue is: **the detector conf is the same for all 4 rows of a box**. So the ranking within a box is determined purely by the classifier probabilities. The ranking across boxes is determined by conf * p[c].
+
+For mAP, what matters is:
+1. True detections (box overlaps GT of class c) should have high scores
+2. False detections (box doesn't overlap any GT, or overlaps GT of different class) should have low scores
+
+The current scoring: score = conf * p[c]. For a true detection of class c, p[c] should be high → high score. For a false detection, p[c] might be moderate → moderate score. The issue is that for a false detection, the max p[c] might still be 0.3-0.5, giving a moderate score.
+
+What if we use score = conf * (p[c] - p_bg) where p_bg is some background estimate? But we don't have a background class in the current model.
+
+What about score = conf * p[c] * (1 - max_other_p)? Where max_other_p is the max of the other 3 class probabilities? This would suppress predictions where the classifier is uncertain.
+
+Actually, let me reconsider. The brief says "stage-1 boxes scored as a single class 'defect': 0.755 mAP@0.5". This means if we just output 1 class per box with score = conf, we get 0.755. The 4-class detector gets 0.638. The gap is because the 4-class detector sometimes assigns the wrong class.
+
+Our stage-2 system gets 0.6311, which is slightly below the one-step 4-class detector (0.638). The ceiling is 0.758.
+
+The fact that single-class gets 0.755 means the detector boxes are very good. The classification accuracy is the bottleneck.
+
+Let me think about TTA. At inference time, we could:
+1. Horizontal flip
+2. Vertical flip  
+3. No flip (original)
+4. Maybe different scales
+
+Average the logits/probabilities across these augmentations. This is cheap (just 2-3x inference time) and often improves accuracy by 1-3%.
+
+The current inference already does 2 forward passes (tight crop + wide crop). Adding TTA would make it 4-6 forward passes per box. With 41879 eval boxes, this might be tight on time.
+
+Let me check the time budget. The current run takes 162s total for 180s budget. The eval phase is at the end. Let me estimate:
+- Loading: 13s
+- Training: ~112s (13s to 125s)
+- Inference + writing: ~37s (125s to 162s)
+
+With 41879 boxes and batch size 256, that's ~164 batches. Each batch does 2 forward passes (tight + wide). With TTA (hflip + vflip + original), it would be 6 forward passes per box → 3x the inference time. That might push us over the budget.
+
+But we could reduce the training time to compensate. Or use a smaller model. Or reduce the number of TTA augmentations.
+
+Actually, let me think about a simpler approach. What about just doing horizontal flip TTA? That's 2x the inference (original + hflip), so 4 forward passes per box instead of 2. That's 2x the inference time, adding ~18s. Total would be ~180s, right at the limit. Too risky.
+
+What about reducing training to free up time? The current training does 5 epochs. We could do 3 epochs and use the saved time for TTA.
+
+Actually, let me reconsider the approach. Let me look at what's been tried:
+- Data changes: mostly rejected
+- Scoring changes: mostly rejected
+- Architecture: bug
+- Augmentation: not confirmed
+- Loss: rejected
+
+What hasn't been tried:
+1. **TTA at inference** - not tried
+2. **Top-1 only output** (instead of all 4 classes) - not tried
+3. **Different model with proper setup** - e006 had a bug
+4. **Learning rate / optimizer changes** - not tried
+5. **Different image size** - not tried
+6. **Single crop instead of two** - not tried (might be faster, allowing more training)
+
+Let me think about the top-1 approach more carefully.
+
+If we output only the top-1 class per box:
+- Each box contributes exactly 1 prediction
+- No extra FPs for other classes
+- But if the top-1 is wrong, we miss the true class entirely
+
+If we output all 4 classes:
+- Each box contributes 4 predictions
+- 3 extra FPs per box for other classes
+- But the true class is always represented (even if low-ranked)
+
+For mAP, the extra FPs from all-4 output hurt the AP of the "wrong" classes. But the true class always gets a TP.
+
+I think the optimal might be to output only the top-2 classes, or to use a threshold: only output class c if p[c] > some threshold.
+
+Actually, let me think about this differently. The mAP@0.5 is computed per class. For class c:
+- All class-c predictions are ranked by score
+- A prediction is TP if it matches an unmatched class-c GT with IoU > 0.5
+- AP = area under the precision-recall curve
+
+The key factors:
+1. True class-c detections should rank high
+2. False class-c predictions should rank low
+
+With all-4 output, for each box:
+- If the box overlaps a class-c GT: the class-c prediction is a TP (good), the other 3 are FPs for their respective classes
+- If the box doesn't overlap any GT: all 4 predictions are FPs for their respective classes
+- If the box overlaps a class-d GT (d≠c): the class-c prediction is a FP for class c, the class-d prediction is a TP for class d
+
+The FPs from "wrong class" predictions are the main issue. A box that overlaps a class-0 GT but the classifier says class 1 will produce:
+- class 0: low score (TP for class 0, but low-ranked)
+- class 1: high score (FP for class 1)
+- class 2: low score (FP for class 2)
+- class 3: low score (FP for class 3)
+
+The class-1 FP with high score is bad for class 1's AP.
+
+If we only output top-1:
+- class 1: high score (FP for class 1) - same bad FP
+- class 0: no prediction - missed TP for class 0
+
+So top-1 removes the low-ranked TP for class 0 but also removes the low-score FPs for classes 2 and 3. The net effect depends on the tradeoff.
+
+I think the most promising untried idea is **TTA at inference**. Let me design it carefully.
+
+Current inference: for each box, compute logits from tight crop and wide crop, average them, softmax.
+
+TTA: for each box, compute logits from:
+1. Original tight crop
+2. H-flipped tight crop
+3. Original wide crop
+4. H-flipped wide crop
+
+Average all 4 sets of logits, then softmax.
+
+This doubles the inference time. To compensate, I could:
+- Reduce training epochs (use time-based stopping, which is already there)
+- The training loop already stops when time runs out, so reducing the reserve or adjusting would help
+
+Actually, the current code already has a time-based training loop. If I add TTA to inference, the inference takes longer, but the training loop will just do fewer steps because the deadline is fixed. The RESERVE_S is 55s for prediction and writing. If inference takes 2x longer, I need to increase RESERVE_S or reduce training.
+
+Let me estimate the inference time more carefully. 41879 boxes, batch size 256 → 164 batches. Each batch: 2 forward passes (tight + wide) on the model. With TTA (hflip), it's 4 forward passes. The model is EfficientNet-B0 on 160x160 images.
+
+On a GPU, EfficientNet-B0 forward pass on a batch of 256 160x160 images takes maybe 5-10ms. So 2 forward passes per batch ≈ 10-20ms. 164 batches × 15ms ≈ 2.5s. With TTA (4 passes), ≈ 5s. That's not a big deal.
+
+Wait, but the current total is 162s, with 13s loading, ~112s training, and ~37s for inference + writing. The 37s for inference seems high. Let me reconsider.
+
+Actually, the inference includes:
+1. Creating crops for all 41879 boxes (CPU work - reading images, cropping, resizing)
+2. DataLoader with 8 workers
+3. Forward passes
+4. Writing 53543 rows to CSV
+
+The crop creation is probably the bottleneck, not the forward passes. Each box needs 2 crops (tight + wide), each involving image reading (cached in memory), cropping, resizing to 160x160. With 8 workers, this should be parallelized.
+
+With TTA (hflip), each box needs 4 crops (tight, tight_hflip, wide, wide_hflip). But the hflip is just a numpy flip, which is cheap. The crop creation (resize) is the expensive part. So TTA hflip adds minimal overhead to crop creation (just a flip operation) and doubles the forward passes.
+
+Actually, I can be smarter: create the 2 crops as before, then at inference time, also compute the hflip version. The hflip is just x[:, :, ::-1] which is a view, very cheap. So the crop creation time is unchanged, and only the forward passes double.
+
+Let me estimate: if the forward passes take ~5s currently, they'd take ~10s with TTA. The total would be ~167s, still within 180s.
+
+But wait, I should be more careful. Let me look at the timing:
+- 13s: loading
+- 60s: end of epoch 0 (47s for epoch 0, 94 steps)
+- 78s: end of epoch 1 (18s, 94 steps)
+- 97s: end of epoch 2 (19s, 94 steps)
+- 116s: end of epoch 3 (19s, 94 steps)
+- 125s: end of epoch 4 (9s, 45 steps - partial epoch)
+- 162s: done (37s for inference + writing)
+
+So inference + writing takes 37s. If TTA doubles the forward pass time, and forward passes are maybe 10s of that 37s (rest is crop creation and writing), then TTA adds ~10s, making it 47s. Total: 172s. Still within 180s but tight.
+
+To be safe, I could:
+1. Increase RESERVE_S from 55 to 65 (reduces training time by 10s)
+2. Or reduce BATCH_SIZE for training to speed up each step (unlikely to help)
+3. Or accept the risk
+
+Actually, the training loop already stops when time.time() >= t_end. If I increase RESERVE_S, t_end moves earlier, and training does fewer steps. The current training does 421 steps in ~112s. If I reduce by 10s, it'd do ~370 steps. That's a small reduction.
+
+Let me go with TTA (horizontal flip) and increase RESERVE_S to 65.
+
+Wait, actually I want to be more careful. Let me think about what TTA actually does.
+
+For a box, the current inference:
+1. Create tight crop (160x160)
+2. Create wide crop (160x160)
+3. Forward pass tight → logits_t
+4. Forward pass wide → logits_w
+5. Average: (logits_t + logits_w) / 2
+6. Softmax → probabilities
+
+With TTA (hflip):
+1. Create tight crop → x_t
+2. Create wide crop → x_w
+3. Forward pass x_t → logits_t
+4. Forward pass x_t_hflip → logits_t_h
+5. Forward pass x_w → logits_w
+6. Forward pass x_w_hflip → logits_w_h
+7. Average: (logits_t + logits_t_h + logits_w + logits_w_h) / 4
+8. Softmax → probabilities
+
+The hflip of a crop is just x[:, :, ::-1] (or x[:, ::-1] for a 2D array). This is a view, no copy needed.
+
+In the dataset's __getitem__, I currently create 2 views. For TTA, I need to also create the hflip versions. But I can do this at inference time without changing the dataset.
+
+Actually, the cleanest approach: modify the inference loop to also compute hflip versions. The dataset returns (tight_crop, wide_crop, label). At inference, I can compute:
+- logits_t = model(tight_crop)
+- logits_t_h = model(tight_crop[:, :, ::-1])
+- logits_w = model(wide_crop)
+- logits_w_h = model(wide_crop[:, :, ::-1])
+- avg = (logits_t + logits_t_h + logits_w + logits_w_h) / 4
+
+This is clean and doesn't require changing the dataset.
+
+Let me also consider: should I do vertical flip TTA too? That would be 8 forward passes per box. Probably too much. Let me stick with hflip only.
+
+Actually, weld beads are typically horizontal, so horizontal flip might not be as useful as vertical flip. But the boxes can be in any orientation. Let me just do hflip for simplicity.
+
+Wait, actually, I should think about whether hflip is a good augmentation for weld defects. Weld beads have a specific texture pattern. Flipping horizontally would mirror the texture, which might not be realistic. But for classification purposes, the model should learn orientation-invariant features. And TTA with hflip is a standard technique that usually helps.
+
+Let me go with this plan:
+1. Add TTA (horizontal flip) to inference
+2. Increase RESERVE_S from 55 to 65 to account for the extra inference time
+3. Keep everything else the same
+
+Let me write the code changes.
+
+Current inference code:
+```python
+    model.eval()
+    probs = []
+    with torch.no_grad(), torch.autocast(**amp):
+        for xt, xw, _ in dl_ev:
+            xt = xt.to(device).to(memory_format=torch.channels_last)
+            xw = xw.to(device).to(memory_format=torch.channels_last)
+            probs.append(torch.softmax(((model(xt) + model(xw)) / 2).float(), 1).cpu())
+    probs = torch.cat(probs).numpy()
+```
+
+New inference code with TTA:
+```python
+    model.eval()
+    probs = []
+    with torch.no_grad(), torch.autocast(**amp):
+        for xt, xw, _ in dl_ev:
+            xt = xt.to(device).to(memory_format=torch.channels_last)
+            xw = xw.to(device).to(memory_format=torch.channels_last)
+            xt_h = xt.flip(3)  # horizontal flip
+            xw_h = xw.flip(3)  # horizontal flip
+            logits = (model(xt) + model(xt_h) + model(xw) + model(xw_h)) / 4
+            probs.append(torch.softmax(logits.float(), 1).cpu())
+    probs = torch.cat(probs).numpy()
+```
+
+And change RESERVE_S from 55 to 65.
+
+Let me also think: is there anything else I should change? The hypothesis should be clear: TTA with horizontal flip at inference will improve classification accuracy by averaging over augmented views, reducing variance in the predictions.
+
+Let me finalize the changes:
+
+1. RESERVE_S: 55 → 65
+2. Inference loop: add hflip TTA
+
+Let me write the SEARCH/REPLACE blocks.
+
+Block 1: Change RESERVE_S
+```
+SEARCH: RESERVE_S = 55          # seconds kept free for prediction and writing
+REPLACE: RESERVE_S = 65          # seconds kept free for prediction and writing
+```
+
+Block 2: Change inference
+```
+SEARCH:
+    model.eval()
+    probs = []
+    with torch.no_grad(), torch.autocast(**amp):
+        for xt, xw, _ in dl_ev:
+            xt = xt.to(device).to(memory_format=torch.channels_last)
+            xw = xw.to(device).to(memory_format=torch.channels_last)
+            probs.append(torch.softmax(((model(xt) + model(xw)) / 2).float(), 1).cpu())
+    probs = torch.cat(probs).numpy()
+REPLACE:
+    model.eval()
+    probs = []
+    with torch.no_grad(), torch.autocast(**amp):
+        for xt, xw, _ in dl_ev:
+            xt = xt.to(device).to(memory_format=torch.channels_last)
+            xw = xw.to(device).to(memory_format=torch.channels_last)
+            logits = (model(xt) + model(xt.flip(3)) + model(xw) + model(xw.flip(3))) / 4
+            probs.append(torch.softmax(logits.float(), 1).cpu())
+    probs = torch.cat(probs).numpy()
+```
+
+This should be a clean, focused change. Let me verify the SEARCH strings match exactly.
+
+Looking at the file:
+```
+RESERVE_S = 55          # seconds kept free for prediction and writing
+```
+Yes, that's exact.
+
+And the inference block:
+```python
+    model.eval()
+    probs = []
+    with torch.no_grad(), torch.autocast(**amp):
+        for xt, xw, _ in dl_ev:
+            xt = xt.to(device).to(memory_format=torch.channels_last)
+            xw = xw.to(device).to(memory_format=torch.channels_last)
+            probs.append(torch.softmax(((model(xt) + model(xw)) / 2).float(), 1).cpu())
+    probs = torch.cat(probs).numpy()
+```
+
+Let me double-check the indentation. In the file, it's:
+```
+    model.eval()
+    probs = []
+    with torch.no_grad(), torch.autocast(**amp):
+        for xt, xw, _ in dl_ev:
+            xt = xt.to(device).to(memory_format=torch.channels_last)
+            xw = xw.to(device).to(memory_format=torch.channels_last)
+            probs.append(torch.softmax(((model(xt) + model(xw)) / 2).float(), 1).cpu())
+    probs = torch.cat(probs).numpy()
+```
+
+Yes, 4-space indentation. Good.
+
+This is a clean, focused experiment. The hypothesis is clear: TTA with horizontal flip will improve classification accuracy.
+
+Let me also consider: should I use `.flip(-1)` instead of `.flip(3)`? For a 4D tensor (N, C, H, W), dim 3 is W (horizontal). `.flip(3)` flips the width dimension, which is horizontal flip. `.flip(-1)` is the same as `.flip(3)` for a 4D tensor. Either works. Let me use `.flip(-1)` for clarity.
+
+Actually, `.flip(3)` is fine and unambiguous. Let me keep it.
+
+One more thought: the training already uses random horizontal and vertical flips (fh, fv in the dataset). So the model has seen flipped images during training. TTA with hflip at inference is consistent with this.
+
+I'm confident this is a good next experiment. Let me write the final response.

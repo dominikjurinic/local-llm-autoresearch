@@ -1,0 +1,286 @@
+===== attempt 1 =====
+Let me analyze the current situation carefully.
+
+Current best: e000, 5-seed val mAP@0.5 0.6288
+
+The lead has chosen an experiment: different resolutions per view (tight=160, wide=224). Let me think about whether this makes sense and check the implementation details.
+
+Key considerations:
+1. Time budget: 180s total. Current run uses 162s. The training uses ~2 views per sample. If one view goes from 160 to 224, that's (224/160)^2 = 1.96x more compute for that view. So total compute goes from 2*160^2 to 160^2 + 224^2 = 25600 + 50176 = 75776 vs 2*25600 = 51200. That's about 1.48x more compute per sample.
+
+Current: 433 steps in ~150s of training (162s total - 13s loading = 149s). So ~0.345s per step.
+
+With 1.48x more compute: ~0.51s per step. In 149s that's ~292 steps instead of 433. That's a significant reduction in training steps.
+
+Wait, let me recalculate. The current training does 2 forward passes per sample (tight and wide, both 160px). If wide becomes 224px:
+- Old compute per sample: 2 * 160^2 = 51200 (in pixel units)
+- New compute per sample: 160^2 + 224^2 = 25600 + 50176 = 75776
+- Ratio: 75776/51200 = 1.48
+
+So we'd get about 433/1.48 ≈ 292 steps. That's a 32% reduction in training steps.
+
+Hmm, but the hypothesis says "the wide crop gets the full 224px so large defects fill the network." The idea is that at 224px, the wide crop (2.5x the box) has more pixels and thus finer detail. But the concern is that we lose ~32% of training steps.
+
+Actually wait - let me reconsider. The model is EfficientNet-B0 which was pretrained at 224px. So 224 is actually the "native" resolution for this model. The current 160px is below that. So using 224 for the wide view might actually be more aligned with the pretrained model's expectations.
+
+But the tradeoff is fewer training steps. Previous experiments with bigger models (which also reduce step count) generally didn't help. However, this is different - we're not changing the model, just the input resolution for one view.
+
+Let me think about whether this is a good experiment. The lead's hypothesis is reasonable: the wide crop at 224px would give more detail for the context view. The tight crop stays at 160px. The model can handle variable input sizes (EfficientNet uses adaptive pooling).
+
+Actually, wait. Let me re-read the plan more carefully:
+
+"1. Add settings IMG_SIZE_TIGHT=160 and IMG_SIZE_WIDE=224"
+"2. In BoxDataset.__getitem__, build views with their respective IMG_SIZES"
+"3. At inference, average the logits from the two differently-sized crops as before"
+
+This should work. The model (EfficientNet-B0) uses global average pooling, so it can handle different input sizes.
+
+Let me check the time budget more carefully:
+- Loading: ~13s
+- Training: currently ~149s (162-13)
+- Prediction: currently ~15s (162-147... let me check)
+
+Actually from the log:
+- 13s for loading
+- Training ends around 147s (5 epochs, last one at 125s... wait no)
+
+Let me re-read: "done: 5 epochs, 433 steps, 53606 prediction rows, 162s total"
+- Loading: 13s
+- Training: from 13s to about 147s (the last epoch print is at 125s, but there's more after that)
+- Actually the training loop runs until t_end = deadline - RESERVE_S = 180 - 55 = 125s. So training runs from ~13s to 125s = 112s.
+- Then prediction: 125s to 162s = 37s.
+
+Wait, that doesn't add up. Let me re-read the log:
+```
+train 6052 boxes, eval 41879 detections, 1022 images (13s)
+epoch 0: loss 0.7217, 94 steps, 59s
+epoch 1: loss 0.3735, 188 steps, 77s
+epoch 2: loss 0.2881, 282 steps, 95s
+epoch 3: loss 0.2532, 376 steps, 114s
+epoch 4: loss 0.2189, 433 steps, 125s
+done: 5 epochs, 433 steps, 53606 prediction rows, 162s total
+```
+
+So:
+- Loading: 13s
+- Training: 13s to 125s = 112s (433 steps, ~0.26s/step)
+- Prediction + writing: 125s to 162s = 37s
+
+With 1.48x compute per step: ~0.38s/step. In 112s: ~295 steps.
+Prediction: also 1.48x slower: 37s * 1.48 = 55s.
+
+Total: 13 + 112 + 55 = 180s. That's exactly at the limit! Too risky.
+
+Hmm, I need to adjust. Options:
+1. Reduce RESERVE_S (risky - might not finish prediction)
+2. Use a smaller size for the wide crop, like 192 instead of 224
+3. Reduce batch size to keep step time similar (no, that doesn't help)
+4. Accept fewer steps but make sure prediction fits
+
+Actually wait, let me recalculate prediction time. Currently prediction does 41879 detections, each with 2 views at 160px. Batch size 256. So 41879/256 ≈ 164 batches. Each batch does 2 forward passes at 160px.
+
+With the change: 1 forward at 160px + 1 forward at 224px. The 224px forward is (224/160)^2 = 1.96x slower. So total prediction compute is 1 + 1.96 = 2.96 vs old 2*1 = 2. Ratio: 2.96/2 = 1.48x.
+
+So prediction goes from 37s to ~55s. Total would be 13 + 112 + 55 = 180s. Exactly at the limit. Too risky.
+
+I should either:
+- Use 192 instead of 224 for the wide crop. Ratio: (192/160)^2 = 1.44. Total compute: 1 + 1.44 = 2.44 vs 2. Ratio: 1.22x. Prediction: 37*1.22 = 45s. Total: 13+112+45 = 170s. That's safer.
+- Or keep 224 but reduce RESERVE_S to 40. Then t_end = 180-40 = 140. Training from 13 to 140 = 127s. Steps: 127/0.38 = 334. Prediction: 55s. Total: 13+127+55 = 195s. No, that's over.
+
+Wait, I'm confusing myself. The RESERVE_S is subtracted from the total budget to get the training end time. The prediction happens after training. So:
+- t_end = deadline - RESERVE_S = T0 + 180 - RESERVE_S
+- Training runs from ~T0+13 to T0+180-RESERVE_S
+- Prediction runs from T0+180-RESERVE_S to whenever it finishes
+- Total must be < 180s
+
+So if RESERVE_S = 55: training ends at 125s, prediction has 55s. Currently prediction takes 37s, so there's 18s margin.
+
+With 1.48x prediction: 37*1.48 = 55s. That exactly uses up the reserve. No margin at all. Too risky.
+
+Options:
+1. Use IMG_SIZE_WIDE = 192 instead of 224. Compute ratio: (1+1.44)/2 = 1.22. Prediction: 37*1.22 = 45s. Margin: 55-45 = 10s. OK.
+   Training: 0.26*1.22 = 0.32s/step. In 112s: 350 steps (vs 433). Still reasonable.
+
+2. Use IMG_SIZE_WIDE = 224 but reduce RESERVE_S to 40 and hope prediction is faster. Risky.
+
+3. Use IMG_SIZE_WIDE = 208. Compute ratio: (1+(208/160)^2)/2 = (1+1.69)/2 = 1.345. Prediction: 37*1.345 = 50s. Margin: 5s. Tight.
+
+Actually, let me reconsider. The lead specifically asked for 224. But the time budget doesn't work. The instructions say "If a detail of the plan cannot work as written (time budget, tensor shapes, missing names), make the smallest fix that keeps the idea and say so at the end of the HYPOTHESIS."
+
+So I should use 192 for the wide crop instead of 224, and note this in the hypothesis. 192 is still a meaningful increase over 160 (20% more pixels per side, 44% more total pixels), and it keeps us within budget.
+
+Actually wait, let me reconsider whether 224 might work. The prediction time estimate might be off. Let me think again...
+
+Current prediction: 41879 samples, batch 256, 2 views at 160px. Time: 37s.
+Per sample: 37s / 41879 = 0.88ms per sample (for 2 views at 160px).
+Per view at 160px: 0.44ms.
+Per view at 224px: 0.44 * (224/160)^2 = 0.44 * 1.96 = 0.86ms.
+Total per sample: 0.44 + 0.86 = 1.30ms.
+Total prediction: 41879 * 1.30ms = 54.4s.
+
+With RESERVE_S = 55: available = 55s. Need 54.4s. Margin = 0.6s. Way too tight.
+
+With RESERVE_S = 45: available = 45s. Need 54.4s. Doesn't fit!
+
+So 224 doesn't work with the current reserve. I'd need to reduce training time. If I set RESERVE_S = 45, training ends at 135s. Training time: 135-13 = 122s. Steps at 0.38s: 321 steps. Prediction: 54.4s. Total: 13+122+54.4 = 189.4s. Over budget!
+
+So 224 is out. Let me go with 192.
+
+With 192: per view at 192px: 0.44 * (192/160)^2 = 0.44 * 1.44 = 0.63ms.
+Total per sample: 0.44 + 0.63 = 1.07ms.
+Total prediction: 41879 * 1.07ms = 44.8s.
+With RESERVE_S = 55: available = 55s. Margin = 10.2s. Good.
+
+Training: per step: 0.26 * (1+1.44)/2 = 0.26 * 1.22 = 0.317s.
+In 112s: 353 steps (vs 433). That's 81% of original steps. Acceptable.
+
+Total: 13 + 112 + 45 = 170s. Margin: 10s. 
+
+So I'll use IMG_SIZE_WIDE = 192 and note the adjustment from 224 to 192 due to time budget.
+
+Now let me implement this:
+
+1. Change settings: Replace IMG_SIZE = 160 with IMG_SIZE_TIGHT = 160 and IMG_SIZE_WIDE = 192
+2. In make_crop: need to accept a size parameter
+3. In BoxDataset.__getitem__: use different sizes for the two views
+4. The rest should work as-is since the model handles variable input sizes
+
+Let me look at the code more carefully:
+
+```python
+IMG_SIZE = 160
+```
+
+This is used in `make_crop`:
+```python
+def make_crop(img, r, context, train):
+    ...
+    return np.asarray(Image.fromarray(canvas).resize((IMG_SIZE, IMG_SIZE), Image.BILINEAR), dtype=np.float32) / 255.0
+```
+
+And in `BoxDataset.__getitem__`:
+```python
+for ctx in (TIGHT_CONTEXT, CONTEXT):
+    x = make_crop(img, r, ctx, self.train)
+    ...
+```
+
+So I need to:
+1. Replace `IMG_SIZE = 160` with `IMG_SIZE_TIGHT = 160` and `IMG_SIZE_WIDE = 192`
+2. Add a `size` parameter to `make_crop`
+3. In `__getitem__`, pass the appropriate size for each view
+
+Let me write the changes:
+
+Change 1: Settings
+```
+IMG_SIZE = 160
+```
+→
+```
+IMG_SIZE_TIGHT = 160
+IMG_SIZE_WIDE = 192
+```
+
+Change 2: make_crop signature and body
+```
+def make_crop(img, r, context, train):
+```
+→
+```
+def make_crop(img, r, context, train, size):
+```
+
+And:
+```
+    return np.asarray(Image.fromarray(canvas).resize((IMG_SIZE, IMG_SIZE), Image.BILINEAR), dtype=np.float32) / 255.0
+```
+→
+```
+    return np.asarray(Image.fromarray(canvas).resize((size, size), Image.BILINEAR), dtype=np.float32) / 255.0
+```
+
+Change 3: In __getitem__, the loop:
+```
+        for ctx in (TIGHT_CONTEXT, CONTEXT):
+            x = make_crop(img, r, ctx, self.train)
+```
+→
+```
+        for ctx, sz in ((TIGHT_CONTEXT, IMG_SIZE_TIGHT), (CONTEXT, IMG_SIZE_WIDE)):
+            x = make_crop(img, r, ctx, self.train, sz)
+```
+
+Let me verify this is correct. The dataset returns two views (tight and wide), each as a tensor. The training loop does:
+```python
+for xt, xw, y in dl_tr:
+    ...
+    loss = crit((model(xt) + model(xw)) / 2, y)
+```
+
+Since xt is 160x160 and xw is 192x192, the model will process them at different sizes. EfficientNet-B0 uses global average pooling so it handles variable input sizes fine. The logits will both be 4-dim, so averaging works.
+
+Similarly for eval:
+```python
+for xt, xw, _ in dl_ev:
+    ...
+    probs.append(torch.softmax(((model(xt) + model(xw)) / 2).float(), 1).cpu())
+```
+
+This should work fine.
+
+Let me also check: is there any issue with the batch? All samples in a batch have the same sizes (tight=160, wide=192), so the batch tensors will be (B, 3, 160, 160) and (B, 3, 192, 192). No issue.
+
+Now let me write the SEARCH/REPLACE blocks carefully, copying exact text from the file.
+
+Block 1: Settings
+SEARCH:
+```
+IMG_SIZE = 160
+```
+REPLACE:
+```
+IMG_SIZE_TIGHT = 160
+IMG_SIZE_WIDE = 192
+```
+
+Block 2: make_crop function signature
+SEARCH:
+```
+def make_crop(img, r, context, train):
+```
+REPLACE:
+```
+def make_crop(img, r, context, train, size):
+```
+
+Block 3: make_crop return
+SEARCH:
+```
+    return np.asarray(Image.fromarray(canvas).resize((IMG_SIZE, IMG_SIZE), Image.BILINEAR), dtype=np.float32) / 255.0
+```
+REPLACE:
+```
+    return np.asarray(Image.fromarray(canvas).resize((size, size), Image.BILINEAR), dtype=np.float32) / 255.0
+```
+
+Block 4: The loop in __getitem__
+SEARCH:
+```
+        for ctx in (TIGHT_CONTEXT, CONTEXT):
+            x = make_crop(img, r, ctx, self.train)
+```
+REPLACE:
+```
+        for ctx, sz in ((TIGHT_CONTEXT, IMG_SIZE_TIGHT), (CONTEXT, IMG_SIZE_WIDE)):
+            x = make_crop(img, r, ctx, self.train, sz)
+```
+
+Let me double-check each SEARCH appears exactly once in the file.
+
+1. `IMG_SIZE = 160` - appears once in settings. ✓
+2. `def make_crop(img, r, context, train):` - appears once. ✓
+3. `    return np.asarray(Image.fromarray(canvas).resize((IMG_SIZE, IMG_SIZE), Image.BILINEAR), dtype=np.float32) / 255.0` - appears once. ✓
+4. `        for ctx in (TIGHT_CONTEXT, CONTEXT):\n            x = make_crop(img, r, ctx, self.train)` - appears once. ✓
+
+Good. Let me finalize the hypothesis, noting the adjustment from 224 to 192.

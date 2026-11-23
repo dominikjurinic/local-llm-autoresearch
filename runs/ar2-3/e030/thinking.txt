@@ -1,0 +1,705 @@
+===== attempt 1 =====
+Let me analyze the situation carefully.
+
+Current best: e016, 5-seed val mAP@0.5 = 0.6337, seed std 0.0026
+Per-class: pore 0.524, deposit 0.626, discontinuity 0.779, stain 0.606
+
+Key observations from the experiment history:
+1. Training on detector boxes with background class (e002, e005, e015, e025) - all rejected
+2. Scoring changes (e004, e008, e014, e022, e023) - all rejected
+3. Architecture changes (e006, e017, e021, e028) - all rejected or timeout
+4. Augmentation (e007, e011, e026, e027) - none confirmed
+5. Data changes (e003, e009, e024) - none confirmed
+6. Loss changes (e010, e012) - none confirmed
+7. Sampling (e016 2x oversample worked, e018 3x oversample rejected)
+8. Inference TTA with flip (e013) - new best
+9. Optimisation (e019, e020, e029) - all rejected
+
+The current best uses:
+- EfficientNet-B0 pretrained
+- Two-crop input (1.5x tight + 2.5x wide)
+- 160x160 resolution
+- TTA with horizontal flip at inference
+- 2x oversampling of pore/stain
+- AdamW lr=1e-3, wd=0.05
+- ~3 epochs of training (387 steps)
+- Score = conf × p[c]
+
+What hasn't been tried yet?
+- Different batch sizes
+- Different learning rate schedules
+- Training for more epochs (but time budget is tight)
+- Using both high and low res crops (e003 rejected)
+- Different crop strategies
+- Multi-scale inference
+- Different TTA (vertical flip was already in training but not inference)
+- Ensembling different models
+- Using the detector confidence differently
+- Training with a different number of classes
+- Using a different backbone (all tried and rejected)
+- Different image sizes (128 rejected, 224 timeout)
+
+Let me think about what might work:
+
+1. The per-class APs show pore (0.524) and stain (0.606) are weak. Deposit is 0.626. Discontinuity is strong at 0.779.
+
+2. The training only does ~3 epochs (387 steps). The loss is still falling. More training might help, but e019 (reducing reserve to get more training) was rejected.
+
+3. One thing I notice: the current model trains with `drop_last=True` and uses `persistent_workers=True`. The batch size is 64.
+
+4. Let me think about what's different between the current approach and what might help:
+   - The model sees 9084 training boxes (6052 GT + 3032 oversampled weak)
+   - 387 steps × 64 batch = ~24,768 samples seen
+   - That's about 2.7 epochs worth of the 9084 boxes
+   - Wait, actually with drop_last=True and 9084/64 = 141.9, so 141 steps per epoch
+   - 387/141 ≈ 2.75 epochs
+
+5. What about using a larger batch size? This could help with training stability and allow more steps. But it might not help much.
+
+6. What about using a lower learning rate with more steps? The current LR schedule is 5% warmup then cosine. With only 387 steps, the warmup is only ~19 steps.
+
+7. What about training with both crops but using a different combination? Currently it's (model(xt) + model(xw)) / 2. What if we use the tight crop more heavily?
+
+8. What about using the wide crop for context but the tight crop for the main classification?
+
+9. Actually, let me think about what's been tried and what hasn't:
+   - The model is undertrained (loss still falling)
+   - More training time would help but e019 (reducing reserve) was rejected
+   - What about reducing the prediction time? Currently prediction takes ~42s of the 65s reserve
+   - What about reducing the number of eval images loaded?
+
+10. Actually, wait. Let me re-read e019: "cutting the reserve to 50s buys ~20% more training steps" - rejected with 0.6291. So more training didn't help.
+
+11. What about a different approach to the problem? The key insight from the background is:
+    - "When all types are merged into one class, the same detector reaches 0.77, so many errors are wrong types, not missed defects."
+    - The stage-1 boxes with perfect classes reach 0.758
+    - The current best is 0.6337
+
+12. The gap between 0.6337 and 0.758 is large. The classifier needs to be much better.
+
+13. What about using a different training strategy? For example:
+    - Training with a longer warmup
+    - Using a different optimizer
+    - Using gradient accumulation
+    - Using a different loss function
+
+14. Actually, I notice that e010 (label smoothing) and e012 (focal loss) were tried and rejected. But what about a simple approach: training for longer with a lower learning rate?
+
+15. Wait, let me reconsider. The model trains for ~3 epochs. What if we use a lower initial LR but train for more steps? The cosine schedule might be too aggressive.
+
+16. Actually, let me think about what specific change could help. The per-class APs are:
+    - pore 0.524 (weakest)
+    - stain 0.606
+    - deposit 0.626
+    - discontinuity 0.779
+
+17. Pore is the weakest. Pores are small holes in the weld. They might be hard to distinguish from background or from each other. The 2x oversampling helped (e016), but 3x oversampling hurt (e018).
+
+18. What about a different approach to handling the weak classes? Instead of oversampling, what about:
+    - Using a class-balanced sampler
+    - Using a different loss weighting
+    - Using a different augmentation for weak classes
+
+19. Actually, let me think about the inference side. Currently the model does TTA with horizontal flip. What about:
+    - Adding vertical flip TTA
+    - Adding 90° rotation TTA
+    - Multi-scale inference (resize the crop to different sizes)
+
+20. Wait, e027 tried adding rotation to training and it was rejected (0.6323). But that's different from test-time augmentation with rotation.
+
+21. Let me think about multi-scale inference. The current model uses 160x160. What if at inference time, we also evaluate at 128x128 and 192x192 and average? This could help with small pores (which might be better at higher resolution) and large stains (which might be better at lower resolution for more context).
+
+22. Actually, that's interesting. Multi-scale TTA at inference:
+    - Train at 160x160
+    - At inference, evaluate at 128, 160, 192 (or 128, 160, 224)
+    - Average the logits
+    - This costs more inference time but we have ~42s of prediction time and 65s reserve
+
+23. Let me calculate: 41879 eval boxes, 4 crops per box (tight+wide × original+flip) = 167,516 forward passes at 160x160. If we add 2 more scales, that's 3x the inference compute. 42s × 3 = 126s, which exceeds the 65s reserve. So we can't do 3 scales.
+
+24. What about just 2 scales? 160 and 224? That would be 2x the inference compute: 42s × 2 = 84s, still too much.
+
+25. What about 160 and 128? That's 2x: 84s, still too much.
+
+26. Hmm, the inference time is a constraint. Let me think of something else.
+
+27. What about reducing the TTA? Currently we do 4 forward passes per box (tight+wide × original+flip). What if we just do 2 (tight+wide, no flip)? That would halve the inference time, giving us more training time. But e013 (adding flip TTA) was the change that made e016 the best, so removing it would be a step back.
+
+28. Actually, wait. Let me re-read the code. The inference does:
+    ```
+    logits = (model(xt) + model(xt.flip(3)) + model(xw) + model(xw.flip(3))) / 4
+    ```
+    That's 4 forward passes per box. For 41879 boxes, that's 167,516 forward passes.
+
+29. What if we use a different TTA strategy? For example, only flip the tight crop (which is more important for classification) and not the wide crop? That would be 3 forward passes instead of 4.
+
+30. Or what about: only use the tight crop with flip (2 forward passes) and drop the wide crop? The wide crop provides context but might not be as important.
+
+31. Actually, let me think about this differently. The key bottleneck is that the model is undertrained. With only 387 steps, the model hasn't converged. What if we can get more training steps?
+
+32. The training time is about 157s - 42s = 115s for training. With 387 steps, that's about 0.3s per step. To get 500 steps, we'd need about 150s, which is too much.
+
+33. What about reducing the batch size? With batch_size=32 instead of 64, we'd get 2x the steps (774 steps) but each step would be faster. Actually, the time per step might not halve because of fixed overhead.
+
+34. Hmm, let me think about a completely different angle. What about the scoring?
+
+35. The current score is conf × p[c]. What if we use a different scoring that better handles the ranking? For example:
+    - score = conf × p[c] × (1 - p_bg) where p_bg is the probability of background
+    - But we don't have a background class...
+
+36. What about using the max probability as a confidence multiplier? score = conf × p[c] × max(p). This was tried in e008 and rejected (0.6265).
+
+37. What about score = conf × p[c] / (1 + sum of other p's)? Or some other normalization?
+
+38. Actually, let me think about what makes mAP@0.5 work. For each class, we need:
+    - True positives: boxes that overlap a GT box of that class, predicted as that class
+    - False positives: boxes that don't overlap a GT box of that class, predicted as that class
+    - The ranking matters: TPs should score higher than FPs
+
+39. The key issue is that the detector produces many false alarms (background boxes). The classifier assigns non-trivial probabilities to all 4 classes for these boxes. The scoring needs to suppress these.
+
+40. What if we use a threshold on the max probability? If max(p) < threshold, we don't output any predictions for that box. This would suppress background boxes.
+
+41. But this is similar to what e008 tried (multiplying by max(p)). Let me think of something different.
+
+42. What about using the ratio p[c] / max(p) as a confidence? score = conf × p[c] / max(p). This would give score = conf for the top class and lower scores for other classes. But this is similar to e023 which was rejected.
+
+43. OK, let me think about training strategies that haven't been tried:
+    - Gradient accumulation (train with smaller effective batch but accumulate gradients)
+    - Different warmup schedule
+    - Training with a lower LR for longer
+    - Using a different data augmentation strategy
+
+44. Actually, what about using a lower learning rate? The current LR is 1e-3 with AdamW. What if we use 5e-4 or 3e-4? This might allow more stable training and better convergence.
+
+45. But with only 387 steps, a lower LR might mean the model doesn't train enough. The loss is still falling at the end.
+
+46. What about a different approach: train with a higher LR for a short warmup, then drop to a lower LR? This is similar to what the current cosine schedule does, but the warmup is only 5% (about 19 steps).
+
+47. Let me think about what specific change could give a meaningful improvement:
+
+Option A: Reduce inference TTA from 4 to 2 forward passes (drop flip), saving ~21s for more training
+- Risk: e013 showed flip TTA helps, so removing it would hurt
+- But we'd get ~2x more training steps, which might help more
+
+Option B: Use a lower LR (5e-4) with the same schedule
+- Might help with stability but might not train enough in 387 steps
+
+Option C: Use batch_size=32 for 2x more steps
+- More steps but each step sees fewer samples
+- Might help with convergence
+
+Option D: Use a different augmentation strategy
+- Most augmentations have been tried and rejected
+
+Option E: Train with both high and low res crops
+- e003 rejected this
+
+Option F: Use a different crop strategy
+- e009 (wider context) was not confirmed
+
+Option G: Use a different backbone
+- All tried and rejected
+
+Option H: Multi-scale inference
+- Too expensive
+
+Option I: Use a different scoring function
+- Most tried and rejected
+
+Option J: Use gradient accumulation
+- Train with batch_size=16 but accumulate 4 batches (effective batch 64)
+- This gives 4x more steps with the same effective batch size
+- Each step is 4x faster but we do 4x more steps
+- Net effect: same number of samples seen, but 4x more optimizer steps
+- This might help with convergence
+
+Actually, wait. Gradient accumulation doesn't change the number of samples seen, but it does change the number of optimizer steps. With batch_size=16 and accumulation=4, we'd do 4x more optimizer steps but see the same number of samples per "epoch". The effective batch size is the same (64).
+
+But the time per optimizer step would be 4x the time per micro-batch. So the total time would be the same. We wouldn't get more steps in the same time.
+
+Unless... the overhead per step is significant. With batch_size=64, each step takes about 0.3s. With batch_size=16, each micro-batch might take 0.1s, and 4 micro-batches + 1 optimizer step might take 0.4s. So we'd actually be slower.
+
+OK, gradient accumulation probably won't help.
+
+Let me think about this differently. What's the most impactful change we can make?
+
+The per-class APs are:
+- pore 0.524
+- stain 0.606
+- deposit 0.626
+- discontinuity 0.779
+
+The overall mAP is 0.6337. The ceiling is 0.758.
+
+The biggest gap is for pore (0.524 vs 0.758 ceiling). Pores are small holes. They might be hard to detect and classify.
+
+What if we use a different crop strategy specifically for pores? For example, a tighter crop (1.2x instead of 1.5x) to focus more on the pore itself?
+
+But we can't have different crops per class in the current architecture...
+
+Actually, we could. The dataset could use different context factors based on the class. But this would complicate the code.
+
+Let me think about something simpler.
+
+What about using a different image size for training vs inference? Train at 128 (faster, more steps) but infer at 160 (better quality)?
+
+Wait, e029 tried training at 128 and it was rejected (0.6177). But that was training AND inference at 128. What about training at 128 but inferring at 160?
+
+Actually, that might not work well because the model would be trained on 128x128 images and then see 160x160 images at inference. The features might not transfer well.
+
+What about training at 160 but using a different augmentation? Let me think...
+
+Actually, I just realized something. The current model uses `drop_last=True`. This means the last incomplete batch is dropped. With 9084 samples and batch_size=64, that's 141 complete batches (9024 samples) and 60 samples dropped. Not a big deal.
+
+Let me think about what's been tried and what the most promising untried idea is.
+
+Looking at the history:
+- e013 (TTA with flip) was the key improvement
+- e016 (2x oversampling of weak classes) was the next improvement
+- Everything else has been rejected or not confirmed
+
+The most promising untried ideas:
+1. Different LR (lower, e.g., 5e-4)
+2. Different batch size
+3. Different warmup schedule
+4. Training with a different number of epochs (but time constrained)
+5. Different TTA strategy
+6. Different scoring
+
+Actually, let me reconsider the scoring. The current score is conf × p[c]. What if we use:
+- score = conf × p[c] × (p[c] / max(p))^α for some α?
+- This would suppress non-top-class predictions more aggressively
+
+But e023 tried p[c]²/max(p) and it was rejected.
+
+What about score = conf × p[c] / (1 + λ × (1 - max(p)))? This would penalize predictions where the model is uncertain.
+
+Actually, let me think about this more carefully. The issue is that background boxes get non-trivial probabilities. The max(p) for a background box might be 0.3-0.5, while for a true defect it might be 0.7-0.9.
+
+What if we use score = conf × p[c] × max(p)^β for some β > 1? This would suppress background boxes more.
+
+But e008 tried conf × p[c] × max(p) (β=1) and it was rejected.
+
+What about β=2? score = conf × p[c] × max(p)²?
+
+This is similar to e004 (p²) but different. e004 used conf × p[c]², which squares the class probability. Here we'd square the max probability, which is different.
+
+Actually, let me think about what's most likely to help.
+
+The key insight is that the model is undertrained. With only 387 steps, the loss is still falling. If we could get more training, the model would be better.
+
+But e019 (reducing reserve for more training) was rejected. So more training alone doesn't help.
+
+What about a different training strategy that converges faster? For example:
+- Using a higher LR with a longer warmup
+- Using a different optimizer
+- Using a different loss function
+
+Actually, e020 tried SGD and it was rejected. e012 tried focal loss and it was rejected. e010 tried label smoothing and it was rejected.
+
+What about using a different warmup schedule? The current warmup is 5% of the total steps. What if we use 20% warmup? This might help with training stability.
+
+Or what about using a constant LR with no cosine decay? The model might benefit from a constant LR for the short training period.
+
+Actually, let me think about this from a different angle. The model trains for 387 steps. The loss goes from 0.62 to 0.31 to 0.24. It's still falling. What if we use a lower LR to get a more stable training?
+
+Let me try: LR = 5e-4 instead of 1e-3. This might give a more stable training and better convergence.
+
+Actually, wait. With a lower LR, the loss might not fall as much in 387 steps. The current loss at the end is 0.24. With LR=5e-4, it might be 0.30 or so. That's worse.
+
+What about a higher LR? LR = 2e-3? This might train faster but might be unstable.
+
+Hmm, let me think about something else.
+
+What about using a different data loading strategy? Currently, the dataset loads images into memory and then crops them. What if we pre-compute the crops and save them to disk? This would speed up data loading and allow more training steps.
+
+But this would require a different approach to the code. And the images are already loaded into memory, so the bottleneck is the crop computation, not the image loading.
+
+Actually, the crop computation involves:
+1. Computing the crop coordinates
+2. Extracting the crop from the image
+3. Resizing to 160x160
+4. Normalizing
+
+This is done for every sample in every epoch. With 9084 samples and 3 epochs, that's 27,252 crop computations. Each crop involves a resize operation, which is relatively expensive.
+
+What if we pre-compute the crops and save them as tensors? This would speed up training significantly.
+
+But this would require a different approach to the code. And it might use a lot of memory (9084 × 2 × 3 × 160 × 160 × 4 bytes = 9084 × 2 × 307200 bytes ≈ 5.6 GB). That might be too much.
+
+Actually, 9084 × 2 crops × 3 channels × 160 × 160 × 4 bytes = 9084 × 2 × 307200 = 5,593,881,600 bytes ≈ 5.6 GB. That's a lot but might be feasible.
+
+But this is a big change and might not be worth it.
+
+Let me think about something simpler.
+
+What about using a different augmentation? The current augmentation is:
+- Horizontal flip (50%)
+- Vertical flip (50%)
+- Brightness (0.8-1.2)
+- Center jitter (±10% of side)
+- Size jitter (0.85-1.2)
+
+What about adding color jitter (hue, saturation, contrast)? This might help with generalization.
+
+But e026 (random erasing) and e027 (rotation) were rejected. Color jitter might also be rejected.
+
+Let me think about what's most likely to give a meaningful improvement.
+
+Actually, I just realized something. The current model uses `persistent_workers=True` in the DataLoader. This means the workers persist between epochs. But with only 3 epochs, the benefit is limited.
+
+What about using `pin_memory=True`? It's already set. Good.
+
+What about using `num_workers=8`? It's already set to min(8, cpu_count). Good.
+
+Let me think about the model architecture. The current model is EfficientNet-B0 with 4 output classes. The two crops are passed through the same model and the logits are averaged.
+
+What about using a different combination? For example:
+- Use the tight crop for the main classification
+- Use the wide crop for context
+- Combine them differently (e.g., concatenate features before the classifier)
+
+But this would require a different model architecture and would be a big change.
+
+What about using a different number of output classes? For example, 5 classes (4 defects + 1 background)?
+
+e025 tried this and it was rejected (0.6233).
+
+OK, let me think about what's the most promising untried idea.
+
+Actually, I just thought of something. The current model trains on GT crops (from crops.csv). But the detector boxes (from dets.csv train) are slightly misplaced. What if we train on the detector boxes but use the GT class labels?
+
+Wait, e005 and e015 tried this and were rejected.
+
+What about training on a mix of GT crops and detector boxes? e015 tried adding detector boxes to GT and it was rejected.
+
+Hmm. Let me think about something completely different.
+
+What about using a different approach to the problem? Instead of classifying each box independently, what if we use a global approach that considers all boxes in an image together?
+
+For example, we could use a model that takes all boxes in an image and predicts the class for each box, considering the context of other boxes. This would be a set-based model.
+
+But this would be a big change and might not fit in the time budget.
+
+What about a simpler approach: for each image, compute the class distribution of the boxes and use it to adjust the scores? For example, if an image has many boxes predicted as "pore", we might be more confident in those predictions.
+
+But this is a post-hoc adjustment and might not help much.
+
+Let me go back to basics. The most impactful changes so far have been:
+1. TTA with flip (e013)
+2. 2x oversampling of weak classes (e016)
+
+What's the next most impactful change?
+
+I think the key issue is that the model is undertrained. With only 387 steps, the model hasn't converged. But e019 (more training time) was rejected.
+
+Wait, let me re-read e019: "cutting the reserve to 50s buys ~20% more training steps". The score was 0.6291, which is lower than 0.6337. So more training didn't help.
+
+This is interesting. It suggests that the model is not undertrained in the sense that more data doesn't help. Maybe the model is overfitting? Or maybe the training is not efficient.
+
+What if the issue is that the model is not learning the right features? Maybe the architecture is not suitable for this task.
+
+But all architecture changes have been rejected.
+
+Let me think about the data. The training data consists of 6052 GT crops (high-res) + 3032 oversampled weak crops = 9084 total. The eval data has 41879 detections.
+
+The ratio of training to eval is very low (9084 vs 41879). The model sees 9084 training samples but needs to classify 41879 eval samples. This is a lot of eval samples relative to training samples.
+
+What if we use the detector boxes from the training images (dets.csv train) as additional training data? e002, e005, e015, and e025 all tried variations of this and were rejected.
+
+But wait, e002 crashed, e005 was 0.6248, e015 was 0.6285, e025 was 0.6233. All lower than 0.6337.
+
+So adding detector boxes as training data doesn't help.
+
+What about using the detector confidence as a weight in the training loss? For example, weight the loss by the detector confidence so that high-confidence boxes (more likely to be true defects) get more weight.
+
+But the training data is GT crops, not detector boxes. The detector confidence is not available for GT crops.
+
+Hmm.
+
+Let me think about the inference side again. The current inference does 4 forward passes per box (tight+wide × original+flip). What if we do a different TTA?
+
+For example:
+- Tight crop: original + flip (2 passes)
+- Wide crop: original only (1 pass)
+- Total: 3 passes
+
+This would save 25% of the inference time, giving us more training time.
+
+But e013 showed that flip TTA helps. Removing the flip on the wide crop might hurt.
+
+What about:
+- Tight crop: original + flip (2 passes)
+- Wide crop: flip only (1 pass)
+- Total: 3 passes
+
+This is asymmetric and might not help.
+
+What about:
+- Tight crop: original + flip (2 passes)
+- Wide crop: original + flip (2 passes)
+- Total: 4 passes (current)
+
+OK, let me think about a completely different idea.
+
+What about using a two-pass inference? First, classify all boxes with the current model. Then, for boxes where the top-2 classes are close (e.g., within 0.1), do a second pass with a different crop strategy (e.g., tighter crop) to break the tie.
+
+This would be complex and might not fit in the time budget.
+
+Let me think about something simpler.
+
+What about using a different normalization? The current normalization uses ImageNet mean/std. What if we use the dataset-specific mean/std?
+
+This is a small change that might help. Let me calculate the mean/std of the training crops and use them for normalization.
+
+But this would require computing the mean/std first, which takes time. And the change might be small.
+
+Actually, let me think about what's the most likely to give a meaningful improvement.
+
+I think the most promising idea is to try a different learning rate. The current LR is 1e-3 with AdamW. What if we try 5e-4?
+
+With a lower LR, the training might be more stable and the model might converge to a better solution. The loss might not fall as fast, but the final loss might be lower.
+
+Let me try LR = 5e-4.
+
+Actually, wait. With only 387 steps, a lower LR might mean the model doesn't train enough. The current loss at the end is 0.24. With LR=5e-4, it might be 0.30 or so. That's worse.
+
+What about LR = 2e-3? This might train faster but might be unstable.
+
+Hmm, I'm not sure. Let me think about something else.
+
+Actually, I just realized that the current model uses a cosine LR schedule with 5% warmup. The warmup is about 19 steps (5% of 387). After that, the LR decays from 1e-3 to 1e-3 × 1e-3 (the minimum).
+
+Wait, the minimum LR is `LR * max(f, 1e-3)` where f is the cosine value. At the end of training, f ≈ 0, so the minimum LR is 1e-3 × 1e-3 = 1e-6. That's very low.
+
+What if we use a higher minimum LR? For example, `LR * max(f, 0.1)` instead of `LR * max(f, 1e-3)`. This would keep the LR at 1e-4 at the end of training instead of 1e-6.
+
+This might help with convergence. The model would continue to learn at a reasonable rate even at the end of training.
+
+Let me try this: change the minimum LR from 1e-3 to 0.1 (as a fraction of the initial LR).
+
+Actually, looking at the code:
+```python
+f = frac / 0.05 if frac < 0.05 else 0.5 * (1 + math.cos(math.pi * (frac - 0.05) / 0.95))
+for pg in opt.param_groups:
+    pg["lr"] = LR * max(f, 1e-3)
+```
+
+The `max(f, 1e-3)` ensures the LR doesn't go below 1e-3 × LR = 1e-6. If I change it to `max(f, 0.1)`, the minimum LR would be 0.1 × LR = 1e-4.
+
+This is a small change that might help with convergence.
+
+Let me try this.
+
+Actually, wait. Let me reconsider. The cosine schedule goes from 1.0 (at the end of warmup) to 0.0 (at the end of training). The `max(f, 1e-3)` is just a safety net to prevent the LR from going to exactly 0. Changing it to `max(f, 0.1)` would mean the LR stays at 10% of the initial value for the last part of training.
+
+This might help, but it's a small change. Let me think about whether there's a bigger impact change.
+
+Actually, I think the most promising change is to try a different learning rate. Let me try LR = 5e-4 with the same schedule.
+
+With LR = 5e-4:
+- The model trains more slowly
+- The loss might not fall as much in 387 steps
+- But the model might be more stable and converge to a better solution
+
+Let me try this.
+
+Actually, I'm going back and forth. Let me just pick the most promising idea and go with it.
+
+I think the most promising idea is to change the minimum LR in the cosine schedule. Currently, the LR decays to nearly 0 (1e-6) at the end of training. This means the last few steps are essentially no-ops. If we keep the LR at a reasonable level (e.g., 10% of the initial), the model can continue to learn.
+
+Let me change `max(f, 1e-3)` to `max(f, 0.1)`.
+
+This is a small, focused change that's easy to test.
+
+Wait, but this is a very small change. The seed-to-seed noise is ±0.005 to 0.01. A small change might not be detectable.
+
+Let me think about a bigger change.
+
+What about using a different optimizer? e020 tried SGD and it was rejected. What about using a different Adam variant? For example, AdamW with a different beta1/beta2?
+
+The current optimizer is AdamW with default betas (0.9, 0.999). What if we use beta1=0.9, beta2=0.999 (same) but with a different weight decay?
+
+The current weight decay is 0.05. What if we use 0.01 or 0.1?
+
+A lower weight decay (0.01) might allow the model to fit the training data better. A higher weight decay (0.1) might regularize more.
+
+Let me try weight decay = 0.01.
+
+Actually, e020 tried SGD with WD=1e-4 and it was rejected. But that was a different optimizer.
+
+Let me try AdamW with WD=0.01 (instead of 0.05).
+
+This is a small change but might help with overfitting.
+
+Hmm, but the model is undertrained (loss still falling), so overfitting might not be the issue.
+
+OK, let me think about this from a completely different angle.
+
+The key insight from the background is: "When all types are merged into one class, the same detector reaches 0.77, so many errors are wrong types, not missed defects."
+
+This means the detector finds the boxes well, but the classifier assigns the wrong types. The classifier needs to be better at distinguishing between the 4 classes.
+
+The per-class APs are:
+- pore 0.524
+- stain 0.606
+- deposit 0.626
+- discontinuity 0.779
+
+The weak classes are pore and stain. Pore is small holes, stain is discoloration. Deposit is extra material. Discontinuity is a gap.
+
+What if we use a different crop strategy for the weak classes? For example:
+- For pore: use a tighter crop (1.2x) to focus on the hole
+- For stain: use a wider crop (3.0x) to see the discoloration in context
+
+But we can't have different crops per class in the current architecture. The model takes two crops (tight and wide) and averages the logits.
+
+What if we use 3 crops instead of 2? For example:
+- Tight crop (1.2x)
+- Medium crop (1.5x)
+- Wide crop (2.5x)
+
+This would give the model more information at different scales. But it would also increase the inference time by 50% (3 crops × 2 flips = 6 passes instead of 4).
+
+With 41879 eval boxes, 6 passes each = 251,274 forward passes. At the current rate (4 passes = 167,516 passes in ~42s), 6 passes would take ~63s. That's close to the 65s reserve.
+
+This is risky. Let me think of something else.
+
+Actually, what about using a different combination of the two crops? Currently, the logits are averaged: (model(xt) + model(xw)) / 2. What if we use a weighted average? For example, (2 × model(xt) + model(xw)) / 3, giving more weight to the tight crop.
+
+This is a small change that might help if the tight crop is more informative than the wide crop.
+
+Let me try this: change the logit combination from (xt + xw) / 2 to (2*xt + xw) / 3.
+
+Actually, this is a very small change. Let me think about something bigger.
+
+What about using a different model architecture? All architecture changes have been rejected, but what about a different combination of the same model?
+
+For example, what if we use two EfficientNet-B0 models: one for the tight crop and one for the wide crop, with separate classifiers? This would allow each crop to have its own feature extractor and classifier.
+
+But this would double the model size and training time. And it's a big change.
+
+OK, I'm going to go with a focused change. Let me think about what's most likely to help.
+
+I think the most promising change is to try a different learning rate. The current LR is 1e-3. Let me try 5e-4.
+
+With a lower LR:
+- The model trains more slowly
+- The loss might not fall as much in 387 steps
+- But the model might be more stable and converge to a better solution
+- The final loss might be lower
+
+Let me try LR = 5e-4.
+
+Actually, I just realized that with a lower LR, the model might not train enough. The current loss at the end is 0.24. With LR=5e-4, it might be 0.30 or so. That's worse.
+
+What about LR = 2e-3? This might train faster but might be unstable.
+
+Hmm, let me think about this differently.
+
+The current LR schedule is:
+- 5% warmup (about 19 steps): LR goes from 0 to 1e-3
+- 95% cosine decay: LR goes from 1e-3 to ~0
+
+What if we use a different schedule? For example:
+- 10% warmup (about 39 steps): LR goes from 0 to 1e-3
+- 90% cosine decay: LR goes from 1e-3 to 1e-4 (not 0)
+
+This would give a longer warmup and a higher minimum LR.
+
+Let me try this: change the warmup from 5% to 10% and the minimum LR from 1e-3 to 0.1 (as a fraction of the initial LR).
+
+This is a focused change to the LR schedule.
+
+Actually, let me just try one thing: change the minimum LR from `max(f, 1e-3)` to `max(f, 0.1)`. This keeps the LR at 10% of the initial value (1e-4) instead of 0.001% (1e-6) at the end of training.
+
+This is a small, focused change. Let me go with this.
+
+Wait, I want to be more careful. Let me re-read the code:
+
+```python
+frac = min(1.0, (time.time() - t_start) / budget)
+f = frac / 0.05 if frac < 0.05 else 0.5 * (1 + math.cos(math.pi * (frac - 0.05) / 0.95))
+for pg in opt.param_groups:
+    pg["lr"] = LR * max(f, 1e-3)
+```
+
+At the end of training (frac=1.0):
+- f = 0.5 * (1 + cos(pi * 0.95/0.95)) = 0.5 * (1 + cos(pi)) = 0.5 * (1 - 1) = 0
+- LR = 1e-3 * max(0, 1e-3) = 1e-3 * 1e-3 = 1e-6
+
+So the LR at the end is 1e-6, which is essentially 0. The last few steps are no-ops.
+
+If I change `max(f, 1e-3)` to `max(f, 0.1)`:
+- LR at end = 1e-3 * 0.1 = 1e-4
+
+This keeps the LR at 1e-4 at the end, which is 100x higher than before. The model can continue to learn at the end of training.
+
+This seems like a reasonable change. Let me go with this.
+
+Actually, I want to make sure this is a meaningful change. The cosine schedule goes from 1.0 to 0.0 over 95% of the training. The last 5% of the training (frac from 0.95 to 1.0) has f going from 0.5*(1+cos(0.95*pi/0.95)) to 0.5*(1+cos(pi)) = 0.
+
+Wait, let me recalculate. The cosine schedule is:
+f = 0.5 * (1 + cos(pi * (frac - 0.05) / 0.95))
+
+At frac = 0.05: f = 0.5 * (1 + cos(0)) = 0.5 * 2 = 1.0
+At frac = 0.5: f = 0.5 * (1 + cos(pi * 0.45/0.95)) = 0.5 * (1 + cos(0.474)) = 0.5 * (1 + 0.887) = 0.944
+At frac = 0.95: f = 0.5 * (1 + cos(pi * 0.9/0.95)) = 0.5 * (1 + cos(2.967)) = 0.5 * (1 - 0.985) = 0.0075
+At frac = 1.0: f = 0.5 * (1 + cos(pi * 0.95/0.95)) = 0.5 * (1 + cos(pi)) = 0.5 * 0 = 0
+
+So the LR drops to near 0 only in the very last few steps. The `max(f, 1e-3)` only kicks in when f < 1e-3, which is in the last tiny fraction of training.
+
+So changing `max(f, 1e-3)` to `max(f, 0.1)` would only affect the last few steps where f < 0.1. Let me find when f = 0.1:
+0.5 * (1 + cos(pi * (frac - 0.05) / 0.95)) = 0.1
+cos(pi * (frac - 0.05) / 0.95) = -0.8
+pi * (frac - 0.05) / 0.95 = arccos(-0.8) = 2.498
+frac - 0.05 = 2.498 * 0.95 / pi = 0.757
+frac = 0.807
+
+So for frac > 0.807 (the last ~20% of training), f < 0.1. With the current `max(f, 1e-3)`, the LR is essentially f (since f > 1e-3 for most of this range). With `max(f, 0.1)`, the LR would be 0.1 * LR = 1e-4 for the last ~20% of training.
+
+This is a more significant change than I initially thought. The last 20% of training (about 77 steps) would have a constant LR of 1e-4 instead of decaying to 0.
+
+This might help with convergence. Let me go with this.
+
+Actually, I want to reconsider. The last 20% of training is about 77 steps. With a constant LR of 1e-4, the model would continue to learn at a reasonable rate. This might help the loss fall further.
+
+Let me make this change.
+
+The change is:
+```python
+pg["lr"] = LR * max(f, 1e-3)
+```
+to:
+```python
+pg["lr"] = LR * max(f, 0.1)
+```
+
+This is a focused change to the LR schedule. Let me go with this.
+
+Wait, but I should also consider: is this the best use of my next experiment? Let me think about alternatives.
+
+Alternative 1: Change the minimum LR (as above)
+Alternative 2: Try a different LR (e.g., 5e-4 or 2e-3)
+Alternative 3: Try a different weight decay
+Alternative 4: Try a different batch size
+Alternative 5: Try a different TTA strategy
+
+I think Alternative 1 is the most focused and testable. Let me go with it.
+
+Actually, let me reconsider one more time. The per-class APs show that pore (0.524) is the weakest. What if I focus on improving pore classification specifically?
+
+One idea: use a different crop context for pore. Pores are small holes, so a tighter crop might help. But we can't have different crops per class in the current architecture.
+
+Another idea: use a different augmentation for pore. For example, add more jitter to pore crops to make the model more robust to misplacement.
+
+But this would require a different dataset that applies different augmentations per class. This is a bigger change.
+
+Let me stick with the LR schedule change. It's focused and testable.
+
+Final decision: Change `max(f, 1e-3)` to `max(f, 0.1)` to keep the LR at 10% of the initial value for the last 20% of training, allowing the model to continue learning.
+
+Hypothesis: The cosine LR schedule decays to near-zero in the last 20% of training, making those steps essentially no-ops. Keeping the LR at 10% of the initial value (1e-4) for the last 20% allows the model to continue learning and converge to a better solution, improving per-class APs.
+
+Let me write the code change.

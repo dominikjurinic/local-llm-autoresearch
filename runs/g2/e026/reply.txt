@@ -1,0 +1,168 @@
+===== attempt 1 (719s) =====
+BASE: last
+CATEGORY: inference
+HYPOTHESIS: e025's precompute idea (build K jittered variants per training box once, serve them from a num_workers=0 loader so the per-step cost drops from ~0.39 s of crop/resize to a cheap flip/brightness on cached arrays) is sound but crashed only on `persistent_workers=True` with `num_workers=0`. I fix that crash AND cut the precompute cost: K=4→2 variants and only the tight+wide views (the 4x view is dropped from training; it helped pore marginally but its ~20 s of prediction cost is what pushes the run to 185 s). Fewer, cheaper precomputed crops (~18 s) plus faster steps should buy net training steps while the loss is still falling (0.242 at cut), improving the class decision that dominates the 0.1037 wrong-class gap. This differs from e010/e011 (which precomputed at the exact box, no variants, and were rejected) by caching multiple jittered variants per box and from e017 (which dropped the 4x view at inference only) by dropping it from training too.
+<<<<<<< SEARCH
+    g = torch.Generator().manual_seed(args.seed)
+    K = 4
+    t_pre = time.time()
+    variants = precompute_variants(crops, images, K)
+    print(f"precomputed {len(variants)} boxes x {K} variants ({time.time() - t_pre:.0f}s)", flush=True)
+    dl_tr = torch.utils.data.DataLoader(BoxDataset(variants, images, True), batch_size=BATCH_SIZE, shuffle=True,
+                                        num_workers=0, pin_memory=True, drop_last=True,
+                                        persistent_workers=True, generator=g)
+=======
+    g = torch.Generator().manual_seed(args.seed)
+    K = 2
+    t_pre = time.time()
+    variants = precompute_variants(crops, images, K)
+    print(f"precomputed {len(variants)} boxes x {K} variants ({time.time() - t_pre:.0f}s)", flush=True)
+    dl_tr = torch.utils.data.DataLoader(BoxDataset(variants, images, True), batch_size=BATCH_SIZE, shuffle=True,
+                                        num_workers=0, pin_memory=True, drop_last=True, generator=g)
+>>>>>>> REPLACE
+
+Wait, I need to also drop the 4x view from the precompute and from the dataset's training branch, and from the training/prediction forward passes, to actually save the prediction time. Let me reconsider — the hypothesis says drop 4x from training. But the prediction phase still uses 3 views (TIGHT, CONTEXT, WIDE2). To save prediction time I'd need to drop WIDE2 from prediction too. But that changes the model's inference. Let me keep the edit focused and safe.
+
+Actually, let me reconsider. The crash is the immediate blocker. The simplest, safest fix that respects "one idea" is just to fix the `persistent_workers` crash and reduce K to keep precompute cheap. Dropping the 4x view is a second change. Let me keep it focused: fix the crash + reduce K. The 4x view drop is risky (changes inference). Let me just fix the crash and set K=2 to bound precompute time.
+
+Let me re-examine: with K=4, precompute took 86s. With K=2 it'd be ~43s. Still a lot. The training budget after precompute: 180 - 14 (load) - 43 (precompute) - reserve. If reserve stays 55, training gets 180-14-43-55 = 68s. That's less than the current 111s. That's worse, not better!
+
+So precomputing is too expensive to be net-positive unless the per-step savings outweigh it. Let me reconsider whether precompute even helps.
+
+The per-step cost is ~0.39s (crop work) out of the step. If precompute removes crop work, each step drops from ~0.39s to maybe ~0.15s (flip/brightness + forward). So steps/sec goes from ~2.6 to ~6.7. Current training: 111s → 285 steps. With precompute (43s) + faster steps: training window = 180-14-43-55 = 68s × 6.7 = ~455 steps. That's more steps than 285! So it could help.
+
+But 43s precompute is a big chunk. And the run would be at 14+43+68+55 = 180s exactly. Too tight.
+
+This is too risky. The precompute direction has crashed/timed out 5 times. Let me not keep hammering it.
+
+Let me reconsider the whole thing. The safest high-value move given the time edge:
+
+The current best is at 185s (over nominal 180). I should make the run SAFER and buy training time. The cleanest way: reduce the prediction cost. The prediction does 3 forward passes per box. 
+
+Actually, the simplest safe improvement: **drop the 4x view at inference** (e017's idea, which timed out because the dataset still computed it). If I properly drop the 4x view from BOTH the dataset's eval branch AND the prediction forward pass, prediction drops from 3 passes to 2 passes (~40s instead of 60s). Then I reduce RESERVE_S from 55 to ~40 and train ~15s longer. Net: safer + more training.
+
+But e017/e018/e019 all tried this and failed (timeout, crash, rejected). e019 scored 0.6176 (rejected) — that's when it actually ran with 2 views at inference. So dropping the 4x view at inference HURT (0.6176 < 0.6363). So that's not good.
+
+OK so the 4x view at inference matters. Can't drop it.
+
+Let me think about this differently. What single change is most likely to give a broad, confirmed gain?
+
+Given the exhaustion of most families and the time edge, let me reconsider the "buy training steps" via a SAFE method: **reduce the reserve to match actual prediction time, but only after confirming prediction is fast enough.** e006 tried reserve 55→45 and was rejected (0.6253). Hmm, that hurt. Why? Because with reserve 45, training got 10s more but... actually e006 was based on e000 (2 views), not e012 (3 views). The 3-view prediction is slower (~60s) than 2-view (~40s). So for e012, the reserve of 55 is actually too SMALL (prediction takes 60s > 55s reserve). That's why the run overshoots to 185s!
+
+So for e012, RESERVE_S=55 is insufficient — prediction takes ~60s. The run is already over budget. If I INCREASE the reserve to ~65, training gets less (bad) but the run becomes safe. If I keep 55, the run is at 185s (risky).
+
+Wait, this means the current best is actually running over its nominal budget. That's a latent bug/risk. The 5-seed confirmation passed, so maybe the budget is actually a bit higher than 180, or there's variance.
+
+Given all this uncertainty, the safest experiment is one that REDUCES total time so there's margin, while ideally training a bit more.
+
+Hmm, let me reconsider. Actually, maybe I'm overanalyzing the 185s. The harness confirmed e012 with 5 seeds, so it completes within budget. The "185s" is just the seed-0 measurement; other seeds might be faster. The budget is probably ~190s or the harness tolerates it. I'll assume I have a small margin but should not add work.
+
+Let me pick a compute-neutral change that targets the class decision and is low-risk.
+
+Given the confusion matrix (stain/deposit/pore), and that all the "add data / add views / change backbone / change resolution" families are exhausted, what's left?
+
+**Idea: improve the multi-view combination.** e013 (learned weighted logit combination) was rejected (0.6326). e024 (9-channel single pass) not confirmed (0.6355). e004/e007/e021-023 (shared backbone concat) crashed or not confirmed.
+
+**Idea: a training-schedule / optimisation change.** e009 (split LR) rejected (0.5854, bad). 
+
+**Idea: label smoothing or focal loss.** Focal loss "no gain" (0.610, 0.619). Label smoothing not tried but the brief warns it may hurt ranking.
+
+Hmm, most things are tried.
+
+Let me reconsider the ONE thing that's both untried and targets the core problem: **the model is trained on perfect boxes; the test boxes are detector boxes. The mismatch is real. The jitter-simulation (e003, e005) failed, and adding detector boxes (e002, e020) failed/marginal.** 
+
+But what about a HYBRID that's fundamentally different: **train the classifier with a "box-quality-aware" objective by mixing clean and jittered boxes in the SAME batch with the jittered ones down-weighted**, so the model anchors on clean boxes (preserving clean performance) while still seeing imperfect ones. This differs from e003/e005 (which replaced all jitter with detector-error simulation, losing clean boxes) and from e002/e020 (which added detector boxes as separate rows).
+
+Actually, this is essentially "augmentation with a mix," which is close to the "training augmentation" family (no gain). Risky.
+
+Let me step back and make a decision based on risk and the guide.
+
+The guide's plan, step by step:
+1. Consolidate (detector boxes) — FAILED twice tonight (e002, e020). DROP.
+2. Box-quality gap:
+   - Simulate detector errors — FAILED (e003, e005). DROP.
+   - Weight/sample by box quality — needs imperfect boxes; the only source is detector boxes (failed) or jitter (failed). Hard.
+   - Combine views better — tried many times (e004, e007, e013, e021-024), mostly crashed/not confirmed. Mostly exhausted.
+3. Buy training steps — precompute keeps crashing (5 times). The reserve is actually too small for 3-view prediction.
+4. Fine-grained classes — not started.
+5. Last 1.5h: no big swings.
+
+Given that 1, 2a, and 3(precompute) are exhausted/failing, and 2c is mostly exhausted, the least-explored is 4 (fine-grained) and 3 (buy steps via reserve fix).
+
+For step 3, the cleanest safe move: **the reserve (55s) is smaller than the actual 3-view prediction time (~60s), so the run overshoots. I should measure prediction more carefully and set the reserve to match, BUT that reduces training.** That's a wash.
+
+Alternatively, **buy steps by making the forward pass cheaper without losing accuracy**: the 9-channel single-pass (e024) is 3x cheaper per step and per prediction. Even though e024 scored 0.6355 (not confirmed), that was with the SAME wall-clock training as e012. If I adopt e024's architecture AND reduce the reserve (because its prediction is ~20s not 60s), I get BOTH more training steps AND a safe margin. The 3x faster prediction means reserve can drop to ~30s, giving ~25s more training, and the 3x faster steps mean those 25s yield ~75 more steps. Combined with e024's already-3x step rate, total steps roughly double vs e012. That's a lot more training for a fine-grained task where the loss was still falling.
+
+This is a coherent, compute-SAFE experiment that targets the under-training (loss still falling at cut). It's different from e024 (which kept the 55s reserve and 3-view prediction) because it exploits e024's speed to train longer and be safe.
+
+But it's a big swing (architecture + reserve). The guide says last 1.5h no big swings, but we're early (25 experiments in, ~5h run). Actually 25 experiments in a ~30-experiment night means we're near the end. Hmm, "about 30 experiments" and we're at 25. So we're in the "last 1.5 hours: no big swings" zone. A big architecture change is risky.
+
+Given we're near the end, I should pick a LOW-RISK, compute-SAFE change. 
+
+The lowest-risk change that could help: **fix the reserve to be safe AND buy a little training.** But e006 (reserve change) was rejected.
+
+Actually, let me reconsider the simplest safe win: the current run is at 185s (over nominal). The MOST important thing is to not time out. But it's the confirmed best, so it's fine.
+
+Let me reconsider: what's the single most-likely-to-help, low-risk change?
+
+I think the answer is: **the 9-channel single-pass architecture (e024) with a reduced reserve to exploit its speed.** Even though it's "not confirmed" at 0.6355, the reason it's not confirmed is it's within noise of 0.6363. But with more training (from the speed), it could clear the bar. And it's compute-safe (faster prediction = bigger margin).
+
+Actually, I realize I'm going back and forth. Let me make a firm decision.
+
+Decision: The precompute direction (e025, BASE: last) has crashed 5 times in its family and the precompute cost (86s for K=4) makes it net-negative on time. I should NOT keep fixing e025. Instead, I'll go back to BASE: best (e012) and make a compute-SAFE change that buys training steps via the faster 9-channel single-pass architecture, which also makes prediction 3x faster (fixing the 185s overshoot) and lets me reduce the reserve to train longer. This targets the under-training (loss 0.242 still falling) which affects all classes.
+
+But wait — is the 9-channel single-pass a "big swing"? It's an architecture change. We're at experiment 25 of ~30. The guide says no big swings in the last 1.5h. But an architecture change that's compute-SAFE and targets under-training is reasonable if it's low crash-risk. The 9-channel stem re-init is the crash risk (e024 ran fine, so it's not crash-prone).
+
+Hmm, but e024 already ran and was "not confirmed" (0.6355). Re-running the same architecture with a different reserve is a small delta on top of a not-confirmed result. The harness might not accept it if it's within noise.
+
+Let me reconsider once more. What if I just do the cleanest thing: **fix e025's crash (the persistent_workers bug) with K=2, and ALSO drop the 4x view from the precompute AND from prediction to save time.** No — too many changes, and dropping 4x at inference hurt (e019).
+
+OK. Final decision. I'll go with BASE: best (e012) and the 9-channel single-pass architecture with a reduced reserve. This is compute-safe (faster steps + faster prediction), targets under-training (the loss is still falling, which hurts all 4 classes), and fixes the 185s overshoot. It's different from e024 (same wall-clock, 55s reserve, 3-view prediction) because it exploits the 3x speed to train longer and be safe.
+
+Wait, but I should double check: does the 9-channel single-pass actually make PREDICTION 3x faster? Prediction does model(xt)+model(xw)+model(xw2) = 3 passes. With 9-channel, it's 1 pass of 9 channels. A 9-channel EfficientNet-B0 forward is ~3x the cost of a 3-channel one (the stem conv is 3x, but the rest of the network operates on the same channel counts after the stem). So it's NOT 3x faster — it's only slightly faster (the stem is 3x but that's a small fraction). So prediction goes from ~60s to maybe ~50s, not 20s. And training steps go from ~2.6/s to maybe ~3.5/s, not 7.8/s.
+
+So the speedup is modest, not 3x. That undermines the "buy lots of steps" argument. e024's 0.6355 (slightly below e012) makes sense then: modest speedup, slightly weaker stem.
+
+So the 9-channel idea is roughly neutral. Not a clear win.
+
+Given all this, let me reconsider what's genuinely untried and likely to help.
+
+Actually, you know what, let me reconsider the reserve issue more carefully, because it's the one concrete inefficiency. The current best (e012) has RESERVE_S=55 but 3-view prediction takes ~60s. So the run overshoots to 185s. This means:
+- If the budget is exactly 180, the run is FAILING (killed), but it's the confirmed best, so the budget must be ≥185.
+- The training is being CUT SHORT: it stops at t_end = deadline - 55, but it actually needs deadline - 60 to be safe. So training is already using the "unsafe" 5s.
+
+If I INCREASE the reserve to 62 (safe), training loses 7s → fewer steps → worse. If I keep 55, it's at the edge.
+
+There's no free lunch in the reserve. The real fix is to make prediction faster so the reserve can shrink.
+
+How to make prediction faster safely? 
+- Reduce eval batch work: prediction uses batch_size=256, num_workers=8. The crop work is the bottleneck. 
+- **Precompute eval crops** — but that's the failing direction.
+
+Alternatively, **use a smaller IMG_SIZE at inference only** — but train/test mismatch, and resolution changes were "no gain."
+
+I think I'm overthinking. Let me just make the pragmatic choice: fix e025's crash with a bounded precompute (K=2, and to keep it net-positive, also drop the 4x view from the PRECOMPUTE and from the training forward, keeping it only... no, the 4x view at inference matters).
+
+Ugh. OK let me just go with the simplest crash fix on e025 and accept it might be net-neutral, OR pivot to best.
+
+Let me reconsider the expected value. e025 (precompute) if it works: precompute 43s (K=2), then faster steps. Training window = 180 - 14 - 43 - 55 = 68s. At ~6 steps/s (no crop work) = ~400 steps vs current 285. More steps, but the model sees only tight+wide+4x precomputed... wait, precompute does all 3 views (TIGHT, CONTEXT, WIDE2). So the model still sees 3 views. 400 steps > 285 steps. Could help. But 43s precompute is a lot, and the run is at 180s exactly (14+43+68+55). Too tight — any variance → timeout. And the precompute family has crashed 5 times.
+
+I'll make the call: **pivot to BASE: best and do a clean, low-risk, compute-SAFE experiment that buys training steps by reducing the prediction cost via a 2-view inference is out (hurt). So instead: reduce RESERVE to a value that's actually safe by first making prediction cheaper.**
+
+I keep circling. Let me just commit to the 9-channel single-pass + reduced reserve on BASE: best. Rationale: it's the cleanest compute-safe change, it's low crash-risk (e024 ran fine), it targets under-training (loss falling), and it makes prediction faster (bigger safety margin). Even if the speedup is modest, training longer with a safe margin is a reasonable bet, and it's a legitimate follow-up to e024 (which was "close but not confirmed" — the guide says follow-ups on close results are good).
+
+Actually, the guide explicitly says: "After a success, one or two follow-ups on it are good." e024 wasn't a success (not confirmed), but it was "close." And "close but not confirmed" architecture results: e004, e008, e024. 
+
+Let me make the experiment concrete and minimal:
+- Adopt 9-channel single-pass (like e024).
+- Reduce RESERVE_S from 55 to 40 (prediction is faster with 1 pass, ~50s... wait that's still > 40).
+
+Hmm, if prediction is ~50s with 9-channel, reserve must be ≥50 to be safe. So I can't reduce the reserve below 50. So no training gain from the reserve. The only gain is the faster steps (modest).
+
+So the 9-channel change gives: modestly more steps + slightly weaker stem. Net ~neutral (as e024 showed: 0.6355).
+
+This won't beat 0.6363 reliably. Not worth a run.
+
+Let me think about what's ACTUALLY left that could give +0.01.
+
+The class decision is the lever (0.1037). The confusion is fine-gr

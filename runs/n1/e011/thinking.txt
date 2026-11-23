@@ -1,0 +1,604 @@
+===== attempt 1 =====
+Let me analyze the situation carefully.
+
+Current best: e000 with 5-seed mean 0.6318 (std 0.0059)
+Best attempt so far: e010 with 5-seed 0.6493 (+0.0175 over e000) but NOT confirmed because it didn't hold on held-out validation images.
+
+Key observations from diagnostics:
+- Per-class AP: pore 0.478, deposit 0.649, discontinuity 0.789, stain 0.610
+- Confusion matrix shows pore is the weakest (60% correct), often confused with stain (12) and deposit (4)
+- Stain is confused with deposit (31) and pore (9)
+- Small defects: 77% correct, medium 89%, large 94%
+- Ceiling with perfect classes: 0.7530 (vs current 0.6318) - so 0.12 mAP lost to wrong classes
+- The reference numbers: one-step detector 0.638, perfect classes on stage-1 boxes 0.758, class-agnostic 0.755
+
+History shows:
+- Architecture ideas: 8 attempts, 0 new best, 5 close but not confirmed, 3 crashed - EXHAUSTED
+- Data ideas: 2 attempts, 0 new best, 2 close but not confirmed
+
+The e010 experiment added a 3rd wide view (4x) with 2-of-3 random sampling during training and averaging all 3 at inference. It showed +0.0175 on 5-seed but didn't hold on held-out images.
+
+The main issues seem to be:
+1. Pore class is very weak (0.478 AP)
+2. Stain/deposit confusion
+3. Small defect classification (77% vs 94% for large)
+
+The e010 tried to help pore with extra context but the gain didn't generalize.
+
+What hasn't been tried effectively:
+- The "detector boxes as training data" (e002, e009) showed some promise (0.6389, 0.6403) but not confirmed
+- Box metadata (size/aspect) had crashes but e008 got 0.6343
+- Test-time augmentation, ensembles, bigger models - all tried, no gain
+- Class-weighted loss, focal loss - hurt
+
+Let me think about what could work:
+1. The detector boxes as training data idea seems promising but needs to be done right. The domain shift between perfect crops and detector boxes is real.
+2. The pore class needs specific help - it's small and round, confused with stain/deposit
+3. The scoring mechanism: currently score = det_conf * class_prob. But AP only cares about ranking within each class. Maybe we can improve ranking.
+
+Wait, the diagnostics show: "mAP@0.5 if every box had its correct class but kept your scores: 0.7530 (yours: 0.6318). The difference is what wrong classes cost; the remaining gap to the perfect-classes ceiling in the brief is what your scores cost compared with the detector's conf."
+
+So 0.7530 - 0.6318 = 0.1212 mAP lost to wrong class assignments.
+The ceiling from brief: d2_boxes_perfect_classes_val_map50 = 0.758 (but that keeps false alarms as class 0 with detector conf)
+And d2_class_agnostic_val_map50 = 0.755 (single class 'defect')
+
+So the gap from current 0.6318 to 0.7530 is mostly classification errors on true positive boxes.
+The gap from 0.7530 to 0.755/0.758 is scoring/ranking of false alarms vs true detections.
+
+The e010 helped pore (the weakest class) but didn't generalize.
+
+What about improving the classifier's calibration/ranking ability? The current approach uses softmax probabilities multiplied by detector confidence. But AP only cares about ranking within each class.
+
+Maybe we should try:
+- Training on detector boxes (domain adaptation) - but e002 and e009 tried this with limited success
+- Better handling of the pore class specifically
+- Using the detector confidence as a prior or feature
+- Temperature scaling or better probability calibration
+
+Actually, looking at the confusion matrix again:
+- Pore: 25 correct, 4 deposit, 12 stain → pore confused with stain mostly
+- Stain: 288 correct, 31 deposit, 9 pore, 5 discontinuity → stain confused with deposit mostly
+- Deposit: 102 correct, 2 pore, 1 discontinuity, 27 stain → deposit confused with stain
+
+So pore↔stain and stain↔deposit are the main confusions.
+
+The pore class is small (60% correct). The stain class is larger but confused with deposit.
+
+What if we try a different approach: instead of adding more views, improve the quality of the existing views for the difficult classes?
+
+Or: the detector confidence might carry information about box quality. Boxes with high detector conf are more likely to be well-localized true defects. Boxes with low conf are more likely to be false alarms or poorly localized.
+
+Currently: score = det_conf * class_prob. This means a box with high det_conf but moderate class_prob can outrank a box with lower det_conf but higher class_prob. Since AP only cares about ranking within class, and det_conf is the same for all 4 classes of a given box, the relative ranking of boxes within a class is preserved if we just use class_prob (since det_conf is constant per box). Wait, no - det_conf varies per box, so it does affect ranking across boxes.
+
+Actually, for a given class c, the score for box i is det_conf_i * p_i(c). So boxes with higher det_conf get boosted. But det_conf is the detector's confidence that there's ANY defect, not class-specific. This might not be optimal.
+
+What if we use only class_prob for ranking within each class? Or use a different combination?
+
+But the metric says: "AP depends only on this ORDER. Any change that keeps the order of a class's predictions (for example multiplying all its scores by a constant, or a monotone function of the score) leaves its AP unchanged."
+
+So for each class, the ranking is by det_conf_i * p_i(c). Since det_conf_i varies per box, this is not just a constant multiplier per class.
+
+Maybe we should try: score = p_i(c) only (ignore det_conf for ranking), or score = det_conf_i^alpha * p_i(c), or use the detector conf as a feature for the classifier.
+
+Another idea: the classifier currently sees only the image crops. It doesn't know the detector's confidence or the box size/aspect. Adding box metadata (size, aspect, det_conf) as features to the classifier head could help.
+
+Earlier attempts at box metadata crashed (e007) or got 0.6343 (e008). But e008 only added log relative area + aspect ratio, not detector confidence.
+
+What about training the classifier on detector boxes from the training set? This matches the test distribution (detector boxes with localization errors). e002 and e009 tried this and got close but not confirmed (0.6389, 0.6403 vs 0.6318 baseline). The gain was ~0.007-0.008.
+
+But the acceptance threshold is strict: need gain > uncertainty. The seed std is ~0.0059, validation image noise ~0.0056, so total uncertainty ~0.008. A gain of 0.007-0.008 might not pass.
+
+We need something with larger effect.
+
+Let me think about the pore class specifically. It's small, round, and confused with stain. The wide view (4x) helped in e003 and e010 but didn't generalize.
+
+What if we use a different strategy for pore: crop at a fixed physical size instead of relative to box? Or use a higher resolution for small boxes?
+
+Or: use a specialist pore classifier? But that's complex.
+
+Another angle: the current model is EfficientNet-B0 at 160x160. The crops are resized to 160x160 regardless of original size. Small defects become tiny in the crop.
+
+What if we use a larger input resolution for the model? But that increases compute.
+
+Wait, the budget is 180 seconds. Current run takes 162s. e010 with 3 views would take more time (it crashed or timed out in earlier attempts? No, e010 ran and got 0.6435 seed-0).
+
+Actually e010 log isn't shown but it ran. The 2-of-3 sampling during training keeps training compute similar (2 views per step), but inference uses 3 views (50% more).
+
+What if we do the opposite: train on 3 views, test on 2? Or use a lighter model for the 3rd view?
+
+Actually, let me look at the most promising direction: **training on detector boxes** (domain adaptation). The fact that e002 and e009 both showed gains (though not confirmed) suggests it's a real effect. Maybe we need to do it better.
+
+How was it done in e002/e009? "Detector boxes from the train split as extra training data (IoU > 0.5 with a true box, labelled with its class)"
+
+But there are issues:
+- Detector boxes include false alarms (IoU < 0.5 with any true box)
+- Detector boxes have localization errors
+- The classifier sees different crop statistics
+
+What if we:
+1. Use detector boxes with IoU > 0.5 as positive samples (with the matched class)
+2. Use detector boxes with IoU < 0.3 as negative/background samples? But we don't have a background class.
+3. Or: train a 5th "background" class? But earlier attempts at background class failed (9 attempts, no gain).
+
+Wait, the scoring currently outputs 4 classes per box. What if we add a "no defect" class and use (1 - p_bg) * p_c? But that was tried and failed.
+
+Another idea: **calibrate the classifier probabilities per class**. The softmax probabilities might be miscalibrated, affecting the ranking when multiplied by det_conf.
+
+Or: **use the detector confidence as an input feature to the classifier**. The classifier could learn that high det_conf boxes are more likely to be certain classes.
+
+Let me check if detector confidence correlates with class. Probably not strongly, but it correlates with localization quality.
+
+What about **test-time augmentation**? Tried 8 times, no gain.
+
+**Ensembles**? Tried, no gain (or timeout).
+
+**Larger model**? Tried, no gain (fewer steps fit).
+
+**Box metadata** (size, aspect, det_conf)? Only properly tested once (e008: 0.6343), with just log-area and aspect.
+
+What if we add **detector confidence as a feature**? This is new.
+
+Hypothesis: The detector confidence indicates box quality (localization accuracy, likelihood of being a true defect). Feeding this to the classifier head lets it adjust predictions: for low-conf boxes, be more conservative; for high-conf, trust the visual features more. This could improve ranking of true vs false detections within each class.
+
+Implementation: Modify the model head to accept an extra scalar (det_conf) and concatenate before the final FC layer. Or use it to modulate the logits.
+
+But wait - at training time, we don't have detector conf for the crops.csv boxes (they're ground truth boxes, not detector boxes). We only have det_conf for dets.csv train split boxes.
+
+So we'd need to either:
+- Train on detector boxes (which have conf) - domain adaptation
+- Or simulate conf during training on gt boxes
+
+This connects back to training on detector boxes.
+
+Let me think of a cleaner experiment: **Train on a mix of ground-truth crops and detector boxes from training images, using detector confidence as an additional input feature.**
+
+But this is getting complex.
+
+Simpler: **Just train on detector boxes (with IoU>0.5 matching) without extra features.** This was e002/e009. They got ~0.007 gain but not confirmed. Maybe with a better implementation it could be larger.
+
+What was different in e002 vs e009? Both "data" category. e002: 0.6389, e009: 0.6403. Both not confirmed.
+
+The current best is 0.6318. So +0.007 to +0.008.
+
+The uncertainty: seed std 0.0059, validation noise 0.0056. Combined ~0.008. So need >0.008 to confirm. 0.007-0.008 is borderline.
+
+We need a bigger effect.
+
+What about **combining detector-box training with the wide view for pore**? e010 got +0.0175 but didn't hold on held-out. Maybe the wide view helps pore specifically on the validation set but not generally.
+
+Wait, the harness says: "It passed on the validation images you see, but did not hold on a separate set of held-out validation images that you never see, so it was not accepted. Gains that depend on the particular images you are scored on are not real improvements."
+
+So e010 overfit to the validation set.
+
+What generalizes? Training on detector boxes (domain adaptation) should generalize because it matches test distribution.
+
+But why didn't it confirm? Maybe the implementation had issues, or the gain is real but small.
+
+Let me think of a different approach: **Improve the scoring function**.
+
+Currently: score = det_conf * softmax_prob
+
+But softmax_prob is calibrated for classification on gt crops. On detector boxes, the distribution shifts.
+
+What if we use **temperature scaling** on the logits? Or **Platt scaling** per class? But we don't have a calibration set.
+
+We could use the detector boxes on training images as a calibration set: we have their true classes (via IoU matching). We can calibrate the classifier's outputs on detector boxes.
+
+But that's complex for one experiment.
+
+Another idea: **The classifier is trained with CrossEntropy on gt crops. But at test time, we rank by det_conf * p. The det_conf is the same for all 4 classes of a box. So for ranking within a class, it's equivalent to ranking by p * det_conf. But det_conf varies per box.**
+
+What if the classifier learns to output scores that are already calibrated for ranking with det_conf? Hard.
+
+Let me look at the confusion matrix again. The main errors:
+1. Pore → Stain (12), Pore → Deposit (4)
+2. Stain → Deposit (31), Stain → Pore (9)
+3. Deposit → Stain (27)
+
+Pore and Stain are confused. Stain and Deposit are confused.
+
+Pore is small, round. Stain is larger, irregular. Deposit is elongated.
+
+The wide view (4x) helps pore by showing context. But it didn't generalize.
+
+What if we **use a different crop strategy for small boxes**? For boxes smaller than a threshold, use a larger context multiplier.
+
+Or: **Use the box size to decide the context**. Small boxes get wider context.
+
+This is like the "resolution and small-box handling" family (9 attempts, no gain). But maybe not done right.
+
+The "MIN_CROP = 16" means crops are at least 16 pixels before resize. But the context multiplier is fixed.
+
+What if we make CONTEXT adaptive: for small boxes, use larger context?
+
+But earlier attempts at this failed.
+
+Let me think about **the scoring again**. The current score is det_conf * p_c. But p_c is softmax probability. For a given box, the 4 p_c sum to 1. So if the classifier is uncertain (uniform), all classes get ~0.25 * det_conf. If confident, one class gets ~1.0 * det_conf.
+
+But the detector conf is the confidence that there's ANY defect. A false alarm box might have moderate det_conf but the classifier should output low probabilities for all classes (if it recognizes it's not a defect). But the classifier is trained only on defect boxes (crops.csv has only defects). It never sees background/false-alarm crops!
+
+This is crucial: **The classifier is trained only on true defect crops. It has never seen false alarm detector boxes. So on false alarms, it will still output some class probabilities (probably uniform or biased).**
+
+Then score = det_conf * p_c. For a false alarm with det_conf=0.5, it gets 0.125 per class. A true defect with det_conf=0.5 and correct class p=0.9 gets 0.45. So true defects rank higher. But if a false alarm has high det_conf (0.9) and the classifier outputs p=0.3 for some class, score=0.27, which could beat a true defect with low det_conf (0.3) and p=0.8 (score=0.24).
+
+The classifier should ideally output low probabilities for all classes on false alarms. But it can't, because softmax forces sum=1.
+
+**Solution: Add a background class!** But earlier 9 attempts at background class failed.
+
+Why did they fail? "5th 'background' class from detector false alarms (scores times 1 - p_bg)" - no gain.
+
+Maybe the implementation was wrong. Or maybe the background class needs to be trained properly.
+
+What if we: collect detector boxes from training images with IoU < 0.3 with any gt box → label as background. Train a 5-class classifier (4 defects + background). At test time, score = det_conf * (1 - p_bg) * p_c / (1 - p_bg) = det_conf * p_c for c in defects? No.
+
+If we have 5 classes, softmax gives p_bg + sum(p_defects) = 1. Then for defect class c, we could use score = det_conf * p_c. But p_c is now conditioned on not being background? No, it's joint.
+
+Better: score = det_conf * p_c / (1 - p_bg) ? Or just det_conf * p_c.
+
+But the background class would absorb the false alarms, making p_defects lower for them.
+
+Wait, the earlier attempts: "5th 'background' class from detector false alarms (scores times 1 - p_bg)" - they multiplied by (1 - p_bg). That would downweight boxes with high p_bg.
+
+But they said "no gain: seed 0 from 0.518 to 0.629; 2 crashes, 1 bug (0.0)". The baseline was 0.63, so 0.629 is same, but one got 0.518 (bug).
+
+Maybe the issue is that the background class is trained on detector false alarms, which are different from eval false alarms? Or the classifier can't distinguish well.
+
+Another idea: **Don't use softmax. Use independent sigmoid per class (multi-label style).** Then a false alarm can have low probability for all 4 classes. Score = det_conf * sigmoid(logit_c). This allows "none of the above".
+
+But the classes are mutually exclusive (one defect per box). Sigmoid would allow multiple, but we can still take max or use all.
+
+Actually, the current output allows multiple rows per box (one per class). So multi-label style could work.
+
+But the training is single-label (each gt box has one class). We could train with BCE per class instead of CE. But for single-label, CE is usually better.
+
+Wait, the problem is that on false alarms, the classifier has no "background" option. So it picks one of the 4 classes arbitrarily.
+
+If we add a background class trained on detector false alarms (IoU < 0.3), then on false alarms it should predict background, and p_defects will be low.
+
+But earlier attempts failed. Let me think why.
+
+Possible reasons:
+1. The detector false alarms on training images don't represent eval false alarms (domain shift)
+2. The background class is too diverse (everything that's not a defect)
+3. The classifier overfits to the specific false alarms in training
+4. The scoring rule (times 1-p_bg) was wrong
+
+What if we try a simpler background approach: **Train on gt crops (4 classes) + detector false alarms (background), but at inference, don't use the background class for scoring. Instead, use the defect class probabilities directly, but they'll be lower for false alarms because the model learned a background class.**
+
+Actually, if we train 5-class softmax, the defect probabilities on false alarms should be lower because p_bg will be high. Then score = det_conf * p_c naturally downweights false alarms.
+
+But we need to be careful: the gt crops are all defects (p_bg=0). The detector false alarms are background (p_bg=1). The detector true positives (IoU>0.5) are defects with their class.
+
+So we can create a mixed training set:
+- GT crops: labels 0-3
+- Detector boxes with IoU>0.5: label matched class
+- Detector boxes with IoU<0.3: label 4 (background)
+
+Train 5-class classifier. At inference, use only classes 0-3, score = det_conf * p_c.
+
+This is different from earlier attempts because:
+- Earlier "detector boxes as training data" (e002, e009) only added IoU>0.5 boxes as extra data for the 4 classes. They didn't add background.
+- Earlier "background class" attempts added background but maybe without the IoU>0.5 boxes, or with wrong scoring.
+
+Let me check the history: "5th 'background' class from detector false alarms (scores times 1 - p_bg)" - 9 attempts, no gain.
+
+"Detector boxes from the train split as extra training data (IoU > 0.5 with a true box, labelled with its class)" - 6 attempts, accepted twice (+0.004), but not in this run (e002, e009 not confirmed).
+
+So combining both: add IoU>0.5 boxes as defect classes, add IoU<0.3 boxes as background class. Train 5-class. Inference on 4 classes.
+
+This could be a new idea not tried before.
+
+But it's complex. Let me see if there's a simpler high-impact idea.
+
+Another observation: The current model uses EfficientNet-B0. The per-class APs show discontinuity is very high (0.789), deposit 0.649, stain 0.610, pore 0.478.
+
+The pore class is the bottleneck. It's small. The wide view helped but didn't generalize.
+
+What if we **use a higher resolution for the tight crop**? Currently both crops resize to 160x160. The tight crop (1.5x) for a small pore might be tiny in the original image, then upscaled to 160x160, losing detail.
+
+What if we **don't resize the tight crop, but pad/crop to a fixed size**? Or use a larger IMG_SIZE for the tight crop?
+
+But that breaks the batching.
+
+What about **using a feature pyramid or multi-scale features**? Too complex.
+
+Let me think about **the scoring function again**. The harness says: "AP depends only on this ORDER. Any change that keeps the order of a class's predictions (for example multiplying all its scores by a constant, or a monotone function of the score) leaves its AP unchanged."
+
+So for each class, we can apply any monotone transformation to the scores without changing AP. The current score is det_conf * p_c. The ranking within class c is by det_conf_i * p_i(c).
+
+What if p_i(c) is poorly calibrated? Temperature scaling could help calibration but not ranking (since it's monotone per class? No, temperature scaling: softmax(logits/T) - this changes relative probabilities across classes for the same box, but for a fixed class c, p_c as a function of logit_c is monotone if other logits are fixed? Not necessarily, because softmax couples them.
+
+Actually, for a fixed box, the 4 logits are fixed. Temperature scaling changes p_c = exp(l_c/T) / sum(exp(l_k/T)). As T changes, the ranking of p_c across different boxes for the same class c can change! Because the denominator depends on all logits.
+
+Example: Box A: logits [10, 0, 0, 0] → p0 ≈ 1. Box B: logits [5, 5, 0, 0] → p0 = 0.5. At T=1, Box A > Box B for class 0. At T=10, Box A: p0 ≈ 0.25, Box B: p0 ≈ 0.25. Ranking changes!
+
+So temperature scaling CAN change ranking within a class. But we don't have a calibration set.
+
+However, we have detector boxes on training images with known classes (via IoU matching). We could use them to tune a temperature per class.
+
+But that's a post-processing step, not a training change.
+
+What about **learning a per-class scale factor for the scores**? Like score = det_conf * p_c * w_c. But w_c is constant per class, so it doesn't change ranking within class. Useless for AP.
+
+What about **score = det_conf^alpha * p_c**? Alpha > 1 emphasizes detector confidence more. This changes ranking within class because det_conf varies per box.
+
+We could tune alpha on the training detector boxes (with known classes). But again, post-processing.
+
+The experiment should be a training change.
+
+Let me go back to the **detector boxes as training data** idea. It's the only one that showed consistent (though small) gains across multiple runs. The fact that it was "accepted twice" in the 5-hour runs (with looser criteria) suggests it's real.
+
+In this run, e002 got 0.6389 (5-seed) vs 0.6318 baseline = +0.0071. e009 got 0.6403 = +0.0085. Both "not confirmed" because gain < uncertainty threshold.
+
+The uncertainty threshold: "A new best needed more than 0.0066 = 1 x the uncertainty of the gain (seeds ±0.0034, validation images ±0.0056)." Wait, for e010 it was 0.0066. For e002/e009, the 5-seed means are reported, so the seed uncertainty is reduced by sqrt(5) ≈ 2.2, so seed std ~0.0059/2.2 ≈ 0.0027. Validation noise ±0.0056. Combined ~0.0062. Gain of 0.007-0.008 > 0.0062, so it SHOULD have been confirmed? But it says "not confirmed".
+
+Wait, the harness says: "If it beats the current best mean, it is re-run with more seeds; only if the multi-seed mean beats the best by more than its uncertainty does it become the new best."
+
+And for e010: "A new best needed more than 0.0066 = 1 x the uncertainty of the gain (seeds ±0.0034, validation images ±0.0056)."
+
+Seeds ±0.0034 is the standard error of the mean gain? For 5 seeds, if seed std is 0.0059, SEM = 0.0059/sqrt(5) ≈ 0.0026. But they say ±0.0034. Validation images ±0.0056. Combined sqrt(0.0034^2 + 0.0056^2) ≈ 0.0065. So threshold ~0.0066.
+
+For e002: 5-seed mean 0.6389 vs best 0.6318, gain 0.0071. If the same uncertainty applies, 0.0071 > 0.0066, so it should be confirmed? But it says "not confirmed".
+
+Maybe the uncertainty is estimated per experiment. Or the "5-seed mean" for e002 is from a separate 5-seed run, and the comparison accounts for both having noise.
+
+Anyway, the detector-box training seems promising but the gain is small.
+
+How to amplify it? Combine with something else.
+
+What if we **train on detector boxes AND use the detector confidence as a feature**?
+
+Or: **Use the detector boxes to do a second stage of training (fine-tuning)**. First train on gt crops, then fine-tune on detector boxes (with IoU>0.5 labels). This is like domain adaptation.
+
+The current training already runs until time budget. We could split the budget: 70% on gt, 30% on detector boxes.
+
+But the detector boxes are fewer? Let's check: crops.csv has 6052 boxes (from log). Dets train split: not shown, but probably similar or more.
+
+Actually, the log says "train 6052 boxes, eval 41879 detections". So 6052 gt crops. Detector train boxes unknown.
+
+What if we **oversample the detector boxes** or **use a curriculum**?
+
+Another idea: **The classifier currently averages logits from two crops. What if we concatenate the features instead of averaging logits?** This gives the classifier more capacity to combine information. But it doubles the feature size before the final FC.
+
+The model is EfficientNet-B0, final features 1280-d. Two views → 2560-d → FC to 4 classes. More parameters, might overfit.
+
+But we could project each view to a lower dim first.
+
+Too complex for one experiment.
+
+Let me think of the **simplest highest-leverage change**.
+
+The pore class is the worst. The wide view (4x) helped pore in e003 and e010 but didn't generalize. Why? Maybe because at inference, the wide view includes too much background for non-pore defects, adding noise.
+
+What if we **use the wide view ONLY for small boxes** (likely pores)? At training and inference, for boxes with area below a threshold, use 3 views (tight, medium, wide); for larger boxes, use 2 views.
+
+This is adaptive computation. Could help pore without hurting other classes.
+
+But it adds complexity.
+
+What about **changing the context multipliers**? Currently 1.5x and 2.5x. Maybe 1.5x and 4x? Or 1.2x and 3x?
+
+The e003 used fixed 4x as third view and got accepted twice (+0.005). e010 used 4x with 2-of-3 sampling and got +0.0175 but didn't generalize.
+
+The difference: e003 used 3 views always (train and test), e010 used 2-of-3 at train, 3 at test.
+
+e003: "accepted twice (5-seed 0.6342 both, +0.005), gain almost entirely from the pore class; once rejected (0.633). Adds ~20 s per run, close to the time limit"
+
+So fixed 3 views gives +0.005 confirmed (in the 5-hour runs with looser criteria). In this run, e003 got 0.6447 seed-0, 0.6455 5-seed? Wait, the table says e003: seed-0 0.6447, 5-seed 0.6455, not confirmed. But the 5-hour runs said it was accepted twice.
+
+In this run, the acceptance criteria are stricter. e003's 5-seed 0.6455 vs best 0.6318 = +0.0137. That's larger than 0.0066. Why not confirmed?
+
+Wait, the table says "outcome: not confirmed" for e003. But the 5-hour runs said "accepted twice". Maybe the validation set is different, or the acceptance threshold is different.
+
+The current run uses "part of the validation images" so scores are "a little different from the numbers above; compare ideas with each other, not with those numbers."
+
+And the acceptance rule: "only if the multi-seed mean beats the best by more than its uncertainty does it become the new best."
+
+For e003, 5-seed mean 0.6455, best 0.6318, gain 0.0137. Uncertainty ~0.0066. 0.0137 > 0.0066, so it should be confirmed? But it says not confirmed.
+
+Unless the "5-seed mean" for e003 is not directly comparable because the best (e000) 5-seed is 0.6318 with std 0.0059, and e003 5-seed is 0.6455 with its own std. The uncertainty of the gain is sqrt(std_e000^2/5 + std_e003^2/5 + validation_noise^2)? No, the validation noise is shared if same images.
+
+Actually, the harness says for e010: "A new best needed more than 0.0066 = 1 x the uncertainty of the gain (seeds ±0.0034, validation images ±0.0056)." Seeds ±0.0034 is likely the standard error of the mean difference (assuming correlated seeds?).
+
+If e003 gain is 0.0137 and threshold is 0.0066, it should pass. But it didn't. Maybe the 5-seed mean for e003 is not 0.6455? Let me re-read.
+
+The table: "e003 | e000 | architecture | ... | 0.6447 | 0.6455 | not confirmed"
+
+And the current best is e000 with "5-seed val mAP@0.5 0.6318, seed std 0.0059".
+
+0.6455 - 0.6318 = 0.0137. That's > 0.0066. Why not confirmed?
+
+Unless the "5-seed mean" in the table is the mean of 5 seeds for that experiment, but the comparison uses a different calculation. Or the validation noise is larger.
+
+The harness says: "The uncertainty has two parts: seed-to-seed noise (about +-0.005 mAP for a single run) and the particular validation images. A gain that comes from a handful of images, or from one small class, usually does not hold on other images, and the harness will not accept it."
+
+Ah! "A gain that comes from a handful of images, or from one small class, usually does not hold on other images, and the harness will not accept it."
+
+e003's gain is "almost entirely from the pore class". Pore is a small class (low AP, probably fewer instances). So the gain is concentrated in one class, and doesn't generalize to held-out images.
+
+Similarly, e010's gain was pore-driven and didn't hold.
+
+So we need a change that improves **multiple classes** or **generalizes across images**.
+
+The detector-box training (e002, e009) likely helps all classes by matching test distribution. But the gain was small.
+
+What improves multiple classes? **Better feature extraction, better optimization, regularization.**
+
+But bigger model, more augmentation, etc. were tried and failed.
+
+What about **label smoothing**? It can improve calibration and sometimes generalization. But "Label smoothing improves calibration in some settings but can reduce the information in class probabilities that ranking metrics use."
+
+**Mixup/CutMix**? Tried, no gain.
+
+**Focal loss**? Tried, hurt.
+
+**Class-weighted loss**? Tried, hurt.
+
+**Test-time augmentation**? Tried, no gain.
+
+**Ensembles**? Tried, no gain.
+
+**Longer training**? Tried, no gain (but had bugs).
+
+Wait, "Longer training (smaller reserve, measured prediction time) - 6 attempts, no gain: best 5-seed 0.6355 (not confirmed); 2 bugs where a timing probe ate the training time (0.44, 0.40)"
+
+So longer training gave 0.6355 vs 0.6318 = +0.0037, not confirmed.
+
+What about **learning rate schedule**? Current: 5% warmup, then cosine to 0.001*LR. Maybe a different schedule?
+
+Or **optimizer**: AdamW with WD=0.05. Maybe different WD?
+
+But these are small knobs.
+
+Let me think about **the data loading / crop generation**. The current crop uses random jitter during training: center jitter ±10%, scale jitter 0.85-1.2x. Flips and brightness.
+
+What if we **add more aggressive augmentation for the pore class specifically**? Like random erasing, or rotation?
+
+But "Training augmentation (rotation, mixup, stronger colour or geometry) - 5 attempts, no gain."
+
+Rotation was tried.
+
+What about **using the detector confidence during training as a weight**? For detector boxes added to training, weight by det_conf? But we're not adding them yet.
+
+I keep coming back to **training on detector boxes** as the most promising because it addresses the domain shift directly. The gains were small but consistent. Maybe we can make the gain larger by:
+
+1. Adding background class (false alarms) → 5-class training
+2. Using detector confidence as a feature
+3. Fine-tuning on detector boxes after gt pre-training
+
+Let me design an experiment: **Two-stage training: first train on gt crops (4 classes), then fine-tune on detector boxes from training images (5 classes: 4 defects + background), using detector confidence as an additional input to the classifier head.**
+
+But this is complex. Let me simplify.
+
+**Experiment: Train a 5-class classifier (4 defects + background) on a mixed dataset of gt crops and detector boxes from training images. Detector boxes with IoU>0.5 → defect class; IoU<0.3 → background. At inference, use only defect classes with score = det_conf * p_c.**
+
+This combines two previously separate ideas (detector boxes as data + background class) which individually showed some promise but not confirmed. Together they might give a larger gain.
+
+But it's a big change. Let me check if it fits in the time budget.
+
+Current: 162s total, 125s training (5 epochs, 433 steps). Budget 180s, reserve 55s → training budget 125s. So it's tight.
+
+Adding more data (detector boxes) increases dataset size. But we can adjust.
+
+Detector boxes on train images: unknown count. Could be similar to gt (6052) or more.
+
+If we double the dataset, steps per epoch halve, but we might need more epochs.
+
+Alternatively, we can **replace** some gt crops with detector boxes, or **sample** from both.
+
+But the current best is e000. I should propose a change to e000.
+
+Given the history, the "architecture" category is exhausted (8 ideas, 0 new best). "Data" has 2 ideas, 0 new best, but the detector-box idea got close twice.
+
+The harness says: "A direction where three or more attempts gave no confirmed gain is exhausted: do not propose another variant of it unless you can say what is fundamentally different."
+
+For architecture: 8 attempts, 0 new best, 5 close but not confirmed, 3 crashed. Status: EXHAUSTED?.
+
+For data: 2 attempts, 0 new best, 2 close but not confirmed. Not exhausted yet (only 2 attempts).
+
+So I should propose a **data** experiment, fundamentally different from e002/e009.
+
+What's fundamentally different? e002/e009 added detector boxes (IoU>0.5) as extra training data for the 4 classes. They did NOT add a background class.
+
+The background class attempts were separate (9 attempts, no gain), but they might have been poorly implemented (e.g., "scores times 1 - p_bg" which is a scoring hack, not proper training).
+
+So the new idea: **Properly train a 5-class classifier (4 defects + background) using both gt crops and detector boxes (true positives as defects, false alarms as background).**
+
+This is a new combination not tried before.
+
+Let me formulate the hypothesis.
+
+HYPOTHESIS: The classifier currently only sees perfect defect crops, so it cannot recognize false alarms (detector boxes with no defect) and assigns them arbitrary defect classes, hurting ranking. Training on a 5-class task (adding background from detector false alarms with IoU<0.3) teaches the model a "not a defect" option, lowering defect probabilities on false alarms and improving per-class ranking. Combined with adding detector true positives (IoU>0.5) to match test-time box statistics, this addresses both domain shift and false-alarm suppression. Expected gain >0.01 mAP by improving all classes' precision-recall curves, not just pore.
+
+This is a data category experiment.
+
+Now I need to write the code changes.
+
+Changes needed:
+1. Load detector boxes from training split (dets.csv with split="train")
+2. Match them to gt crops by IoU > 0.5 to get class labels; IoU < 0.3 → background (class 4)
+3. Create a combined dataset: gt crops (classes 0-3) + matched detector boxes (classes 0-4)
+4. Modify model to output 5 classes
+5. Modify inference to use only classes 0-3, score = det_conf * p_c
+6. Adjust training loop for 5 classes
+
+But wait: the gt crops don't have detector confidence. The detector boxes have conf. If we use det_conf as a feature, we need it for all training samples. For gt crops, we could set conf=1.0 (perfect detection).
+
+But adding det_conf as a feature requires model architecture change (architecture category). Let's avoid that for now.
+
+Just do 5-class training without extra features.
+
+Also, the current model uses `num_classes=4`. Change to 5.
+
+The loss is CrossEntropy, works for 5 classes.
+
+Inference: model outputs 5 logits. Softmax to 5 probs. Use probs[:,:4] for the 4 defect classes. Score = det_conf * p_c.
+
+But the detector confidence is for "any defect". For a background box, det_conf might be low. But we multiply by det_conf anyway.
+
+Actually, for a false alarm box, the classifier should output high p_bg, low p_defects. Then score = det_conf * p_defect will be low. Good.
+
+For a true defect box, classifier outputs low p_bg, high p_correct. Score = det_conf * p_correct. Good.
+
+This seems correct.
+
+Implementation details:
+- Need IoU computation between detector boxes and gt crops.
+- Gt crops are in crops.csv with res in TRAIN_ON.
+- Detector boxes in dets.csv with split="train".
+- Both have image, x1,y1,x2,y2.
+
+We need to match per image.
+
+Let me sketch the code changes.
+
+First, read detector train boxes:
+```python
+det_train = [d for d in dets if d["split"] == "train"]
+```
+
+Then for each image, collect gt boxes and det boxes. Compute IoU matrix. Match each det box to best gt if IoU>0.5. If matched, label = gt class. If max IoU < 0.3, label = 4 (background). If 0.3 <= max IoU <= 0.5, discard (ambiguous).
+
+Then combine with gt crops (which are perfect boxes, label 0-3).
+
+But gt crops are already the "perfect" boxes. The detector true positives are redundant but with localization noise.
+
+We can create a combined list of training rows, each with image, box coords, label (0-4), and a flag if it's a gt crop or det box (for crop context?).
+
+The crop generation uses the box coords. For gt crops, we use the gt box. For det boxes, we use the det box. This naturally introduces the localization noise for det boxes.
+
+The `BoxDataset` currently takes `rows` with x1,y1,x2,y2,image,cls. We'll add det boxes with cls=4 for background.
+
+But the `make_crop` function uses the box coords. For background boxes, we still crop around the detector box. That's fine - it's a region the detector thought was a defect but isn't.
+
+We need to modify `read_csv` to not convert 'cls' for det boxes (they don't have cls). We'll add cls after matching.
+
+Let me write the SEARCH/REPLACE blocks.
+
+This is a significant change. I need to be careful.
+
+First, add IoU function and matching logic in main().
+
+Second, create combined training rows.
+
+Third, change model to num_classes=5.
+
+Fourth, change inference to use only first 4 classes.
+
+Let me start.
+
+Current code reads crops and dets separately. I'll modify the data loading section.
+
+Search for:
+```python
+    crops = [r for r in read_csv(os.path.join(args.data, "crops.csv")) if r["res"] in TRAIN_ON]
+    dets = read_csv(os.path.join(args.data, "dets.csv"))
+    ev = [d for d in dets if d["split"] == "eval"]
+    needed = {r["image"] for r in crops} | {d["image"] for d in ev}
+```
+
+I'll replace this with logic that also loads det_train, matches, and creates combined training set.
+
+Also need to compute IoU. Add a helper function.
+
+Let me write the changes.

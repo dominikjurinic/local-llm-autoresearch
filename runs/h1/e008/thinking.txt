@@ -1,0 +1,305 @@
+===== attempt 1 =====
+Let me analyze the situation.
+
+Current state:
+- Best: e000, 5-seed 0.6318
+- e007 (4x wide context view, based on e006 which crashed, fixed in e007): seed-0 0.6490, 5-seed 0.6422, not confirmed. The gain was +0.0104 vs e000 but the required margin was 0.0079... wait, +0.0104 > 0.0079? Let me re-read.
+
+"Its 5-seed gain over e000: +0.0104. A new best needed more than 0.0079 = 1 x the uncertainty of the gain (seeds ±0.0047, validation images ±0.0064)."
+
+Hmm, +0.0104 > 0.0079. But then: "It passed on the validation images you see, but did not hold on a separate set of held-out validation images that you never see, so it was not accepted."
+
+So there's an additional check: the gain must hold on held-out validation images. The 5-seed mean on the visible validation was 0.6422, but on the held-out set it didn't hold. So e007's gain was image-specific (probably pore class on specific images).
+
+Key diagnostic info:
+- Perfect classes: 0.7530 vs current 0.6318. So class decision is the main problem.
+- Confusion matrix: pore is the weak class (60% correct, 12 out of 41 true pores misclassified as stain, 4 as deposit). Stain is confused with deposit (31 stain->deposit, 27 deposit->stain).
+- Small defects: only 77% correct class vs 94% for large.
+- 32 true defects not covered by any detector box (stage 1 problem, can't fix).
+
+Error budget: 0.7530 - 0.6318 = 0.1212 from wrong classes. Plus 0.758 - 0.7530 = 0.005 from scores.
+
+So the main problem: pore classification. Pore AP 0.478. Pore is confused with stain.
+
+What has been tried (from the earlier 5-run history + this run's history):
+1. Score row manipulation: exhausted, no gain.
+2. Background class: no gain.
+3. Detector boxes from training split as extra data: accepted twice at +0.004 (marginal).
+4. Third wider 4x view: +0.005, almost entirely from pore; in this run e007 got +0.0104 visible but not confirmed on held-out.
+5. Low-res crops: no gain.
+6. Bigger backbone / ensemble: no gain.
+7. Resolution / small box handling: no gain (best 0.634 not confirmed).
+8. TTA: no gain.
+9. Longer training: no gain.
+10. Class-balanced sampling / weighted loss: no gain.
+11. Training augmentation: no gain.
+12. Focal loss: no gain.
+13. Box geometry as input: never properly tested (crashes). In this run e002/e003 crashed.
+
+This run's history:
+- e001 (data, based on e000): 0.6326 seed-0, 0.6354 5-seed, not confirmed. What was e001? The hypothesis text is cut off: "trained on perfectly-placed GT boxes but tested on the..." — probably detector boxes from training split as extra training data (the family that got +0.004 in earlier runs). 5-seed 0.6354, not confirmed (gain +0.0036 < noise).
+- e002/e003: box geometry as model input — crashed (scoping bug in worker processes).
+- e004 (data): replaced 1.5x tight crop with something — 0.6244, rejected. Probably changed crop scale.
+- e005 (architecture): 6-channel concat input — 0.6251, rejected.
+- e006: crashed (4x view, missing views[2] in return).
+- e007: fixed e006, 4x view — 0.6422 5-seed, not confirmed (didn't hold on held-out).
+
+So the 4x view idea had a real effect on visible val but wasn't robust. Hmm.
+
+What to do next? Let me think about where the error is and what's fundamentally untried.
+
+Main error: pore vs stain confusion, and stain/deposit confusion. Pore AP 0.478.
+
+Ideas not yet tried (outside the exhausted families):
+
+1. **Box geometry as input, done right** (e002/e003 crashed due to scoping). The family "box size and aspect ratio as extra model input" was "never properly tested: 2 crashes, 1 edit failure, 1 run at 0.629". So it's not exhausted — it was never actually run properly! The "1 run at 0.629" is basically baseline. So a proper implementation of box geometry input is a legitimate new experiment. But would it help? Pore vs stain: pores are small round holes; stains are larger diffuse marks. Box size/aspect could be informative. But the model sees the crop which already encodes size relative to context... actually the crop is resized to 160x160 so absolute size is lost; the ratio of box to crop is fixed by construction (1.5x/2.5x context). So the model cannot know the absolute size of the defect. Small defects are 77% correct vs 94% for large — small pores look like stains when upscaled? Giving the model absolute box size (and aspect ratio) as extra input could help disambiguate. This is a fundamentally informative feature that the model currently lacks.
+
+How to implement: add 2-3 extra input channels (log box width, log box height, or log area, aspect ratio, normalized by dataset stats). The dataset computes these in __getitem__ (must be at module level or passed in — the crash was due to G_MEAN/G_STD being defined inside main()). Compute stats from crops at module level? Can't — need data. Pass stats via a global set before DataLoader creation, or compute in __init__ (main process) and store on self. BoxDataset is created in main, so __init__ can compute stats from rows and store as self attributes. That's clean and avoids the worker scoping issue.
+
+Implementation: in BoxDataset.__init__, if rows have boxes, compute mean/std of log(w), log(h) (or log area, log aspect). In __getitem__, compute features for that row, normalize, make a 3-channel constant tensor (or 2-channel), and return as an extra view. In the model, modify the first conv to accept 6 channels (3 per view) — i.e., each view becomes 3+3=6 channels? Or concatenate geometry as 3 extra channels per view and average logits across views as before. Simplest: each view = 6-channel tensor (RGB + 3 constant geometry channels). Modify model.conv1 (first conv layer) to have in_channels=6. In timm's efficientnet_b0, the first conv is model.conv1 (nn.Conv2d(3, 32, 3, stride 2, padding 1)). We can wrap: replace with nn.Conv2d(6, 32, 3, 2, 1) and initialize the extra 3 channels to zero (so pretrained weights are preserved for the first 3 channels, and the geometry starts as an unused input the network can learn to use). Zero-init of new channels means at start the model behaves identically to before, then learns to use geometry.
+
+This is a clean, focused experiment. Hypothesis: pore/stain and small-defect errors are partly driven by absolute size information that is lost in the fixed-size crop; giving the network box size/aspect as zero-initialized extra channels should improve class accuracy, especially for pore (small round holes) and stain (large diffuse marks). Expected gain: 0.01+ on pore AP.
+
+But wait — is this in an exhausted family? "Box size and aspect ratio as an extra model input | 4 | never properly tested: 2 crashes (wrong attribute name), 1 edit failure, 1 run at 0.629". So 4 attempts but never properly tested. The rule says "a direction where 3 or more attempts gave no confirmed gain is exhausted: do not propose another variant of it unless you can say what is fundamentally different". Here the attempts crashed/failed — the idea was never actually tested. So proposing a proper implementation is not repeating a failed experiment; it's the first real test. The brief explicitly says "never repeat an experiment that is already in the history, even reworded, unless it crashed or had a bug that you are now fixing". The geometry family crashed due to bugs; now I'm fixing it properly. In this run, e002/e003 crashed on scoping. So this is a legitimate "fix the crash" path, and I should say what's different: module-level / instance-level stats to avoid worker scoping, and zero-init of the new conv channels to preserve pretrained behavior.
+
+Actually wait — e002/e003 in this run crashed on the same scoping bug. The earlier 5 runs crashed on "wrong attribute name". So the geometry idea has 4 crashes + 1 edit failure + 1 run at 0.629 (baseline level). The 0.629 run — was that a proper test? "1 run at 0.629" suggests it ran but got baseline score, meaning the feature was present but didn't help (or was broken). Hmm, ambiguous. If the 0.629 run had working geometry input and got baseline, that's evidence it doesn't help. But "never properly tested" is the harness's own label. I'll trust that label.
+
+Risk: if geometry doesn't help, we waste one run. But it's the only family that was never properly tested, and it targets the identified error (size-dependent confusion).
+
+2. **Alternative: train on detector boxes (stage 1 proposals) instead of GT boxes.** e001 tried adding detector boxes from training split as extra data: 5-seed 0.6354, not confirmed (+0.0036). The family got +0.004 twice in earlier runs. That's marginal. Replacing GT with detector boxes (Faster R-CNN style) is a variant — probably exhausted-ish (6 attempts in earlier runs, 1 in this run). Skip.
+
+3. **Pore-specific: pores are small; the 1.5x tight crop on a small pore is mostly background.** Maybe use a tighter crop for small boxes? The "resolution and small box handling" family: 9 attempts, no gain, 2 crashes. Exhausted.
+
+4. **Two models / specialized head**: e.g., train a separate classifier for the pore-vs-stain subproblem? Complicated.
+
+5. **Score = conf × p, but use a different combination**: exhausted family (16 attempts).
+
+6. **Better use of time: 433 steps in ~125s of training. Model is EfficientNet-B0 at 160px with 2 views. Could we train longer with a smaller/faster backbone?** "Longer training" family: 6 attempts, no gain. "Bigger or other backbone": 8 attempts, no gain. So backbone changes are exhausted.
+
+7. **Data: use "low" resolution crops for training?** TRAIN_ON = ("high",). Earlier family "low-resolution crops added to training": 4 attempts, no gain. Exhausted.
+
+8. **Class-balanced sampling**: no gain. Focal loss: no gain. Label smoothing: not explicitly in the list... "loss" category: focal (2, no gain), class-weighted (in sampling family). Label smoothing not listed. But loss tuning "helped little" per the known-facts. And the error is in the class decision, not calibration.
+
+9. **Inference: TTA** — 8 attempts, no gain. Exhausted.
+
+10. **Snapshot ensemble / SWA**: "Bigger or other backbone (2-3 model ensembles)" included ensembles: no gain. SWA specifically not listed. Hmm. SWA under a budget: take the last few checkpoints, average weights. Could give a small gain. But ensembles already showed no gain; SWA is a cheaper variant of ensembling. Probably marginal (<0.005). Not worth it.
+
+11. **Multi-crop at inference with different context scales** — that's TTA-ish (extra views at inference: 8 attempts no gain). Exhausted.
+
+12. **Train the classifier with the detector confidence as a sample weight or filter**: e.g., only train on boxes with high detector conf? Or weight training samples by detector conf? Hmm. Actually interesting: the training data is GT boxes; the test boxes are detector boxes with varying quality. If we weight training samples by how well the detector found them... but GT boxes are not detector boxes. We could match GT boxes to detector boxes on training images and weight by the detector's conf for the matching box. This is a variant of "detector boxes as extra training data" (e001, +0.004 not confirmed). Probably in the same exhausted family.
+
+13. **The 4x view (e007) didn't hold on held-out.** What about a 3x view instead of 4x? The earlier family "third, very wide view (4x)": 3 attempts, accepted twice at +0.005, gain almost entirely from pore. In this run e007 got +0.0104 visible but failed held-out. The pattern: the wide view's gain is image-specific and not robust. Trying 3x is a variant of an exhausted family (3+ attempts, no confirmed gain under today's rules). Skip.
+
+14. **Pore vs stain specifically**: pores are small dark round holes; stains are diffuse discolored regions. What distinguishes them? Texture (pores = many small holes; stain = smooth color variation) and size. The model sees 160px crops. Maybe higher resolution for the tight crop would help pore texture? "Resolution and small-box handling (224 px...)" family: 9 attempts, no gain. Exhausted.
+
+15. **Input: grayscale + extra channels?** No.
+
+16. **Preprocessing: the crops are resized with BILINEAR to 160. Pores at small size need sharpness; use BICUBIC or LANCZOS?** Cosmetic, probably <0.005.
+
+17. **Training data: remove low-quality GT boxes?** We don't have quality labels.
+
+18. **Use both high and low res images for eval?** Eval boxes have res? dets.csv has image, and images come from images/ directory. crops.csv has res high/low. Eval images — are they high or low res? The original paper: 0.69 mAP on high-res. Our baseline 0.638 (one-step 4-class) — probably on high-res val. Hmm, the brief says "0.69 mAP@0.5 on high-res images" and our reference numbers are on validation. If eval includes low-res images, that's a domain issue. Can't easily tell.
+
+19. **Architecture: the 6-channel concat (e005) was rejected (0.6251).** So fusing scales in one network hurt. Keep 2-view logit averaging.
+
+20. **What about training the two views with different losses or a shared backbone but separate heads?** The current setup shares the whole backbone and averages logits. Separate heads per view (each view has its own classifier head) might help: the tight crop is good for texture, the wide crop for context. Currently one head must serve both. This is an architecture change not in the exhausted list ("architecture" family in this run: 2 crashes + 1 rejected 6-channel concat; earlier runs: "bigger or other backbone" 8 attempts). Hmm, "architecture" category in this run is marked EXHAUSTED? (3 ideas, 1 ran, 0 new best). The 3 ideas were: box geometry (crashed x2), 6-channel concat (rejected). So architecture as a category has 3 ideas. But the specific idea of separate heads per view hasn't been tried. The exhaustion rule is about idea families/directions, not categories. The geometry family is "never properly tested" — that's my candidate.
+
+Let me reconsider: which single experiment has the best expected value?
+
+The error breakdown:
+- Wrong classes cost 0.1212. Confusion: pore is the biggest problem (41 true pores on overlapping boxes: 25 correct, 12->stain, 4->deposit, 0->discontinuity). Stain: 336 true stains, 288 correct, 31->deposit, 9->pore, 5->discontinuity. Deposit: 132 true, 102 correct, 27->stain, 2->pore, 1->discontinuity.
+
+Total misclassified: pore 16, deposit 30, discontinuity 7, stain 45. Total 98 misclassified out of 545 overlapping boxes (81% correct).
+
+Pore has only 41 positive boxes — small class. Improving pore accuracy from 60% to say 80% = +8 correct pores. With ~41 pores, that's meaningful for pore AP (0.478).
+
+What distinguishes pore from stain? Pore = cluster of small round holes (dark spots); stain = diffuse discoloration. In a 1.5x tight crop, a pore box contains the hole texture; a stain box contains smooth color. The model should be able to tell... unless the small pores are so small that in 160px the texture is a few pixels. Small defects are 77% correct. Pores are probably the smallest class (area third: small). So pore texture at 160px is under-resolved. Higher resolution for pore-like crops would help, but the resolution family was exhausted with no gain (9 attempts). Hmm, but those attempts were "224 px, larger MIN_CROP, enlarged tight crops for small boxes" — global resolution changes. All no gain. OK.
+
+Size information: the model doesn't know absolute size. Pores are small; stains are large. If we give the model the box area, it can use "small box + hole-like texture = pore". This directly targets the pore/stain confusion and the small-defect weakness. And it's the only family never properly tested.
+
+I'm fairly convinced the next experiment should be: **box geometry (log area, log aspect) as zero-initialized extra input channels**, implemented correctly (stats in __init__, no main-local globals, zero-init new conv weights).
+
+Let me double-check the implementation details:
+
+- BoxDataset.__init__(self, rows, images, train): compute geometry stats from rows (all have x1,y1,x2,y2). log_w = log(x2-x1), log_h = log(y2-y1). Or log area = log(w*h) and log aspect = log(w/h). Use 2 features: log area, log aspect. Clip to avoid log(0): w = max(x2-x1, 1). Compute mean/std per feature over training rows. For eval rows use the same stats (computed from training rows only, to avoid leakage... eval boxes are detector boxes; using their stats would be fine too, but using training stats is cleaner and avoids any concern).
+
+Wait — but the dataset is used for both training (GT boxes) and eval (detector boxes). If we compute stats from all rows passed in, the eval dataset would use detector box stats. Better: compute stats in main from the crops (training GT boxes) and pass to BoxDataset. That's clean: BoxDataset(rows, images, train, gmean, gstd). No globals needed — passed as constructor args, pickled to workers.
+
+- In __getitem__: compute a = log(max(w*h,1)), b = log(max(w,1)/max(h,1)) — wait, aspect = w/h. Normalize: (a - gmean[0])/gstd[0], (b - gmean[1])/gstd[1]. Clip to [-4, 4] for safety. Make a constant 2-channel tensor of shape (2, IMG_SIZE, IMG_SIZE): torch.ones(2, IMG_SIZE, IMG_SIZE) * val. Actually build with torch.full.
+
+- Views: each view becomes 5 channels (3 RGB + 2 geometry). Concatenate: torch.cat([x_rgb, geom], dim=0).
+
+- Model: timm efficientnet_b0 first conv: model.conv1 is Conv2d(3, 32, 3, 2, 1). Replace:
+```python
+old = model.conv1
+new = nn.Conv2d(5, old.out_channels, old.kernel_size, stride=old.stride, padding=old.padding, bias=old.bias is not None)
+with torch.no_grad():
+    new.weight[:, :3] = old.weight
+    if old.bias is not None: new.bias.copy_(old.bias)
+    new.weight[:, 3:].zero_()
+model.conv1 = new
+```
+Zero-init of the geometry channels => at step 0 the model is identical to baseline; it learns to use geometry.
+
+- Everything else the same: 2 views, logit averaging, same training loop.
+
+Time budget: adding 2 constant channels to the first conv is negligible compute. No change to step time.
+
+Now, is there a risk the model ignores the constant channels? Zero-init means the network starts ignoring them; with AdamW and a 125s budget, it may or may not learn to use them. The gradient through the zero-init channels: the output of the first conv has zero contribution from the geometry at start, but the gradient w.r.t. those weights is the input (the constant geometry values), which is nonzero, so the weights will move. Yes, it will learn.
+
+One concern: the geometry channels are constant across the spatial extent of the crop — a global bias-like signal. The network can use it as a per-sample offset. That's fine; convs can exploit spatially-constant input channels (they act like conditioning).
+
+Also for eval boxes: detector boxes may be slightly misplaced / different size from GT; the geometry reflects the detector box, which is what the model sees at test time. Consistent.
+
+Hypothesis statement: The pore/stain confusion and the small-defect weakness (77% correct on small boxes) suggest the classifier can't use absolute defect size, which the fixed 160px crop discards. Add log box area and log aspect ratio as two extra, zero-initialized input channels (stats from training GT boxes, passed to the dataset to avoid the worker-scoping crash of e002/e003). This is the first proper test of the geometry family (previous attempts crashed or never ran). Expected: pore AP up, overall +0.01 or more; zero-init means no regression risk at step 0.
+
+Category: architecture (adding input channels / modifying first conv). Or "data" (adding features)? The category list: data, augmentation, architecture, loss, sampling, optimisation, inference, scoring, other. Adding input channels = architecture. I'll use architecture.
+
+BASE: best (e000). Because e007 (last) wasn't confirmed; base should be the current best.
+
+Now let me write the edit. Current file = e000 (best). Let me copy the relevant sections exactly.
+
+Edit 1: BoxDataset class — add geometry stats and features.
+
+Current:
+```python
+class BoxDataset(torch.utils.data.Dataset):
+    def __init__(self, rows, images, train):
+        self.rows, self.images, self.train = rows, images, train
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __getitem__(self, i):
+        r = self.rows[i]
+        img = self.images[r["image"]]
+        fh = fv = False
+        bright = 1.0
+        if self.train:  # same flips and brightness for both views
+            fh, fv, bright = random.random() < 0.5, random.random() < 0.5, random.uniform(0.8, 1.2)
+        views = []
+        for ctx in (TIGHT_CONTEXT, CONTEXT):
+            x = make_crop(img, r, ctx, self.train)
+            if fh:
+                x = x[:, ::-1]
+            if fv:
+                x = x[::-1, :]
+            if self.train:
+                x = np.clip(x * bright, 0, 1)
+            x = (x - MEAN) / STD
+            views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))
+        return views[0], views[1], r.get("cls", -1)
+```
+
+New:
+```python
+class BoxDataset(torch.utils.data.Dataset):
+    def __init__(self, rows, images, train, gstats):
+        self.rows, self.images, self.train = rows, images, train
+        self.gmean, self.gstd = gstats  # (mean, std) of (log area, log aspect) from training boxes
+
+    def __len__(self):
+        return len(self.rows)
+
+    def _geom(self, r):
+        w = max(r["x2"] - r["x1"], 1.0)
+        h = max(r["y2"] - r["y1"], 1.0)
+        a = math.log(w * h)
+        b = math.log(w / h)
+        g = torch.full((2, IMG_SIZE, IMG_SIZE), 0.0)
+        g[0] = (a - self.gmean[0]) / self.gstd[0]
+        g[1] = (b - self.gmean[1]) / self.gstd[1]
+        return g.clamp(-4.0, 4.0)
+
+    def __getitem__(self, i):
+        r = self.rows[i]
+        img = self.images[r["image"]]
+        fh = fv = False
+        bright = 1.0
+        if self.train:  # same flips and brightness for both views
+            fh, fv, bright = random.random() < 0.5, random.random() < 0.5, random.uniform(0.8, 1.2)
+        views = []
+        for ctx in (TIGHT_CONTEXT, CONTEXT):
+            x = make_crop(img, r, ctx, self.train)
+            if fh:
+                x = x[:, ::-1]
+            if fv:
+                x = x[::-1, :]
+            if self.train:
+                x = np.clip(x * bright, 0, 1)
+            x = (x - MEAN) / STD
+            views.append(torch.cat([torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))), self._geom(r)]))
+        return views[0], views[1], r.get("cls", -1)
+```
+
+Wait — flips: when we flip the image, the geometry channels are constant so flipping them is a no-op. Fine.
+
+Edit 2: In main, compute gstats from crops and pass to both datasets.
+
+Current:
+```python
+    g = torch.Generator().manual_seed(args.seed)
+    dl_tr = torch.utils.data.DataLoader(BoxDataset(crops, images, True), batch_size=BATCH_SIZE, shuffle=True,
+```
+New: compute before:
+```python
+    # Box geometry stats (log area, log aspect) from training boxes, for the extra input channels.
+    ga = np.array([math.log(max(max(r["x2"] - r["x1"], 1.0) * max(r["y2"] - r["y1"], 1.0), 1.0)) for r in crops])
+    gb = np.array([math.log(max(r["x2"] - r["x1"], 1.0) / max(r["y2"] - r["y1"], 1.0)) for r in crops])
+    gstats = (float(ga.mean()), float(gb.mean()), max(float(ga.std()), 1e-3), max(float(gb.std()), 1e-3))
+    g = torch.Generator().manual_seed(args.seed)
+    dl_tr = torch.utils.data.DataLoader(BoxDataset(crops, images, True, gstats), batch_size=BATCH_SIZE, shuffle=True,
+```
+
+And the eval loader:
+```python
+    dl_ev = torch.utils.data.DataLoader(BoxDataset(ev, images, False), batch_size=256, shuffle=False,
+```
+→
+```python
+    dl_ev = torch.utils.data.DataLoader(BoxDataset(ev, images, False, gstats), batch_size=256, shuffle=False,
+```
+
+Edit 3: Model first conv.
+
+Current:
+```python
+    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
+    model = model.to(device).to(memory_format=torch.channels_last)
+```
+New:
+```python
+    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
+    # Extra 2 input channels for box geometry (log area, log aspect); zero-init so the pretrained
+    # network starts unchanged and learns to use the size cue.
+    old = model.conv1
+    new = nn.Conv2d(5, old.out_channels, old.kernel_size, stride=old.stride, padding=old.padding,
+                    bias=old.bias is not None)
+    with torch.no_grad():
+        new.weight[:, :3] = old.weight
+        if old.bias is not None:
+            new.bias.copy_(old.bias)
+        new.weight[:, 3:].zero_()
+    model.conv1 = new
+    model = model.to(device).to(memory_format=torch.channels_last)
+```
+
+Check: does efficientnet_b0 in timm have model.conv1? Yes, timm's EfficientNet has `self.conv1 = nn.Conv2d(...)`. Good.
+
+One more check: the geometry tensor is created on CPU (torch.full default is CPU) — consistent with the views being CPU tensors before .to(device). Good.
+
+Memory: 5-channel views instead of 3 — negligible.
+
+Also `math` is already imported. Good.
+
+Potential issue: `torch.full((2, IMG_SIZE, IMG_SIZE), 0.0)` then assign g[0] = scalar — fine.
+
+Clamp to [-4,4]: after normalization, values are usually within ±3; clamp guards outliers.
+
+Now, does the training loop unpack `for xt, xw, y in dl_tr` still work? Yes, the return signature is unchanged (2 views + label). The views are now 5-channel. Good.
+
+Inference loop also unchanged.
+
+Time: no meaningful change.
+
+Let me also double-check the hypothesis against the "score" facts: adding geometry changes the class probabilities → changes the rankingThinking budget reached. Stop thinking now and write the reply in the required format.

@@ -1,0 +1,258 @@
+===== attempt 1 =====
+Let me analyze the current situation carefully.
+
+## Current State
+- Best model (e000): 5-seed val mAP@0.5 = 0.6318 (seed std 0.0059)
+- Per-class AP: pore 0.478, deposit 0.649, discontinuity 0.789, stain 0.610
+- The main weakness is pore (0.478) and stain (0.610)
+
+## History Analysis
+Looking at the experiment history:
+1. **Architecture ideas (7 attempts)**: Adding box features (log area, aspect ratio), third wide view (4x context), bigger backbones, resolution changes - all either crashed or not confirmed. The 4x wide view was accepted twice in earlier runs (+0.005 mAP, pore-driven) but not confirmed here.
+2. **Data ideas (2 attempts)**: Adding detector boxes from train split as extra training data (e002, e009) - both showed seed-0 gains but not confirmed in 5-seed runs. e009 had +0.0084 gain but didn't hold on held-out validation.
+
+## Key Insights from Diagnostics
+- Confusion matrix shows pore is often confused with stain (12/41) and deposit (4/41) - only 60% correct
+- Stain is confused with deposit (31/335) and pore (9/335) - 86% correct
+- Small defects: 77% correct, medium: 89%, large: 94% - size matters
+- Perfect classes ceiling: 0.7530 vs current 0.6318 - big gap from wrong classes
+- The gap to perfect-classes ceiling (0.758) is what wrong classes cost
+
+## What hasn't been tried properly?
+1. **Third wide view (4x context)** - was accepted in earlier 5-hour runs but crashed here (e005, e006). The idea: pore needs more context.
+2. **Box metadata (log area + aspect ratio)** - tried in e001, e004, e007, e008 but all crashed or not confirmed. The bug in e007 was fixed in e008 but still not confirmed.
+3. **Detector boxes as training data** - tried twice (e002, e009) with seed-0 gains but not confirmed on held-out validation.
+
+## Most Promising Direction
+The pore class is the main weakness (AP 0.478). The earlier 5-hour runs showed that a **third, very wide view (4x context)** helped pore specifically and gave +0.005 mAP twice. This was accepted in those runs but crashed in this run's attempts (e005, e006).
+
+The crash in e005/e006 was likely due to time budget issues (3 views instead of 2 = 50% more compute). Let me check the timing: current run takes 162s total with 5 epochs, 433 steps. Adding a third view would increase per-step time by ~50%, reducing steps/epochs.
+
+But wait - the earlier runs accepted it twice. The key is to implement it efficiently. Maybe:
+- Use a smaller third view resolution?
+- Or use the third view only for certain classes?
+- Or make the model more efficient?
+
+Actually, looking at the crash - it says "crashed" not "timeout". Let me check if there's a bug in the implementation.
+
+The hypothesis for the third view: pore defects are small and round, and at 1.5x and 2.5x context they may not have enough surrounding context to distinguish from stain/deposit. A 4x view gives more context.
+
+But the current best doesn't have the third view. Let me think about what's different between this run and the earlier 5-hour runs that accepted it.
+
+Actually, the "Lessons so far" table says architecture is "EXHAUSTED? (3+ ideas, no new best)". But the third view was accepted in earlier runs! The issue might be implementation or time budget.
+
+Let me look at the time budget more carefully. Current run: 180s total, 162s used. Reserve is 55s. Training time budget = 180 - 55 - 13 (loading) = ~112s. Actually the log shows training from 59s to 125s = 66s of training, then prediction.
+
+Wait, the deadline calculation: `t_end = deadline - RESERVE_S` where RESERVE_S=55. deadline = T0 + 180. So training budget = 180 - 55 - (time before training starts). Loading takes 13s, so training budget ~112s. But the log shows training only took 66s (from 59s to 125s). Then prediction took 37s (125s to 162s).
+
+So there's actually slack! The reserve of 55s might be too conservative. Prediction took 37s, so we could reduce RESERVE_S to ~45s and get more training time.
+
+But for a third view, we'd need more compute per step. Let's estimate: 2 views -> 3 views is 1.5x compute. If training took 66s for 433 steps, that's ~0.15s/step. With 3 views, ~0.23s/step. In 112s budget, we'd get ~487 steps vs 433 - actually more steps because the budget is the same! Wait, no - the budget is time-based, so fewer steps would fit.
+
+Actually, the loop runs until `time.time() >= t_end`. With 1.5x slower steps, we'd get 433/1.5 ≈ 289 steps. That's significantly fewer.
+
+But the earlier runs accepted it... maybe they had more time? Or maybe the third view was implemented differently (e.g., only at inference, not training? No, the description says "during training" too).
+
+Wait, the earlier run description: "Third, very wide view (4x the box) next to the 1.5x and 2.5x crops, logits averaged" - "accepted twice (5-seed 0.6342 both, +0.005), gain almost entirely from the pore class; once rejected (0.633). Adds ~20 s per run, close to the time limit"
+
+So it adds ~20s per run. Current run is 162s, +20s = 182s, over the 180s limit! That's why it crashed (timeout).
+
+But the current run uses 162s with RESERVE_S=55. If we reduce RESERVE_S to 35s (since prediction only takes 37s, but we need margin), we get 20s more training time. 162 + 20 = 182s still over.
+
+Wait, the 20s is for the whole run including the third view. If the base run was faster (maybe fewer epochs?), then +20s might fit.
+
+Let me check: the current best does 5 epochs, 433 steps in 66s training. If third view adds 50% per step, training would take 99s for same steps. Total run: 13 (load) + 99 (train) + 37*1.5 (prediction with 3 views) = 13 + 99 + 55 = 167s. That fits! But wait, prediction also uses 3 views now.
+
+Actually the prediction loop processes both views. With 3 views, prediction would be 1.5x slower: 37 * 1.5 = 55.5s. Training 66 * 1.5 = 99s. Load 13s. Total = 167.5s. Under 180s! So it should fit.
+
+But the earlier note says "Adds ~20 s per run, close to the time limit". Maybe their base was slower.
+
+Let me check the current run's prediction time more carefully. The log says "done: 5 epochs, 433 steps, 53606 prediction rows, 162s total". Training ended at 125s, so prediction took 37s. With 3 views, prediction ~55s. Training with 3 views: each step does 3 forward passes instead of 2. But the model is the same, just 3 inputs. Actually the current code does `model(xt) + model(xw)` - two forward passes. With three views, three forward passes. So 1.5x compute.
+
+But wait - the model is called twice per batch (once for tight, once for wide). With three views, three times. So yes, 1.5x.
+
+Training time: 66s * 1.5 = 99s. Prediction: 37s * 1.5 = 55.5s. Load: 13s. Total: 167.5s. Well under 180s.
+
+So why did e005/e006 crash? Maybe they had a bug causing infinite loop or memory issue. Or maybe the implementation was inefficient (e.g., not batching the three views together).
+
+Actually, looking at e005/e006: they're based on e000 but the hypothesis mentions "2-of-3 random sampling during training" for e006. That's different from always using 3 views.
+
+Let me think about a better approach: **Use the third view only at inference time, not training**. This would:
+1. Keep training fast (2 views)
+2. Add context at test time for pore classification
+3. Only increase prediction time by 50% (37s -> 55s), total run ~145s + 18s = 163s? Wait.
+
+Current: load 13s, train 66s, predict 37s = 116s (not 162s - the 162s includes the print statements and overhead). Actually T0 is at import time, so 162s total wall time.
+
+If we add third view only at inference: training unchanged (66s), prediction 55s, load 13s = 134s. Well under budget.
+
+But would it help? The model is trained on 2 views, but at test time sees 3 views averaged. The third view logits would be from a model never trained on 4x context crops. That might not work well.
+
+Better: **Train with 3 views but use a faster backbone or smaller resolution for the third view**.
+
+Or: **Use the third view only for small boxes (where pore appears)**. Pore is small - the diagnostics show small defects 77% correct vs 94% for large. The third view (4x context) would help most for small boxes.
+
+Actually, the pore class AP is 0.478 - very low. The confusion is with stain and deposit. Stain is larger/irregular, deposit is elongated. At 1.5x and 2.5x, a small pore might look like a dot; at 4x, the surrounding weld texture might help distinguish.
+
+Let me consider another angle: **The box metadata idea (log area + aspect ratio)** was tried 4 times (e001, e004, e007, e008) but all crashed or not confirmed. e008 fixed a bug but still not confirmed (0.6343 vs 0.6318, +0.0025, not significant).
+
+But wait - e008's seed-0 was 0.6392, 5-seed 0.6343. The gain is small and not confirmed. The issue might be how the metadata is used - just concatenated to the classifier head? That's a weak signal.
+
+What about **using the detector confidence as a feature**? The detector conf correlates with box quality. But the current scoring already multiplies detector conf * class prob.
+
+Another idea: **The class imbalance**. Pore has few samples? Let me check: confusion matrix shows pore 41 samples (25+4+0+12), deposit 132, discontinuity 222, stain 335. Pore is the smallest class. But class-weighted loss was tried and hurt.
+
+What about **oversampling pore boxes during training**? The current sampler is random. We could oversample pore boxes.
+
+Or: **Focal loss** was tried (2 attempts, no gain).
+
+Let me look at the "data" category: only 2 attempts (e002, e009), both adding detector boxes as training data. Both showed seed-0 gains but not confirmed on held-out validation. The harness says "Gains that depend on the particular images you are scored on are not real improvements."
+
+This suggests the detector boxes addition overfits to the validation set seen during development.
+
+## New Idea: Test-Time Augmentation (TTA) with Flips
+The history shows "Test-time augmentation (flips, extra views at inference)" - 8 attempts, no gain, best 5-seed 0.631, 8 views timed out.
+
+But wait - the current code already does flips during training (fh, fv). At inference, no flips. What if we do TTA at inference: average predictions over flips?
+
+Current prediction: one forward pass per view per box. With TTA: 4 forward passes per view (original, hflip, vflip, hvflip) = 4x prediction time. 37s * 4 = 148s prediction alone - too much.
+
+But we could do just horizontal flip (2x): 74s prediction. Total: 13 + 66 + 74 = 153s. Fits.
+
+But history says no gain from TTA. However, those were with the baseline model. Maybe with the detector-boxes-augmented training (e009) it would help? But e009 wasn't confirmed.
+
+## Another Idea: Temperature Scaling / Calibration
+The scoring uses `detector_conf * class_prob`. The class probabilities from softmax might be miscalibrated. Temperature scaling could help ranking.
+
+But AP depends only on order within each class. Temperature scaling is monotonic, so it preserves order within a class! It only changes relative scores across classes. Since each class's AP is computed independently, temperature scaling per class (or global) doesn't change AP at all.
+
+Wait: "Several rows per box (one per class) are allowed; per image at most the 300 highest-scoring rows count." So the cross-class ranking matters for the 300-row limit per image. But that's a minor effect.
+
+Temperature scaling won't help per-class AP.
+
+## Another Idea: Learnable Score Combination
+Instead of `detector_conf * class_prob`, learn a combination: `detector_conf^a * class_prob^b` or a small MLP that takes (detector_conf, class_prob, box_features) -> score.
+
+But AP per class only depends on order of that class's predictions. For a given class, all its predictions have the same class_prob scaling (if we use class_prob^b). The detector_conf varies per box. So `detector_conf^a * class_prob^b` preserves the order of detector_conf within each class (since class_prob^b is constant per class per box? No, class_prob varies per box per class).
+
+Actually for a fixed class c, each box has a class_prob p_c and detector_conf d. The score is d * p_c. If we change to d^a * p_c^b, the order could change because boxes with high d but low p_c vs low d but high p_c could swap.
+
+This could help if detector_conf is not perfectly correlated with classification correctness.
+
+But this is a scoring change, not a model change. Could be tried quickly.
+
+## Most Promising: Third Wide View (4x Context) - Properly Implemented
+The earlier runs accepted this twice with +0.005 mAP, pore-driven. The crashes in e005/e006 were likely implementation bugs or timeouts from inefficient code.
+
+Let me design a clean implementation:
+1. Add a third crop context: WIDE_CONTEXT = 4.0
+2. During training: randomly sample 2 of 3 views per box (to keep compute similar to 2 views) - this is what e006 tried but crashed
+3. During inference: average all 3 views
+
+Random 2-of-3 during training: each step does 2 forward passes (same as now), but sees all 3 views over time. This keeps training time same!
+Inference: 3 forward passes (1.5x current prediction time).
+
+Total time: training unchanged (~66s), prediction 37*1.5=55.5s, load 13s = ~135s. Well under budget!
+
+This is different from e005 (which used 3 views always during training, 1.5x training time) and e006 (which had a bug).
+
+Let me verify: e005 hypothesis says "fixed third wide view (4×) alongside the 1.5× and 2.5× crops, with logits averaged" - always 3 views.
+e006: "2-of-3 random sampling during training keeps compute similar to two views" - this is the efficient version!
+
+But e006 crashed. The crash might be a bug in the sampling code.
+
+Let me propose this clean 2-of-3 training + 3-view inference approach.
+
+## Hypothesis
+The pore class (AP 0.478) is the main weakness, confused with stain/deposit due to insufficient context at small scales. Earlier 5-hour runs confirmed a fixed third wide view (4×) twice (+0.005 mAP, pore-driven) but it increased compute. Using 2-of-3 random sampling during training keeps training compute identical to two views, while inference averages all three views for maximum context. This should improve pore AP with minimal time cost (~18s extra prediction time, well within budget).
+
+## Implementation Plan
+1. Add WIDE_CONTEXT = 4.0
+2. In BoxDataset.__getitem__: create three crops (tight, wide, extra_wide)
+3. During training: randomly select 2 of 3 views to return
+4. During inference: return all 3 views (need to modify DataLoader or dataset to handle this)
+5. Model forward: average logits of all views returned
+
+Actually, the DataLoader expects fixed return format. For training, return 2 views. For inference, return 3 views. But the model forward expects 2 inputs currently.
+
+Better: Always return 3 views from dataset. During training, randomly drop one (set to zero or skip). But that wastes compute.
+
+Alternative: Dataset returns 3 views always. Training loop randomly selects 2 of 3 for forward pass. Inference loop uses all 3.
+
+This is cleanest. Let me check the current code structure.
+
+Current dataset returns (view_tight, view_wide, label). Training loop does `model(xt) + model(xw)`.
+
+New: dataset returns (view_tight, view_wide, view_extra, label). Training loop: randomly pick 2 of 3, average their logits. Inference loop: average all 3 logits.
+
+This keeps the dataset simple and moves the logic to the training/inference loops.
+
+Let me write the change.
+
+Wait, the dataset is used for both training and eval. The eval DataLoader uses the same BoxDataset with train=False. So in __getitem__, we can check self.train and return different number of views? But DataLoader expects consistent return format.
+
+Better: always return 3 views. In training loop, use 2. In eval loop, use 3.
+
+But the current training loop unpacks `xt, xw, y = batch`. We'd need to change to `v1, v2, v3, y = batch` and then randomly select two.
+
+Similarly for eval.
+
+This is a focused change. Let me write it.
+
+Actually, looking at the code again:
+```python
+def __getitem__(self, i):
+    r = self.rows[i]
+    img = self.images[r["image"]]
+    fh = fv = False
+    bright = 1.0
+    if self.train:
+        fh, fv, bright = random.random() < 0.5, random.random() < 0.5, random.uniform(0.8, 1.2)
+    views = []
+    for ctx in (TIGHT_CONTEXT, CONTEXT):
+        x = make_crop(img, r, ctx, self.train)
+        if fh: x = x[:, ::-1]
+        if fv: x = x[::-1, :]
+        if self.train: x = np.clip(x * bright, 0, 1)
+        x = (x - MEAN) / STD
+        views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))
+    return views[0], views[1], r.get("cls", -1)
+```
+
+I need to add a third context to the loop: `(TIGHT_CONTEXT, CONTEXT, WIDE_CONTEXT)`.
+
+Then return `views[0], views[1], views[2], r.get("cls", -1)`.
+
+In training loop:
+```python
+v1, v2, v3, y = batch
+# Randomly pick 2 of 3
+views = [v1, v2, v3]
+idx = random.sample(range(3), 2)
+x_a = views[idx[0]].to(device).to(memory_format=torch.channels_last)
+x_b = views[idx[1]].to(device).to(memory_format=torch.channels_last)
+y = y.to(device, non_blocking=True)
+with torch.autocast(**amp):
+    loss = crit((model(x_a) + model(x_b)) / 2, y)
+```
+
+In eval loop:
+```python
+v1, v2, v3, _ = batch
+v1 = v1.to(device).to(memory_format=torch.channels_last)
+v2 = v2.to(device).to(memory_format=torch.channels_last)
+v3 = v3.to(device).to(memory_format=torch.channels_last)
+with torch.no_grad(), torch.autocast(**amp):
+    logits = (model(v1) + model(v2) + model(v3)) / 3
+    probs.append(torch.softmax(logits.float(), 1).cpu())
+```
+
+This should work. The training compute is identical (2 forward passes per box per step). Eval compute is 1.5x (3 vs 2 forward passes).
+
+Time check: current eval 37s -> 55.5s. Total run: 13 + 66 + 55.5 = 134.5s. Well under 180s.
+
+Let me also add WIDE_CONTEXT = 4.0 as a constant.
+
+This is a clean implementation of the idea that worked in earlier runs but crashed here due to (likely) buggy sampling code.
+
+Let me write the SEARCH/REPLACE blocks.

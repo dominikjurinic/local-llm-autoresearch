@@ -1,0 +1,239 @@
+===== attempt 1 =====
+Let me analyze the current situation and think about what would be the most impactful next experiment.
+
+Current state:
+- 5-seed val mAP@0.5: 0.6280
+- Per-class AP: pore 0.494, deposit 0.629, discontinuity 0.780, stain 0.610
+- The baseline one-step 4-class detector is 0.638, so we're slightly below it
+- The ceiling (perfect classes on stage-1 boxes) is 0.758
+- Stage-1 boxes scored as single class 'defect': 0.755
+
+Key observations:
+1. The classifier is trained ONLY on true training boxes (crops.csv), so it has no notion of "background" - it will always assign some class to every box
+2. The scoring is `detector_conf * class_probability` - this means false alarms (background boxes) will still get non-zero scores for some classes
+3. Pore (0.494) and stain (0.610) are the weakest classes
+4. The brief mentions that training on detector boxes with a "background" class could help
+
+The biggest issue I see: the classifier has no background class. When a detector box is a false alarm (background), the classifier still assigns it to one of the 4 defect classes with some probability. This means false alarms get non-zero scores and hurt the ranking.
+
+The most impactful change would be to train the classifier on detector boxes (dets.csv train split) with a "background" class for false alarms. This would:
+1. Give the model a way to say "this isn't a defect"
+2. Allow us to use the background probability to suppress false alarm scores
+3. Better calibrate the scores
+
+Let me think about how to implement this:
+- For dets.csv "train" boxes, compute IoU with crops.csv boxes. If IoU > 0.5, the box gets the class of the matched crop. If no match, it's background (class 4).
+- Train with 5 classes (4 defects + 1 background)
+- At inference, score = detector_conf * class_prob * (1 - background_prob) or similar
+
+Actually, let me think more carefully. The scoring formula matters a lot. Currently:
+- score = conf * p(class)
+
+If I add a background class:
+- score = conf * p(class) * (1 - p_bg) would down-weight all classes when background is likely
+- Or: score = conf * p(class) / (p(class) + p_bg) - normalizing out background
+- Or simply: score = conf * p(class) * (1 - p_bg)
+
+The simplest and most effective: train with 5 classes, and at inference use score = conf * p(class) * (1 - p_bg). This way, if the model thinks it's background, all defect scores get suppressed.
+
+Wait, actually there's a subtlety. If I train with 5 classes, the softmax will spread probability mass across 5 classes instead of 4. The p(class) values will be lower in absolute terms. But the relative ranking should be better because the model can now distinguish background from defects.
+
+Let me think about the implementation:
+1. Build training data from dets.csv "train" split
+2. For each train det, find the best matching crop (IoU > 0.5) to get the class
+3. If no match, label as class 4 (background)
+4. Train with 5 classes
+5. At inference, compute 5-class probabilities
+6. Score = conf * p(class) * (1 - p_bg) for each of the 4 defect classes
+
+This is a significant change but well-motivated. Let me write it.
+
+Actually, I need to be careful about the IoU computation. The dets.csv train boxes and crops.csv boxes are on the same images. I need to match them.
+
+Let me also consider: should I keep the crops.csv training data too? The crops are the "ground truth" boxes, while the dets are the detector's boxes (which may be slightly misplaced). Training on both would give the model exposure to both perfect and slightly-off boxes. But the dets already include the class labels (via matching), so maybe I should just use the dets for training since they're more representative of what the model will see at inference.
+
+Actually, let me use BOTH: crops.csv (labeled directly) and dets.csv train (labeled by IoU matching, with background for unmatched). This gives more training data and exposure to the actual distribution of boxes the model will see.
+
+Wait, but if I use both, I need to be careful not to double-count. A crop and a det on the same image with similar position would be essentially the same sample. That's probably fine for training purposes - it's like data augmentation.
+
+Let me focus on the key change: adding a background class. I'll use dets.csv train as the primary training set (since they're the actual boxes the model will see), with crops.csv as additional training data.
+
+Actually, to keep the change focused (one idea per turn), let me just:
+1. Add background class (class 4) to training using dets.csv train boxes
+2. Change scoring to use (1 - p_bg) as a multiplier
+
+Let me write the code. The main changes:
+- Build training data from dets.csv train split, labeling by IoU with crops.csv
+- Train with 5 classes
+- At inference, use 5-class probs, score = conf * p(c) * (1 - p_bg)
+
+Let me think about the IoU matching. For each det in dets.csv train:
+- Get all crops on the same image
+- Compute IoU with each
+- If max IoU > 0.5, label = that crop's class
+- Otherwise, label = 4 (background)
+
+This is straightforward. Let me code it up.
+
+For the dataset, I'll modify BoxDataset to handle 5 classes. The model will have num_classes=5.
+
+Let me write the full modified train.py. Actually, I should use SEARCH/REPLACE blocks to make focused changes.
+
+Key changes needed:
+1. Change num_classes from 4 to 5
+2. Build training data from dets.csv train (with background labels)
+3. Modify scoring to include background suppression
+
+Let me plan the SEARCH/REPLACE blocks:
+
+Block 1: Change the training data construction to use dets.csv train
+Block 2: Change num_classes to 5
+Block 3: Change the scoring at inference
+
+Actually, let me think about this more carefully. The current code uses `crops` (from crops.csv) as training data. I want to replace this with dets.csv train data (labeled by IoU matching).
+
+The dets.csv train rows have: det_id, split, image, x1, y1, x2, y2, img_w, img_h, conf
+The crops.csv rows have: id, res, image, x1, y1, x2, y2, img_w, img_h, cls
+
+For matching, I need to group crops by image, then for each det, find the best IoU match.
+
+Let me write this out:
+
+```python
+# Build training data from dets.csv train split
+dets_train = [d for d in dets if d["split"] == "train"]
+crops_by_img = {}
+for c in crops_all:  # all crops, not just high-res
+    crops_by_img.setdefault(c["image"], []).append(c)
+
+def iou(r1, r2):
+    x1 = max(r1["x1"], r2["x1"])
+    y1 = max(r1["y1"], r2["y1"])
+    x2 = min(r1["x2"], r2["x2"])
+    y2 = min(r1["y2"], r2["y2"])
+    inter = max(0, x2 - x1) * max(0, y2 - y1)
+    area1 = (r1["x2"] - r1["x1"]) * (r1["y2"] - r1["y1"])
+    area2 = (r2["x2"] - r2["x1"]) * (r2["y2"] - r2["y1"])
+    return inter / max(1e-6, area1 + area2 - inter)
+
+train_rows = []
+for d in dets_train:
+    best_iou, best_cls = 0, 4  # 4 = background
+    for c in crops_by_img.get(d["image"], []):
+        i = iou(d, c)
+        if i > best_iou:
+            best_iou, best_cls = i, c["cls"]
+    if best_iou >= 0.5:
+        d["cls"] = best_cls
+        train_rows.append(d)
+    else:
+        d["cls"] = 4
+        train_rows.append(d)
+```
+
+Wait, but I also want to keep the high-res crops as training data (they're the "perfect" boxes). Let me include both.
+
+Actually, let me reconsider. The brief says:
+"train the classifier on detector boxes from the training images (dets.csv split "train"), labelled by overlap with the true boxes in crops.csv, including a "background" class for false alarms"
+
+So the primary idea is to use dets.csv train as training data with background. Let me do that, and also keep the crops as additional training data (labeled 0-3, no background among them).
+
+For the scoring, I'll use: score = conf * p(class) * (1 - p_bg)
+
+This is clean and effective. If the model is confident it's background, all defect scores get suppressed.
+
+Let me now write the actual code changes. I need to be careful about:
+1. The dataset needs to handle cls=4 (background) - it already does since it just passes the label through
+2. The model needs 5 output classes
+3. The inference needs to use 5-class probs
+
+Let me write the SEARCH/REPLACE blocks:
+
+Block 1: After reading dets, add the training data construction from dets_train
+Block 2: Change num_classes=4 to num_classes=5
+Block 3: Change the inference scoring
+
+Let me look at the current code more carefully to find exact text to match.
+
+Current training data:
+```python
+    crops = [r for r in read_csv(os.path.join(args.data, "crops.csv")) if r["res"] in TRAIN_ON]
+    dets = read_csv(os.path.join(args.data, "dets.csv"))
+    ev = [d for d in dets if d["split"] == "eval"]
+    needed = {r["image"] for r in crops} | {d["image"] for d in ev}
+```
+
+I need to:
+1. Read all crops (not just high-res) for IoU matching
+2. Build train_rows from dets_train
+3. Use train_rows for training
+
+Let me restructure. I'll replace the data loading section.
+
+Actually, let me be more careful. The current code filters crops by TRAIN_ON = ("high",). For IoU matching, I should use all crops (both high and low res) since the dets are on the same images.
+
+Wait, actually the dets are on specific images. The crops are also on those images. The "res" field in crops.csv indicates the resolution of the crop, not the image. So I should use all crops for matching.
+
+Let me write the changes:
+
+```python
+    crops_all = read_csv(os.path.join(args.data, "crops.csv"))
+    dets = read_csv(os.path.join(args.data, "dets.csv"))
+    ev = [d for d in dets if d["split"] == "eval"]
+    dets_train = [d for d in dets if d["split"] == "train"]
+    
+    # Label dets_train by IoU with crops
+    crops_by_img = {}
+    for c in crops_all:
+        crops_by_img.setdefault(c["image"], []).append(c)
+    
+    def iou(r1, r2):
+        x1 = max(r1["x1"], r2["x1"])
+        y1 = max(r1["y1"], r2["y1"])
+        x2 = min(r1["x2"], r2["x2"])
+        y2 = min(r1["y2"], r2["y2"])
+        inter = max(0, x2 - x1) * max(0, y2 - y1)
+        area1 = (r1["x2"] - r1["x1"]) * (r1["y2"] - r1["y1"])
+        area2 = (r2["x2"] - r2["x1"]) * (r2["y2"] - r2["y1"])
+        return inter / max(1e-6, area1 + area2 - inter)
+    
+    train_rows = []
+    for d in dets_train:
+        best_iou, best_cls = 0.0, 4
+        for c in crops_by_img.get(d["image"], []):
+            i = iou(d, c)
+            if i > best_iou:
+                best_iou, best_cls = i, c["cls"]
+        d["cls"] = best_cls if best_iou >= 0.5 else 4
+        train_rows.append(d)
+    
+    # Also include high-res crops as additional training data
+    crops = [r for r in crops_all if r["res"] in TRAIN_ON]
+    train_rows = train_rows + crops
+    
+    needed = {r["image"] for r in train_rows} | {d["image"] for d in ev}
+```
+
+Hmm wait, this might be too much data. Let me check: dets_train could be large. Let me just use dets_train for now (it's the actual distribution the model sees at inference).
+
+Actually, I think using both is fine. The crops give "perfect" examples and the dets give "real" examples. Together they should help.
+
+But wait - if I include both, the background class only appears in the dets_train portion. The crops are all labeled 0-3. That's fine - it's like having some samples with a 5th class and some without.
+
+Actually, for the crops, I should also add cls=4 as "not applicable" - no wait, the crops ARE defects, they just don't have a background label. In the 5-class model, a crop labeled "pore" (cls=0) means the model should predict class 0 with high probability and class 4 (background) with low probability. That's correct.
+
+OK let me finalize my approach:
+1. Use dets_train (labeled 0-4) + high-res crops (labeled 0-3) as training data
+2. Train with 5 classes
+3. Score = conf * p(c) * (1 - p_bg) for c in 0-3
+
+This should help because:
+- The model learns to recognize background
+- False alarms get suppressed by (1 - p_bg)
+- The ranking improves because true defects have lower p_bg than false alarms
+
+Let me write the code now. I'll try to keep the changes minimal and focused.
+
+One concern: the IoU matching might be slow if there are many crops per image. Let me check - typically a weld image might have 5-20 defects. And dets_train might have 50-200 boxes per image. So the matching is at most 200*20 = 4000 IoU computations per image. With ~1000 images, that's 4 million IoU computations. Each is just a few float ops, so it should be fast (< 1 second).
+
+Let me write the final code. I'll use multiple SEARCH/REPLACE blocks.

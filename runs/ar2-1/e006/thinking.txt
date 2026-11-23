@@ -1,0 +1,215 @@
+===== attempt 1 =====
+Let me analyze the current situation and think about what would be the most impactful next experiment.
+
+Current best: e005 with 5-seed mean 0.6286 mAP@0.5
+Per-class: pore 0.514, deposit 0.620, discontinuity 0.780, stain 0.601
+
+Key observations:
+1. The ceiling for stage 2 is 0.758 mAP@0.5 (perfect classes on stage-1 boxes)
+2. The single-class score is 0.755 mAP@0.5
+3. We're at 0.6286, so there's significant room to improve
+4. Pore (0.514) and stain (0.601) are the weakest classes
+5. Training on detector boxes with background class (e001) actually hurt (0.5512)
+6. Low-res crops (e002) didn't help (0.6209)
+7. ConvNeXt-Nano was a bug (0.3721)
+8. Training on detector boxes matched by IoU (e004) was close but rejected (0.6234)
+9. TTA with horizontal flip (e005) helped (0.6372 seed-0, 0.6286 mean)
+
+What hasn't been tried yet that could help:
+- Scoring: The current scoring is `d["conf"] * float(p[c])`. Maybe we can do better with the score formula.
+- The background class idea failed, but maybe a different approach to ranking would help.
+- Architecture: ConvNeXt-Nano was a bug. Maybe try a different architecture properly.
+- More TTA: vertical flip, rotation?
+- Training data: Use all crops (high + low)?
+- Loss: focal loss for better class balance?
+- The fact that merging all classes gives 0.77 suggests the detection is good but classification is the bottleneck.
+
+Let me think about what's most promising:
+
+1. **Scoring improvement**: Currently score = conf * p[c]. The mAP@0.5 cares about ranking. If we use a different combination, like conf^alpha * p[c]^beta, or subtract a background penalty, we might improve ranking. But e001 tried background and it hurt.
+
+2. **More TTA**: We already do horizontal flip. Adding vertical flip or 180° rotation could help. But this costs more inference time.
+
+3. **Architecture**: Try a different backbone that's properly implemented. The ConvNeXt-Nano was a bug. Maybe try convnext_nano properly, or regnety_016, or efficientnet_b2.
+
+4. **Training on low-res + high-res**: e002 tried adding low-res and it didn't help (0.6209 vs 0.6372 for TTA). But that was without TTA.
+
+5. **Focal loss**: Could help with the imbalanced classes.
+
+6. **Score calibration**: The current score is conf * p[c]. Maybe p[c] / sum(p) is already normalized. What about using log(p[c]) or p[c]^2 to be more selective?
+
+Actually, let me think more carefully. The key issue is:
+- Pore is the weakest (0.514) - likely confused with other classes or background
+- Stain (0.601) is confused with deposit and background
+- The single-class score is 0.755, meaning the boxes are mostly correct, but the class assignment is wrong
+
+The scoring formula `conf * p[c]` means that for a box where the model is uncertain (p spread evenly), all classes get similar scores. This is fine for ranking within a box, but the absolute score matters for ranking across boxes.
+
+Wait, actually for mAP@0.5, what matters is:
+- For each class, the detections are ranked by score
+- A detection is a TP if it matches a GT of that class with IoU >= 0.5
+- A detection is a FP if it doesn't match
+
+So for a given box, if we assign it class 0 with score 0.5 and class 1 with score 0.3, both are separate detections. The class 0 detection is a TP if it matches a pore GT, the class 1 detection is a TP if it matches a deposit GT.
+
+The key insight: we want the correct class to have the highest score for each box, AND we want boxes that are actually defects to have higher scores than false alarms.
+
+Current approach: score = conf * p[c]. This means:
+- A false alarm with high conf but low p[correct_class] gets a low score for the correct class - good
+- A true defect with moderate conf but high p[correct_class] gets a decent score - good
+- But a false alarm with high conf and moderate p[wrong_class] could get a high score for the wrong class - bad (this creates FPs)
+
+What if we use score = conf * p[c]^2? This would be more selective - only give high scores when the model is very confident about a class. This might reduce FPs for wrong classes.
+
+Or what about: score = conf * p[c] * (p[c] - max(p[other_classes]))? This rewards boxes where the correct class is clearly the top choice.
+
+Actually, a simpler idea: what if we only output the top-1 class for each box (or top-2)? Currently we output all 4 classes for every box. This means for a box that's actually a pore, we also output deposit, discontinuity, and stain predictions. These are all FPs for their respective classes. If we only output the top-1 or top-2, we reduce the number of FPs.
+
+Wait, but the problem says "Several rows per box (one per class) are allowed and often help." So outputting all classes is generally good. But maybe outputting only the top-2 would be better?
+
+Actually, let me reconsider. For mAP, having extra FP rows for wrong classes doesn't hurt the TP rows - it just adds FPs to the ranking. If the FP scores are lower than the TP scores, they don't affect precision at the TP's rank. But if they're higher, they do hurt.
+
+The current scoring is conf * p[c]. For a true pore box where p = [0.6, 0.2, 0.1, 0.1]:
+- pore: conf * 0.6
+- deposit: conf * 0.2
+- discontinuity: conf * 0.1
+- stain: conf * 0.1
+
+The deposit, discontinuity, and stain rows are FPs. If their scores are lower than the pore score, they rank below and don't hurt pore's AP. But they do hurt deposit's, discontinuity's, and stain's AP (as FPs).
+
+So by outputting all 4 classes, we help the correct class (it gets a high score) but hurt the other 3 classes (extra FPs). The net effect depends on the balance.
+
+What if we only output the top-1 class? Then:
+- For a true pore box: only pore gets a score. No FPs for other classes.
+- But we lose the ability to have a "second guess" that might be correct.
+
+What if we output top-2? This seems like a good compromise.
+
+Actually, let me think about this differently. The issue is that we're at 0.6286 and the ceiling is 0.758. The gap is 0.13, which is huge. The main sources of error are:
+1. Wrong class assignment (the model picks the wrong class)
+2. False alarms (background boxes getting high scores)
+3. Ranking issues (true detections ranked below false ones)
+
+Since e001 (background class) hurt, and e004 (detector boxes) was close, the issue might be more about the model's discriminative power than about the training data.
+
+Let me think about what could give a significant boost:
+
+1. **Better architecture**: The ConvNeXt-Nano attempt was a bug. Let me try it properly. Or try regnety_016 which has a different inductive bias.
+
+2. **Focal loss**: Instead of cross-entropy, use focal loss which down-weights easy examples and focuses on hard ones. This could help with the confused classes.
+
+3. **Score formula change**: Instead of conf * p[c], try conf * p[c]^1.5 or conf^0.5 * p[c] to change the ranking.
+
+4. **Only output top-1 or top-2 classes**: Reduce FPs for wrong classes.
+
+5. **More aggressive TTA**: Add vertical flip, 90° rotation.
+
+Let me go with a scoring change since it's low-risk and could help. The hypothesis: by only outputting the top-2 classes per box (instead of all 4), we reduce the number of false positive rows for wrong classes, which should improve the AP for the weaker classes (pore, stain) by reducing the FP clutter in their rankings.
+
+Actually wait - let me reconsider. The problem says "Several rows per box (one per class) are allowed and often help." This suggests that outputting multiple classes per box is generally beneficial. The benefit is that if the model's top-1 is wrong but top-2 is right, we still get a TP. The cost is extra FPs.
+
+Given that pore and stain are the weak classes, and they're often confused with each other and with deposit, having multiple rows per box might actually help catch the correct class even when the top-1 is wrong. So reducing to top-1 might hurt.
+
+Let me think of another approach. What about the score formula?
+
+Currently: score = conf * p[c]
+
+What if: score = conf * p[c] / (1 + p_bg) where p_bg is some background indicator? But we don't have a background class.
+
+What about: score = conf * p[c] * (p[c] - mean(p))? This rewards boxes where the predicted class is clearly above average.
+
+Or simpler: score = conf * p[c]^2. Squaring the probability makes the score more peaked - the top class gets a much higher score relative to others. This could help ranking.
+
+Actually, I think the most promising untried idea is to try a different architecture properly. The ConvNeXt-Nano attempt was a bug (0.3721 is way too low). Let me try regnety_016 which is a different architecture family and might have better discriminative power.
+
+Wait, but I need to be careful. The bug in e003 was likely an implementation issue. Let me check what could go wrong with ConvNeXt... Actually, I don't have the e003 code to check. Let me just try a different architecture that's more likely to work correctly.
+
+Actually, let me reconsider the options:
+
+The most impactful change would probably be one of:
+1. Better model (architecture change) - high risk, high reward
+2. Better scoring formula - low risk, moderate reward
+3. Better training (loss, data) - moderate risk, moderate reward
+
+Given that we've tried data changes (e001, e002, e004) and they mostly didn't help or were close, and the architecture change was a bug, I think the next best move is either:
+- Fix the architecture (try convnext_nano or regnety_016 properly)
+- Try a scoring change
+
+Let me go with a scoring change since it's lower risk. Specifically, I'll try squaring the class probability: score = conf * p[c]^2. This makes the score more peaked, which should help ranking by making the correct class stand out more from the wrong classes.
+
+Wait, actually, let me think about this more carefully. For mAP@0.5:
+- We need TP to be ranked above FP
+- Within a box, the correct class should have higher score than wrong classes (this is already handled by p[c] being higher for the correct class)
+- Across boxes, true defect boxes should have higher scores than false alarm boxes
+
+The conf * p[c] formula handles both. Squaring p[c] would make the within-box ranking more extreme (good) but wouldn't change the across-box ranking much (since conf dominates the scale).
+
+Hmm, what about: score = conf^0.5 * p[c]? This reduces the weight of conf and increases the weight of p[c]. This might help if the detector's conf is noisy.
+
+Or: score = conf * p[c] / (1 - p[c] + epsilon)? This normalizes by the uncertainty.
+
+Actually, I think the most impactful thing to try is a different model architecture. Let me try convnext_nano properly. The e003 attempt was a bug, but the architecture itself should be good. ConvNeXt has better inductive biases for classification tasks.
+
+But wait - I need to be careful about the time budget. ConvNeXt-Nano is larger than EfficientNet-B0, so it might be slower. Let me check: EfficientNet-B0 has ~4M params, ConvNeXt-Nano has ~89M params. That's a big difference. It might be too slow.
+
+What about regnety_016? It has ~16M params, which is between EfficientNet-B0 and ConvNeXt-Nano. It might be a good middle ground.
+
+Actually, let me look at the param counts:
+- efficientnet_b0: ~4M
+- regnety_016: ~16M
+- convnext_nano: ~89M
+- convnext_pico: ~5.7M
+- convnext_atto: ~1.9M
+- mobilenetv3_large_100: ~5.4M
+- resnet50: ~25M
+- efficientnet_b2: ~9M
+
+convnext_pico (5.7M) is close to efficientnet_b0 (4M) in size but has the ConvNeXt architecture. This might be a good choice - similar speed but better architecture.
+
+Let me try convnext_pico. The hypothesis is that ConvNeXt's modern inductive biases (depthwise convolutions, LayerNorm) will improve classification accuracy for the visually similar defect types, while the similar parameter count ensures it fits within the time budget.
+
+Actually, I realize I should be more careful. Let me think about what's most likely to give a measurable improvement.
+
+Looking at the per-class scores:
+- pore: 0.514 (weakest)
+- deposit: 0.620
+- discontinuity: 0.780 (strongest)
+- stain: 0.601
+
+The gap between discontinuity and the others suggests the model can distinguish discontinuity well but struggles with pore/deposit/stain. These three are visually more similar to each other.
+
+A better architecture might help with this. But so could better training.
+
+Let me try a different angle: what about using focal loss instead of cross-entropy? Focal loss down-weights easy examples and focuses the training on hard (confused) examples. This could help the model better distinguish between pore, deposit, and stain.
+
+Focal loss: -alpha * (1-p)^gamma * log(p)
+
+With gamma=2 and alpha=1 (no class weighting, since class-weighted loss hurt before), this should focus on the hard examples without introducing class imbalance issues.
+
+This is a low-risk change (just replacing the loss function) with moderate expected reward. Let me go with this.
+
+Actually, wait. Let me reconsider. The problem statement says "Class-weighted loss hurt classification every time it was tried." Focal loss is different from class-weighted loss - it's example-weighted, not class-weighted. It down-weights easy examples regardless of class. This should be safe.
+
+Let me go with focal loss (gamma=2, no class weights).
+
+Hypothesis: Replacing cross-entropy with focal loss (gamma=2) will improve classification of the visually similar defect types (pore, deposit, stain) by focusing training on hard, confused examples rather than easy separable ones, leading to better discrimination and higher mAP.
+
+Let me write the code change. I need to:
+1. Replace `crit = nn.CrossEntropyLoss()` with a focal loss implementation
+2. Keep everything else the same
+
+Here's my focal loss implementation:
+
+```python
+class FocalLoss(nn.Module):
+    def __init__(self, gamma=2.0):
+        super().__init__()
+        self.gamma = gamma
+    def forward(self, logits, targets):
+        ce = nn.functional.cross_entropy(logits, targets, reduction='none')
+        pt = torch.exp(-ce)
+        focal = (1 - pt) ** self.gamma * ce
+        return focal.mean()
+```
+
+This is simple and should work. Let me write the SEARCH/REPLACE blocks.

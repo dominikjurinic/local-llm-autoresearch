@@ -1,0 +1,328 @@
+===== attempt 1 =====
+Let me analyze the situation carefully.
+
+**Current state:**
+- Best: e000, 5-seed val mAP@0.5 = 0.6311
+- Per-class AP: pore 0.506, deposit 0.630, discontinuity 0.780, stain 0.608
+- The ceiling is 0.758 (stage-1 boxes with perfect classes)
+- The one-step baseline is 0.638
+
+**What's been tried and rejected:**
+- e001/e002: Training on detector boxes with background class → 0.5172 (rejected)
+- e003: Including low-res crops → 0.6251 (rejected)
+- e004: Squaring class probability → 0.6161 (rejected)
+- e005: Training on detector boxes (overlap) without background → 0.6248 (rejected)
+- e006: ConvNeXt-Nano → 0.2901 (suspicious/bug)
+- e007: MixUp → 0.6326 seed 0, 0.6292 5-seed (not confirmed)
+- e008: conf × p[c] × max(p) → 0.6265 (rejected)
+
+**Key observations:**
+
+1. The per-class APs show pore (0.506) and stain (0.608) are the weak classes. Deposit is 0.630. Discontinuity is strong at 0.780.
+
+2. The "two-crop" approach (tight 1.5x + wide 2.5x) averages logits. This is the current architecture.
+
+3. Training on detector boxes (e005) didn't help much (0.6248 vs 0.6311). Training with background class (e002) hurt a lot (0.5172).
+
+4. Scoring changes (e004, e008) didn't help.
+
+5. Low-res crops (e003) didn't help.
+
+6. MixUp (e007) was close but not confirmed.
+
+**What ideas remain in scope:**
+- Train classifier on detector boxes from training images (tried, didn't help much)
+- Combine detector conf and classifier probabilities differently (tried, didn't help)
+- Robustness to box misplacement (jitter) - the current code already has some jitter in `make_crop`
+- Use of low-res training crops (tried, didn't help)
+- Test-time augmentation
+- Ensembling within the time budget
+- Architecture changes using pretrained backbones
+
+Let me think about what could actually move the needle:
+
+**Key insight:** The per-class breakdown shows pore (0.506) and stain (0.608) are weak. The background confusion is a problem - stain is often confused with deposit and background.
+
+**Ideas to consider:**
+
+1. **Test-time augmentation (TTA):** At inference time, average predictions over multiple augmentations (flips, slight scale changes). This is a common technique that can improve accuracy without changing training. The time budget is tight (162s out of 180s used), so we need to be careful. But we could do 2x TTA (original + horizontal flip) which would roughly double inference time. Current inference takes about 162-125=37s for 41879 detections. With 2x TTA it'd be ~74s, total ~199s which exceeds 180s. So we'd need to reduce training time or use a faster approach.
+
+Actually wait, let me re-read the timing. The log shows:
+- Loading: 13s
+- Training epochs: 60s, 78s, 97s, 116s, 125s (cumulative from T0)
+- Total: 162s
+
+So training takes about 125-13=112s, and inference+writing takes 162-125=37s.
+
+With 2x TTA, inference would be ~74s, total ~13+112+74=199s > 180s. Too much.
+
+But we could reduce RESERVE_S or reduce training time. Or use a smaller batch size for eval... actually the eval batch is already 256.
+
+Alternatively, we could do TTA only on a subset, or use a lighter TTA (just horizontal flip which is cheap).
+
+Actually, horizontal flip is very cheap - it's just reversing the array. The expensive part is the model forward pass. So 2x TTA means 2x forward passes. That's the issue.
+
+Let me think differently.
+
+2. **Better use of the wide crop:** Currently the model averages logits from tight (1.5x) and wide (2.5x) crops. What if we weight them differently? The wide crop gives more context which might help distinguish stain from deposit. But this is a small change.
+
+3. **Class-specific handling:** Since pore and stain are weak, maybe we can use a different approach for these classes. But this is complex.
+
+4. **Training with more epochs / different LR schedule:** The current training does about 421 steps in ~112s. With 6052 training samples and batch size 64, that's about 94 steps per epoch. So 5 epochs. The loss is still decreasing (0.2132 at epoch 4). Maybe training longer would help? But we're time-limited.
+
+5. **Using a different backbone that's faster:** If we use a smaller/faster backbone, we could train longer or do TTA. But e006 (ConvNeXt-Nano) crashed/bugged. Let me think about what went wrong there.
+
+Actually, e006 was "suspicious (likely bug)" with score 0.2901. This is way below the baseline, suggesting a bug. The issue might be with how timm creates the model - maybe the pretrained weights weren't loaded correctly, or the model architecture wasn't compatible.
+
+6. **Ensembling two models:** Train two different models (e.g., EfficientNet-B0 and ResNet18) and average their probabilities. This would give diversity. But training two models in the time budget is tight.
+
+7. **Training on detector boxes with a better background strategy:** e002 tried adding a background class and it hurt a lot (0.5172). e005 tried training on detector boxes without background and got 0.6248. Maybe the issue is that the background class was too dominant or the IoU threshold was wrong.
+
+8. **Score calibration / temperature scaling:** Instead of using raw probabilities, apply a temperature to sharpen or soften them. But e004 (squaring) and e008 (×max_p) both hurt.
+
+9. **Using the detector confidence more cleverly:** The current score is `conf * p[c]`. What if we use `conf^a * p[c]^b` for some a, b? Or what if we threshold the conf?
+
+10. **Multi-scale inference:** Instead of just tight (1.5x) and wide (2.5x), use more scales. But this increases inference time.
+
+11. **Training with more data augmentation:** The current augmentation is light geometric jitter (±10% center, 0.85-1.2 scale), random flips, and brightness (0.8-1.2). We could add:
+    - Color jitter (hue, saturation)
+    - Random erasing
+    - Cutout
+    - More aggressive geometric transforms
+
+12. **Label smoothing:** Instead of cross-entropy, use label smoothing (e.g., 0.1). This can help with calibration.
+
+13. **Focal loss:** For handling class imbalance. But the problem statement says "Class-weighted loss hurt classification every time it was tried." Focal loss is different from class weighting though.
+
+14. **Training with a longer warmup or different LR:** The current warmup is 5% of the budget. Maybe a different schedule would help.
+
+15. **Using both high and low res crops but with different weights:** e003 tried including low-res and it didn't help. But maybe weighting them differently would.
+
+Let me think about what's most likely to work given the constraints:
+
+The key weaknesses are:
+- Pore (0.506) - very weak
+- Stain (0.608) - weak, confused with deposit and background
+- Deposit (0.630) - moderate
+
+The ceiling is 0.758, so there's a lot of room. The gap between current (0.631) and ceiling (0.758) is 0.127.
+
+I think the most promising direction is **test-time augmentation** because:
+1. It doesn't change training (which has been hard to improve)
+2. It can improve classification accuracy directly
+3. It's a well-known technique that typically gives 1-3% improvement
+4. The main challenge is time budget
+
+For TTA, the simplest approach is horizontal flip + original. But that doubles inference time.
+
+Alternative: We could reduce training time to make room for TTA. For example:
+- Reduce RESERVE_S from 55 to 30 (we only need ~37s for inference, so 30s reserve with 2x TTA = ~74s, total ~13+112+74=199s... still too much)
+
+Hmm, let me recalculate. If we do 2x TTA:
+- Loading: 13s
+- Training: ~112s (5 epochs)
+- Inference with 2x TTA: ~74s
+- Writing: ~2s
+- Total: ~199s > 180s
+
+We need to save about 20s. Options:
+- Reduce training to 4 epochs (save ~20s): total ~179s. Tight but possible.
+- Reduce RESERVE_S to 15s and train until deadline - 15s.
+
+Actually, the training loop already stops at `deadline - RESERVE_S`. So if we set RESERVE_S = 15, training would run until 165s, leaving 15s for inference. But 2x TTA needs ~74s. That's way more than 15s.
+
+Wait, I think I'm confusing myself. Let me re-read the code.
+
+```python
+t_end = deadline - RESERVE_S
+```
+
+So training stops at `deadline - RESERVE_S`. With RESERVE_S=55 and deadline=180, training stops at 125s. Then inference runs from 125s to 162s (37s), and writing takes a bit more.
+
+If I want 2x TTA (74s for inference), I need training to stop at 180-74-some_margin = ~100s. So RESERVE_S should be about 80s. But then training would only get to about 100s-13s = 87s, which is about 4 epochs (87/94*94 ≈ 3.3 epochs... wait, each epoch is about 19s based on the log: 60-13=47s for epoch 0? No wait, the times are cumulative from T0.
+
+Let me re-read:
+- Loading: 13s (T0 to 13s)
+- Epoch 0: ends at 60s → 47s for epoch 0
+- Epoch 1: ends at 78s → 18s for epoch 1
+- Epoch 2: ends at 97s → 19s for epoch 2
+- Epoch 3: ends at 116s → 19s for epoch 3
+- Epoch 4: ends at 125s → 9s for epoch 4 (partial, stopped by time)
+
+So epoch 0 takes 47s (includes data loading for the first time), and subsequent epochs take ~19s each. If training stops at 100s, we'd get:
+- 13s loading
+- 47s epoch 0 (total 60s)
+- 19s epoch 1 (total 79s)
+- 19s epoch 2 (total 98s)
+- ~2s into epoch 3 (total 100s)
+
+So about 2.8 epochs. That's less than the current 4.2 epochs. The loss at epoch 2 was 0.3022, so we'd be training less.
+
+Hmm, this is a tradeoff. Less training but TTA at inference.
+
+Actually, let me think about a different approach. What if instead of full 2x TTA, we do a lighter form?
+
+**Light TTA idea:** At inference, for each box, compute the prediction with the original crop and with a horizontally-flipped crop, then average the logits. This is 2x forward passes.
+
+Alternatively, we could do TTA only for the wide crop (which is more important for context) and keep the tight crop as-is. That would be 1.5x forward passes instead of 2x.
+
+Or, we could do TTA with a small scale variation (e.g., 0.9x and 1.1x) instead of flip. But flip is more standard.
+
+Actually, let me reconsider. The time budget issue is real. Let me think about what else could work.
+
+**Another idea: Training with a different augmentation strategy specifically targeting the weak classes.**
+
+The problem says "stain is often confused with deposit and background." This suggests the model needs more context to distinguish stain. The wide crop (2.5x) should help with this, but maybe it's not enough.
+
+What if we increase the wide crop context from 2.5 to 3.0 or 3.5? This would give more surrounding context. The tradeoff is that the crop covers more of the image, potentially including other defects or more background.
+
+Actually, this is a simple change that's easy to test. Let me consider it.
+
+**Idea: Increase CONTEXT from 2.5 to 3.5**
+
+Hypothesis: A wider context crop (3.5x instead of 2.5x) will help distinguish stain from deposit and background by providing more surrounding visual context, improving the weak stain class AP.
+
+This is a one-line change, easy to test, and directly targets the identified weakness.
+
+But wait, would a wider crop actually help? If the stain is a thin line or small area, a wider crop would dilute the signal. On the other hand, if stain has a characteristic pattern in the surrounding area (like discoloration spreading), a wider crop would capture that.
+
+Given that stain is confused with deposit and background, the issue might be that stain looks like deposit in the tight crop but has different characteristics in the wider context. Or it might be that stain is harder to distinguish from background (i.e., the detector finds boxes that look like stain but are actually background).
+
+I think this is worth trying. It's a simple, focused change.
+
+**Alternative idea: Use a different scoring function that accounts for class prior.**
+
+The current score is `conf * p[c]`. If some classes are more common than others, the classifier might be biased. But we don't have explicit class priors in the training data... actually we do, we can compute them from crops.csv.
+
+But this is similar to class weighting which "hurt classification every time it was tried."
+
+**Another idea: Train for more steps by using a smaller model or faster training.**
+
+If we switch to a smaller/faster backbone (e.g., mobilenetv3_large_100 or resnet18), we could train for more epochs in the same time. But we'd lose some model capacity.
+
+Actually, let me check: the current model is EfficientNet-B0. What about using ResNet18? It's smaller and faster, so we could train for more epochs. But would it be as accurate?
+
+The problem is that e006 (ConvNeXt-Nano) had a bug. Let me think about what could go wrong with a different backbone. The issue might be:
+1. timm model name not matching
+2. Pretrained weights not loading correctly
+3. Model output dimension different
+
+For ResNet18, the timm name is "resnet18" and it should work fine with `num_classes=4`.
+
+But I'm not sure if a smaller model would be better. The current model already has a reasonable accuracy.
+
+**Let me go with the CONTEXT change.** It's simple, targeted, and easy to test.
+
+Actually, wait. Let me reconsider the TTA idea more carefully.
+
+Current inference time: 37s for 41879 detections with 2 forward passes per detection (tight + wide).
+So 1 forward pass per detection: ~18.5s.
+With 2x TTA (4 forward passes per detection): ~74s.
+
+If I set RESERVE_S = 80, training stops at 100s.
+Training: 13s loading + 47s epoch 0 + 19s epoch 1 + 19s epoch 2 + 2s partial epoch 3 = 100s.
+Inference: 74s.
+Writing: ~2s.
+Total: 100 + 74 + 2 = 176s. Within 180s!
+
+But we'd only train for ~2.8 epochs instead of 4.2. The loss at epoch 2 was 0.3022, and at epoch 4 it was 0.2132. So we'd have a less trained model.
+
+The question is: does the TTA gain outweigh the loss from less training?
+
+Typically, TTA gives 1-3% improvement in accuracy. Less training (2.8 vs 4.2 epochs) might lose 2-5% in accuracy. It's a wash or slightly negative.
+
+Unless the model is already well-trained by epoch 2 and the additional epochs give diminishing returns. Looking at the loss: 0.7254 → 0.3777 → 0.3022 → 0.2555 → 0.2132. The improvement from epoch 2 to 4 is 0.3022 → 0.2132 = 0.089 in loss. From epoch 0 to 2 it's 0.7254 → 0.3022 = 0.423. So the later epochs do give meaningful improvement.
+
+I think TTA with reduced training is risky. Let me go with the CONTEXT change instead.
+
+**Final decision: Increase CONTEXT from 2.5 to 3.5**
+
+This is a simple, focused change that targets the weak stain class by providing more visual context. It doesn't change training time or inference time (the crop size changes but the model input size is fixed at 160x160).
+
+Wait, actually the crop size does change. With CONTEXT=3.5, the wide crop would be larger, but it's still resized to 160x160. So the inference time is the same. The only difference is what's in the crop.
+
+Let me also consider: should I change TIGHT_CONTEXT too? Probably not - the tight crop is meant to focus on the defect itself. The wide crop is for context. So I'll only change CONTEXT.
+
+Let me also consider whether 3.5 is the right value. The current is 2.5. Going to 3.5 is a 40% increase. Maybe 3.0 is a safer middle ground? But for a hypothesis test, a bigger change is more informative. If 3.5 helps, we can try 3.0. If 3.5 hurts, we know the direction is wrong.
+
+Actually, let me think about this differently. The image size is 160x160. The box is, say, 50x50 pixels. With CONTEXT=2.5, the crop is 125x125, resized to 160x160. With CONTEXT=3.5, the crop is 175x175, resized to 160x160. So the crop includes more surrounding area, but it's all squished into the same 160x160 input. The defect itself would appear smaller in the input.
+
+This could be a problem if the defect is small - it might become too small to detect. But for stain (which might be a larger, more diffuse area), the wider context could help.
+
+I'll go with CONTEXT=3.0 as a more moderate change. Actually, let me go with 3.5 for a more decisive test.
+
+Hmm, but actually I realize I should think about what's most likely to move the needle given the history. Many simple changes have been tried and rejected. The CONTEXT change is another simple change. Let me think about whether there's something more impactful.
+
+**What about ensembling?** Train two models (e.g., EfficientNet-B0 and ResNet18) and average their probabilities. This would give diversity and could improve accuracy. But training two models in the time budget is challenging.
+
+If each model takes ~112s to train, two models would take ~224s, which exceeds 180s. Unless we train them for fewer epochs each.
+
+Alternative: Train one model, then fine-tune it with a different augmentation for the remaining time. This is a form of ensembling.
+
+Actually, this is getting complex. Let me stick with the simple CONTEXT change.
+
+Wait, I just realized something. Let me re-read the problem statement:
+
+"stain is often confused with deposit and background"
+
+This suggests that the model confuses stain with deposit (similar visual appearance) and with background (stain might look like a non-defect). The wide crop context might help with the deposit confusion (by showing the surrounding weld pattern) but might not help with the background confusion (if the stain is subtle).
+
+For the background confusion, a different approach might be needed - like training with background examples (which was tried in e002 and hurt a lot).
+
+Let me think about why e002 hurt so much. The background class was added, and the model was trained to distinguish 4 defect classes from background. If the background class was too dominant (many false alarms), the model might have been biased towards predicting background, reducing recall for all classes. This would explain the large drop in mAP.
+
+What if we add background examples but with a much smaller weight or fewer examples? This is a sampling strategy.
+
+Actually, the problem says "Class-weighted loss hurt classification every time it was tried." But sampling (using fewer background examples) is different from class weighting.
+
+**New idea: Train on a mix of true boxes and a limited number of false alarm boxes (background), with the background class.**
+
+This is similar to e002 but with a controlled ratio of background to foreground examples. Instead of including all false alarms, include only a fraction (e.g., 20% of the true boxes count).
+
+But this is complex and similar to what was already tried. Let me not go down this path.
+
+**Let me go with the CONTEXT change. It's simple, targeted, and easy to test.**
+
+Actually, I want to reconsider one more time. Let me look at the per-class APs:
+- pore: 0.506 (very weak)
+- deposit: 0.630
+- discontinuity: 0.780 (strong)
+- stain: 0.608 (weak)
+
+Pore is the weakest. What makes pore different? Pores are small holes in the weld. They might be hard to distinguish from other small defects or from background. The tight crop (1.5x) should capture the pore well, but the wide crop (2.5x) might dilute the signal.
+
+For pore, maybe a tighter crop would be better. But the current TIGHT_CONTEXT is already 1.5x. Making it tighter (1.2x?) might help pore but hurt other classes.
+
+This is getting into class-specific crop sizes, which is complex.
+
+**Final decision: Increase CONTEXT from 2.5 to 3.5**
+
+Hypothesis: A wider context crop (3.5x instead of 2.5x) will improve the weak stain and pore classes by providing more surrounding visual context, helping the model distinguish defects from background and from each other.
+
+This is a one-line change. Let me write it.
+
+Actually, I want to be more careful. Let me think about whether increasing CONTEXT could hurt. If the crop is too wide, it includes more background, which might make the model more likely to predict background (lower confidence for all classes). This could hurt the strong discontinuity class.
+
+But the net effect depends on the balance. For stain (confused with background), more context might help by showing the weld pattern. For pore (small holes), more context might dilute the signal.
+
+It's a gamble, but a reasonable one. Let me go with it.
+
+Let me write the SEARCH/REPLACE block:
+
+```
+SEARCH: CONTEXT = 2.5           # wide crop: side = CONTEXT * long side of the box
+REPLACE: CONTEXT = 3.5           # wide crop: side = CONTEXT * long side of the box
+```
+
+This is clean and simple.
+
+Wait, I should double-check: is there any other place where CONTEXT is used? Let me look at the code.
+
+```python
+for ctx in (TIGHT_CONTEXT, CONTEXT):
+    x = make_crop(img, r, ctx, self.train)
+```
+
+Yes, CONTEXT is used in the dataset's `__getitem__` method. Changing it will affect both training and inference. Good.
+
+Let me finalize my answer.

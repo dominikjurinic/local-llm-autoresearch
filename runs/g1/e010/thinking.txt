@@ -1,0 +1,302 @@
+===== attempt 1 =====
+Let me analyze the situation carefully.
+
+**Current state:**
+- Best: e005, 5-seed mean 0.6345 (architecture: MLP head on concatenated backbone features)
+- Per-class AP: pore 0.505, deposit 0.639, discontinuity 0.781, stain 0.613
+- Diagnostics: pore is the weakest class (62% right on overlapping boxes), stain is confused with deposit (41 stain→deposit), deposit→stain 48
+- Gap: mAP if every box had correct class but kept scores = 0.7464. So wrong classes cost 0.7464 - 0.6345 = 0.1119. The remaining gap to perfect ceiling (0.758) is 0.0116, which is what scores cost.
+
+So the dominant error is the class decision. Pore is the weakest (0.505 AP, 62% accuracy on overlapping boxes). Stain/deposit confusion is also significant.
+
+**What's been tried:**
+- Data: detector boxes as extra training (e001 crashed, e002 not confirmed 0.6307, e009 rejected 0.6325) — 3 attempts, no confirmed gain. The guide says "if it fails twice, drop it." e002 not confirmed, e009 rejected. That's 2 failures. So drop it.
+- e003: stage-1 error simulation (random shifts/scales) — 0.6342 seed0, 5-seed 0.6294, not confirmed.
+- e004: pre-compute crops — bug (0.0531)
+- e005: MLP head — NEW BEST 0.6345
+- e006: wider MLP — rejected 0.6338
+- e007: box size/aspect as input — not confirmed 0.6317
+- e008: random zoom views — crashed
+- e009: detector boxes again — rejected 0.6325
+
+**Lessons:**
+- data: EXHAUSTED? (3 ideas, no new best)
+- architecture: 3 ideas, 1 new best
+- optimisation: 1 idea (bug)
+
+**Guide plan:**
+1. Consolidate: detector boxes — but this has now failed twice (e002 not confirmed, e009 rejected). Drop it.
+2. Close the box-quality gap: simulate detector errors (e003 tried, not confirmed), weight/sample by box quality, combine views better (e005 did this, e006 wider head rejected).
+3. Buy training steps.
+4. Fine-grained classes.
+
+Let me think about what's fundamentally different and likely to help.
+
+The dominant error is the class decision, especially:
+- Pore: 62% right. Pore→stain 21, pore→deposit 5. So pores are confused with stain mostly.
+- Stain→deposit 41, deposit→stain 48. Stain/deposit confusion.
+
+The guide says: "Look for one change that helps the whole pore / deposit / stain confusion, not one class."
+
+Now, what hasn't been tried?
+
+From the earlier runs (90 ideas across 5 runs), the families tried:
+- Score rows (argmax, margin, entropy, temperature) — no gain
+- 5th background class — no gain
+- Detector boxes as training data — accepted twice (small gain ~+0.004), but tonight e002 and e009 both failed
+- Third wide view — accepted twice (+0.005, mostly pore)
+- Low-res crops — no gain
+- Bigger backbone / ensembles — no gain
+- Resolution / small-box — no gain
+- TTA — no gain
+- Longer training — no gain
+- Class-balanced sampling / weighted loss — no gain
+- Training augmentation — no gain
+- Focal loss — no gain
+- Box size/aspect input — never properly tested
+
+So what's left that's fundamentally different?
+
+Let me think about the actual problem. The classifier is trained on TRUE boxes (hand-drawn, clean). At test time it sees DETECTOR boxes (misplaced, different sizes). The mismatch is the core issue.
+
+Ideas:
+1. **Train on detector boxes** — tried, failed tonight. Drop.
+2. **Simulate detector errors** (e003) — tried, not confirmed. The guide lists this as a main direction. But e003 already tried it and it wasn't confirmed. Hmm. e003 was "per-sample random tight zoom 1.0-1.8 and wide zoom 2.0-4.0" — wait no, e008 was the random zoom. Let me re-read.
+
+e003: "I replace the mild crop jitter (center ±0.1 of crop side, scale 0.85–1.2, i.e. effective box IoU only ~0.75–1.0) with a stage-1 error simulation: per training box, one shared center shift (magnitude uniform in 0–0.3 box..." — 0.6342 seed0, 5-seed 0.6294, not confirmed.
+
+e008: "I replace the fixed 1.5x/2.5x views with a per-sample random tight zoom (uniform 1.0–1.8) and random wide zoom (uniform 2.0–4.0), sharing the same center and jitter per view pair" — crashed.
+
+So detector error simulation via center shift (e003) was tried and not confirmed. Random zoom (e008) crashed.
+
+Hmm. So the "simulate detector errors" direction has one not-confirmed and one crash.
+
+Let me think differently. What's the biggest lever?
+
+The gap from wrong classes is 0.1119. Pore is the weakest at 0.505. If I could fix pore, that's a big chunk.
+
+Wait — let me reconsider. The per-class AP: pore 0.505 is very low. The confusion shows pore→stain 21, pore→deposit 5, pore→pore 47. So of 74 true pores on overlapping boxes, 47 are right (62%). 21 go to stain.
+
+Actually, let me reconsider the whole approach. What about the SCORING? The current score is conf × p_class. The diagnostic says "mAP@0.5 if every box had its correct class but kept your scores: 0.7464". So if I just fixed the class, keeping scores, I'd get 0.7464. That's the ceiling for the class decision given current scores.
+
+But wait, there's a subtlety. The score = conf × p_class. For a given box, the class with highest p_class gets the highest score (since conf is the same for all classes of that box). So the argmax class is the one with highest p_class. The ranking within a class across boxes is determined by conf × p_class.
+
+Now, the "no row" column in the confusion matrix: pore 1, deposit 1, discont 1, stain 3. These are boxes where the chosen class (argmax) doesn't... wait, "no row" means no row was written? Actually MIN_SCORE = 0.001, so rows below that aren't written. But the argmax class always has p > 0.25, so conf × p > conf × 0.25. If conf is very low, the row might be dropped. That's a tiny number though.
+
+Let me think about what could give a broad gain.
+
+Actually, let me reconsider the problem from the "train/test mismatch" angle, which the guide emphasizes as #1.
+
+The classifier is trained on clean true boxes. At test it sees detector boxes. The key insight: **train the classifier on the detector's own boxes** (R-CNN style). This is e001/e002/e009. But it failed tonight. Why?
+
+e002: 0.6307 (5-seed), not confirmed. e009: 0.6325 seed0, rejected. Both below 0.6345.
+
+Hmm, so adding detector boxes as training data didn't help. Maybe because the detector boxes are mostly false alarms or the labeling is noisy. Or maybe the issue is that adding ~? extra rows dilutes the clean boxes.
+
+Wait, actually — maybe the problem is that the detector boxes include MANY false alarms (boxes that don't overlap any true box). Those get excluded (IoU > 0.5 filter). But the ones that DO overlap might be mislabeled if the detector box is offset and overlaps the wrong true box. Actually the code takes argmax IoU, so it should pick the best match.
+
+Let me think about what's fundamentally different.
+
+Alternative: **The classifier should be robust to box placement.** Instead of training on clean boxes with jitter, or on detector boxes, what about **training on a distribution of box placements** — i.e., for each true box, generate multiple crops at different offsets/scales that mimic the detector's error distribution, and train on all of them with the same label. This is data augmentation for box robustness.
+
+But e003 tried center shifts and it wasn't confirmed. e008 tried random zoom and crashed.
+
+Hmm, let me reconsider. Maybe the issue with e003 is that the shift magnitude was too large or the approach diluted the clean signal.
+
+Let me think about a completely different angle: **the input the model sees**.
+
+Currently: tight crop 1.5x + wide crop 2.5x, both resized to 160x160, through the same EfficientNet-B0, features concatenated, MLP head.
+
+The pore class is weak. Pores are small, round, dark spots. Stain is... different. The confusion pore→stain suggests the model can't distinguish small pores from stain.
+
+What if the model needs HIGHER resolution for small objects? The guide says "input resolution and how much of the object fills both matter." But "Resolution and small-box handling" family was tried 9 times in earlier runs with no gain. So that's exhausted.
+
+Let me reconsider. What about the **number of training steps**? The log shows 436 steps in ~125s of training. The budget is 180s, reserve 55s, so training ends at 125s. Actually 436 steps. Each epoch ~94 steps. 5 epochs.
+
+Wait, "buy training steps" is direction 3. The log shows load time 13s, then training. The first epoch took 44s (13→57), later epochs ~18s each. So the first epoch has overhead (data loader warmup, image loading). Actually images are pre-loaded into memory at start (the `images` dict). So the per-step cost is crop generation (PIL extract + resize). e004 tried to pre-compute crops and had a bug.
+
+Hmm, pre-computing crops could buy steps. But e004 crashed with a bug. Let me think about whether I can do it correctly.
+
+Actually, wait. Let me reconsider the time budget. Total 180s. Load 13s. Training 13s→125s = 112s. Prediction 125s→162s = 37s. Reserve was 55s but prediction only took 37s. So there's slack. Actually the reserve is 55s, and training ends at deadline - 55 = 125s. Prediction took 125→162 = 37s. So 162 < 180, fine. There's 18s of slack (162 to 180).
+
+So I could reduce the reserve to ~40s and gain ~15s of training = ~15 more steps. That's a small gain. But the guide says "each step gained is worth more than a bigger model." 15 more steps out of 436 is ~3.5%. Might help a little but probably below the 0.005 noise threshold.
+
+Actually, let me reconsider. The bigger lever is the class decision. Let me focus there.
+
+Let me reconsider the confusion matrix more carefully:
+```
+                         pore  deposit disconti    stain  no row
+  true pore                47        5        1       21        1   (62% right)
+  true deposit              2      217        3       48        1   (80% right)
+  true discontinuity        1        2      442       14        1   (96% right)
+  true stain                9       41        6      555        3   (90% right)
+```
+
+Total overlapping boxes: pore 75, deposit 271, discont 456, stain 614. Total 1416.
+
+Errors:
+- pore→stain: 21
+- pore→deposit: 5
+- deposit→stain: 48
+- stain→deposit: 41
+- stain→pore: 9
+- discont→stain: 14
+- Others small.
+
+Total wrong: 21+5+48+41+9+14+... let me count. pore: 5+1+21+1=28 wrong. deposit: 2+3+48+1=54 wrong. discont: 1+2+14+1=18 wrong. stain: 9+41+6+3=59 wrong. Total wrong = 28+54+18+59 = 159. Right = 47+217+442+555 = 1261. Total 1420. Accuracy = 1261/1420 = 88.8%.
+
+The biggest confusions: deposit↔stain (48+41=89), pore→stain (21).
+
+So stain is the hub of confusion. Stain is confused with deposit (both ways) and pore.
+
+Hmm. What distinguishes stain from deposit and pore? This is a domain-specific question I can't answer directly.
+
+Let me think about what's a fundamentally different, high-value change.
+
+**Idea: Train with the detector's box distribution by using detector boxes from BOTH train and... no, eval boxes are hidden.**
+
+Wait, actually, here's a thought. The detector boxes on the TRAIN split are available (dets.csv has split="train"). These are the actual stage-1 boxes on training images. The guide's direction #2 first item is "simulate detector errors on the true boxes during training." But a more direct approach is to use the ACTUAL detector boxes.
+
+e009 used detector boxes with IoU>0.5 filter, labeled with the overlapping true box's class. It got 0.6325, rejected.
+
+Why did it fail? Possible reasons:
+1. The detector boxes are mostly false alarms → few useful rows.
+2. The detector boxes that overlap true boxes are a biased subset.
+3. Adding them dilutes the clean true boxes.
+4. The labeling is noisy (detector box overlaps true box but the crop looks different).
+
+Hmm. Let me think about whether there's a way to use detector boxes that's fundamentally different.
+
+Actually, maybe the issue is that e009 added detector boxes but kept the SAME jitter. So the detector boxes (already imperfect) get MORE jitter on top, making them even more imperfect, and the clean boxes get jitter too. The result is a mix that might not match the test distribution well.
+
+Alternative: **use detector boxes WITHOUT jitter** (they're already at the test distribution), and true boxes WITH jitter. This way the model sees the exact test-time box distribution (detector boxes) plus clean boxes.
+
+But that's a variant of e009. The guide says "Two failed variants of a direction: move to the next direction." Detector boxes failed twice (e002, e009). So I should move on.
+
+OK here's another angle. Let me reconsider the **view combination**. e005 (MLP head on concatenated features) is the current best. e006 (wider head) rejected. So the head architecture is settled.
+
+What about **adding a third view** (very wide, 4x)? Earlier runs: "Third, very wide view (4x the box) next to the 1.5x and 2.5x crops, logits averaged — accepted twice (5-seed 0.6342 both, +0.005), gain almost entirely from the pore class."
+
+But that was with logit averaging, and it was on the OLD base (logit averaging). Now the base is e005 (MLP head). Adding a third view to the MLP head would triple the feature concatenation (3 × 1280 = 3840 dims). And it adds compute (3 forward passes instead of 2). The guide warns about time.
+
+Actually wait, the third wide view gave +0.005 mostly from pore. Pore is our weakest class! That's interesting. A wider context view helps pore because... pores are small, so a wider view gives more context to distinguish them from stain? That makes sense with the guide's note "Context around an object can help separate classes that look alike up close."
+
+But the earlier runs used logit averaging and it was +0.005 (small, mostly pore). The guide says "Aim for changes that should move every class." A pore-only gain might not be accepted. But combined with the current best base, it might be different.
+
+Hmm, but the time cost: 3 views = 3 forward passes. Currently 2 views. That's 50% more forward pass time. Training: 436 steps in 112s. If forward pass is the bottleneck, 3 views → ~168s for the same steps, or fewer steps. Actually the reserve is 55s, so training budget is 125s. With 3 views, steps might drop to ~290. That's a big loss in steps.
+
+Actually, let me reconsider. The forward pass does the backbone twice (once per view). With 3 views, 3 times. The backbone is EfficientNet-B0 at 160x160. Let me estimate: 436 steps in 112s = 3.9 steps/s. The backbone forward+backward dominates. 2 backbones per step. So 1 backbone ≈ 1/2 step-time... roughly. With 3 backbones, ~2.6 steps/s, so ~325 steps in 125s. That's 111 fewer steps. That's a significant loss.
+
+So the third view is risky on time. And it was only +0.005 before (mostly pore). Probably not worth it.
+
+Let me think about **what's fundamentally untried and high-value.**
+
+Re-reading the guide's plan:
+1. Consolidate (detector boxes) — failed, drop.
+2. Close box-quality gap: (a) simulate detector errors [e003 not confirmed, e008 crash], (b) weight/sample by box quality [untried tonight?], (c) combine views better [e005 done, e006 rejected].
+3. Buy training steps.
+4. Fine-grained classes.
+
+Direction 2b: "weight or sample training boxes by box quality, so the model sees enough poorly placed boxes." This is untried tonight. But it's a variant of the detector-box idea in spirit. Hmm.
+
+Actually, let me reconsider the whole thing. What's the single most impactful, untried change?
+
+Let me reconsider the **scoring**. The current score is conf × p_class. The diagnostic says "mAP@0.5 if every box had its correct class but kept your scores: 0.7464". So the scores themselves are fine (the gap to perfect ceiling 0.758 is only 0.0116). The problem is purely the class decision. So scoring is NOT the lever. Good, that rules out scoring experiments.
+
+So 100% of the fixable error is the class decision. I need to improve the classifier's class accuracy on detector boxes.
+
+The classifier is at 88.8% accuracy on overlapping boxes. The "perfect" would be higher. What limits it?
+
+Option A: The model doesn't see enough of the test-time box distribution (mismatch).
+Option B: The model lacks capacity / resolution for fine distinctions.
+Option C: The classes are genuinely hard to distinguish (stain vs deposit vs pore).
+
+For A: detector boxes (failed), simulate errors (e003 not confirmed).
+For B: bigger model (failed in earlier runs), resolution (failed).
+For C: need better features / more context.
+
+Hmm. Let me think about C more. The stain/deposit/pore confusion. What if the model needs to see the texture at higher fidelity? 160x160 might be too low. But resolution was tried 9 times, no gain.
+
+Wait, actually — let me reconsider. The crops are resized to 160x160. The ORIGINAL crop is `side = max(long_side * context, MIN_CROP)`. For a tight crop (1.5x), if the box is, say, 50px, the crop is 75px, resized to 160 — that's an UPSCALE. For a wide crop (2.5x), 125px → 160, slight upscale. For large boxes, the crop might be 200px → 160, a downscale.
+
+So small boxes get upscaled (losing no info, but the network sees a low-res original). Larger boxes get downscaled.
+
+Hmm, what if I use a higher IMG_SIZE? That was tried (224px), no gain.
+
+Let me step back and think about what a senior researcher would try next.
+
+Actually, here's a thought I haven't seen in the history: **the model is trained with standard cross-entropy, which treats all classes equally. But the class decision errors are concentrated in specific confusions (stain↔deposit, pore→stain). What if I use a loss that's aware of the confusion structure?** No, that's a "class-weighted loss" which was tried and hurt.
+
+Another thought: **What if the issue is that the two views (tight and wide) are both resized to 160x160, so the tight crop of a small box is a blurry upscale while the wide crop shows context. The model concatenates their features. But maybe the tight crop is the one that matters for class identity (the defect's texture), and it's being upscaled from a small region. What if I give the tight crop more resolution?**
+
+Hmm, that's a resolution variant.
+
+Let me think about **ensemble of views with different backbones**. No, too slow.
+
+Actually, let me reconsider direction 3: **buy training steps**. The current run does 436 steps. The loss is still falling at the cut (0.1689 at epoch 4). If I could get more steps, the model would train better. How?
+
+The time breakdown: load 13s, train 112s (13→125), predict 37s (125→162). Reserve 55s.
+
+To buy steps:
+1. Reduce reserve: prediction takes 37s, so a reserve of ~45s is safe (with margin). That gains 10s = ~40 steps. Small.
+2. Speed up per-step: pre-compute crops (e004 crashed with bug). If I can pre-compute the crops correctly, the data loader becomes just tensor fetching, which is fast. This could roughly halve the per-step time (crop generation is PIL extract+resize, done in the worker). Actually, the crop generation happens in the DataLoader workers (8 workers). So it's parallelized. The GPU might be waiting for data. If I pre-compute, the data becomes pure memcpy.
+
+Let me estimate: 436 steps in 112s = 0.257s/step. If crop generation is, say, 40% of that (0.10s/step) and it's the bottleneck (GPU waiting), pre-computing could get us to ~0.15s/step = 660 steps in 112s. That's a big gain (+224 steps, +51%).
+
+But e004 crashed with a bug (score 0.0531, "likely bug"). The bug was probably in the pre-computation (wrong shapes, or the dataset returning wrong things). Let me think about how to do it correctly.
+
+Actually, the issue with pre-computing: I'd compute all crops at load time (6052 boxes × 2 views × 160×160×3 float32 = 6052 × 2 × 76800 × 4 bytes = 3.7 GB). That's a lot of memory but probably OK. Or uint8: 6052 × 2 × 160×160×3 = 930 MB. Then normalize on the fly.
+
+Wait, but the training jitter (center shift, scale, flip, brightness) is applied per-step in make_crop. If I pre-compute, I lose the jitter. I could pre-compute the crops WITHOUT jitter (just the extract+resize), then apply jitter (flip, brightness) on the pre-computed tensor per step. But the center shift and scale change require re-extracting from the image, which I can't do on a pre-computed crop.
+
+Hmm. So pre-computing loses the geometric jitter (center shift, scale). That might hurt. Unless I pre-compute the crops at the base and apply only flip+brightness.
+
+Actually, the geometric jitter is mild (±0.1 side, scale 0.85-1.2). If I drop it, the model trains on cleaner boxes. That might be fine or even good (less noise). But it changes the experiment.
+
+This is getting complicated and e004 already crashed. The guide says "A bug: fix it once; a second failure: drop it." e004 was a bug. I could try to fix it once. But it's risky.
+
+Let me reconsider. What's the cleanest high-value experiment?
+
+Let me reconsider the **detector box simulation** more carefully, because it's the guide's #1 direction for the main phase and it's the "train/test mismatch" core.
+
+e003: center shift 0-0.3 box, not confirmed (0.6294).
+e008: random zoom 1.0-1.8 / 2.0-4.0, crashed.
+
+The problem with e003: maybe the shift was applied to BOTH views independently or in a way that didn't match the test distribution. Let me think about what the test distribution actually is.
+
+At test time, each detector box is a SINGLE box (one placement). The model sees tight crop (1.5x) and wide crop (2.5x) of THAT box. So the "error" is in the box placement (center offset, size), and both views are derived from the same (erroneous) box.
+
+In e003, the jitter was "one shared center shift (magnitude uniform in 0-0.3 box...)" — so it shared the center shift between views. That's correct in principle. But it wasn't confirmed.
+
+Why not confirmed? Maybe the shift magnitude was wrong. The detector's actual error: I don't know it precisely, but IoU > 0.5 means the detector box overlaps the true box by >50%. For a detector box to have IoU 0.5 with the true box, the center offset is at most ~0.3-0.5 of the box size (depending on aspect). So 0-0.3 shift might be too small, or the distribution is off.
+
+Alternatively, maybe the issue is that e003 replaced the jitter entirely, and the clean boxes (no jitter) are actually important for the model to learn the "ideal" appearance. Replacing jitter with larger shifts might have hurt.
+
+Hmm. This is hard to reason about without more info.
+
+Let me think about a DIFFERENT high-value idea that's clearly untried.
+
+**Idea: Use the detector confidence as a training signal / auxiliary task.** No, that's weird.
+
+**Idea: Multi-crop with the SAME box but the model sees the box at its native scale (no resize to 160).** I.e., keep the crop at its original pixel size and let the network handle it. But EfficientNet-B0 expects a fixed input size (224 typically, but can take variable). Actually timm models can take variable input sizes. But that changes resolution handling, which was tried.
+
+**Idea: Train on the detector boxes but with a HIGHER IoU threshold (0.7 or 0.8) so the labels are cleaner.** This is a variant of e009. The guide says detector boxes failed twice. But a fundamentally different variant (higher IoU) might be different enough? The guide says "unless you can say what is fundamentally different and why that should change the result." A higher IoU threshold gives cleaner labels (the detector box is closer to the true box, so the crop looks more like a clean box). But it also gives fewer rows. Hmm.
+
+Actually, I think I'm overcomplicating this. Let me reconsider the guide's plan and pick the highest-value untried direction.
+
+The guide's main phase (direction 2) has three sub-directions:
+(a) simulate detector errors — tried (e003 not confirmed, e008 crash). 2 attempts. Per the guide's rule "Two failed variants of a direction: move to the next direction." e003 not confirmed + e008 crash = 2 failures. So move on.
+(b) weight/sample by box quality — untried tonight.
+(c) combine views better — e005 done (best), e006 rejected.
+
+So (b) is the next direction. "weight or sample training boxes by box quality, so the model sees enough poorly placed boxes."
+
+But wait, how do I define "box quality" for the TRUE boxes? True boxes are all "perfect" (IoU 1.0 with themselves). There's no quality variation. Unless I'm talking about the detector boxes' quality.
+
+Hmm, this sub-direction is a bit vague. Let me think about what it concretely means.
+
+Actually, I think the intent is: when you add detector boxes (which have varying quality), weight the training so the model sees enough of the low-quality (misplaced) ones. But if detector boxes as training data failed, this is moot.
+
+Let me reconsider. Maybe I should focus on a genuinely different idea.
+
+**New idea: The model currently sees the defect centeredThinking budget reached. Stop thinking now and write the reply in the required format.

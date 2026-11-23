@@ -1,0 +1,637 @@
+===== attempt 1 =====
+Let me organize the situation.
+
+Current best: e005, 5-seed 0.6345. Two-view classifier with concatenated features + MLP head (2560→128→4).
+
+History:
+- e001/e002: training with detector boxes from the train split (IoU>0.5) — 0.6307, not confirmed (seed0 was 0.6330). Slightly worse than 0.6345.
+- e003: stage-1 error simulation jitter — 0.6294, not confirmed.
+- e004: pre-computed crops — bug, 0.0531.
+- e005: concat feature head — new best 0.6345.
+- e006: wider MLP head — 0.6338, rejected.
+
+Diagnosis: the problem is class misassignment on detector boxes that overlap true defects. Pore is the weakest (0.505), stain is 0.613, deposit 0.639, discontinuity 0.781. Confusion: pore→stain (21 out of 66), stain→deposit (41), deposit→stain (48). So the pore/stain/deposit confusion dominates.
+
+Guide's plan:
+1. Consolidation: training with detector boxes — already tried (e002, 0.6307, not confirmed). Per the guide, "if it fails twice, drop it." We tried it twice (e001 crashed, e002 not confirmed). Hmm, e002 was 0.6307 vs base 0.6345 — actually worse. So drop it.
+
+Wait — actually the earlier run (previous 5-run history) got 0.6337/0.6342 with 5 seeds, "accepted twice" under the looser rule. Tonight's e002 got 0.6307 — worse than base. So training with detector boxes is not helping tonight. Drop.
+
+2. Close the box quality gap: stage-1 error simulation jitter — tried in e003 (0.6294, not confirmed, actually worse). Hmm.
+
+Wait, e003's hypothesis: "replace the mild crop jitter with stage-1 error simulation: per training box, one shared center shift (magnitude uniform 0–0.3 box...)". Result 0.6342 seed0, 5-seed 0.6294 — not confirmed. So that direction failed once.
+
+Next in the guide: "weight or sample training boxes by box quality" — untried. And "combine the two views better than logit averaging" — done in e005 (feature concat), succeeded.
+
+3. Buy training steps: e004 was a bug. The log shows epoch 0 = 94 steps in 44s (13s load + 31s), later epochs ~18s/94 steps. Total 436 steps in 112s of training. Prediction is ~37s (162-125). Reserve is 55s.
+
+Hmm, wait: t_end = deadline - 55 = T0+125. Training stopped at 125s. Total 162s. So prediction took 37s. Reserve is 55s but actual prediction is 37s — so we could reduce reserve to ~45s and buy ~10s of training (~20 steps). Small.
+
+Actually the first epoch is 94 steps in 44s (including warmup?), later 94 steps in 18s. So steady state is ~18s/94 steps = 0.19s/step. 10s buys ~50 steps. Hmm, 10s/0.19 = 52 steps. That's meaningful (436 → ~490 steps).
+
+e004 (pre-computed crops) failed with a bug — the cause is unknown, but the idea itself is good: pre-computing crops at load time. The bug is probably in the implementation. The guide says "bugs: fix once; second failure: drop." e004 was the first failure of that idea. So we can retry with a careful implementation.
+
+But wait — is the data loader really the bottleneck? Epoch 0: 44s for 94 steps (including DataLoader worker warmup, first image decode?). Actually images are already loaded as numpy arrays (13s load). The per-step work is: PIL extract + resize for 2 views × 64 boxes. 94 steps × 64 boxes × 2 views = ~12k crops in 31s (44-13). ~2.5ms per crop pair… with 8 workers, per-crop PIL resize is probably 0.5ms each, so 8 workers × 2 crops × 0.5ms = ~1ms of parallel work per batch → 64 batches… hmm, roughly: 64 boxes × 2 views × 0.5ms = 64ms of serial crop work per batch; with 8 workers, ~8ms/batch. 94 batches × 8ms = 0.75s. That's not 31s. So the bottleneck is probably GPU compute (2 forward passes of EfficientNet-B0 at 160px in bfloat16, batch 64). 31s/94 = 0.33s/step. Later 18s/94 = 0.19s/step. Hmm, the first epoch is slower — DataLoader warmup (worker startup, first prefetch) and probably CUDA warmup.
+
+Actually, pre-computing crops would save the per-step crop work. If crop work is ~8ms/batch out of 190ms, savings are small (~4%). Not huge. But e004's hypothesis claimed "first epoch overhead (46s vs 18s)". The first-epoch overhead might be worker startup + CUDA init. Pre-computing crops at load time (single-threaded or with threads) would add load time but remove per-step work.
+
+Hmm, but honestly the biggest lever for steps: prediction takes 37s with reserve 55s. Reduce reserve to 45 → +10s training. Also batch size 64 → 128? EfficientNet-B0 at 160px, batch 64: 2 forward passes per batch. If GPU memory allows, batch 128 halves the number of steps per epoch but the time per step doubles — the total time is the same, but per-step overhead (data loading, Python) is halved. Actually, for a fixed GPU compute, larger batch = fewer optimizer steps = slower convergence per parameter update, but more samples per wall-clock second… no wait: total samples/sec is roughly fixed by GPU throughput. Larger batch = fewer updates per epoch, but the epoch is longer. In a fixed wall-clock budget, total samples seen is the same; larger batch = fewer updates (which is usually slightly worse) but less overhead. Given the DataLoader overhead, batch 128 might be slightly favorable or neutral.
+
+Alternative: reduce prediction cost. Prediction: 41879 boxes × 2 views, batch 256. 37s. Could we predict at lower resolution? No — that changes the test distribution.
+
+What about using a faster backbone to buy steps? Guide says "a smaller or faster model… can win." convnext_nano or regnety_016? convnext_atto/pico are smaller than EfficientNet-B0. But capacity might matter for fine-grained classes. Hmm.
+
+Let me think about what the largest error is:
+- mAP if all boxes had correct class but kept our scores: 0.7464. Ours: 0.6345. So wrong classes cost 0.112.
+- Perfect-class ceiling: 0.758. So scores cost another 0.012 relative to detector conf.
+
+So the class decision is the dominant error. Per-class: pore 0.505 is the weakest. Confusion: pore→stain 21/66 (32% of pores misclassified as stain!), stain→deposit 41, deposit→stain 48.
+
+What can improve class decisions?
+1. Better training distribution (detector boxes) — tried, failed tonight.
+2. Box jitter simulation — tried (e003), failed.
+3. Resolution — tried in earlier runs (9 attempts, no gain).
+4. Views — 3rd view tried in earlier runs (+0.005, pore only, near time limit).
+5. Model capacity — bigger backbone no gain; bigger head no gain.
+6. Training augmentation — no gain in earlier runs.
+7. Loss — class weights hurt; focal no gain.
+
+Hmm. What hasn't been tried?
+- Box size/aspect ratio as an additional input: "properly untested: 2 crashes, 1 edit failure, 1 run at 0.629." So effectively untested! This is a promising direction. Pore vs stain/deposit might depend on box size/shape. Actually, is that plausible? Defect types have different size distributions? Pores are small holes; deposits are raised material; stains are discolorations. The detector box aspect ratio/size might carry class information. Adding log(side) and aspect ratio as 2 additional inputs to the head is cheap and low-risk. The earlier attempts crashed due to "wrong attribute names" — implementation bugs. So a careful implementation could be the first real test.
+
+- Snapshot ensemble / SWA: untried in this task? "Ensembles" — bigger backbone ensembles were tried (2-3 model ensembles, no gain). SWA/snapshot ensemble is different: averaging weights within one run. SWA is cheap: in the last part of training, periodically save weights, and at the end average the weights. Can be done within the same budget with no extra forward passes (just periodic state_dict copies). Might improve generalization. But the effect is probably small (<0.005?).
+
+- Test-time augmentation: 8 attempts no gain.
+
+- Longer training: 6 attempts no gain (best 0.6355 not confirmed).
+
+- Pre-computed crops (e004 bug): retry? If the data loader is the bottleneck, we buy steps. But from my estimate, GPU is the bottleneck. First epoch 44s vs later 18s — the 26s difference includes worker startup + CUDA warmup. Pre-computing crops at load time removes per-step crop work but worker startup remains. Actually, if we pre-compute crops, we can even use 0 workers (in-memory dataset) and avoid the worker overhead entirely. But the load time increases (12k crops × 2 views pre-computed… 6052 boxes × 2 views = 12k crops, each ~2ms → 24s single-threaded, ~6s with 8 threads). Training budget: t_start is after load. Load goes from 13s to ~20s, saving ~2-3s per epoch… hmm, 94 steps/epoch; if per-step crop work is ~5-8ms of the 190ms, savings are ~4-8s per epoch. Marginal.
+
+Actually, wait, let me reconsider. In the e004 log, what was the bug? "0.0531" — the model was essentially untrained. Probably a label/shape bug in the pre-computed tensors (e.g., transpose order, or float conversion). The idea itself is sound. But the expected gain is small (~50 extra steps?). Given "each step gained is worth more than a bigger model"… hmm.
+
+Let me quantify: 436 steps in 112s. If we reduce reserve from 55 to 45 (prediction is 37s, so 45 is safe), training gets +10s ≈ +50 steps (0.19s/step). That's +11% steps. Loss was still dropping: 0.49 → 0.33 → 0.26 → 0.21 → 0.17. Still dropping at the cutoff. More steps should help somewhat. But "longer training" was tried 6 times in earlier runs with no gain (best 0.6355 not confirmed). Hmm, but those may have had bugs (2 bugs where the timing probe ate the training time). The 6 attempts: "no gain: best 5-seed 0.6355 (not confirmed)". So longer training alone didn't help. OK.
+
+So what is fundamentally different and untried?
+
+Ideas:
+A. Box size/aspect ratio input (properly untested). Cheap, low-risk, plausible: class prior depends on box size (pores are small). If box size is informative, it directly improves class decisions. Effect size: if it helps pore (the weakest class), potentially +0.01+. Previous 1 run at 0.629 — that was probably a buggy version (crashes due to wrong attribute names suggest the code was broken). So essentially untested.
+
+B. SWA (stochastic weight averaging) in the last ~20% of training. Cheap, no extra forward passes. Might reduce seed variance and slightly improve AP. Effect probably small.
+
+C. Retry pre-computed crops (fix e004's bug) to buy steps. Gain probably small.
+
+D. Training with detector boxes from the train split — failed tonight (e002: 0.6307 < 0.6345). Drop per guide (failed… well, e001 crashed, e002 not confirmed; guide says "if it fails twice, drop it").
+
+E. Box quality weighting/sampling — untried. "Weight or sample training boxes by box quality so the model sees enough poorly placed boxes." But wait — our training boxes are true boxes; "box quality" here means how well the detector box matches the true box. We can compute the IoU between each detector box (train split) and the true box, and weight true-box training samples by… hmm, that's a bit indirect. Alternative: use the detector box itself as the crop (with the true box's label) for train-split detector boxes that overlap — that's e002, which failed.
+
+Hmm wait, actually e002 added detector boxes as additional training rows. What about replacing some true-box rows with the corresponding detector boxes (matching the test distribution) instead of adding? That's a different flavor, but it's the same family ("detector boxes from train split as additional training data") — 6 attempts in earlier runs, 2 accepted under the old rule, but tonight e002 was worse. The family is marked "EXHAUSTED? (3+ ideas, no new best)" in the data category. Avoid.
+
+F. Pore/stain/deposit confusion: what distinguishes them? Pores are small dark holes; stains are discoloration (probably darker/broader); deposits are raised material. The wide context view (2.5×) should help. The 3rd view (4×) helped pore in earlier runs (+0.005, pore only). But "pore only" gains won't be accepted tonight ("aim for changes that should move all classes").
+
+G. Input resolution 160→192 or 224? Tried in earlier runs (9 attempts, no gain). Avoid.
+
+H. Different backbone: convnext_nano (similar size to EfficientNet-B0? convnext_nano is 28.6M params, EfficientNet-B0 is 4.1M). convnext_nano is much bigger and slower. EfficientNet-B0 at 160px: ~0.19s/step at batch 64 with 2 forward passes → ~1.5ms per forward per image. convnext_nano is ~6× the compute → too slow. regnety_016 is smaller (16M? no, regnety_016 is ~9M). Hmm, "bigger or different backbone" family: 8 attempts, no gain. Avoid.
+
+I. Scoring: score = conf × p(class). Tried many variations (16 attempts, no gain). Avoid.
+
+J. Learning rate/schedule: "tuning hyperparameters alone helped little." But with the new head (e005), LR for the head vs backbone… currently AdamW with a single LR 1e-3 for all parameters. Different LRs for backbone vs head (e.g., head at 1e-2, backbone at 1e-3) is a common fine-tuning practice. The head is newly initialized (2560→128→4), so it needs a higher LR to learn the interaction. This is a cheap, low-risk experiment. Effect: probably small, but the head is the new component that gave +0.0057; if it's undertrained, a higher LR might let it learn more in the same number of steps. Loss is still dropping at the cutoff, so the model is undertrained; a higher effective LR for the head could speed things up.
+
+Hmm, but "tuning hyperparameters alone helped little in earlier experiments." Still, this is tied to the new architecture.
+
+K. Mixup/CutMix: no gain in earlier runs (training augmentation family: 5 attempts, no gain). Avoid.
+
+L. Data: use low-res crops too? "Low-res crops added to training: 4 attempts, no gain." Avoid.
+
+M. Reduce prediction time to buy training: prediction is 37s. Use batch 512 for eval? Minor. Or skip boxes with extremely low conf (conf < 0.001 → score < MIN_SCORE anyway). Rows written: 51688 = 41879 × 4 (all boxes have all 4 classes above 0.001? 41879×4 = 167516; 51688 means many were filtered by MIN_SCORE=0.001). Prediction time is dominated by the forward pass over all 41879 boxes. Can't reduce without changing the output.
+
+Actually wait — do we need to predict all boxes? "Leaving a box out drops it." A box with very low conf can't score high anyway; dropping it doesn't change AP (a dropped box = no prediction = same as a very-low-score prediction… actually different: a dropped box produces no row at all; a low-score row is still sorted at the bottom and can't be a hit unless there's no other… no wait, it can't be a hit unless IoU>0.5 with a true box; if it does overlap, dropping it loses recall. But if conf is extremely low, its score is below all true detections and it will be counted as a false positive only if… no — in mAP, all predictions are processed in score order; a low-score prediction that overlaps a true box is a TP (it's a hit, it's matched when its turn comes, as long as the true box is still unmatched). So dropping low-conf boxes that overlap true boxes loses recall. But boxes with conf < ~0.001: their score is < 0.001×1 = 0.001, essentially at the bottom. If they overlap a true box and all higher-scoring predictions of that class have already consumed it… it's a TP and adds to recall at the tail of the precision curve. The contribution is minuscule. But we're already filtering with MIN_SCORE=0.001. We could raise MIN_SCORE to 0.01 or 0.05 to skip forward passes on low-conf boxes. How many boxes have conf < 0.05? Unknown. If 30%, we save ~11s of prediction → +11s training (~55 steps). Hmm, but is the risk acceptable? Boxes with conf in [0.001, 0.05] that overlap true boxes: their rows have score < 0.05. In AP, a TP at score 0.05 contributes to recall at the tail of the precision curve. The effect on AP is tiny (the tail of the precision curve). But the gain from +55 training steps is also probably tiny (loss is 0.17 and dropping). Both are small. Hmm.
+
+Actually, let me reconsider the reserve: 55s reserve, prediction is 37s. Why 55? Probably for safety. Reducing to 45 buys 10s. Combined with MIN_SCORE filtering… let's not combine; one idea per turn.
+
+N. Pre-computed crops (e004 fix): let me think about what the bug was. e004's hypothesis: "pre-compute all training crops (both views) as uint8 tensors at load time so the DataLoader doesn't do PIL extract+resize per step. This should reduce first-epoch overhead (46s vs 18s for later epochs) and sha…" (truncated). Score 0.0531 — essentially random. Possible bugs: (1) pre-computed crops stored in the wrong order/dtype, (2) labels lost, (3) crop computed with train=False but jitter expected, (4) memory: 6052 boxes × 2 views × 160×160×3 uint8 = 6052×2×76800 = ~930MB — fine. (5) maybe they pre-computed with the wrong context. Can't know. The harness says "likely bug." Guide: "bugs: fix once; second failure: drop." So we can retry once.
+
+But is it worth it? Expected gain: remove per-step crop work. Let me estimate more carefully. Steady-state epoch: 94 steps in 18s → 190ms/step. GPU: 2 forward + 1 backward of EfficientNet-B0 at 160px, batch 64, bfloat16. EfficientNet-B0 at 224px is ~1.3 GFLOP forward? At 160px ~0.66 GFLOP. Batch 64: ~42 GFLOP forward, backward ~2.2× → ~135 GFLOP/step. On a modern GPU at ~100 TFLOPS bfloat16 → ~1.35ms?? That seems too fast; 190ms/step suggests much less GPU (maybe a small GPU, or CPU?). Hmm, 135 GFLOP in 190ms = 0.7 TFLOPS — that's a weak GPU or CPU. Actually, if it's CPU, 0.7 TFLOPS is plausible for a many-core CPU with bfloat16? No, bfloat16 on CPU is slow. Maybe it's a small GPU (e.g., T4: bfloat16 is ~650 GFLOPS… T4 doesn't support bfloat16 well; amp is enabled only for cuda). If T4: bfloat16 is ~650 GFLOPS (actually T4's bfloat16 is ~650? T4's FP16 is 65 TFLOPS). Hmm, 135 GFLOP/190ms = 0.7 TFLOPS is way below T4. So the bottleneck might be data loading after all!
+
+Let me recompute: per step, 64 boxes × 2 views. Per crop: PIL fromarray + resize 160×160. PIL resize is ~0.3-0.5ms; fromarray is ~0.1ms; numpy ops (normalization, transpose) ~0.2ms. So ~1ms per view, 2ms per box, 128ms per batch serially. With 8 workers, if the GPU takes ~60ms/batch, the data loader can keep up (128ms/8 = 16ms/batch parallel). Hmm, so data loading is ~16ms/batch out of 190ms. Not dominant.
+
+But wait — first epoch 44s vs later 18s: the extra 26s over 94 steps = 276ms/step extra. That's worker startup + CUDA init + first-batch prefetch. Pre-computing crops doesn't fix CUDA init. So the gain from pre-computing is: steady-state ~16ms/batch → ~1.5s per epoch, plus maybe some first-epoch improvement. Total over the run: probably 5-8s → ~30-40 steps. Marginal. And there's crash risk. Not the best use of a turn.
+
+O. What about batch size 128? If the data loader is partly the bottleneck, larger batches reduce per-sample overhead. But fewer updates… with AdamW and cosine LR, fewer steps is probably slightly worse. Unclear.
+
+P. Use both resolutions for training? No gain in earlier runs.
+
+Q. What about using the detector conf as a training signal? E.g., train the classifier to also predict "is this a defect" (the 5th background class) — tried 9 times, no gain.
+
+R. Pseudo-labeling: use the current model's predictions on train-split detector boxes with high confidence to add training data? That's in the "detector boxes from train split" family (labeling by the model rather than by overlap). Hmm, different: label by the model's own high-confidence predictions (self-training). Risky, probably small.
+
+S. Think more about the pore problem. Pore AP 0.505. Pores: 66 boxes overlap true defects; 47 correct (62%); 21 → stain. Stain: 611 boxes, 555 correct (90%); 41 → deposit, 9 → pore. Deposit: 271, 217 correct (80%); 48 → stain.
+
+So pore→stain is the biggest single confusion (21), then deposit→stain (48), stain→deposit (41). Stain is a magnet: it receives 21+48=69 misclassifications. Why? Stains are probably large, diffuse discolorations; pores are small dark spots; the detector box for a pore is small and dark — the classifier sees a dark blob and might call it stain. The wide context view should help (stains have a broader context).
+
+What change could move all of pore/deposit/stain? Higher resolution for small boxes? Tried ("enlarging tight crops for small boxes" — no gain). Hmm.
+
+What about aspect-ratio-aware crops: the current crop is a square of side = context × long side. For elongated boxes (stains might be elongated), the square crop includes a lot of context. Maybe the class prior from box shape is informative: add box shape features (log size, aspect ratio) to the head. This is idea A. The previous attempts crashed (wrong attribute names) — so the feature plumbing was buggy. A careful implementation: compute log(side) and log(aspect) per box, normalize by train mean/std, and concat to the 2560-dim features before the head (2562-dim). Cheap, no extra forward pass, no time cost. If box shape carries class information (e.g., pores are small), the head can use it.
+
+Is there evidence box shape is informative? Pores are typically small; stains are larger/elongated. In the diagnosis, the right-class rate by size: small 82%, medium 92%, large 93% — small boxes are harder overall, consistent with pores being small. If the model knew "this box is small," it could favor pore. Plausible gain: pore 0.505 → maybe 0.55-0.60? If pore AP improves by 0.05 and others stay, that's +0.0125 overall. But the risk: it might not help at all (the model can already infer size from the crop content — the object fills a fixed fraction of the crop, so absolute size isn't visible! The crop is normalized to 160×160 regardless of box size. So absolute box size is not visible to the model at all. This is a genuinely new input.) Yes! The crop is always 160×160; the model can't tell if the box was 20px or 200px in the original image. Box size and aspect ratio are truly additional information. This is a strong argument.
+
+And the earlier "box size and aspect ratio as additional model inputs" family: 4 attempts, "properly untested: 2 crashes (wrong attribute names), 1 edit failure, 1 run at 0.629." The 1 run at 0.629 — hmm, that was a run that actually executed, at 0.629 (worse than base 0.629-0.630). That was in an earlier 5-run history from a different base (start file 0.629-0.630). So 1 actual run at 0.629 ≈ base. So the feature didn't help in that one run? Or it was also subtly broken ("properly untested" suggests even that run wasn't clean). The harness says "properly untested." So one clean attempt is allowed.
+
+Implementation:
+- In BoxDataset.__getitem__, compute side = max(box w, box h) (the actual box size, not the crop side… use the long side), aspect = long side / short side (or w/h). Return as a 2-element tensor.
+- Normalize: compute mean/std of log(side) and log(aspect) over the train boxes; store in the dataset; apply to both train and eval.
+- Head: Linear(2*512 + 2, 128) etc.
+
+Wait, EfficientNet-B0 num_features = 1280. 2×1280 = 2560. +2 = 2562.
+
+Edge cases: boxes with w or h of 0? Probably not. Clip aspect to [0.05, 20] before log.
+
+Time cost: negligible. Crash risk: low if careful. Category: architecture (or "data"? it's an additional model input — architecture fits; the earlier family was listed without a category… in the table it's "box size and aspect ratio as additional model inputs." Category options: data, augmentation, architecture, loss, sampling, optimisation, inference, scoring, other. "architecture" fits (model input change) or "other." I'll use architecture.
+
+Hypothesis: add log(box long side) and log(aspect ratio) as 2 additional inputs to the head. The crop is always 160×160, so the model currently can't see the absolute size or shape of the detector box; defect types differ in typical size (pores small, stains larger/elongated), and pore is the weakest class (0.505) with pores being small. If box geometry is informative, it should help pore in particular and possibly the deposit/stain confusion. Expected gain ≥0.01 if it works. Different from earlier attempts: those crashed with attribute bugs; this time compute the features directly from the row's x1..y2 in __getitem__ and normalize with train statistics.
+
+Let me write the edit carefully.
+
+Current relevant code:
+
+```Thinking budget reached. Stop thinking now and write the reply in the required format.
+===== attempt 2 =====
+The second block failed. I need to redo the edit properly. Let me think about what I want to do.
+
+I want to add box geometry (log side length, log aspect ratio) as an extra input to the head. I need to:
+
+1. Add `geo_mean` and `geo_std` to `BoxDataset.__init__`.
+2. In `__getitem__`, compute the geo feature and return it.
+3. In `TwoViewModel.forward`, accept and use the geo input.
+4. In the training loop, unpack the geo tensor and pass it to the model.
+5. In the eval loop, unpack the geo tensor and pass it to the model.
+6. In `main`, compute geo statistics from the training crops.
+
+Let me write all the blocks carefully, copying exact lines from the current file.
+
+Current relevant code:
+
+```python
+class BoxDataset(torch.utils.data.Dataset):
+    def __init__(self, rows, images, train):
+        self.rows, self.images, self.train = rows, images, train
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __getitem__(self, i):
+        r = self.rows[i]
+        img = self.images[r["image"]]
+        fh = fv = False
+        bright = 1.0
+        if self.train:  # same flips and brightness for both views
+            fh, fv, bright = random.random() < 0.5, random.random() < 0.5, random.uniform(0.8, 1.2)
+        views = []
+        for ctx in (TIGHT_CONTEXT, CONTEXT):
+            x = make_crop(img, r, ctx, self.train)
+            if fh:
+                x = x[:, ::-1]
+            if fv:
+                x = x[::-1, :]
+            if self.train:
+                x = np.clip(x * bright, 0, 1)
+            x = (x - MEAN) / STD
+            views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))
+        return views[0], views[1], r.get("cls", -1)
+```
+
+I need to modify `__init__` to accept geo stats, and `__getitem__` to compute and return geo.
+
+Let me do the __init__ change:
+
+```python
+class BoxDataset(torch.utils.data.Dataset):
+    def __init__(self, rows, images, train, geo_mean, geo_std):
+        self.rows, self.images, self.train = rows, images, train
+        self.geo_mean = geo_mean
+        self.geo_std = geo_std
+```
+
+And __getitem__ return:
+
+```python
+        w = max(1.0, r["x2"] - r["x1"])
+        h = max(1.0, r["y2"] - r["y1"])
+        geo = torch.tensor([(math.log(max(w, h)) - geo_mean[0]) / geo_std[0],
+                            (math.log(min(w, h) / max(w, h)) - geo_mean[1]) / geo_std[1]], dtype=torch.float32)
+        return views[0], views[1], geo, r.get("cls", -1)
+```
+
+Wait, I should use self.geo_mean and self.geo_std. Let me be careful.
+
+Now the TwoViewModel:
+
+```python
+class TwoViewModel(nn.Module):
+    def __init__(self, backbone, head):
+        super().__init__()
+        self.backbone = backbone
+        self.head = head
+
+    def forward(self, xt, xw):
+        ft = self.backbone(xt)
+        fw = self.backbone(xw)
+        return self.head(torch.cat([ft, fw], dim=1))
+```
+
+I need to add geo. The head currently takes 2*num_features inputs. I'll add geo (2 values) to the concatenation. But the head's first layer is `nn.Linear(2 * backbone.num_features, 128)`. I need to change it to `2 * backbone.num_features + 2`.
+
+Let me modify forward:
+
+```python
+    def forward(self, xt, xw, geo):
+        ft = self.backbone(xt)
+        fw = self.backbone(xw)
+        return self.head(torch.cat([ft, fw, geo], dim=1))
+```
+
+And head init:
+
+```python
+    head = nn.Sequential(
+        nn.Linear(2 * backbone.num_features + 2, 128),
+        nn.ReLU(),
+        nn.Dropout(0.2),
+        nn.Linear(128, 4),
+    ).to(device)
+```
+
+Now in main, I need to compute geo stats. Let me add after crops are loaded:
+
+```python
+    geo_feats = []
+    for r in crops:
+        w = max(1.0, r["x2"] - r["x1"])
+        h = max(1.0, r["y2"] - r["y1"])
+        geo_feats.append([math.log(max(w, h)), math.log(min(w, h) / max(w, h))])
+    geo_feats = np.array(geo_feats, dtype=np.float32)
+    geo_mean = geo_feats.mean(axis=0)
+    geo_std = np.where(geo_feats.std(axis=0) < 1e-6, 1.0, geo_feats.std(axis=0))
+```
+
+Then the DataLoaders:
+
+```python
+    dl_tr = torch.utils.data.DataLoader(BoxDataset(crops, images, True, geo_mean, geo_std), ...)
+    dl_ev = torch.utils.data.DataLoader(BoxDataset(ev, images, False, geo_mean, geo_std), ...)
+```
+
+Training loop:
+
+```python
+        for xt, xw, y in dl_tr:
+```
+becomes
+```python
+        for xt, xw, geo, y in dl_tr:
+```
+
+And:
+```python
+            xt = xt.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            xw = xw.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            y = y.to(device, non_blocking=True)
+            with torch.autocast(**amp):
+                loss = crit(model(xt, xw), y)
+```
+becomes
+```python
+            xt = xt.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            xw = xw.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            geo = geo.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+            with torch.autocast(**amp):
+                loss = crit(model(xt, xw, geo), y)
+```
+
+Eval loop:
+```python
+        for xt, xw, _ in dl_ev:
+            xt = xt.to(device).to(memory_format=torch.channels_last)
+            xw = xw.to(device).to(memory_format=torch.channels_last)
+            probs.append(torch.softmax(model(xt, xw).float(), 1).cpu())
+```
+becomes
+```python
+        for xt, xw, geo, _ in dl_ev:
+            xt = xt.to(device).to(memory_format=torch.channels_last)
+            xw = xw.to(device).to(memory_format=torch.channels_last)
+            geo = geo.to(device)
+            probs.append(torch.softmax(model(xt, xw, geo).float(), 1).cpu())
+```
+
+Now let me be careful about the DataLoader collation. The geo is a torch tensor of shape (2,) per item. The default collate will stack them into (batch, 2). Good.
+
+Now, one concern: the `__getitem__` returns `views[0], views[1], geo, r.get("cls", -1)`. The default collate will handle lists of tensors fine.
+
+Let me double check that geo_mean and geo_std are numpy arrays. In __getitem__ I use `self.geo_mean[0]` etc. That works with numpy.
+
+Actually, let me reconsider. I'll store geo_mean and geo_std as lists or numpy arrays. `self.geo_mean[0]` works for both.
+
+Let me write all the blocks now. I'll be careful to copy exact lines.
+
+Block 1: __init__ of BoxDataset
+
+SEARCH:
+```
+class BoxDataset(torch.utils.data.Dataset):
+    def __init__(self, rows, images, train):
+        self.rows, self.images, self.train = rows, images, train
+```
+
+REPLACE:
+```
+class BoxDataset(torch.utils.data.Dataset):
+    def __init__(self, rows, images, train, geo_mean, geo_std):
+        self.rows, self.images, self.train = rows, images, train
+        self.geo_mean = geo_mean
+        self.geo_std = geo_std
+```
+
+Block 2: __getitem__ return
+
+SEARCH:
+```
+            x = (x - MEAN) / STD
+            views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))
+        return views[0], views[1], r.get("cls", -1)
+```
+
+REPLACE:
+```
+            x = (x - MEAN) / STD
+            views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))
+        w = max(1.0, r["x2"] - r["x1"])
+        h = max(1.0, r["y2"] - r["y1"])
+        geo = torch.tensor([(math.log(max(w, h)) - self.geo_mean[0]) / self.geo_std[0],
+                            (math.log(min(w, h) / max(w, h)) - self.geo_mean[1]) / self.geo_std[1]], dtype=torch.float32)
+        return views[0], views[1], geo, r.get("cls", -1)
+```
+
+Wait, is `x = (x - MEAN) / STD` unique? Let me check. It appears once in __getitem__. Yes.
+
+Block 3: TwoViewModel forward
+
+SEARCH:
+```
+    def forward(self, xt, xw):
+        ft = self.backbone(xt)
+        fw = self.backbone(xw)
+        return self.head(torch.cat([ft, fw], dim=1))
+```
+
+REPLACE:
+```
+    def forward(self, xt, xw, geo):
+        ft = self.backbone(xt)
+        fw = self.backbone(xw)
+        return self.head(torch.cat([ft, fw, geo], dim=1))
+```
+
+Block 4: head init
+
+SEARCH:
+```
+    head = nn.Sequential(
+        nn.Linear(2 * backbone.num_features, 128),
+```
+
+REPLACE:
+```
+    head = nn.Sequential(
+        nn.Linear(2 * backbone.num_features + 2, 128),
+```
+
+Block 5: DataLoaders. I need to add geo stats computation and pass to DataLoaders.
+
+Let me find the DataLoader lines:
+```
+    g = torch.Generator().manual_seed(args.seed)
+    dl_tr = torch.utils.data.DataLoader(BoxDataset(crops, images, True), batch_size=BATCH_SIZE, shuffle=True,
+                                        num_workers=workers, pin_memory=True, drop_last=True,
+                                        persistent_workers=True, generator=g, worker_init_fn=worker_init)
+    dl_ev = torch.utils.data.DataLoader(BoxDataset(ev, images, False), batch_size=256, shuffle=False,
+                                        num_workers=workers, pin_memory=True)
+```
+
+I'll insert the geo stats computation before `g = torch.Generator()...` and modify the DataLoader calls.
+
+Actually, let me put the geo stats computation right after the print statement about train boxes. Let me find:
+
+```
+    print(f"train {len(crops)} boxes, eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
+```
+
+I'll add after it:
+```
+    geo_feats = np.array([[math.log(max(1.0, max(r["x2"] - r["x1"], r["y2"] - r["y1"]))),
+                           math.log(min(1.0, r["x2"] - r["x1"]) / max(1.0, r["x2"] - r["x1"], r["y2"] - r["y1"]))]
+                          for r in crops], dtype=np.float32)
+    geo_mean = geo_feats.mean(axis=0)
+    geo_std = np.where(geo_feats.std(axis=0) < 1e-6, 1.0, geo_feats.std(axis=0))
+```
+
+Wait, I need to be careful with the aspect ratio: min(w,h)/max(w,h) where w=x2-x1, h=y2-y1. Let me use consistent definitions. In __getitem__ I use w = x2-x1, h = y2-y1, geo[1] = log(min(w,h)/max(w,h)). Let me keep consistent.
+
+Let me rewrite the geo_feats computation:
+```
+    geo_feats = []
+    for r in crops:
+        w = max(1.0, r["x2"] - r["x1"])
+        h = max(1.0, r["y2"] - r["y1"])
+        geo_feats.append([math.log(max(w, h)), math.log(min(w, h) / max(w, h))])
+    geo_feats = np.array(geo_feats, dtype=np.float32)
+    geo_mean = geo_feats.mean(axis=0)
+    geo_std = np.where(geo_feats.std(axis=0) < 1e-6, 1.0, geo_feats.std(axis=0))
+```
+
+That's cleaner and consistent.
+
+Now for the DataLoaders, I'll modify:
+```
+    dl_tr = torch.utils.data.DataLoader(BoxDataset(crops, images, True), batch_size=BATCH_SIZE, shuffle=True,
+```
+to
+```
+    dl_tr = torch.utils.data.DataLoader(BoxDataset(crops, images, True, geo_mean, geo_std), batch_size=BATCH_SIZE, shuffle=True,
+```
+
+and
+```
+    dl_ev = torch.utils.data.DataLoader(BoxDataset(ev, images, False), batch_size=256, shuffle=False,
+```
+to
+```
+    dl_ev = torch.utils.data.DataLoader(BoxDataset(ev, images, False, geo_mean, geo_std), batch_size=256, shuffle=False,
+```
+
+Block 6: training loop unpack and forward
+
+SEARCH:
+```
+        for xt, xw, y in dl_tr:
+```
+REPLACE:
+```
+        for xt, xw, geo, y in dl_tr:
+```
+
+Block 7:
+SEARCH:
+```
+            xt = xt.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            xw = xw.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            y = y.to(device, non_blocking=True)
+            with torch.autocast(**amp):
+                loss = crit(model(xt, xw), y)
+```
+REPLACE:
+```
+            xt = xt.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            xw = xw.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            geo = geo.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+            with torch.autocast(**amp):
+                loss = crit(model(xt, xw, geo), y)
+```
+
+Block 8: eval loop
+SEARCH:
+```
+        for xt, xw, _ in dl_ev:
+            xt = xt.to(device).to(memory_format=torch.channels_last)
+            xw = xw.to(device).to(memory_format=torch.channels_last)
+            probs.append(torch.softmax(model(xt, xw).float(), 1).cpu())
+```
+REPLACE:
+```
+        for xt, xw, geo, _ in dl_ev:
+            xt = xt.to(device).to(memory_format=torch.channels_last)
+            xw = xw.to(device).to(memory_format=torch.channels_last)
+            geo = geo.to(device)
+            probs.append(torch.softmax(model(xt, xw, geo).float(), 1).cpu())
+```
+
+Now let me verify uniqueness of each SEARCH text.
+
+Block 1: `class BoxDataset(torch.utils.data.Dataset):\n    def __init__(self, rows, images, train):\n        self.rows, self.images, self.train = rows, images, train` — unique. Yes.
+
+Block 2: `            x = (x - MEAN) / STD\n            views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))\n        return views[0], views[1], r.get("cls", -1)` — `x = (x - MEAN) / STD` appears once. The return line appears once. Good.
+
+Block 3: forward — unique.
+
+Block 4: `    head = nn.Sequential(\n        nn.Linear(2 * backbone.num_features, 128),` — unique.
+
+Block 5a (geo stats after print): 
+`    print(f"train {len(crops)} boxes, eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)` — unique.
+
+Block 5b (dl_tr): `    dl_tr = torch.utils.data.DataLoader(BoxDataset(crops, images, True), batch_size=BATCH_SIZE, shuffle=True,` — unique.
+
+Block 5c (dl_ev): `    dl_ev = torch.utils.data.DataLoader(BoxDataset(ev, images, False), batch_size=256, shuffle=False,` — unique.
+
+Block 6: `        for xt, xw, y in dl_tr:` — unique.
+
+Block 7: the training to-device block — unique.
+
+Block 8: the eval loop — unique.
+
+Now, one concern about block 5a: I'm inserting code after the print line. Let me make sure I include the print line in SEARCH and repeat it in REPLACE plus add the new code.
+
+Let me also double check: in the print line, there's `{time.time() - T0:.0f}`. I need to copy exactly.
+
+Let me reconsider whether the geo features will actually be useful and whether this is a good experiment. The hypothesis is that box geometry (size and aspect ratio) carries class information. Pores are small, stains/deposits larger. This is a reasonable, low-cost addition. It differs from earlier "box size and aspect ratio as extra model input" family which "never properly tested: 2 crashes (wrong attribute name), 1 edit failure, 1 run at 0.629". So this family was never properly tested. My implementation computes features directly from row coordinates, avoiding attribute name issues. Good.
+
+Actually wait — the "one run at 0.629" — that was a run that presumably did test it and got 0.629, which is below baseline 0.6345. Hmm. But that might have been buggy too. The family is described as "never properly tested". Let me be careful. The 0.629 run — if it was a proper test and got 0.629 (below the 0.629-0.630 start file baseline), that suggests box size/aspect as input didn't help. But the description says "never properly tested" and lists crashes and edit failures. The 0.629 might have been a buggy run.
+
+Given the uncertainty, I think this is still a reasonable experiment because:
+1. It's low cost (just 2 extra inputs to the head).
+2. It directly targets pore (the weakest class) which is likely small.
+3. The earlier attempts were buggy.
+
+But I should be honest in the hypothesis about the risk. Actually, the hypothesis format wants me to state why it should help and how it differs from similar earlier experiments. Let me note that earlier attempts crashed due to attribute name bugs and one scored 0.629 (possibly buggy), and this version computes features directly from coordinates.
+
+Hmm, but if the 0.629 run was a proper test, then this idea is somewhat exhausted. But the family is described as "never properly tested". I'll proceed but frame it carefully. Actually, let me reconsider — maybe I should pick a different, more clearly untried and higher-value experiment.
+
+Let me reconsider the research guide. The plan:
+1. Consolidate (detector boxes from train split) — done, e002 not confirmed, e001 crashed. So this direction: e001 crashed, e002 not confirmed (0.6307, below best). That's 2 attempts, one crash. The guide says "If it is accepted, build on it; if it fails twice, drop it and move on." e001 crashed (not a real failure of the idea), e002 not confirmed. Hmm. Actually e002 at 0.6307 vs baseline 0.6295 — that's basically at baseline, not a gain. So detector-boxes-as-training-data hasn't shown a clear gain. I could retry it more carefully, but it's risky.
+
+2. Close the box-quality gap (main phase):
+   - simulate detector errors on true boxes during training (random shifts and scale changes, IoU 0.5-1.0). This was e003! e003 was "stage-1 error simulation" — 0.6342 seed 0, 0.6294 5-seed, not confirmed. So that direction was tried (e003) and not confirmed. Hmm.
+   - weight or sample training boxes by box quality. Not tried.
+   - combine the two views better than averaging logits — e005 did this (concat features + MLP head), and it became the best. So that's done.
+
+3. Buy training steps. e004 was pre-compute crops but crashed (bug, 0.0531). So buying steps via pre-compute hasn't been done properly.
+
+4. Fine-grained classes.
+
+So the box-quality directions: e003 (error simulation) not confirmed. The "weight/sample by box quality" is untried. 
+
+Given e005 (concat head) is the best and e006 (wider head) was rejected, the architecture direction has 2 attempts with 1 new best. The guide says "after a success, one or two follow-ups on it are good; after two failed follow-ups, switch." e006 was one failed follow-up. So I could do one more architecture follow-up or switch.
+
+Let me think about what's most likely to give a broad gain of ~0.01.
+
+The diagnostics:
+- pore 0.505 (weakest), 32% misread (21 as stain, 5 as deposit)
+- deposit 0.639, 16% misread (48 as stain)
+- discontinuity 0.781, 4% misread
+- stain 0.613, 10% misread
+
+The main confusion: pore→stain (21), deposit→stain (48), stain→deposit (41). So stain is a big confuser. Pore is the weakest.
+
+The gap: mAP if every box had correct class = 0.7464 vs yours 0.6345. So wrong classes cost 0.112. The remaining gap to ceiling 0.758 is 0.012 (scores).
+
+So the dominant error is class decision on boxes that overlap real defects. To fix that, I need better classification.
+
+Ideas that could broadly help:
+1. More training steps (buy time) — the loss is still falling at the cut (0.1689 at epoch 4). More steps would help all classes. This is a "free improvement."
+2. Better features / higher resolution for fine texture (pore vs stain).
+3. Box geometry input (targets pore/small boxes).
+
+Let me reconsider buying training steps. The log shows:
+- load 13s
+- epoch 0: 94 steps, 57s (so ~0.46s/step, but first epoch includes warmup + data loading overhead)
+- epoch 1: 94 steps (188-94), 18s (75-57) → ~0.19s/step
+- Later epochs ~0.19s/step
+- 436 steps total in ~125s of training (57-13=44s for epoch 0, then 125-57=68s for 342 steps → 0.2s/step)
+- prediction: 162-125 = 37s
+
+So training is 436 steps in ~112s (from 13s to 125s). Reserve is 55s, prediction takes 37s. So we have 55-37 = 18s of slack in the reserve. Actually the run finished at 162s, budget 180s. So 18s slack.
+
+The first epoch took 44s (13→57) for 94 steps = 0.47s/step, much slower than later 0.19s/step. That's the data loading / warmup overhead. If I pre-compute crops (e004 approach but done correctly), I could speed up the first epoch and get more steps. But e004 crashed (0.0531, likely bug). 
+
+Actually, the main time sink is that the first epoch is 2.5x slower. If I pre-compute all crops once at load time, all epochs would be ~0.19s/step, and I'd get more steps. Currently 436 steps. If first epoch were fast, I'd get ~94/0.19 ≈ 494 steps in the first 44s... wait let me recompute.
+
+Total training time available: from t_start (~13s) to t_end (180-55=125s) = 112s. Currently 436 steps. Step rate: first 94 steps take 44s, remaining 342 take 68s. If all steps were 0.19s/step, 112/0.19 = 589 steps. So I could get ~150 more steps (35% more) by eliminating first-epoch overhead. That's a meaningful "free" improvement that helps all classes.
+
+But e004 crashed. The crash was "Pre-compute all training crops (both views) as uint8 tensors at load time so the DataLoader no longer performs PIL extract+resize per step." Result 0.0531, "suspicious (likely bug)". So the pre-compute approach had a bug. I'd need to be very careful.
+
+Actually, a simpler way to buy steps: the data loading bottleneck. The first epoch is slow because of PIL extract+resize per step in the workers. Pre-computing crops as uint8 (before normalization) and storing them, then the worker just does normalization + resize... wait, if I pre-compute at IMG_SIZE already, the worker just does (x-MEAN)/STD which is cheap.
+
+Hmm, but e004 crashed. Let me think about why. Possibly memory, or the collation, or the crop computation at load time taking too long, or a bug in how crops were stored. 0.0531 mAP suggests the model was basically untrained or broken — maybe the crops were wrong (e.g., all gray, or wrong indexing).
+
+Given the risk, maybe I should buy steps a different, safer way. Options:
+- Reduce RESERVE_S from 55 to ~40 (prediction takes 37s, so 40 leaves 3s margin — risky). Actually prediction is 37s, so reserve 45 would leave 8s margin. That buys 10s of training = ~50 steps. Small but safe-ish. Actually the guide warns about reserve: "earlier runs broke this twice by timing during warm-up: measure after warm-up, never before training." So I should measure prediction time after warm-up. But I can just set reserve a bit lower based on the measured 37s. Reserve 50 would leave 13s margin. That buys 5s = ~26 steps. Small.
+
+- Speed up the model: use a faster backbone. But "Bigger or other backbone" family had no gain. A smaller/faster backbone like convnext_pico or regnety_016 might give more steps. But the guide says "a smaller or faster model... can win." However, the backbone family was tried (8 attempts, no gain). But those were "bigger or other backbone (EfficientNet-B2, ResNet-50, 2-3 model ensembles)" — all bigger. A smaller/faster backbone for more steps is different but still in the "other backbone" family. Risky to claim.
+
+Let me reconsider. The cleanest high-value, low-risk experiment that targets the dominant error (class decision) and helps all classes:
+
+Option A: Box geometry input (my current plan). Low cost, targets pore. But family "never properly tested" with one 0.629 run. Medium risk.
+
+Option B: Buy training steps via safer pre-compute or lower reserve. Targets all classes. Medium risk (e004 crashed).
+
+Option C: Weight/sample training boxes by box quality (untried). Targets the train/test mismatch. But harder to implement safely, and unclear effect.
+
+Option D: Higher resolution / better view for fine texture. "Resolution and small-box handling" family had no gain (9 attempts). So avoid.
+
+Option E: The "combine the two views better" — e005 did concat+MLP. e006 wider head rejected. So that's somewhat explored.
+
+Let me reconsider the box geometry idea more carefully. The concern is the 0.629 run. But actually, re-reading: "Box size and aspect ratio as an extra model input | 4 | never properly tested: 2 crashes (wrong attribute name), 1 edit failure, 1 run at 0.629". So 4 attempts: 2 crashes, 1 edit failure, 1 run at 0.629. The 0.629 run — was it a proper test? It's listed under "never properly tested", which suggests even the 0.629 run wasn't fully proper (maybe it was a partial/buggy run). The 0.629 is at the start-file baseline (0.629-0.630), so it's "no gain" but also not clearly a failure of the idea.
+
+Given the family is "never properly tested" and my implementation is clean (computing from coordinates, no attribute lookups), I think this is a legitimate, low-cost experiment. And it directly targets the pore weakness. Let me go with it.
+
+Actually, wait. Let me reconsider whether the geometry features will survive the resizing. The crop is resized to 160x160 regardless of box size. So the model sees a 160x160 image where the defect fills a certain fraction. Actually, the tight crop is 1.5x the boxThinking budget reached. Stop thinking now and write the reply in the required format.

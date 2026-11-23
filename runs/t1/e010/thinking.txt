@@ -1,0 +1,348 @@
+===== attempt 1 =====
+Let me carefully analyze the current state and the plan.
+
+Current best: e008, 5-seed val mAP@0.5 0.6327.
+
+The most recent experiment e009 (based on e008) added detector boxes from the train split as extra training data. It wasn't confirmed (gain +0.0009, needed >0.0045).
+
+The research lead wants BASE: last (i.e., e009), CATEGORY: architecture.
+
+The plan: 3-crop architecture with per-class soft attention over all three views (tight 1.5x, wide 2.5x, very wide 4.0x).
+
+Let me look at the current train.py (e008, the best). But wait — BASE: last means I edit the most recent version (e009). The e009 file differs from e008 only by the diff shown. So the e009 file is e008 plus the extra training data code.
+
+Let me reconstruct the e009 file. The diff shows:
+- e009 has the extra_train code added
+- e009 uses `train_rows` instead of `crops` in the DataLoader
+
+So the e009 file is essentially e008 with:
+1. The `all_crops` / `extra_train` / `iou` code block
+2. `train_rows = crops + extra_train`
+3. `needed = {r["image"] for r in train_rows} | {d["image"] for d in ev}`
+4. The print statement changed
+5. `dl_tr = torch.utils.data.DataLoader(BoxDataset(train_rows, images, True), ...)`
+
+Now I need to apply the 3-crop architecture change on top of e009.
+
+Let me think about what changes I need to make:
+
+1. Add `THIRD_CONTEXT = 4.0` in settings.
+2. Change the crop loop in `BoxDataset.__getitem__` from `(TIGHT_CONTEXT, CONTEXT)` to `(TIGHT_CONTEXT, CONTEXT, THIRD_CONTEXT)`, returning three views.
+3. Replace `FusionModel` with per-class attention fusion over 3 views.
+4. Update the training loop to unpack 3 views.
+5. Update the inference loop to unpack 3 views.
+
+Let me carefully write the new FusionModel.
+
+Current FusionModel:
+```python
+class FusionModel(nn.Module):
+    """EfficientNet-B0 backbone with a learnable per-class tight/wide logit fusion."""
+    def __init__(self, base):
+        super().__init__()
+        self.base = base
+        self.logit_w = nn.Parameter(torch.zeros(4))  # sigmoid -> 0.5 (equal weight)
+
+    def forward(self, xt, xw):
+        w = torch.sigmoid(self.logit_w)
+        return w * self.base(xt) + (1 - w) * self.base(xw)
+```
+
+New FusionModel with 3 views and per-class attention:
+```python
+class FusionModel(nn.Module):
+    """EfficientNet-B0 backbone with learnable per-class attention over three views."""
+    def __init__(self, base, n_views=3):
+        super().__init__()
+        self.base = base
+        self.attn = nn.Parameter(torch.zeros(4, n_views))  # per-class, per-view; softmax
+
+    def forward(self, views):
+        # views: list of tensors, each (B, 3, H, W)
+        logits = [self.base(v) for v in views]  # each (B, 4)
+        stacked = torch.stack(logits, dim=1)  # (B, n_views, 4)
+        w = torch.softmax(self.attn, dim=1)  # (4, n_views)
+        # per-class weighted sum: for each class c, sum_v w[c, v] * stacked[:, v, c]
+        # stacked is (B, V, 4); w is (4, V). We want out (B, 4) where out[:, c] = sum_v stacked[:, v, c] * w[c, v]
+        out = torch.einsum("bvc, cv -> bc", stacked, w)
+        return out
+```
+
+Wait, let me check the einsum. `stacked` has shape (B, V, C) where V=3 views, C=4 classes. `w` has shape (C, V) = (4, 3). We want `out` of shape (B, C) where `out[b, c] = sum_v stacked[b, v, c] * w[c, v]`.
+
+`torch.einsum("bvc, cv -> bc", stacked, w)`:
+- b: batch
+- v: view
+- c: class
+- For output bc, we sum over v: stacked[b, v, c] * w[c, v]. Yes, that's correct.
+
+Actually wait, `w` is indexed as `cv` meaning first index c, second index v. `w[c, v]`. And `self.attn` is (4, 3) = (C, V), so `w[c, v]` = attn[c, v]. Good.
+
+Let me double check: `self.attn = nn.Parameter(torch.zeros(4, n_views))` = shape (4, 3) = (C, V). `torch.softmax(self.attn, dim=1)` = softmax over V (dim 1), so each class's weights sum to 1 over the 3 views. Good, this is the per-class attention normalized within each class.
+
+Now, the forward takes `views` as a list. But the DataLoader returns views as separate tensors. Let me check how the dataset returns them.
+
+Current dataset:
+```python
+        return views[0], views[1], r.get("cls", -1)
+```
+
+This returns a tuple of (tensor, tensor, label). The DataLoader collates these into (batch_tensor0, batch_tensor1, batch_label).
+
+In training:
+```python
+        for xt, xw, y in dl_tr:
+```
+
+In inference:
+```python
+        for xt, xw, _ in dl_ev:
+```
+
+If I change the dataset to return 3 views, I need to update both loops to unpack 3.
+
+Option A: return `views[0], views[1], views[2], r.get("cls", -1)` and unpack as `for xt, xw, xv, y in dl_tr:`.
+
+Let me do that.
+
+New dataset getitem:
+```python
+    def __getitem__(self, i):
+        r = self.rows[i]
+        img = self.images[r["image"]]
+        fh = fv = False
+        bright = 1.0
+        if self.train:  # same flips and brightness for both views
+            fh, fv, bright = random.random() < 0.5, random.random() < 0.5, random.uniform(0.8, 1.2)
+        views = []
+        for ctx in (TIGHT_CONTEXT, CONTEXT, THIRD_CONTEXT):
+            x = make_crop(img, r, ctx, self.train)
+            if fh:
+                x = x[:, ::-1]
+            if fv:
+                x = x[::-1, :]
+            if self.train:
+                x = np.clip(x * bright, 0, 1)
+            x = (x - MEAN) / STD
+            views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))
+        return views[0], views[1], views[2], r.get("cls", -1)
+```
+
+Training loop:
+```python
+        for xt, xw, xv, y in dl_tr:
+            ...
+            xt = xt.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            xw = xw.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            xv = xv.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            y = y.to(device, non_blocking=True)
+            with torch.autocast(**amp):
+                loss = crit(model([xt, xw, xv]), y)
+            ...
+```
+
+Inference loop:
+```python
+        for xt, xw, xv, _ in dl_ev:
+            xt = xt.to(device).to(memory_format=torch.channels_last)
+            xw = xw.to(device).to(memory_format=torch.channels_last)
+            xv = xv.to(device).to(memory_format=torch.channels_last)
+            probs.append(torch.softmax(model([xt, xw, xv]).float(), 1).cpu())
+```
+
+Now, the model is created with `FusionModel(base)`. Since I'm adding `n_views=3` as default, `FusionModel(base)` still works. Good.
+
+Let me now think about the time budget. The current run does 441 steps in ~149s (from 13s load to 162s total, so ~149s of training). Wait, let me recompute. The log says:
+- load: 13s
+- epoch 0: 59s (94 steps)
+- epoch 1: 77s (188 steps)
+- epoch 2: 94s (282 steps)
+- epoch 3: 112s (376 steps)
+- epoch 4: 125s (441 steps)
+- done: 162s total
+
+Wait, that's confusing. Let me re-read.
+
+```
+train 6052 boxes, eval 41879 detections, 1022 images (13s)
+epoch 0: loss 0.7190, 94 steps, 59s
+epoch 1: loss 0.3495, 188 steps, 77s
+epoch 2: loss 0.2841, 282 steps, 94s
+epoch 3: loss 0.2462, 376 steps, 112s
+epoch 4: loss 0.2150, 441 steps, 125s
+done: 5 epochs, 441 steps, 52909 prediction rows, 162s total
+```
+
+So the times are cumulative from T0. Load = 13s. After epoch 0: 59s total. After epoch 1: 77s. ... After epoch 4: 125s. Then prediction + writing takes 162 - 125 = 37s.
+
+Wait, but the RESERVE_S = 55. So training should stop at deadline - 55 = 180 - 55 = 125s. Yes! Training stops at 125s (that's t_end). Then prediction takes until 162s, leaving 18s margin. Good.
+
+So training does 441 steps in 125 - 13 = 112s. That's ~0.254s per step.
+
+Now with 3 views instead of 2, the per-step compute increases. The backbone forward is the main cost. Currently 2 forward passes per step (tight + wide). With 3 views, it's 3 forward passes. So ~50% more compute per step. That means ~0.254 * 1.5 = 0.38s per step. In 112s, that's ~295 steps. The plan estimates ~290 steps. Good.
+
+But wait, there's a subtlety. The backbone is shared, but we call it 3 times. Each call is a full forward. So yes, 1.5x compute.
+
+Actually, let me reconsider. The training also has backward pass. The backward is proportional to the number of forward passes too. So overall ~1.5x.
+
+Let me verify: 441 steps in 112s. With 1.5x, we'd get ~294 steps in 112s. The plan says ~290. Close enough.
+
+Now, will fewer steps hurt? The model trains for fewer steps but each step is "bigger" in some sense (more views). It's a trade-off. The hypothesis is that the extra context view helps pore/stain/deposit classification.
+
+Let me think about whether this is a good experiment. The plan says the 3rd very wide crop (4x) helped pore specifically in earlier experiments (+0.005, accepted twice). And e008's per-class fusion helped. So combining them makes sense.
+
+Actually, wait. Let me reconsider the "third very wide view" experiment. From the history table:
+| Third, very wide view (4x the box) next to the 1.5x and 2.5x crops, logits averaged | 3 | accepted twice (5-seed 0.6342 both, +0.005), gain almost entirely from the pore class; once rejected (0.633). Adds ~20 s per run, close to the time limit |
+
+So the 4x crop with fixed averaging gave +0.005, mostly pore. And e008's per-class fusion gave +0.005. Combining: per-class attention over 3 views.
+
+But there's a concern: the 4x crop "adds ~20s per run, close to the time limit." With e009's extra training data, the training set is larger (6052 + extra_train). Let me think about how many extra training boxes there are.
+
+Actually, e009 wasn't confirmed, but it's the "last" version. The lead wants BASE: last. So I'm building on e009 which has the extra training data.
+
+Hmm, but e009's extra training data adds time. Let me reconsider. Actually the extra training data means more boxes in the training set, so more steps per epoch, but the total time is fixed. So it doesn't change the total training time (still stops at 125s), just changes how many boxes per epoch and thus step count.
+
+Wait, actually the number of steps is determined by time, not by epoch count. The DataLoader iterates and stops when time runs out. So more boxes = more steps per epoch but the total steps in the fixed time is roughly the same (determined by time per step). Actually no — total steps = total_time / step_time. More boxes per epoch doesn't change step_time (each step is a batch of 64). So total steps is the same regardless of dataset size, as long as the dataset is big enough to not run out within a single epoch.
+
+Wait, but if the dataset is small, you might do multiple epochs. With 6052 boxes and batch 64, that's ~94 steps per epoch. With extra training data, say 6052 + ~2000 = 8052 boxes, that's ~125 steps per epoch. Either way, in 112s at 0.254s/step, that's ~441 steps = ~4.7 epochs (with 94/epoch) or ~3.5 epochs (with 125/epoch). The total steps is the same.
+
+OK so the key change is: 3 views instead of 2, so step_time increases by ~50%, so total steps decrease by ~33%.
+
+Let me now also reconsider: is the per-class attention the right approach vs. just averaging? The plan says per-class soft attention. e008 used per-class sigmoid weighting (2 views). Now extending to 3 views with softmax attention per class. This is a natural extension.
+
+Actually, let me reconsider whether to use softmax or keep the sigmoid approach. With 3 views, sigmoid per view per class would give independent weights (not summing to 1), which could let the model scale the logits. But the plan says softmax-normalized within each class. Let me follow the plan: softmax over views within each class.
+
+Hmm, but actually there's a subtlety. With softmax, the weights sum to 1, so the output is a convex combination of the 3 view logits. This is clean. Let me go with softmax as the plan says.
+
+Let me now write the code changes.
+
+First, the settings. Current:
+```python
+MODEL = "efficientnet_b0"
+PRETRAINED = True
+IMG_SIZE = 160
+CONTEXT = 2.5           # wide crop: side = CONTEXT * long side of the box
+TIGHT_CONTEXT = 1.5     # tight crop
+MIN_CROP = 16
+```
+
+I'll add THIRD_CONTEXT = 4.0. Let me add it after TIGHT_CONTEXT.
+
+```python
+CONTEXT = 2.5           # wide crop: side = CONTEXT * long side of the box
+TIGHT_CONTEXT = 1.5     # tight crop
+THIRD_CONTEXT = 4.0     # very wide crop
+```
+
+Now the FusionModel. Current:
+```python
+class FusionModel(nn.Module):
+    """EfficientNet-B0 backbone with a learnable per-class tight/wide logit fusion."""
+    def __init__(self, base):
+        super().__init__()
+        self.base = base
+        self.logit_w = nn.Parameter(torch.zeros(4))  # sigmoid -> 0.5 (equal weight)
+
+    def forward(self, xt, xw):
+        w = torch.sigmoid(self.logit_w)
+        return w * self.base(xt) + (1 - w) * self.base(xw)
+```
+
+New:
+```python
+class FusionModel(nn.Module):
+    """EfficientNet-B0 backbone with learnable per-class attention over three views."""
+    def __init__(self, base, n_views=3):
+        super().__init__()
+        self.base = base
+        self.attn = nn.Parameter(torch.zeros(4, n_views))  # per-class, per-view; softmax over views
+
+    def forward(self, views):
+        stacked = torch.stack([self.base(v) for v in views], dim=1)  # (B, n_views, 4)
+        w = torch.softmax(self.attn, dim=1)  # (4, n_views)
+        return torch.einsum("bvc, cv -> bc", stacked, w)
+```
+
+Now the dataset getitem. Current:
+```python
+        views = []
+        for ctx in (TIGHT_CONTEXT, CONTEXT):
+            x = make_crop(img, r, ctx, self.train)
+            if fh:
+                x = x[:, ::-1]
+            if fv:
+                x = x[::-1, :]
+            if self.train:
+                x = np.clip(x * bright, 0, 1)
+            x = (x - MEAN) / STD
+            views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))
+        return views[0], views[1], r.get("cls", -1)
+```
+
+New:
+```python
+        views = []
+        for ctx in (TIGHT_CONTEXT, CONTEXT, THIRD_CONTEXT):
+            x = make_crop(img, r, ctx, self.train)
+            if fh:
+                x = x[:, ::-1]
+            if fv:
+                x = x[::-1, :]
+            if self.train:
+                x = np.clip(x * bright, 0, 1)
+            x = (x - MEAN) / STD
+            views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))
+        return views[0], views[1], views[2], r.get("cls", -1)
+```
+
+Now the training loop. Current:
+```python
+    while not done:
+        tot, nb = 0.0, 0
+        for xt, xw, y in dl_tr:
+            frac = min(1.0, (time.time() - t_start) / budget)
+            f = frac / 0.05 if frac < 0.05 else 0.5 * (1 + math.cos(math.pi * (frac - 0.05) / 0.95))
+            for pg in opt.param_groups:
+                pg["lr"] = LR * max(f, 1e-3)
+            xt = xt.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            xw = xw.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            y = y.to(device, non_blocking=True)
+            with torch.autocast(**amp):
+                loss = crit(model(xt, xw), y)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+            tot += loss.item(); nb += 1; steps += 1
+            if time.time() >= t_end:
+                done = True
+                break
+```
+
+New:
+```python
+    while not done:
+        tot, nb = 0.0, 0
+        for xt, xw, xv, y in dl_tr:
+            frac = min(1.0, (time.time() - t_start) / budget)
+            f = frac / 0.05 if frac < 0.05 else 0.5 * (1 + math.cos(math.pi * (frac - 0.05) / 0.95))
+            for pg in opt.param_groups:
+                pg["lr"] = LR * max(f, 1e-3)
+            xt = xt.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            xw = xw.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            xv = xv.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            y = y.to(device, non_blocking=True)
+            with torch.autocast(**amp):
+                loss = crit(model([xt, xw, xv]), y)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+            tot += loss.item(); nb += 1; steps += 1
+            if time.time() >= t_end:
+                done = True
+                break
+```
+
+Now the inference loop. Current:
+```python
+    probs = []
+    with torch.no_gradThinking budget reached. Stop thinking now and write the reply in the required format.

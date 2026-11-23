@@ -1,0 +1,285 @@
+Let me analyze the current state and choose the next experiment carefully.
+
+## Current State Analysis
+
+**Current best (e009):** 5-seed val mAP@0.5 = 0.6359
+- Uses 4-scale crop pyramid (1.25x, 1.75x, 2.5x, 3.5x) with EfficientNet-B0 at 160px, feature-pyramid fusion head
+- Score = detector conf × class probability
+
+**Per-class AP@0.5:** pore 0.531, deposit 0.625, discontinuity 0.778, stain 0.610
+- Discontinuity is already strong (95% right on true defects)
+- Pore and deposit are weak (63%, 77%), often misclassified as stain
+- Stain is reasonably good (90%) but gets confused with pore/deposit
+
+**Key diagnostics:**
+- mAP@0.5 if every box had correct class (but kept current scores): 0.7366 vs current 0.6359 → the wrong-class cost is ~0.10 mAP
+- The remaining gap to perfect-classes ceiling (0.758) is mostly what our scores cost vs detector conf
+
+**Error profile:**
+- pore→stain: 19/63 errors (30% of pores misread as stain)
+- deposit→stain: 55/271 errors (~20% of deposits misread as stain)
+- Stain is the "default" class for ambiguous boxes
+
+**What's been tried (exhausted):**
+- data: training on detector boxes, different resolutions - exhausted, no new best
+- inference: TTA, ensembles - exhausted
+- scoring: logit biases, per-class priors - exhausted
+- architecture: 13 ideas, mostly variations of the crop fusion / backbone. The only confirmed gain was e009 (4-scale pyramid). Subsequent architecture ideas (e010-e020) all failed.
+
+**What remains:**
+The bottleneck is clear: pore and deposit are confused with stain. The "stain" class acts as a sink for ambiguity. 
+
+Let me think about what hasn't been tried that could matter:
+
+1. **Training data augmentation for the weak classes** - e.g., synthetic examples? But the brief says "no internet", so we can't get more data.
+
+2. **The scoring/ranking approach** - we score = conf × p(class). The reference numbers tell us:
+   - d2_boxes_perfect_classes_val_map50: 0.758 (ceiling with our boxes + perfect classes, using detector conf as score)
+   - d2_class_agnostic_val_map50: 0.755 (our boxes, one class, scored by conf)
+   - Our current: 0.6359
+
+So the gap from perfect classes is 0.122 mAP. The gap from class-agnostic scoring is 0.120 mAP. This tells us: the loss is entirely in the class decision (wrong classes on true defects), NOT in the ranking/score magnitude. If we had perfect classes with our scores, we'd get 0.7366; if we had perfect classes with detector conf, 0.758.
+
+Wait, actually let me re-read: "mAP@0.5 if every box had its correct class but kept your scores: 0.7366 (yours: 0.6359)." The difference (0.10) is what wrong classes cost. But then the remaining gap to 0.758 (perfect classes with detector conf) is 0.022 — that's what our scores cost compared to detector conf.
+
+So the main fix target is: reduce wrong-class on true defects, especially pore→stain and deposit→stain. The per-class geometric prior idea (e016, e020) didn't work. 
+
+What about... **the fundamental question: is this a resolution/texture problem or a training data problem?**
+
+e018 and e019 were timeouts (trying higher resolution / different backbone). Let me think about what could actually help:
+
+**Key insight I should explore:** The reference numbers suggest the "stage-1 boxes scored as single class" reaches 0.755, and perfect classes with our scores reach 0.7366. So even the best possible classifier given our boxes only gets to 0.7366 — meaning OUR SCORES are not well-calibrated for ranking (compared to detector conf). But wait, that's about ranking within a class...
+
+Actually no. Let me reconsider. The 0.7366 is "if every box had its correct class but kept your scores." This means the order of predictions within each class stays the same; only the class assignment changes. So this measures: given our scoring/ranking, what would happen if we also got the classes right?
+
+The gap from 0.758 (perfect classes + detector conf) is 0.022. The gap from perfect classes + our scores (0.7366) is 0.10. So:
+- Wrong class assignment costs ~0.10 mAP
+- Our score ranking vs detector conf costs ~0.02 mAP
+
+The dominant problem remains wrong classes, especially on pore and deposit.
+
+**What hasn't been tried that could help:**
+
+1. **A completely different approach to the weak classes: treating this as a fine-grained recognition problem with harder mining.** But many ideas have tried variations of architecture.
+
+2. **Multi-view ensemble / snapshot ensemble at inference?** That's "inference" category, already tried (e014, e016) with no gain.
+
+3. **The training data itself:** What if we could use the stage-1 detector boxes on training images as additional training data? That was tried (e013, also earlier families) — "no gain: seed 0 from 0.555 to 0.632, best 5-seed 0.627" - wait, that family got accepted twice (0.6337 and 0.6342). But e013 on e009 was rejected (0.6168). The earlier family had "accepted twice (5-seed 0.6337 and 0.6342, about +0.004)". Hmm, that's small gains.
+
+4. **What about the imbalance in a different way?** The weak classes are pore and deposit. They're misclassified as stain. Stain is common. Maybe the model learns "if I'm not sure, call it stain." 
+
+5. **A fundamentally different idea: using the detector's own features?** No, stage 1 is fixed.
+
+6. **Two-stage classifier refinement:** The reference numbers say a crop classifier given perfect boxes reaches macro-F1 ~0.87 with the starting recipe. So there IS headroom in classification accuracy. Our per-class AP suggests pore 0.531 and deposit 0.625 — these could be better.
+
+7. **Wait — what about the MIN_SCORE threshold and row filtering?** The current code writes up to 3 rows per box (one per class with score > MIN_SCORE). What if we only write the top-1 or top-2 rows? Hmm, e001-e004 tried "fewer or re-weighted score rows" with no gain.
+
+8. **What about the loss function?** Cross entropy is standard. Focal loss was tried (no gain). Class-weighted loss was tried (no gain). 
+
+9. **A completely different angle: test-time or inference-time calibration.** e003 tried "instead of changing what the model sees... apply per-class biases". Tried and rejected.
+
+10. **What about using the box context differently?** The current best uses a 4-scale pyramid. e020 added a 5th scale (1.0x tight) and failed slightly.
+
+Hmm, let me think about what is fundamentally different from everything tried so far.
+
+**Idea: Use multiple independent crops per box but with a DIFFERENT strategy for the weak classes — specifically, since pore and deposit are confused with stain, maybe we need MORE diverse views of the same defect, or harder augmentation to force the model to learn distinguishing features.**
+
+Actually, wait. Let me reconsider the problem from scratch. The key constraint is:
+- Stage 1 detector boxes are fixed (already done)
+- We score each box with a class and a score
+- mAP@0.5 depends on ranking within each class
+
+**The big realization:** The current system gives each eval box up to 4 rows (one per class), scored as conf × p. The problem is that for a pore box, the model might give stain a higher probability than pore, and since the score = conf × p, the order within the pore class matters for detection but the ORDER WITHIN a class doesn't change with scaling...
+
+Hmm wait, actually re-read: "AP depends only on this ORDER. Any change that keeps the order of a class's predictions (for example multiplying all its scores by a constant, or a monotone function of the score) leaves its AP unchanged."
+
+So for each class, what matters is the ORDER of predictions of that class. Currently, each box contributes up to 4 rows (one per class). For the "pore" class, the order of pore rows across boxes depends on conf × p(pore|box). If the model's p(pore|box) is well-calibrated, then the order is good.
+
+The main error: boxes that overlap real defects get the WRONG class assigned (e.g., a pore box gets classified as stain). This means the "pore" rows for those boxes have low scores, and the "stain" rows have higher scores. So in the pore class ranking, those true positives fall below false alarms from other boxes.
+
+**The fix must: make the model's p(class) correct such that true positives rank above false positives within each class.**
+
+Now, what hasn't been tried? 
+
+**IDEA: Train the classifier to directly optimize the ranking metric rather than classification accuracy.** I.e., use a pairwise / ranking loss instead of cross-entropy. Given that AP depends only on the order of predictions within each class, maybe a hinge-loss or margin-based loss would be more effective at getting the ordering right — specifically pushing true positives above false positives for each class.
+
+Hmm, but e018-e020 all were about "resolution/texture" and data quality. The earlier family (e001-e004) tried scoring/ranking changes with no gain (except the small ones).
+
+Actually, let me reconsider: what about **focusing on the specific error pattern — pore/deposit misread as stain** — using a fundamentally different approach: **hard negative mining / focused training**. The model confuses pore and deposit with stain. This is a very specific confusion. What's special about this confusion?
+
+The key difference: pores are small voids, deposits are raised ridges, stains are flat discolorations. But the classifier at 160px with EfficientNet-B0 may not see these details.
+
+**Wait — what about data augmentation that specifically targets the weak classes?** e.g., oversampling, or synthetic generation of pore/deposit examples. The "data" category is marked EXHAUSTED? but only 3 ideas were tried there (e001-e003 are more "architecture/data hybrid"). Actually looking at the history:
+- e001: training on detector boxes (data) — rejected
+- e013: same idea (training on detector boxes) — rejected  
+- e015/e016: geometric priors — crashed/rejected
+
+Hmm, the "data" category only has 3 ideas total. The "architecture" category is where most ideas went (13). 
+
+Let me think about what's fundamentally different and plausible:
+
+**IDEA: Two-model approach with different crops.** Since pore/deposit confusion dominates, and a single backbone at 160px may be insufficient for fine texture discrimination... but e018 and e019 (higher resolution) timed out.
+
+Wait, actually, I want to revisit the TIME BUDGET issue. The current run does:
+- load + prep: 13s
+- epoch 0: 72s total (59s for ~63 steps)
+- epoch 1: 95s total (23s for ~64 steps... wait, that's odd — epoch 1 took only 23s?)
+
+Let me re-read the log: "epoch 0: loss 0.4703, 94 steps, 72s" then "epoch 1: loss 0.2745, 157 steps, 95s". So epoch 1 took ~23s (95-72) and completed 63 more steps. Then prediction took until 168s. Total budget is 180s.
+
+The time per step seems to be around 0.9-1.0s at batch 64 with 4 crops... Actually epoch 0 took 59s for 94 steps = 0.63s/step, and epoch 1 took 23s for 63 steps = 0.37s/step? That's inconsistent. Actually the first epoch might include warmup overhead. Hmm, whatever — total is 168s out of 180s.
+
+The key question: what experiment could give a big gain and fit in the budget?
+
+**A promising untried idea: improve the quality of training data for the weak classes by synthesizing or augmenting them specifically.** But we can't get new data (no internet). We could do heavy augmentation on existing weak-class examples.
+
+Actually, hold on. Let me re-read the background section: "A crop classifier given perfect boxes reaches macro-F1 ~0.87 with the starting recipe." The current best gets pore 0.531, deposit 0.625. Macro-F1 would be around 0.74. So there's ~13% headroom in classification accuracy on top of what we have.
+
+**A fundamentally different approach: ensemble the classifier with the "perfect classes" approach?** No...
+
+**Let me think about the most impactful untried thing:** 
+
+The problem is specifically pore vs deposit vs stain confusion. Three visual classes that look similar at low resolution. The current model uses a 4-scale pyramid.
+
+**What if we train multiple independent classifiers (different seeds) and ensemble them?** That's "inference" (e014: rejected). But e014 tried "averaging predictions of several independently trained models" and got 0.5771 — that's actually worse than the base! Why? Maybe because with a small budget, multiple models are undertrained, or the ensembling was implemented wrong (e.g., averaging logits vs probabilities).
+
+Hmm wait, e014 scored 0.5771 which is WAY below 0.6359. That's suspicious — probably a bug or severe undertraining. The brief says "A score far below the current best usually means a bug (wrong class order, wrong box format, untrained model), not a bad idea."
+
+**A new angle on ensembling:** instead of averaging probabilities, use a **weighted ensemble based on the detector conf**, or use **model averaging (SWA)** along the training trajectory. Actually SWA/snapshot ensembles would be within budget — one training run, collect checkpoints at different points, average weights, then evaluate. That's a well-established technique that could work.
+
+Actually, let me think about this differently. The brief says: "Under a fixed budget, an ensemble means less training per member; the trade-off depends on how undertrained each member is." Our model trains for 2 epochs, 157 steps. That's not much. Maybe models are undertrained.
+
+Hmm, but e014 tried ensembles (several independently trained models) and failed badly. Why? Probably because with a fixed budget of 180s, training N independent models means each gets only 180/N seconds, making them severely undertrained. The gain from ensembling doesn't compensate.
+
+**What about SWA (Stochastic Weight Averaging)?** One training run, but average weights at multiple points along the trajectory. This doesn't reduce training per member — it's one run. And it often gives better generalization. But... has this been tried? Looking at the history... no, I don't see SWA in the history.
+
+But wait, SWA is a form of "inference" or "architecture"? It's more like optimisation/inference.
+
+**Let me reconsider: what if the real fix is to change HOW the model sees the defect — specifically, using much larger context around each box?** The background says "Context around an object can help separate classes that look alike up close; several views at different scales can be combined (multi-scale or multi-crop inputs)." We already do 4-scale crops.
+
+Hmm, actually one thing I notice: SCALES = (1.25, 1.75, 2.5, 3.5). These are contexts around the box. But the CROP SIZE at each scale depends on the box size and context. For small boxes, the crop is MIN_CROP=16 min...
+
+Wait, actually there's something interesting: the current model uses `IMG_SIZE = 160` for ALL crops regardless of scale. The different scales just change how much context (padding) around the box is included. So a tight 1.25x crop and a wide 3.5x crop both get resized to 160×160 — the tight crop has the defect larger in frame, the wide crop has more context but the defect smaller. This is like a multi-scale view.
+
+**What if we instead use DIFFERENT IMG_SIZE per scale?** e.g., the tight crop at higher resolution and wide crops at lower? That changes what the model sees. But this was essentially e011 ("a dedicated high-resolution stre...") — rejected, 0.5990. So that idea failed.
+
+Hmm. Let me think about what's actually the most promising untried direction given the constraints.
+
+**Actually, let me revisit a fundamentally different idea: TWO-CLASS vs FOUR-CLASS re-thinking.**
+
+What if we use a hierarchical approach? First decide "pore/deposit" vs "stain/discontinuity"? No...
+
+**Or: what about using box geometry more cleverly — not just per-class priors (e016), but actual geometric features as model input?** e015/e016 tried this — crashed / rejected.
+
+**What about the loss function? Specifically, a contrastive or metric learning approach?** We could train the classifier to pull same-class examples together and push different-class examples apart in embedding space, then classify by nearest neighbor. This is quite different from cross-entropy and hasn't been tried. But it's risky given the budget.
+
+**OK let me step back and think about what "unexplored" means.** The exhausted categories: data (3 ideas), inference (2), scoring (2). Architecture has 13 ideas with only e009 succeeding.
+
+Actually, looking more carefully at the "data" category — it says "EXHAUSTED?" with a question mark. Only 3 ideas tried there (e001, e013, and... hmm, e002 is "architecture", e003 is "inference"). Let me recount:
+- data: e001 (detector boxes for training), e013 (detector boxes for training), e018? No, e018 is architecture. 
+
+Actually looking at the table: data has 3 ideas, all rejected or no new best. But the "data" category in the lessons table only lists 3 ideas vs architecture's 13. So there's more room in data-related experiments.
+
+**Wait, here's a thought:** e001 and e013 both tried training on detector boxes (IoU > 0.5 with true box, labelled with its class). This was accepted twice earlier with +0.004 gain. But when applied to e009 it was rejected at 0.6168 (below 0.6359). Why? Maybe because:
+- The detector boxes are noisier (offset, mis-sized) so training on them hurts the fine texture learning needed for pore/deposit/stain distinction
+- Or the added data diluted the high-quality GT boxes
+
+Hmm. Actually the earlier family was "Detector boxes from the train split as extra training data (IoU > 0.5 with a true box, labelled with its class)" — accepted twice with ~+0.004 gain. But applied to e009 it failed. So this is not clearly exhausted — maybe the combination matters (ratio of GT to detector boxes?).
+
+But I need something fundamentally different and plausible for a 0.01+ gain.
+
+**Let me think about the actual bottleneck more carefully.**
+
+The diagnostics say:
+- mAP with perfect classes but our scores: 0.7366
+- Our score: 0.6359
+- Difference: 0.10 — the cost of wrong classes
+
+And per-class: pore 0.531, deposit 0.625, discontinuity 0.778, stain 0.610.
+
+**The critical observation:** "Share of those boxes with the right class, by defect size (area thirds): small 82%, medium 90%, large 92%" — wait, that says SMALL boxes are actually MORE accurately classified? That contradicts the idea that it's a resolution problem! Small boxes have less texture... but they're classified better. Hmm, that's interesting. So the model handles small defects (pores) better in terms of class accuracy?
+
+But then why is pore AP only 0.531? Because pores are SMALL and numerous, so there are many false positives of pore class from other things... Actually no, the AP is low because of the confusion with stain — 30% of pores misread as stain.
+
+Hmm wait, "small 82%" right on small boxes — but pores tend to be small. If small boxes are 82% right and pores are only 63% right... that doesn't add up unless pores are mostly medium/large or the confusion is with other classes too. Let me look again:
+
+true pore: 48 pore, 7 deposit, 1 discontinuity, 19 stain → 63% right
+The size breakdown says small boxes overall are 82% right. But this includes all classes. Since pores are mostly small... if small is 82% and pores are 63%, then there's something inconsistent. Unless pores are not actually "small" in this dataset.
+
+Hmm, maybe the size thirds are computed over all true defect boxes regardless of class, so a mix. If pores were typically small and classified 82% right at small size, that would suggest resolution isn't the problem for pores. But pore AP is only 0.531... 
+
+Wait, I need to be careful: "Share of those boxes with the right class" — this is conditional on the box overlapping a true defect AND being classified correctly. The per-class AP@0.5 accounts for ALL predictions of that class (including false positives). A low pore AP could be due to:
+1. Many pores misclassified as other classes (recall problem for pore)
+2. Or non-pore boxes misclassified as pore (precision problem)
+
+From the confusion matrix, 63% of true pores are correctly classified — that's recall. The 19 that go to stain, 7 to deposit, 1 to discontinuity. But we don't see how many false positive "pore" predictions exist.
+
+Actually, the mAP with perfect classes (0.7366) vs current (0.6359) is 0.10 difference. This 0.10 comes from wrong-class boxes. The reference says this is "what wrong classes cost."
+
+**OK, let me focus on a concrete untried idea that targets the specific weakness.**
+
+**The specific weakness: pore and deposit are misread as stain (the "default" class). The model likely uses coarse features — if it can't find fine texture distinguishing pore from deposit, it defaults to stain.**
+
+**Untried idea: A two-head architecture.** One head for "stain vs not-stain" and another for "pore vs deposit vs other"? This splits the hard decision. But actually a more standard approach: **hard example mining focused on the weak classes** — specifically, oversample pore/deposit examples or use focal loss on them (tried focal — no gain).
+
+**Hmm, let me think about what's really unique and promising.**
+
+Actually — here's an idea I haven't seen in the history: **Use the stage-1 detector boxes on the TRAIN split to identify which true defects are ambiguous (mislabeled or genuinely hard), and specifically train on those.** No wait.
+
+**Better idea: The "stain" class is too easy for the model, and it becomes a sink.** What if we use **label smoothing on stain** or make the loss function treat stain differently? e.g., asymmetric loss where misclassifying pore/deposit as stain is penalized more. That's essentially "class-weighted loss" which was tried ("Class-balanced sampling or class-weighted loss: no gain") and explicitly said to hurt in the background ("Class-weighted loss hurt classification every time it was tried").
+
+**OK, what about a completely different training strategy: train on multiple tasks simultaneously?** Like, train the model to also predict box attributes (aspect ratio, area) alongside class. That's been hinted at (e015-e016 "box size and aspect ratio as an extra model input") but "never properly tested: 2 crashes." So it wasn't actually tried properly!
+
+**Hmm, that's a candidate.** But the brief says these geometric cues alone don't help much.
+
+Let me think about the most promising thing...
+
+**IDEA: Multi-view HARD TRAINING — specifically, since pore/deposit/stain confusion is the issue, use stronger augmentation on the weak classes (pore, deposit) to force the model to learn distinguishing features.** e.g., for pore and deposit boxes, apply harder augmentations (color jitter, random erase, mixup with other classes?) to make the classification task harder during training. This is "augmentation" category — has that been tried?
+
+Looking at history: "Training augmentation (rotation, mixup, stronger colour or geometry): 5 attempts, no gain." So augmentation was tried and failed. But those were general augmentations for all classes. Targeted augmentation for weak classes specifically hasn't been tried... but it's risky and the "augmentation" category says "no gain: best 5-seed 0.633".
+
+Hmm. OK let me think about this more carefully, because I need a strong candidate.
+
+**The most promising untried thing I can identify:**
+
+**Idea: Two-stage classifier with SOFT annotations from the detector — use the stage-1 boxes on training images to learn which defects are ambiguous.** No...
+
+**Actually, here's a cleaner idea that hasn't been tried and directly targets the error:** **Ensemble of two models trained on DIFFERENT crops:** one model optimized for texture (tight crop) and one for context (wide crop), then combine their predictions. e007-e008 tried cross-attention between crops (failed). But a two-model ensemble with different views hasn't been cleanly tested... wait, e014 was "averaging predictions of several independently trained models" — that IS an ensemble.
+
+Hmm. Let me look at e014's result: 0.5771, way below base. The brief says this usually indicates a bug or untrained model. With 180s budget and N models, each gets too little training. So the idea might be good but undertrained.
+
+**SWA (Stochastic Weight Averaging) / snapshot ensemble: one training run, save checkpoints at intervals, average weights.** This gives you multiple "models" for the price of one run. This is a different approach from e014 (independent models) and directly addresses the undertraining concern. It's also very budget-friendly — no extra time.
+
+Hmm, but SWA is more of an "optimisation" technique. Let me check: has SWA been tried? Not in the history. The history mentions "snapshot ensembles from one training run (Huang et al., 2017), weight averaging along the trajectory (SWA, Izmailov et al., 2018)" in the background reading — so this is a known technique but apparently not tried on this task.
+
+Wait, but would SWA actually help here? The current model trains for 2 epochs. SWA typically needs more epochs to be effective (it averages over a wide range of the loss landscape). With only ~157 steps... it might work but it's uncertain.
+
+**Let me think about what's REALLY the bottleneck.**
+
+Actually, let me reconsider something: **the current model scores each box with up to 4 rows (conf × p(c)). What if we change the ranking strategy within a class?** 
+
+Currently, for the "pore" class, predictions are ordered by conf × p(pore). The detector conf is already high-quality. So the ordering depends on p(pore|box). If the classifier gives higher p(pore) to true pore boxes than to false-positive boxes, we're good.
+
+The issue: for a box that overlaps a true pore but the model thinks it's stain, p(pore) is low → the row falls below false alarms. So we need the classifier to give higher p(pore) to true pores. That's just better classification.
+
+So the fix really must be about classification quality, not ranking mechanics. And everything tried in "scoring" (e003-e004, e016) targets ranking with biases — they all failed because the fundamental class assignment is wrong.
+
+**OK so I need a classification-quality improvement that's been untried.** Let me enumerate what's genuinely untried:
+
+1. **Higher resolution input** (e018/e019 tried but timed out)
+2. **Different backbone** (e011, e017 — no gain; also 5-seed 0.636 unconfirmed from earlier family)
+3. **Ensemble/SWA** (e014 — bad result, likely undertrained; SWA not tried)
+4. **Training on detector boxes** (e001/e013 — small gains then rejected)
+5. **Hard mining / targeted augmentation for weak classes** (not tried)
+6. **Different loss: ranking losses, margin-based, contrastive** (not tried)
+7. **Multi-task learning with geometry** (not properly tested)
+
+**The most promising untried direction I see:** 
+
+**A focused hard-mining / curriculum approach on the weak classes.** Specifically, train the model to be robust to the exact failure modes: take the pore and deposit boxes that are confused with stain and use them more heavily. But this is data augmentation-adjacent...
+
+Hmm wait, actually let me reconsider something entirely different. 
+
+**KEY INSIGHT ATTEMPT:** The current system scores = conf × p(class). The detector conf is ~0.755 class-agnostic mAP. If we could get perfect classes with our scoring, 0.7366. With detector conf instead of our scores, 0.758. 
+
+The fact that perfect classes + detector conf (0.758) beats perfect classes + our scores (0.7366) means OUR SCORING IS WORSE THAN THE DETECTOR'S CONF for ranking within classes. But the difference is only 0.022 —Thinking budget reached. Stop thinking now and write the reply in the required format.

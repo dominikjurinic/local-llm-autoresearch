@@ -1,0 +1,536 @@
+===== attempt 1 =====
+Let me carefully analyze the situation.
+
+**Current state:**
+- Best: e001, 5-seed average 0.6302, std 0.0069
+- Per class: pore 0.517, deposit 0.622, discontinuity 0.776, stain 0.605
+- Baseline to beat: 0.638 (one-step detector)
+- Stage 1 box ceiling: 0.758
+- Class-agnostic score: 0.755
+
+**History analysis:**
+1. e001 (data): Adding low-resolution training crops → new best 0.6302. Data diversity helps.
+2. e002 (architecture): Single crop → crash (bug).
+3. e003 (architecture): Fixed single crop → 0.6247, rejected. So single tight crop is worse than two-crop.
+4. e004 (architecture): More training? Wait, e004's hypothesis says "the training loss is still dropping rapidly… undertrained" — what was the change? The hypothesis is cut off mid-sentence. Score 0.6296, rejected. Probably some training change (longer training or different architecture?). Actually the category is "architecture." Hmm, cut off. Probably changed the model.
+5. e005 (architecture): IMG_SIZE 160→128 → 0.6217, rejected. So smaller resolution is worse.
+6. e006 (data): Training on detector boxes instead of GT boxes → 0.6338 seed 0, 5-seed average 0.6278, not confirmed. Slightly worse.
+7. e007 (sampling): 2x duplication of pore and stain → 0.6280, rejected. Class reweighting via sampling failed.
+8. e008 (data): Training on detector boxes with a background class (5 classes) → 0.5635, a big drop. This is a "score far below the current best" — could be a bug, but the harness says "rejected," and the brief says "a score far below the current best usually means a bug (wrong class order, wrong box format, untrained model), not a bad idea; the harness will tell you so." The harness marked it as rejected, not crashed. Hmm, 0.5635 vs 0.6302. That's a -0.067 drop. Could be a genuine bad idea: training on detector boxes with background labels — detector boxes include false positives, and labeling by IoU>0.5 overlap with GT may produce noisy labels (detector boxes that partially overlap two defects, boxes offset from GT). Also, adding a 5th class changes the scoring: predictions are still 4 classes? Wait, in e008 the model has 5 classes, but the prediction loop writes 4 rows per box (c in range(4))? Let me check: the diff shows `num_classes=5`, but the prediction loop isn't changed… actually the diff doesn't show a change to the prediction loop, so it still writes 4 classes with score = conf * p[c]. The background probability is simply ignored. So the model learns to push some mass into background, and the 4 defect probabilities become relatively… hmm, softmax over 5 classes; if a box is a false positive, the background class fires. For true defects, the background class shouldn't fire much. This could actually be useful for ranking false positives… but the result was 0.5635, much worse.
+
+Wait — there might be a subtle issue: in e008, training rows are detector boxes labeled by IoU>0.5 with GT crops. Detector boxes that overlap multiple crops get the class of the best overlap. Boxes with no overlap → background. But many detector boxes might be offset from GT (detector boxes are "slightly misplaced"), so IoU > 0.5 with GT may fail for many true positives → labeled as background → the model learns "this appearance is background," but at eval time those boxes are true defects → wrong. That's a big source of label noise. Also, the class distribution is now dominated by detector boxes (probably ~40k train boxes?).
+
+Actually wait, how many train detector boxes are there? eval is 41,879 detections. Train is probably similar scale, ~40k. GT crops: 14,128 boxes. So detector boxes are ~3x GT crops, many false positives. Training on them with noisy IoU>0.5 labels is a bad idea.
+
+Hmm, but the score drop is -0.067, which is large. Could also be a bug: `r.get("cls", -1)` — detector boxes have cls 0-4, no problem. Dataset returns views[0], views[1], cls. No problem. Loss is CrossEntropyLoss over 5 classes. No problem. Prediction: 4 rows per box. No problem. So probably not a bug, just a bad idea. The harness would have flagged a bug if there was one ("the harness will tell you so" — and it says rejected, so probably no bug).
+
+**Where is the error?**
+
+Reference numbers:
+- One-step baseline: 0.638
+- Stage 1 box with perfect classes: 0.758
+- Class-agnostic: 0.755
+
+Current: 0.6302. So the gap to the ceiling is 0.758 - 0.630 = 0.128. The class-agnostic score is 0.755, meaning if we just scored all boxes as a single class, AP would be 0.755. Our 4-class system is 0.630.
+
+Per class: pore 0.517, deposit 0.622, discontinuity 0.776, stain 0.605. Average = (0.517+0.622+0.776+0.605)/4 = 2.52/4 = 0.63. ✓
+
+The crop classifier with perfect boxes reaches macro-F1 ~0.87. So classification accuracy itself is decent, but:
+1. The boxes are detector boxes (false positives + misplacement).
+2. The score is conf × prob.
+
+Key insight from the metric: per-class AP depends only on the ranking of that class's predictions. Score = conf × p_c. For a true defect of class c, the ranking is dominated by conf (detector confidence) and p_c. For false positives, if the classifier gives them high p_c, they rank high and hurt.
+
+Where is the biggest loss? Let me think about what the 0.758 ceiling means: all detector boxes overlapping a true defect get the correct class, all false positives are kept as class 0 with detector conf, score = conf. That gives 0.758. So if we had perfect classes, AP would be 0.758. Our 0.630 means class errors cost ~0.128.
+
+But wait — the ceiling keeps false positives as class 0 (pore) with score=conf. So in the ceiling, false positives pollute the pore ranking with conf scores. Our system: false positives get 4 rows with conf × p_c. If the classifier gives false positives low overall probability (e.g., max p ~0.3), their scores are lower than true positives with similar conf… hmm.
+
+Let me think about what specifically causes the per-class AP to be lower than the ceiling:
+- Pore 0.517: in the ceiling, pore is the class that absorbs all false positives (score=conf). So the ceiling's pore AP already includes false-positive contamination. Our pore 0.517 is below what the ceiling's pore would be… actually we don't know the per-class ceiling numbers.
+
+Hmm, let me think differently. The ceiling is 0.758 with perfect classes. The class-agnostic single-class is 0.755. Our 4-class is 0.630.
+
+The classifier's macro-F1 on perfect boxes is ~0.87. So on true boxes, ~87% get the right class. The remaining error:
+1. Misclassified true boxes (13%): each misclassification removes a hit from one class and adds a false positive to another.
+2. False positives: the detector produces boxes that don't overlap any true defect. In the ceiling they're kept as class 0. In our system they get 4 rows. The ranking within each class matters: a false positive with score conf×p_c competes with true class-c boxes.
+
+Actually, an important subtlety: in the ceiling, false positives are only in class 0 (pore). So the ceiling's pore AP is dragged down by false positives, but deposit/discontinuity/stain APs are high. The average is 0.758.
+
+In our system, false positives spread across all 4 classes according to p_c. If the classifier is uncertain on false positives (p spread ~0.25 each), their scores are ~0.25×conf, and they rank below true positives of any class with p_c > 0.25×… hmm, it's complex.
+
+Let me think about what experiments could yield ≥0.01 gain.
+
+**Ideas tried:**
+- Data: low-res inclusion (worked), detector box training (failed), GT→detector box replacement (not confirmed), background class training (failed badly).
+- Architecture: single crop (failed), smaller image (failed), e004 (cut off, failed — probably model change or training length).
+- Sampling: class duplication (failed).
+- Loss: class weighting (per brief, failed in earlier experiments — "class-weighted loss hurt classification every time it was tried" — that's in the "known" section, so probably before e001).
+
+**Untested directions:**
+1. **Scoring**: The score is conf × p_c. The metric says AP depends only on ranking. We can change the scoring function. E.g., score = conf × p_c / (1 - p_bg) or use a calibrated probability. Actually, a key idea: **sharpening** the class probability (temperature scaling) changes the ranking between classes… no wait, per-class AP depends only on the ranking within a class. Sharpening p_c by a monotonic transform of p_c alone doesn't change within-class ranking. But changing score = f(conf, p_c) with f non-monotonic in p_c alone… any function of (conf, p_c) that is monotonic in each… hmm. Within-class ranking: predictions of class c are sorted by score. Score = conf × p_c. If we change to score = conf × p_c^α, that's a monotonic transform of p_c for fixed conf, but the ranking between two predictions with different (conf, p_c) can change. So score design matters!
+
+Example: currently a false positive with conf=0.9, p_c=0.25 scores 0.225, beating a true positive with conf=0.7, p_c=0.5 (0.35)? No, 0.35 > 0.225. Hmm. But a false positive with conf 0.9, p_c 0.3 → 0.27 vs true positive with conf 0.5, p_c 0.6 → 0.30. Close.
+
+What if we use score = conf × p_c × (p_c - p_second)? Or use a "margin" to demote uncertain predictions? That changes the ranking: uncertain predictions (p spread) get demoted relative to confident ones. For true positives, the classifier is usually confident (F1 0.87), so they retain high scores; false positives are often uncertain → demoted. This could improve ranking.
+
+But wait — is there a risk? If the true positive is uncertain (e.g., stain/deposit confusion), demoting it could hurt. But the stain-deposit confusion is symmetric.
+
+Actually, let me think about what's most impactful. The gap is 0.128 to the ceiling. Components:
+(a) Class misassignment on true boxes: ~13% of true boxes get the wrong class. Each such error: the correct class loses a potential hit (and the box is scored as the wrong class, becoming a false positive there).
+(b) False-positive pollution: detector false positives rank within each class.
+
+In the ceiling (0.758), false positives are in class 0 only, with score=conf. So even with perfect classes, false positives cost us (0.758 vs 1.0). Our additional cost is 0.758 - 0.630 = 0.128, from (a) class errors and (b') false positives spread across classes with conf×p_c scores.
+
+Hmm wait, actually there's another subtlety: in the ceiling, boxes overlapping a true defect get the correct class even if the detector box is "slightly misplaced" (IoU>0.5 with GT). In our system, the classifier sees the detector box crop and assigns a class. If the detector box is offset, the crop shows a partial defect → classifier may misclassify. That's part of (a).
+
+**What could plausibly gain ≥0.01?**
+
+Option A: **Better classifier** (architecture/model). The current model is EfficientNet-B0 at 160px, trained for ~2 epochs (428 steps). The loss is still dropping (0.31 at the end). Undertraining. But e005 (smaller image → more steps) failed, and e004 (something, failed). Hmm, e004's hypothesis: "The training loss is still dropping rapidly at the end of the budget (0.31 after only ~2 epochs / 428 steps), so the classifier is undertrained rather than feature-limited, and the main error is class misassignment on true d…" — cut off. Category is architecture. What did it change? Maybe it changed to a smaller/faster model to get more steps? Or removed the two-crop? Score 0.6296, basically the same as the best (0.6302), rejected (within noise).
+
+So "more steps" via smaller image failed. What about a different backbone with better features per step? E.g., convnext_nano or tf_efficientnetv2_b0 or resnet50? But those are slower per step → fewer steps. Hmm.
+
+Actually wait — the real bottleneck: 428 steps over 14,128 samples = 2.2 epochs, batch 64. Step time: (125-85)/(428-220) = 40/208 ≈ 0.19s/step. Two forward passes per step (two views). Single view is ~0.1s/step. Budget is ~125s for training (180-55). At 0.1s/step, ~1200 steps possible with single crop. But e003 (single tight crop) scored 0.6247 — worse! Interesting: so the wide crop view is worth more than the extra steps. OK.
+
+What about training both views but with a faster model? E.g., convnext_pico/atto? Those are small and fast, but pretrained features might be weaker. Hmm, risky.
+
+Option B: **Test-time augmentation** (inference). At eval, average predictions over flips (h-flip, v-flip) — the training already uses flips, so the model is roughly flip-invariant; TTA would give little. Or TTA over crop jitter: average over multiple side scales (e.g., context 1.5±0.1, 2.5±0.1). That triples the inference cost: currently 56,470 rows from 41,879 boxes, 2 views → inference time: total 162s, load 14s, training 125s → inference ~23s. 3x views → ~35s extra, total ~197s > 180s. Too much. 1.5x? Hmm.
+
+Actually wait, let me recompute: T=180s. Load 14s. Training until t_end = 180-55 = 125s. Inference + write: 162-125 = 37s. So inference is 37s for 41,879 boxes × 2 views = 83,758 crops at 160px. ~0.44ms/crop. If we add 2 more views (2x), inference doubles to ~74s, total ~14+125+74 = 213s > 180. We'd need to cut RESERVE or training. We could set RESERVE_S lower, but training runs until deadline - RESERVE, so total is fixed at ~180 anyway… actually total = load + train + infer. If inference grows, training shrinks (it runs until t_end). So total stays ~180s. The question is whether inference fits in the reserve: reserve 55s, inference currently 37s. With 2x views, inference ~74s > 55s reserve → training ends at 125s, then inference 74s → total 14+125+74 = 213 > 180 → killed. So we'd need to reduce RESERVE to ~80… but then training ends later (deadline-80=100s), inference 74s, total 14+100+74=188 > 180. Still over. Hmm, we'd need to reduce views or reduce inference batch. Actually inference time scales with number of crops. 4x views (h/v flip × 2 views) = 148k crops → ~65s. 2 views + 2 flips = 4 views → 167,516 crops → ~74s.
+
+Alternatively, reduce inference resolution? No, the model is fixed at 160.
+
+Option C: **Scoring change** (category: scoring). This is cheap (no retraining cost change) and directly targets ranking. Ideas:
+1. score = conf × p_c, but renormalize p_c over the 4 defect classes (already the case, 4 classes).
+2. Use a margin: score = conf × p_c × (p_c - max_{c≠c} p_c + ε)? That demotes uncertain boxes.
+3. Calibrate: the classifier's probabilities on detector boxes may be overconfident on false positives.
+
+Hmm, but how big is the effect? Hard to estimate. The ranking within a class: true positives have p_c ~0.7-0.9 (when classified correctly), false positives have p_c ~0.2-0.4 (uncertain) or occasionally high (confusing weld patterns). Multiplying by (p_c - p_second) would sharply demote uncertain ones.
+
+But there's a risk: stain/deposit confusion — a true stain classified as deposit with p_stain 0.4, p_deposit 0.5: margin is small → demoted in both. That hurts stain and deposit APs (the two weak classes besides pore).
+
+Option D: **Pore-specific improvement**. Pore is the weakest (0.517). In the "known" section: "pore and deposit are the weak classes; stain is often confused with deposit." Pore AP 0.517 — why so low? Pores are small defects. Detector boxes for pores are small; the crop at 1.5x is small too. Also, in the ceiling, false positives are dumped into pore — so the ceiling's pore AP is probably the lowest of the ceiling's per-class. Our pore 0.517 vs the ceiling's pore (unknown, but probably ~0.6?).
+
+Hmm wait, actually let me reconsider: what's the per-class breakdown of the ceiling? We don't have it. But class-agnostic is 0.755 (single class). If we take the ceiling's boxes (true → correct class, false → class 0) and merge all into one class, AP is… the single-class AP over all boxes with score=conf is 0.755. So the ceiling's per-class average is 0.758, slightly above single-class 0.755.
+
+Our system: 0.630. The 0.128 gap = class errors + false-positive spread.
+
+Let me estimate: if 13% of true boxes are misclassified, that's a big chunk. Improving classification accuracy from 87% to 92% (macro-F1) might gain ~0.03-0.05 mAP. How to improve classification?
+
+Ideas for better classification:
+1. **Train longer / better optimizer**: LR schedule, more steps. e005 (smaller image, more steps) failed — but that also changed resolution (less info). What about keeping 160px but reducing per-step cost another way? E.g., batch 128 instead of 64 → same steps? No, batch size doesn't change step time much (more compute per step). Hmm.
+
+Actually, what's the step time breakdown? 0.19s/step for 2 views of 160px on GPU, batch 64. That's 128 crops per step. ~1.5ms/crop for forward+backward. GPU-bound. To get more steps: fewer pixels per step (failed), or a smaller model.
+
+2. **A better model at the same speed**: e.g., `tf_efficientnetv2_b0` (better architecture than b0, similar speed), or `convnext_nano` (slightly larger than b0? convnext_nano is 50M params vs efficientnet_b0 4M — much slower). EfficientNet-B0 is 4M params, very small. tf_efficientnetv2_b0 is ~6-7M? Actually tf_efficientnetv2_b0 is 7.9M? No: efficientnetv2_b0 is 0.8M? Let me recall: EfficientNetV2-B0: 7.9M? Hmm. EfficientNetV2 sizes: B0 0.8M? No that's not right either. EfficientNet-V2 B0: 7.9M params? I think EfficientNet-V2 B0 is 0.8M… let me think. EfficientNet B0: 4.0M. EfficientNetV2 B0: 7.9M? I recall V2-B0 was ~0.8M… no. From the timm docs: efficientnetv2_b0 has 7.9M? Hmm, actually I think tf_efficientnetv2_b0 is 7.9M params. Wait no — EfficientNetV2-B0: 7.9M? The paper says V2-B0 is 0.8M? I'm confusing with MobileNet.
+
+Let me recall properly: EfficientNetV2 paper: B0: 0.8M? No… V2-B0: 7.9M, V2-S: 22.6M? Hmm, I really recall V2-B0 being ~8M. Actually yes: EfficientNetV2-B0 has 7.9M params (vs EfficientNet-B0's 4.0M). So ~2x the compute of b0. That halves the steps. But better features. e004 (cut off) might have been exactly this — "undertrained… main error is class misassignment" — maybe it tried a bigger model and got 0.6296 (no gain). Can't tell. Risky to repeat an unknown.
+
+3. **Ensemble of two models**: train two different models within the budget, average logits. E.g., efficientnet_b0 + regnety_016 or convnext_nano? Time: currently 428 steps for one model. Two models → ~214 steps each. Undertrained. Probably worse.
+
+4. **Better training data**: e006 (detector box training) not confirmed (0.6278 vs 0.6302, within noise). e008 (background class) failed badly. What about **training on both GT crops and detector boxes** (mixed)? Or **hard negative mining**: add non-defect crops (background) as an extra class, but only from clearly non-defect regions? e008 failed because detector boxes with IoU≤0.5 to GT were labeled background — many of those are actually true defects (offset boxes). Instead: sample background crops from image regions far from any GT box (e.g., >2x box size away). That gives clean background samples. Then at eval, false positives get high background probability → we can demote them in scoring: score = conf × p_c × (1 - p_bg) or renormalize p over defects given not-background.
+
+This is a fundamentally different approach from e008: clean background labels (no label noise), and the background class is used only for scoring (demote false positives), not as a prediction class.
+
+But wait — how much does false-positive pollution matter? In the ceiling, false positives are kept as class 0 with score=conf and we still get 0.758. So false positives cost ~0.24 in the ceiling (0.758 vs 1.0… well, AP@0.5 can't be 1.0 without perfect ranking). Hmm, actually with perfect classes and perfect ranking, AP would be 1.0. The ceiling's 0.758 means false positives + ranking cost 0.242. In our system, false positives are spread over 4 classes with score conf×p_c. If the classifier gives false positives low p (say 0.2-0.3 max), they rank lower than in the ceiling (where they have full conf in class 0). So our false-positive handling might be better than the ceiling's in some classes and worse in others.
+
+Honestly, the biggest lever is probably classification accuracy on true boxes (13% error → fixable part) and the ranking of uncertain cases.
+
+Let me reconsider the scoring angle more carefully, because it's cheap and directly targets ranking:
+
+Current score: s_c = conf × p_c.
+
+Consider a class c. Its predictions: true class-c boxes (score conf × p_c, p_c usually high) and false positives + misclassified boxes (score conf × p_c, p_c often medium).
+
+AP@0.5: sort by score; a hit if IoU>0.5 with an unmatched true box of class c.
+
+Key: a true class-c box that the classifier misclassifies as class d doesn't appear in class c's list at all (it appears in class d's list as a false positive). So class c loses a hit. That's the class-error cost.
+
+A false positive with high conf and medium p_c ranks above low-conf true positives → steals a hit slot… no, it doesn't steal; it just becomes a false positive in the ranking, lowering precision at that recall point.
+
+So two levers:
+1. Reduce misclassification (better classifier, better crops, better training).
+2. Demote false positives in the ranking (scoring).
+
+For (2), the cleanest signal: the classifier's confidence. False positives often get low max-p (uncertain) or a specific wrong class with medium p. True positives get high p_correct. So score = conf × p_c^α with α>1 demotes uncertain ones. Or score = conf × p_c × (p_c - p_second).
+
+But there's a subtlety: p_c^α is a monotonic transform of p_c — for a fixed conf, the ranking by p_c is preserved, but the ranking across different confs changes. E.g., a false positive with conf 0.9, p 0.3: 0.9×0.3=0.27 vs 0.9×0.09=0.081 (α=2). A true positive with conf 0.5, p 0.8: 0.4 vs 0.32. So α=2 pushes the false positive below the true positive. Good.
+
+But risk: a true positive with conf 0.4, p 0.6 → 0.24 vs 0.144; a false positive with conf 0.9, p 0.5 → 0.45 vs 0.225. If the classifier is 50/50 on a false positive (stain/deposit confusion is symmetric), p=0.5 is high and α doesn't demote it much.
+
+Hmm. What about using the **margin** (p_c - p_second)? For stain/deposit confusion, the margin is small → demoted in both classes. That hurts the confused true positives. But the confused true positives are already misclassified (they're in the wrong class's list). In the correct class's list, they're absent anyway. So demoting the margin in both classes mainly affects: (a) false positives that are uncertain → demoted (good), (b) true positives that are uncertain → demoted (bad, they're in the correct class's list with medium p).
+
+Trade-off. Hard to predict the sign.
+
+Alternative: **calibrate with a background model**. Train a 5th class (clean background) and score = conf × p_c × (1 - p_bg). False positives → high p_bg → demoted. True positives → low p_bg → unchanged. This is more targeted than a global sharpening. And e008's failure was due to label noise (detector boxes labeled background), not the idea itself. Using clean background crops (regions far from any GT) avoids the noise.
+
+But wait: does the background class help at all? The eval boxes are detector boxes — the detector already found "defect-like" things. False positives are things that look like defects but aren't. The classifier sees a crop of a false positive — it looks like a defect (that's why the detector fired). Will a background class trained on clean non-defect regions (smooth weld, no defect) recognize "this looks like a defect but isn't"? The false positive crops are defect-like; the clean background crops are non-defect-like. The classifier might learn "defect-like but no clear defect → background." Plausible, but the overlap between false-positive appearance and clean-background appearance might be low.
+
+Hmm, let me step back and think about what's most likely to yield ≥0.01.
+
+Actually, let me reconsider the problem from the per-class numbers:
+- Pore 0.517 (weakest)
+- Stain 0.605
+- Deposit 0.622
+- Discontinuity 0.776
+
+Pore is way behind. Why? Pores are small, round, dark spots. The detector finds them (class-agnostic). The classifier must distinguish pore from stain/deposit. Pore crops are small (small boxes → small crops, more padding). Also, in the ceiling, false positives go to pore, so the ceiling's pore AP is dragged. Our pore 0.517.
+
+What if we improve pore specifically? e007 (2x duplication of pore+stain) failed. Class-weighted loss failed (known). So reweighting is exhausted (2-3 attempts: e007 + known class-weighted loss).
+
+What about **pore-specific crop scale**? Pores are small; a 1.5x crop of a small pore box is tiny → the defect occupies a small fraction of the 160px image. Maybe pores need a tighter context (1.2x) to make the defect larger in the crop. But that changes the shared pipeline… we could add a 3rd view with a pore-oriented context? That adds inference cost.
+
+Alternatively, **multi-scale training**: add a 3rd view at a different context (e.g., 1.0x or 3.5x) to give the model more scale information. Cost: +50% step time → ~285 steps instead of 428. And inference +50% → 37→55s, total 14+125+55=194 > 180. Over budget. We'd need to cut RESERVE to ~70: training until 110s, inference 55s, total 14+110+55=179. Just fits, no margin. Risky.
+
+Hmm, let me reconsider. Actually, inference: 37s for 83,758 crops. With 3 views: 125,637 crops → ~55s. Training: 3 views per step → step time 0.19×1.5 = 0.285s → steps in 110s ≈ 386. Hmm, 386 steps vs 428. Fewer steps but richer input. Uncertain.
+
+Let me think about the **e004 mystery** again. e004: base e001, category architecture, hypothesis about undertraining, score 0.6296 (≈best, rejected). The cut-off hypothesis: "The training loss is still dropping rapidly at the end of the budget (0.31 after only ~2 epochs / 428 steps), so the classifier is undertrained rather than feature-limited, and the main error is class misassignment on true d[ections]…" — the change was probably: train longer (reduce RESERVE?) or a different optimizer. If it was "train longer" (e.g., RESERVE 55→30), the score didn't improve → more training at the same resolution doesn't help. Combined with e005 (smaller image, more steps, failed), the "more steps" direction looks exhausted.
+
+So the classifier is probably near its data/feature limit at 160px with this recipe. The remaining error is:
+1. Class confusion (stain↔deposit, pore↔stain) — a data/feature problem.
+2. False-positive ranking — a scoring problem.
+3. Box placement (detector boxes are slightly off) — we can't fix stage 1.
+
+Given "changes to the method helped more than tuning hyperparameters," and that data/architecture/sampling/loss are mostly tried, the **scoring** category is largely unexplored (e008 touched it via background but failed). Also **inference** (TTA) is untried.
+
+Let me think harder about TTA. The model is trained with h/v flips (50% each) and brightness. So it's somewhat flip-invariant. TTA over flips: average the logits of the original + h-flip + v-flip + both. That's 4x the views at inference (8 crops per box instead of 2). Inference 37s → ~148s. Way over. Even 2x (original + h-flip): 74s, total 14+125+74=213. Over. So TTA is infeasible without cutting training. If we cut training to ~90s (RESERVE 90), inference 74s, total 14+90+74=178. Fits but training is cut from 125s to 90s (428→~300 steps). Trade-off: less training for TTA. Given that more training didn't help (e004), maybe trading some training for TTA is fine? But TTA on a flip-trained model gives little (the model already internalized flips). Weak.
+
+TTA over crop jitter instead: the training uses side jitter 0.85-1.2 and center jitter ±0.1. At inference, we use the exact box. TTA over 3 side scales (0.9, 1.0, 1.1 of nominal) × 2 views = 6 crops → 3x inference = 111s. Over. 2 scales × 2 views = 4 crops → 74s. Same trade-off as above. Also weak: the model is already jitter-trained.
+
+So TTA looks weak. Let me focus on **scoring**.
+
+Actually, wait. Let me reconsider the problem. Let me re-examine: is the score conf × p_c optimal?
+
+The detector's conf is a class-agnostic confidence. For true defects, conf correlates with defect-ness. For false positives, conf is also present (the detector fired). So conf doesn't perfectly separate true/false. p_c from the classifier: for true class c, p_c is high. For false positives, p_c is medium/low.
+
+The product conf × p_c: a false positive with high conf (0.8) and p_c 0.3 → 0.24. A true positive with medium conf (0.4) and p_c 0.8 → 0.32. OK, the true one wins. But a false positive with conf 0.9, p_c 0.4 → 0.36 beats a true positive with conf 0.4, p_c 0.7 → 0.28. So high-conf false positives with medium p_c rank above low-conf true positives.
+
+If we could better demote false positives… the classifier's max-p or margin is the signal.
+
+**Concrete scoring idea**: score = conf × p_c × (p_c / max(p)) — no, p_c/max(p) is ≤1 and =1 for the argmax class. That just zeros out non-argmax… no, p_c/max(p) for the argmax class is 1, for others <1. So score = conf × p_c × (p_c/max_p) = conf × p_c² / max_p. That's a sharpening.
+
+Or more simply: **score = conf × p_c^2** (or p_c^1.5). Demotes uncertain predictions in every class.
+
+But I'm worried about the stain/deposit confusion: a true stain with p_stain 0.45, p_deposit 0.5 → in the stain list, score conf×0.2 (p²) — heavily demoted. If many stain true positives are confused with deposit, this hurts stain AP.
+
+Alternatively, **use the margin only to demote false-positive-like boxes**: but we can't tell false positives from true ones at scoring time.
+
+Hmm, let me think about the **background class** idea again, but more carefully, because it's the most targeted:
+
+Train a 5-class model (4 defects + background). Background = clean crops from regions with no defect (far from any GT box). At eval, for each detector box, compute p_bg. Score = conf × p_c × (1 - p_bg) or renormalize: p_c' = p_c / (1 - p_bg), score = conf × p_c'.
+
+For a true defect: p_bg low → score ≈ conf × p_c (unchanged).
+For a false positive: p_bg high → score demoted.
+
+This is targeted: it only demotes boxes the classifier thinks are background. If the classifier can distinguish false positives (defect-like but not a real defect) from clean background, this works.
+
+The risk (e008's failure) was label noise: e008 labeled detector boxes with IoU≤0.5 to GT as background, but many of those are true defects (offset boxes) → the model learned wrong backgrounds → 0.5635. Using clean background crops (no defect nearby) avoids that noise.
+
+But will the classifier actually assign high p_bg to false positives? False positives are defect-like (the detector fired on them). Clean background is non-defect-like. The classifier sees a false-positive crop: it looks like a defect (some texture). It might assign p_bg 0.3-0.5. True defects: p_bg 0.05-0.2. So (1-p_bg) demotes false positives by ~1.5-2x. Modest but targeted.
+
+Actually, I realize there might be a cleaner and more powerful idea. Let me reconsider.
+
+**Reconsidering: what does the 0.755 class-agnostic number tell us?** If we scored all boxes as a single class 'defect' with score=conf, AP=0.755. That's the ranking quality of the detector's conf alone. Our 4-class is 0.630. The ceiling (perfect classes, false→pore, score=conf) is 0.758.
+
+So the detector's conf ranking is good (0.755 single-class). The class assignment is what's killing us: 0.758 → 0.630 = 0.128 loss from classes.
+
+Now, if we had perfect classes but kept the conf×p_c scoring… we can't, because p_c is our classifier.
+
+The 0.128 loss decomposes into:
+- Misclassified true boxes: each loses a hit in the correct class and gains a false positive in the wrong class.
+- False positives spread over 4 classes (vs. all in pore in the ceiling).
+
+For the second: in the ceiling, false positives are all in pore with score=conf. In ours, they're in all 4 classes with score=conf×p_c. If p_c for false positives is ~0.25 each (uniform), their scores are 0.25×conf, lower than the ceiling's conf. So in our system, false positives rank lower than in the ceiling → less pollution per class? But they're spread over 4 classes instead of concentrated in pore. Net effect on macro-AP: hard to say, but probably our false-positive handling is comparable or slightly better than the ceiling's.
+
+So the dominant loss is **misclassified true boxes** (~13% of true boxes). To gain ≥0.01, we need to reduce misclassification meaningfully.
+
+How to reduce misclassification? The classifier is at macro-F1 0.87 on perfect boxes. The errors are stain↔deposit and pore↔stain (per "known"). These are appearance-similar classes. To separate them, we need better features or more discriminative training.
+
+Ideas:
+1. **Higher resolution** for the ambiguous classes. IMG_SIZE 160→192 or 224? e005 tried 160→128 (smaller) and failed. Bigger would be ~1.5-2x step time → fewer steps. But more detail for stain/deposit/pore. Risky (fewer steps), but the "more steps" direction failed while "more info per step" (bigger image) is untried. Actually e005's failure was because smaller image lost info, not because more steps didn't help. Bigger image = more info per step, fewer steps. Given the model is undertrained (loss 0.31), fewer steps is bad. But more info might help the ambiguous classes.
+
+Hmm, this is a real trade-off. Let me estimate: 160→224 = (224/160)² = 1.96x pixels → step time 0.19→0.37s → steps 428→~220. That's a big drop in steps. Probably net negative (undertrained). 160→192 = 1.44x → 0.27s → ~310 steps. Moderate. Uncertain.
+
+2. **A better backbone** with stronger features at similar speed. EfficientNet-B0 is 4M params — quite small. tf_efficientnetv2_b0 (~8M) or convnext_nano (~50M, too slow) or regnety_016 (~9M) or resnet50 (~25M, slow). A ~2x larger model → ~2x step time → half the steps. Again the undertraining trade-off.
+
+Given e004 (probably a bigger model or longer training, no gain) and e005 (smaller image, no gain), the "more capacity / more training" direction looks weak.
+
+3. **Better input representation**: the two-crop (tight 1.5x + wide 2.5x) is good (e003 showed single crop is worse). What about adding context that helps stain/deposit? Stain is a broad discoloration; deposit is a raised blob. The wide crop (2.5x) gives context. Maybe a wider crop (3.5x or 4x) would help stain? But stain is confused with deposit — both are broad. Hmm.
+
+Actually, let me reconsider the **pore** problem specifically, since it's the weakest (0.517) and macro-averaged.
+
+Pores: small, round, dark. Confused with stain (also dark). The tight crop of a pore is small. Maybe pores need the defect to be larger in the crop. Currently tight=1.5x. For a small pore box (say 10px), 1.5x=15px crop → resized to 160 → the pore is ~10/15=67% of the crop. That's fine. For a larger box, 1.5x is also fine. So pore crops are OK.
+
+Why is pore so weak? Maybe because pores are small and the detector boxes are imprecise (offset), so the crop misses the pore or includes it partially. Or pores are simply visually similar to stain/other.
+
+Given the difficulty, maybe the best move is a **scoring** change that's cheap and targets ranking, since data/architecture/sampling/loss are mostly exhausted.
+
+Let me reconsider scoring once more, but with a **calibration** angle:
+
+The classifier's p_c is a softmax probability. On true boxes, p_correct is high. On false positives, the distribution is flatter. The **entropy** or **margin** is a false-positive signal.
+
+But actually, here's a cleaner idea I haven't considered: **the score should reflect both the classifier's confidence AND the detector's conf, but the product might double-count or mis-weight**. What if the detector's conf is a poor ranker for some classes?
+
+Actually, let me reconsider whether we should even use conf. The metric: AP depends on ranking. If the classifier's p_c alone ranks true vs false well, we could score by p_c alone (drop conf). But conf carries the detector's "is this a defect" signal, which the classifier (trained on true boxes) doesn't have. So conf is important for demoting false positives. Keep the product.
+
+OK here's another thought. Let me reconsider the **background class** but use it purely for scoring, and train it properly with clean backgrounds. This is the most principled fix for false-positive ranking, and it's fundamentally different from e008 (which had label noise). And it's cheap (same architecture, +1 class, +background crops).
+
+But will it gain ≥0.01? The false-positive pollution is part of the 0.128, but I estimated the dominant part is misclassification. If false positives are, say, 30% of the 0.128, fixing them perfectly gains ~0.04. A partial fix (demote by 1.5x) gains ~0.01-0.02. Plausible.
+
+But the risk: adding a background class changes the softmax, and if the background class is weak (false positives look defect-like), p_bg might be low even for false positives → little demotion. And training on background might slightly reduce defect-class accuracy (the model spends capacity on background).
+
+Hmm, this is getting complicated. Let me think about what's the single most likely to work.
+
+Let me reconsider the whole thing with fresh eyes.
+
+**Key facts:**
+- 0.630 now, 0.758 ceiling. Gap 0.128.
+- Classifier macro-F1 0.87 on perfect boxes → ~13% misclassification.
+- Weak classes: pore 0.517, stain 0.605, deposit 0.622.
+- Exhausted: low-res data (worked), detector-box training (failed), class duplication (failed), class-weighted loss (failed), single crop (failed), smaller image (failed), background via detector boxes (failed), e004 (unknown, failed).
+- Untried: scoring changes, TTA, higher resolution, bigger backbone (maybe e004), cleaner background class, multi-scale, pore-specific.
+
+Given the "changes to the method helped more than tuning hyperparameters" and that we've tried many data/architecture/sampling changes, I think the highest-EV untried direction is **scoring** — specifically, a change that directly improves the ranking of true vs false within each class, which is exactly what AP measures.
+
+But I keep coming back to: the dominant loss is misclassification, not false-positive ranking. Scoring can't fix misclassification (a misclassified true box is in the wrong class's list).
+
+Wait, can it? If a true stain is classified as deposit (p_deposit 0.5, p_stain 0.4), it appears in both lists (we write 4 rows per box). In the stain list, its score is conf×0.4. In the deposit list, conf×0.5. If we could boost its rank in the stain list… but we don't know it's a stain. The margin is small in both. So no.
+
+So scoring only helps false-positive ranking. Misclassification needs a better classifier.
+
+Given that, and given the classifier is at 0.87 F1 with the current recipe, and "more steps" / "smaller image" / "class reweighting" all failed, what improves the classifier?
+
+Let me reconsider **higher resolution**. The stain/deposit/pore confusions are fine-detail problems. 160px might be too low to see the texture differences. e005 showed 128 is worse (less detail). So detail matters → higher resolution should help the ambiguous classes, at the cost of fewer steps. This is a genuine method change (input resolution) that directly targets the class-confusion error. And it's untried (e005 went the wrong way).
+
+Let me estimate more carefully. Current: IMG_SIZE 160, step 0.19s, 428 steps, loss 0.31 at end.
+- 192: (192/160)²=1.44 → step 0.274s. Training budget 125s → ~456 steps? Wait, 125/0.274 = 456. Hmm, that's more than 428? No: 125/0.19 = 658 steps possible, but we only did 428 because… wait, let me recompute.
+
+Actually, the log: epoch 0: 220 steps at 85s; epoch 1: 428 steps at 125s. So from 85s to 125s (40s), 208 steps → 0.192s/step. Total training 125s (from t_start). But t_start is after loading (14s). So training is 125-14=111s? No, the log times are from T0 (start). Load 14s. t_start ≈ 14s (after model init). Training until t_end = 180-55 = 125s. So training duration = 125-14 = 111s. Steps 428 → 111/428 = 0.26s/step. Hmm, but the epoch log shows 220 steps at 85s and 428 at 125s. 85-14=71s for 220 steps → 0.32s/step? Inconsistent. Let me not over-analyze; roughly 0.2-0.26s/step.
+
+Epoch size: 14128/64 = 220 steps/epoch. So 2 epochs = 440 steps ≈ 428 (drop_last). Training 111s / 428 = 0.26s/step.
+
+At 192px: 1.44x → 0.374s/step → 111/0.374 = 297 steps = 1.35 epochs.
+At 128px (e005): 0.64x → 0.166s/step → 668 steps = 3 epochs. e005 got 0.6217 (worse). So 3 epochs at 128px < 2 epochs at 160px. That suggests steps matter less than resolution! 128px with 3 epochs was worse than 160px with 2 epochs. So resolution/detail is more important than step count. That's a strong signal that **higher resolution (192 or 224) would help**, even with fewer steps!
+
+Wait, that's a key insight. e005: 128px, ~3 epochs, 0.6217. e001: 160px, 2 epochs, 0.6302. So going from 160→128 (less detail, more steps) hurt. Therefore detail > steps. Extrapolating: 192 or 224px (more detail, fewer steps) should help.
+
+This is a clean, well-motivated experiment. It directly targets the class-confusion error (the dominant loss) by giving the model more visual detail to separate stain/de
+===== attempt 2 =====
+I need to look at the experiment history and figure out what to do next.
+
+Current best: e001, 5-seed average 0.6302. Per-class: pore 0.517, deposit 0.622, discontinuity 0.776, stain 0.605.
+
+History:
+- e001 (data, adding low-res): new best 0.6302
+- e002 (arch, single crop): crashed
+- e003 (arch, fixed single crop): 0.6247, rejected
+- e004 (arch, more training time?): 0.6296, rejected. Actually the hypothesis was about undertraining — probably changing RESERVE or something. Rejected.
+- e005 (arch, IMG_SIZE 128): 0.6217, rejected
+- e006 (data, train on detector boxes): 0.6338 seed-0, 5-seed average 0.6278, not confirmed
+- e007 (sampling, duplicate pore/stain): 0.6280, rejected
+- e008 (data, 5-class including background): 0.5635, rejected
+
+So what have we learned:
+- Single crop worse than 2-crop (e003)
+- More optimizer steps via smaller image worse (e005)
+- Undertraining hypothesis not confirmed (e004)
+- Training on detector boxes not confirmed (e006)
+- Class duplication worse (e007)
+- Background class far worse (e008)
+
+Reference numbers: one-step 4-class detector 0.638 (baseline to beat). Ceiling 0.758. Class-agnostic 0.755.
+
+Current 0.6302 vs one-step 0.638. So we're just below the baseline.
+
+Where is the error? Per-class: pore 0.517, deposit 0.622, stain 0.605, discontinuity 0.776. Pore and stain are weak. Class-agnostic is 0.755, so the boxes are good; the problem is the class decision. If classes were perfect it would be 0.758. So there's about 0.12 gap between current 0.630 and ceiling 0.758.
+
+Known: crop classifier with perfect boxes reaches macro-F1 ~0.87 with the starting recipe. Pore and deposit are weak; stain is confused with deposit.
+
+Ideas not yet tried:
+1. Better model (convnext? resnet50?). Architecture category — e002/003/004/005 were architecture but about crop view / size / training time. Changing the backbone model itself hasn't been tried. E.g., resnet50 or convnext_tiny... available: convnext_atto, convnext_nano, convnext_pico, efficientnet_b0, efficientnet_b2, mobilenetv3_large_100, regnety_016, resnet18, resnet26d, resnet34, resnet50, tf_efficientnetv2_b0. EfficientNet-B2 is bigger; resnet50 is bigger. With 2 crops and 160px, resnet50 might be too slow. Let me estimate: currently 428 steps in ~148s (from 14s load to 162s total, reserve 55s, so training budget ~103s... actually t_end = deadline - 55 = 180-55 = 125s from T0. Training ran from ~14s to ~125s ≈ 111s, 428 steps → ~0.26s/step. 2 forward passes per step (2 crops). So ~0.13s per forward at 160px with efficientnet_b0.
+
+resnet50 at 160px is probably 2-3x slower per forward → ~0.3-0.4s/step → ~280 steps. Less training but stronger features. Hmm, risky.
+
+2. Test-time augmentation: average over multiple crops/views at inference. E.g., predict with tight crop, wide crop, plus flipped versions. This targets the class decision directly. Inference cost: currently 41879 eval boxes × 2 views. TTA with 4 views (2 crops × 2 flips) doubles inference time. Inference time: total 162s, load 14s, training to 125s... inference + writing is 125→162 = 37s. Doubling to 4 views → ~74s, total ~199s > 180. Too much unless we cut something. Hmm. Actually reserve is 55s; training stops at 125s. Inference 37s. With 4 views inference ~74s → total 125+74 = 199 > 180. Fails. So TTA must be cheaper: only wide crop flipped (2 views total instead of 2)? That's the same cost. Or TTA on tight crop only: tight + tight-flipped + wide = 3 views → 1.5x inference → ~55s → total ~180. Right at the edge. Risky.
+
+3. Larger context / different crop. E.g., CONTEXT 2.5 → 3.0, or adding a third view. Adding a view increases both training and inference cost.
+
+4. Scoring changes: score = conf × prob. Maybe use a different combination, e.g., score = conf^a × prob^b, or rank by prob only within... but mAP is per-class and depends on ordering. Currently per-class ordering is by conf×p_c. Maybe using calibrated probabilities or temperature scaling helps? Temperature scaling is monotonic per class... no wait, temperature scaling p^T is not monotonic across predictions for a fixed class? For a fixed class c, score = conf × p_c^T. The order of predictions for class c changes with T (since p_c varies). So temperature is not a monotonic transform of the score — it changes the order. Could help or hurt. But it's a small tweak, probably <0.003 effect.
+
+Actually, a bigger scoring idea: for each box, output only the top-1 class instead of all 4 classes with conf×p_c. Wait — we're already outputting 4 rows per box. The metric allows multiple rows per box. Hmm, but does a box matched to a GT count as a hit for multiple classes? In standard COCO mAP, each prediction is scored independently; a GT can be matched by at most one prediction (the highest-scoring one among remaining). Multiple rows per box with different classes: the box appears in each class's list. For class c, if the box overlaps a GT of class c, it's a hit in class c's list. But the same GT box... GTs are per-class, so no conflict. But false positives: a box with 4 rows is a false positive in 3 classes (if it doesn't overlap a GT of that class) — that hurts precision of those classes! Currently all 41879 boxes × 4 rows = 167k rows, but only top 300 per image count. Hmm, this could be a real problem: each detector box contributes false positives to 3 of the 4 classes.
+
+The ceiling (0.758) keeps false alarms as class 0 — only one row per box. Class-agnostic 0.755 is a single class. Our 4-row approach: for class c, the list contains all 41879 boxes sorted by conf×p_c. Boxes that are actually class d≠c but have moderate p_c are false positives in class c. This pollutes precision.
+
+Idea: output only top-1 class per box (argmax), score = conf × p_top1 (or just conf?). That's a scoring change. Effect: removes 3/4 of the false-positive rows. Could be a meaningful gain, especially for classes where the model is uncertain.
+
+Wait, but there's a subtlety: for a box that is truly class c but the model's argmax is d, we lose that detection in class c entirely (whereas with 4 rows, it would be a low-scoring detection in class c). Trade-off. But precision loss from 3 spurious rows per box might dominate. With 41879 boxes and probably ~14k GT boxes total... let me think: train has 14128 boxes; eval has 41879 detections, many false alarms. Per image, top 300 rows count — each image probably has <100 boxes, so all rows count.
+
+Hmm, let me think about expected effect. Per class c, currently: all boxes sorted by conf×p_c. True positives: boxes overlapping GT c. False positives: all other boxes. If we output only argmax rows: for class c, only boxes where argmax=c. True positives in class c: boxes overlapping GT c with argmax=c (misses where argmax≠c). False positives: boxes with argmax=c that don't overlap GT c.
+
+Which is better? Depends. The AP for class c: precision-recall curve. With 4 rows, we get high recall (all true boxes appear in class c's list, even with low p_c) but low precision (tons of FPs). With argmax, recall drops (some true c boxes are misclassified) but precision improves a lot (fewer FPs).
+
+For macro mAP, precision improvement on the weak classes might help a lot. Pore is weak (0.517): probably because of confusion with other classes (pore vs deposit?). Actually "pore and deposit are weak classes; stain is often confused with deposit".
+
+Hmm, this is a genuinely new direction: scoring. Nothing in the history has touched scoring. The rules say "changes that preserve the order of a class's predictions leave AP unchanged" — but removing rows changes which predictions exist, not just the order. So this is a real change.
+
+Let me estimate: this could plausibly gain 0.01+. And it's cheap (no extra compute, just fewer rows written). Low risk: if it's worse, we know.
+
+Actually, wait, let me reconsider. Is it better to output only argmax, or output all 4 rows but with a very different scoring? Let me think about what the ceiling does: 1 row per box (class 0 for FAs, correct class for TPs). Class-agnostic: 1 row per box. Both 0.755+. Our 4-row scheme at 0.630. The gap from class-agnostic (0.755) to us (0.630) is 0.125 — that's the class-decision error. The gap from us to ceiling (0.758) is also 0.128.
+
+If class-agnostic is 0.755 with 1 row per box, and adding wrong classes drops us to 0.630, then the false-positive pollution from 3 wrong-class rows per box is a big part of the loss. Argmax-only scoring should recover a lot of that: each box contributes to exactly 1 class's list.
+
+Let me think more concretely. Suppose eval has N boxes, of which T overlap a GT (true detections) and F are false alarms. Per class c (4 classes, GTs roughly balanced, ~T/4 per class):
+
+4-row scheme: class c's list has N entries. TP: T/4 (roughly, all true boxes of class c). FP: N - T/4. Precision at full recall ≈ (T/4)/(N).
+
+Argmax scheme: class c's list has N/4 entries (boxes where argmax=c). TP: those true c boxes where argmax=c, say T/4 × acc_c. FP: F/4 (false alarms where argmax=c) + misclassified true boxes of other classes... roughly N/4 - T/4×acc. Precision ≈ (T/4 acc)/(N/4) = T acc/N... vs (T/4)/(N) = T/(4N). Argmax precision is ~acc×4× higher. Recall is acc× lower. AP is roughly geometric mean-ish → gain of ~sqrt(4acc/acc)=2x in some sense. So argmax-only should be substantially better if acc is decent (~0.87 macro-F1 per known info).
+
+Hmm wait, but is that right? Let me redo. 4-row: recall_c = 1 (all true c boxes are in the list), precision at R=1: P = (T/4)/N. Argmax: recall_c = acc_c (only correctly-classified true boxes), precision at R=acc_c: P = (T/4 acc_c)/(N/4) = T acc_c / N...
+
+Hmm, that's 4×acc_c times the 4-row precision. AP is area under PR curve. Roughly, if the curves are similar shape, AP_argmax ≈ sqrt(recall_ratio × precision_ratio) × AP_4row = sqrt(acc × 4acc) = 2acc × ... that's >1, which can't be. I'm doing this wrong.
+
+Let me think again with concrete numbers. Say N=41879, T=20000 true boxes (guess), F=21879. Per class: T_c = 5000.
+
+4-row, class c: 41879 predictions. 5000 TP, 36879 FP. At R=1, P = 5000/41879 = 0.12.
+
+Argmax, class c: ~10470 predictions (N/4). TP = 5000×0.85 = 4250 (assuming 85% of true c boxes get argmax c). FP = 10470-4250 = 6220. At R=4250/5000=0.85, P = 4250/10470 = 0.406.
+
+PR curve: 4-row starts with P=1.0 at low R (top scores are good), drops to 0.12 at R=1. Argmax starts P=1.0, drops to 0.406 at R=0.85. Argmax curve is much higher. AP gain could be big — maybe +0.05 to +0.10 per class?! That seems too big... but wait, the ceiling uses 1 row per box and gets 0.758, and class-agnostic 1 row gets 0.755. Our 4-row gets 0.630. So going from 4 rows to 1 row (argmax) is in the same direction as going to the ceiling. If argmax were as good as perfect class, we'd be near 0.758. With 85% accuracy, we'd be somewhere in between.
+
+Hmm, but actually there's a subtlety about the score ordering. In the 4-row scheme, score = conf × p_c. A true c box with low p_c ranks below many false boxes. In argmax, score = conf × p_argmax (or conf?). The ordering within class c's list is by conf×p_c (since argmax=c, p_c is the max prob). Similar.
+
+So argmax-only scoring looks like a strong candidate. It's category "scoring" — completely new direction (nothing in history touched scoring). Cheap, no time risk. Testable hypothesis: reducing to 1 row per box (argmax class) removes false-positive pollution in 3 classes per box, and should substantially raise per-class AP, especially pore/stain.
+
+But wait — one risk: dropping rows for non-argmax classes loses recall for boxes that are true c but misclassified as d. But as computed, precision gain should dominate.
+
+Alternative: keep 4 rows but with a much sharper score, e.g., score = conf × p_c^10 (temperature sharpening). This reorders within a class (not monotonic) and pushes uncertain boxes down. But it doesn't remove FPs, just reorders them below... no wait, in per-class AP, all predictions of that class are in the list; reordering only matters relative to TPs. Sharpening pushes low-p_c boxes to the bottom of class c's list, so they only hurt at high recall. But at R=1 they still count. Since AP integrates over all recalls, pushing FPs to the bottom helps a lot. Hmm, p_c^T with large T is like a soft argmax. As T→∞ it approaches argmax-only (only boxes with p_c≈1 remain high-scoring; others sink to the bottom but still exist as FPs at R→1).
+
+Actually, argmax-only is cleaner and strictly removes rows. Let me go with argmax-only.
+
+Hmm, but actually wait. Let me reconsider whether writing all 4 rows is really hurting that much. The harness computed 0.6302 with 4 rows. The class-agnostic single-class is 0.755 with 1 row per box. The difference between "1 row per box, correct class" (ceiling 0.758) and "1 row per box, class 0 for FAs" (0.755) is tiny. And "4 rows per box, conf×p" is 0.630. So yes, the 4-row scheme costs ~0.12 relative to the ceiling. Argmax-only should recover most of that, limited by classification accuracy.
+
+Actually, let me double-check the metric description: "For a single class, all predictions of that class are sorted by score; a prediction is a hit if it overlaps an unmatched true box of that class with IoU > 0.5." So yes, each row is a separate prediction. A box with 4 rows is 4 predictions (one per class). In class c's evaluation, the box's row for class c is a TP if it overlaps GT c, else FP. The other 3 rows are in the other classes' lists.
+
+So my analysis holds. Argmax-only: 1 row per box.
+
+Now, what score to use for the argmax row? Options:
+- conf × p_argmax: combines detector confidence with classification confidence.
+- conf only: rank by detector confidence.
+- p_argmax only: rank by classification confidence.
+
+Hmm. Within class c's list (argmax=c), the order by conf×p_c vs conf vs p_c. The detector conf is presumably well-calibrated for "is there a defect here" and the class prob is "how sure of class c". A box that's a true c defect with high conf and high p_c should rank top. A false alarm with high conf but p_c=0.9 (model confidently wrong) ranks high by conf×p_c — bad. A true c with low detector conf (marginal box) but p_c=0.95 — should rank... it's a true detection, so higher is better.
+
+I think conf × p_c is reasonable and matches the existing scheme (just restricted to argmax rows). Let's keep it simple: score = conf × p_argmax. Minimal change from current code.
+
+Implementation: in the writing loop, instead of writing 4 rows, compute c* = argmax(p), write 1 row with score = conf × p[c*].
+
+Wait, should I also consider dropping boxes with very low score? MIN_SCORE = 0.001 already handles that.
+
+Also, should I worry that argmax-only loses the "soft" signal? E.g., a box that's 55% pore / 45% deposit: argmax pore. In the 4-row scheme it also contributed to the deposit list. With argmax-only, it's gone from deposit's list. If it was a true deposit, we lose it. But as computed, net effect should be positive.
+
+Let me also double-check the time budget: this change only reduces rows written (41879 rows instead of up to 167k). Faster. No training change. Safe.
+
+Hypothesis: "The current scheme writes 4 rows per box (one per class, score=conf×p_c), so each detector box injects ~3 false-positive rows into the other classes' lists, deflating per-class precision (class-agnostic 1-row baseline is 0.755 vs our 0.630, and the ceiling is 0.758). Writing only the argmax row per box (score = conf × p_argmax) removes those spurious FPs at a small recall cost (only misclassified true boxes are lost), and should raise macro AP, most on the weak pore/stain classes. This is a new scoring change; nothing in the history touched output rows."
+
+Expected gain: 0.01+ (plausibly 0.02-0.05).
+
+Edit: change the writing loop.
+
+Current code:
+```python
+    n = 0
+    with open(os.path.join(args.out, "preds.csv"), "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["det_id", "cls", "score"])
+        for d, p in zip(ev, probs):
+            for c in range(4):
+                s = d["conf"] * float(p[c])
+                if s > MIN_SCORE:
+                    w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+
+New:
+```python
+    n = 0
+    with open(os.path.join(args.out, "preds.csv"), "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["det_id", "cls", "score"])
+        for d, p in zip(ev, probs):
+            c = int(np.argmax(p))
+            s = d["conf"] * float(p[c])
+            if s > MIN_SCORE:
+                w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+
+That's the focused edit.
+
+Hmm, wait. Let me reconsider once more whether this is the best next experiment vs alternatives:
+
+Alternative A: backbone swap (resnet50/efficientnet_b2). Risky on time, and "architecture" has 4 failed attempts (though all about views/size/time, not backbone). A stronger backbone could help classification accuracy, which is the core error. But undertraining issues (loss still dropping) suggest the model isn't the bottleneck... actually e004/e005 tested more steps / smaller image and failed, suggesting we're not step-limited. Backbone swap is plausible but time-risky and uncertain.
+
+Alternative B: TTA at inference. Time-risky as computed.
+
+Alternative C: argmax scoring. Cheap, new direction, large plausible effect, directly targets the identified error (FP pollution).
+
+I'm fairly confident C is the best next move. It's also "safe": if it fails, we've learned the 4-row soft scoring was actually fine and we've ruled out scoring.
+
+One more consideration: should the score be conf × p_argmax, or should we keep conf × p_c where c is argmax — same thing. Yes.
+
+Let me also double check: is there any chance the harness's mAP treats multiple rows per box specially (e.g., only counts the best row per box per class)? The docstring says "several rows with different classes for the same box are allowed" and "per image at most the 300 highest-scoring rows count". So rows are independent predictions. Standard.
+
+Also, the ceiling keeps FAs as class 0 with detector conf — 1 row per box — and gets 0.758. So 1 row per box is the regime that works. Argmax-only puts us in that regime with learned classes.
+
+Alright, going with C.
+
+BASE: best (e001). CATEGORY: scoring.
+
+Let me write the SEARCH/REPLACE block carefully. I need to copy exact lines from the file. From the current best train.py:
+
+```
+    n = 0
+    with open(os.path.join(args.out, "preds.csv"), "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["det_id", "cls", "score"])
+        for d, p in zip(ev, probs):
+            for c in range(4):
+                s = d["conf"] * float(p[c])
+                if s > MIN_SCORE:
+                    w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+
+I'll replace the inner loop. Let me use a short search:
+
+```
+        for d, p in zip(ev, probs):
+            for c in range(4):
+                s = d["conf"] * float(p[c])
+                if s > MIN_SCORE:
+                    w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+
+Replace with:
+
+```
+        for d, p in zip(ev, probs):
+            c = int(np.argmax(p))
+            s = d["conf"] * float(p[c])
+            if s > MIN_SCORE:
+                w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+
+That's clean and unique.
+
+Also, maybe update the docstring line about the scheme? Not necessary; keep the edit focused. The rules say keep the edit focused on that idea. I'll just do the one block.
+
+Let me make sure the SEARCH text appears exactly once. The line `for d, p in zip(ev, probs):` — appears once. The inner `for c in range(4):` — appears once. Good.
+
+Let me write the hypothesis concisely.
+
+HYPOTHESIS: The current code writes one row per class per box (score = conf × p_c), so every detector box injects ~3 spurious false-positive rows into the other classes' lists, deflating per-class precision — consistent with the class-agnostic 1-row baseline being 0.755 while we sit at 0.630 and the 1-row ceiling at 0.758. Writing only the argmax row per box (score = conf × p_argmax) removes those FPs at a small recall cost (only misclassified true boxes are lost), so macro AP should rise, most on the weak pore/stain classes. This is a new scoring change; no past experiment touched the output rows.
+
+Good. Let me finalize.
+
+Actually, let me reconsider the expected gain magnitude and whether it could backfire. If classification accuracy is low, argmax loses many true boxes. But macro-F1 ~0.87 with perfect boxes suggests decent accuracy. Even at 0.8, the precision gain (4×) should dominate the recall loss. I'm confident it's a net positive or at least informative.
+
+One more: could removing 3 rows per box hurt because the metric rewards having the box in the list even at low score? No — a low-scoring FP row only hurts precision at high recall; it never helps. A low-scoring TP row helps recall. The rows we remove are: for box with argmax c*, we remove rows for classes c≠c*. Those rows are TPs only if the box is truly class c (i.e., misclassified). So we remove some TPs (misclassified true boxes, in their true class's list) and many FPs (all non-argmax rows on false alarms and misclassified boxes). Net: remove FPs >> remove TPs. Good.
+
+Final answer.

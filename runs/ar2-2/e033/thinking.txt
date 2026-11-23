@@ -1,0 +1,560 @@
+===== attempt 1 =====
+Let me analyze the situation carefully.
+
+Current best: e016 with 5-seed val mAP@0.5 of 0.6411
+- Per-class: pore 0.537, deposit 0.635, discontinuity 0.780, stain 0.612
+- Uses efficientnet_b0, IMG_SIZE=224, H-flip TTA, trained on GT crops + matched detector boxes
+- ~660 training steps in ~164s total (17s loading, ~147s training, ~0s prediction)
+
+The most recent experiment (e032) timed out with regnety_016. The issue was that regnety_016 at 224x224 was slower than expected - it took 101s for epoch 0 (411 steps) vs 94s for e016. Wait, that's actually not that much slower. But then it got killed at 195s with only 531 steps in epoch 1. Let me think about why...
+
+Actually looking more carefully: e016 did 411 steps in epoch 0 (94s total from T0, so ~77s for epoch 0) and 660 total steps by 125s (so ~31s for epoch 1's 249 steps). e032 did 411 steps in epoch 0 (101s total, so ~84s for epoch 0) and 531 total steps by 125s (so ~24s for epoch 1's 120 steps).
+
+Wait, the total budget is 180s. e032 was killed at 195s. The issue is that with regnety_016, the per-step time is slightly higher, and the RESERVE_S of 55s means training should stop at 125s. But it seems like it didn't stop in time.
+
+Actually, looking at the code: `t_end = deadline - RESERVE_S` where deadline = T0 + 180. So t_end = T0 + 125. The training loop checks `if time.time() >= t_end` after each step. So it should stop at T0+125.
+
+But the log shows "epoch 1: loss 0.2753, 531 steps, 125s" - so it did stop at 125s. Then prediction needs to happen. With 41879 eval detections and batch_size=256, that's about 164 batches. With TTA (2 forward passes per batch), that's 328 forward passes. If each takes ~0.1s, that's ~33s. Plus writing 55547 rows.
+
+Wait, but e016 finished at 164s total. e032 was killed at 195s. The difference is 31s. If prediction takes longer with regnety_016... but regnety_016 has only 0.9M params, it should be FASTER than efficientnet_b0 (4M params). 
+
+Hmm, actually the issue might be that the per-step time for training is similar (the data loading is the bottleneck), but the prediction phase might have issues. Or maybe the model initialization/loading is slower.
+
+Actually wait - let me re-read. The timeout was at 195s with budget 180s. The log shows training ended at 125s. So prediction took from 125s to 195s = 70s. That's way too long. In e016, prediction took from ~125s to 164s = 39s. So prediction with regnety_016 took 70s vs 39s for efficientnet_b0? That doesn't make sense for a smaller model.
+
+Unless... the issue is that regnety_016 doesn't support bfloat16 autocast well, or there's some other issue. Or maybe the model is actually slower at inference due to its architecture (many small conv layers can be slower than fewer large ones on GPU).
+
+Actually, I think the real issue might be that regnety_016 at 224x224 has a different computational profile. Let me not go down this path.
+
+Let me think about what to try next. The key observations:
+
+1. Current best is 0.6411 (5-seed mean)
+2. The ceiling is 0.758 (perfect classes on stage-1 boxes)
+3. Single class 'defect' scores 0.755
+4. The one-step baseline is 0.638
+
+So we're at 0.6411, barely above the one-step baseline of 0.638. The gap to the ceiling (0.758) is huge - 0.117 mAP.
+
+Key insights from the history:
+- Training on detector boxes helped (e002)
+- Low-res crops helped (e003)
+- Single wide crop (2.5x) helped (e008) - halved forward pass cost
+- H-flip TTA helped marginally (e009)
+- IMG_SIZE 224 helped (e016)
+- Background class hurt (e005)
+- Various scoring changes mostly hurt
+- Architecture changes mostly hurt (except the resolution change)
+- The model is undertrained (loss still dropping)
+
+The biggest issue: the model is severely undertrained. Only ~660 steps, loss going from 0.52 to 0.29. The per-class APs show pore (0.537) and stain (0.612) are weak.
+
+What hasn't been tried that could help:
+1. **Ensembling**: Train multiple models with different seeds/architectures and average. But time budget is tight.
+2. **Faster architecture to get more steps**: The model is undertrained. If we could get 2-3x more steps, that would help. But regnety_016 timed out (e032).
+3. **Lower resolution training with higher-res inference**: e027 tried 256 inference but hurt. What about training at 160 and inferring at 224?
+4. **Data augmentation improvements**: e028 tried more jitter and hurt. Mixup hurt (e007).
+5. **Different loss**: focal hurt (e006), label smoothing hurt (e023), class weights hurt.
+6. **Scoring**: Many scoring changes hurt. The simple conf × prob seems to be near-optimal.
+
+Wait, let me think about what's actually limiting performance. The model gets macro-F1 ~0.87 with perfect boxes. But mAP@0.5 is only 0.64. The gap suggests:
+- Many false positives (background boxes classified as defects)
+- Wrong class assignments
+- Poor ranking
+
+The single-class 'defect' scores 0.755, meaning the boxes themselves are good. The 4-class detector scores 0.638. So the issue is purely classification quality.
+
+With perfect boxes, the crop classifier gets macro-F1 ~0.87. That's decent but not great. Pore and stain are the weak classes.
+
+Let me think about what could actually move the needle:
+
+1. **More training data / better augmentation**: The model has 26347 training boxes. That's decent. But the distribution might be imbalanced.
+
+2. **Better model architecture that's faster**: We need more steps. The current model does ~660 steps. If we could do 1500+ steps, that would be a big improvement. But we need a model that's fast enough.
+
+Actually, let me reconsider the timeout issue with regnety_016. The problem might be specific to that model's interaction with the data pipeline or GPU. Let me think of other fast models:
+- convnext_pico (1.2M params)
+- convnext_atto (0.3M params)  
+- mobilenetv3_large_100 (5.4M params) - tried as e022, rejected
+- resnet18 (11.7M params) - too big
+- resnet26d (2.7M params)
+- efficientnet_b0 (4.1M params) - current
+
+Wait, e022 tried mobilenetv3 and got 0.6380 (rejected). So faster models don't automatically help - the architecture matters.
+
+Let me think differently. What if the issue isn't the number of steps but the quality of training? 
+
+Actually, I notice something: the training uses `drop_last=True` and the dataset has 26347 items with batch_size=64. That's 411 full batches per epoch. The model trains for about 1.6 epochs (660 steps / 411 steps per epoch). 
+
+What if we reduce the dataset size to make epochs shorter, allowing more complete epochs? No, that would reduce data.
+
+What about **training at a lower resolution**? e018 tried 192 and got 0.6387 (rejected). But what about 160? The original e008 used 160 and got 0.6386. Then e016 jumped to 224 and got 0.6411. So 224 is better than 160.
+
+Hmm, let me think about the **scoring** more carefully. Currently: score = conf × prob[c]. We write 4 rows per box (one per class). 
+
+What if we only write the top-1 or top-2 classes per box? That would reduce false positives from low-confidence class assignments. But we've tried various scoring changes and they mostly hurt.
+
+Actually, let me reconsider. The per-class APs are:
+- pore: 0.537
+- deposit: 0.635
+- discontinuity: 0.780
+- stain: 0.612
+
+Pore is the weakest. Stain is second weakest. These are the small/textural defects.
+
+What about **input augmentation at test time**? We have H-flip TTA. What about:
+- Random crop shifts (not just flip)
+- Multiple scales
+- Color jitter
+
+But e012 tried adding V-flip and rotation and it hurt. e027 tried 256 inference and it hurt.
+
+Let me think about **what's fundamentally different** between the 0.641 we have and the 0.758 ceiling. The ceiling uses the same boxes but with perfect class labels. So the only difference is:
+1. Classification accuracy
+2. Score calibration (ranking)
+
+If we had perfect classification, we'd be at 0.758. We're at 0.641. The gap is 0.117.
+
+The macro-F1 with perfect boxes is ~0.87. That means about 13% of boxes get the wrong class. That's a lot of error.
+
+What if we focus on **reducing the confusion between specific pairs**? Pore↔stain and deposit↔stain are the main confusions.
+
+Actually, I just realized something. Let me re-read the problem statement:
+
+"A crop classifier given perfect boxes reaches macro-F1 ~0.87 with the starting recipe (two-crop input). Pore and deposit are the weak classes; stain is often confused with deposit and background."
+
+So stain is confused with BOTH deposit AND background. This means some stain boxes are being classified as background (or low confidence for any class), and some deposit boxes are being classified as stain.
+
+The current model doesn't have a background class. So it must assign one of the 4 classes to every box. This means background boxes get assigned to whatever class the model thinks is most likely, creating false positives.
+
+e005 tried adding a background class and it hurt (0.6039). But maybe the way it was done was wrong. Let me think about alternatives:
+
+What if instead of a 5th class, we use a **score threshold** based on the model's confidence? If max_prob < threshold, we don't write any rows for that box (or write very low scores). This is effectively a soft background rejection without training on background.
+
+Actually, looking at the current code: `if s > MIN_SCORE` where MIN_SCORE = 0.001. This is a very low threshold. Most boxes will have at least one class with prob > 0.001/conf.
+
+What if we raise MIN_SCORE? Or what if we multiply by (max_prob - 0.25) to penalize uncertain predictions?
+
+Wait, e014 tried multiplying by max_prob and it hurt (0.6320). e019 tried margin scoring and it hurt badly (0.5805). e026 tried histogram calibration and it hurt (0.6278). e029 tried temperature scaling and it hurt (0.6277).
+
+So scoring changes have been consistently harmful. The simple conf × prob seems to be near-optimal for the current model.
+
+Let me think about **training strategy** changes:
+
+1. **Warmup + longer training**: The model is undertrained. But we're limited by the time budget.
+
+2. **Learning rate schedule**: e020 tried raising min LR and it hurt. e017 tried doubling peak LR and it hurt.
+
+3. **Batch size**: e010 tried batch 32 and it hurt.
+
+4. **Optimizer**: e025 tried SGD and it was suspicious (likely bug).
+
+What about **training with a different data distribution**? 
+
+Actually, I want to revisit the **two-crop vs single-crop** question. e008 switched from two-crop to single wide-crop (2.5x) and it helped (0.6386 vs 0.6317). The hypothesis was that halving the forward pass cost allows more epochs. But the current code only uses CONTEXT=2.5 (single crop). Let me verify...
+
+Looking at the code: `x = make_crop(img, r, CONTEXT, self.train)` - yes, it only makes one crop with CONTEXT=2.5. The TIGHT_CONTEXT=1.5 is defined but not used. So we're already on single-crop.
+
+What about **using both crops but with a smaller model or lower resolution** to fit more steps? The two-crop approach was the original (e000) and it was worse than single-crop (e008). So that's probably not the way.
+
+Let me think about **what's been tried and what hasn't**:
+
+Tried and rejected:
+- Background class (e005)
+- Focal loss (e006)
+- Mixup (e007)
+- Batch 32 (e010)
+- WeightedRandomSampler (e011)
+- V-flip TTA (e012)
+- EfficientNet-B2 (e013)
+- Max prob scoring (e014)
+- ConvNeXt-Nano (e015)
+- 2x LR (e017)
+- IMG 192 (e018)
+- Margin scoring (e019)
+- Higher min LR (e020)
+- tf_efficientnetv2_b0 (e021) - not confirmed (0.6352 vs 0.6411)
+- MobileNetV3 (e022)
+- Label smoothing (e023)
+- Upweighting detector boxes (e024)
+- SGD (e025) - bug
+- Histogram calibration (e026)
+- 256 inference (e027)
+- More jitter (e028)
+- Temperature scaling (e029)
+- Remove TTA + more training (e030)
+- Curriculum (e031)
+- RegNetY-016 (e032) - timeout
+
+Not tried:
+- **convnext_pico or convnext_atto** (very small, fast)
+- **resnet26d** (2.7M params, between B0 and regnety)
+- **resnet18** (11.7M, probably too slow)
+- **Different training resolution with different inference resolution** (train at 160, infer at 224?)
+- **Ensembling two models** (e.g., two different architectures)
+- **Training on only high-res crops** (remove low-res)
+- **Different CONTEXT values** (e.g., 3.0 or 2.0)
+- **Data augmentation: color jitter, random erasing**
+- **Multi-scale training** (train at multiple resolutions)
+- **Freezing early layers** (train only later layers)
+- **Different number of TTA views**
+- **Writing fewer rows per box** (top-1 only, or top-2)
+- **Score = conf^a × prob^b** with different exponents
+- **Using the detector confidence differently** (e.g., as a feature)
+- **Training with a larger batch** (e.g., 128)
+- **Cosine annealing with restarts**
+- **Training for more epochs by reducing dataset** (e.g., subsample)
+
+Actually, let me focus on something concrete. The model is undertrained. The most impactful thing would be to get more training steps. The current model does ~660 steps in ~147s of training time.
+
+What if we **reduce the training set size** to make each epoch shorter, allowing more complete epochs? For example, if we use only high-res crops (14128 → maybe 8000) plus matched detector boxes (12219 → maybe 8000), we'd have ~16000 samples instead of 26347. With batch 64, that's 250 steps per epoch instead of 411. In the same time, we'd do ~1.6 × (411/250) = 2.6 epochs instead of 1.6. More complete epochs might help with the LR schedule.
+
+But this is a form of data reduction, which might hurt. And e024 tried upweighting detector boxes and it didn't help.
+
+Actually, wait. Let me reconsider the **CONTEXT** parameter. Currently CONTEXT=2.5. What if a different context size works better? The detector boxes are misaligned with ground truth. A wider context (3.0 or 3.5) might give more context for the classifier to work with, helping it distinguish classes better. But it also dilutes the defect signal.
+
+Let me think about **what specific change is most likely to help**:
+
+Given that:
+1. The model is undertrained (loss still dropping)
+2. Pore (0.537) and stain (0.612) are the weak classes
+3. Stain is confused with deposit and background
+4. Most scoring changes have hurt
+5. Most architecture changes have hurt
+6. The simple conf × prob scoring works best so far
+
+I think the most promising direction is to **improve the training process to get a better model within the time budget**.
+
+One idea: **Train at 160×160 and infer at 224×224**. The model was pretrained at 224, but training at 160 is faster (2.25x fewer pixels). This would allow ~2.25x more training steps. At inference, we use 224 for the detail. The model should still work at 224 since it's a CNN (the spatial dimensions just change).
+
+Wait, but e027 tried inferring at 256 and it hurt. And e018 tried training at 192 and it hurt. But those were different: e018 trained AND inferred at 192, e027 trained at 224 and inferred at 256.
+
+What about training at 160 and inferring at 224? This is different from both. The model sees 160 during training (faster, more steps) but 224 during inference (more detail). The pretrained weights are for 224, so training at 160 means the early layers see a different resolution than they were pretrained on. But CNNs are generally robust to this.
+
+Actually, this is risky. Let me think of something else.
+
+What about **reducing the number of images loaded**? Currently 2255 images are loaded. If some images have very few boxes, we could skip them. But this is a minor optimization.
+
+What about **using a smaller batch size with gradient accumulation**? No, that's essentially the same as a smaller batch.
+
+Let me think about **the data more carefully**. We have:
+- 14128 GT crops (high + low res)
+- 12219 matched detector boxes (IoU ≥ 0.5)
+- Total: 26347
+
+The GT crops include both high and low resolution. e003 added low-res and it helped. So both resolutions are useful.
+
+What about **the class distribution**? Let me think about what the distribution might be:
+- Pore: probably common (small holes)
+- Deposit: probably common
+- Discontinuity: less common
+- Stain: probably common
+
+If pore and stain are underrepresented, oversampling them might help. But e011 tried WeightedRandomSampler and it hurt.
+
+What about **a different approach to the weak classes**? Instead of oversampling, what about **class-specific augmentation**? For example, for pore (small circular defects), we could add circular mask augmentation. For stain (irregular), we could add different augmentations.
+
+But this is complex and might not help.
+
+Let me think about **what's the simplest change that could help**:
+
+Actually, I want to revisit the **CONTEXT** parameter. Currently CONTEXT=2.5. The detector boxes are misaligned with ground truth. If we use a wider context (e.g., 3.0), the crop includes more surrounding area, which might help the classifier understand the context better. But it also means the defect is a smaller fraction of the crop.
+
+Alternatively, what about **using two different context sizes at inference** (like the original two-crop approach) but with a single model? We could average the predictions from a 2.0x crop and a 3.0x crop. This is a form of TTA that's different from flip.
+
+But this doubles the inference time. With 41879 eval boxes, that's a lot of extra inference.
+
+Actually, let me look at the time budget more carefully:
+- Loading: 17s
+- Training: ~108s (from 17s to 125s)
+- Prediction: ~39s (from 125s to 164s)
+- Total: 164s
+- Budget: 180s
+- Reserve: 55s (so training should stop at 125s)
+
+The prediction phase takes 39s. If we add more TTA, it could push us over the budget.
+
+What if we **reduce the reserve** to give more training time? e030 tried reducing reserve from 55 to 40 and removing TTA, and it hurt (0.6374). But that also removed TTA. What if we keep TTA but reduce reserve to 45s? That gives 10s more training.
+
+Actually, e030's result was 0.6374 vs 0.6411 for the base. The removal of TTA probably hurt more than the extra training helped.
+
+Let me think about a different angle. What if the issue is **not the model quality but the score calibration**?
+
+Currently: score = conf × prob[c]. We write 4 rows per box. In mAP@0.5, each row is a detection. If we write 4 rows per box, we have 4x more detections than boxes. The AP computation will penalize the 3 wrong-class rows.
+
+What if we **only write the top-1 class per box**? This reduces the number of false detections. But it also means we can't recover from a wrong top-1 prediction.
+
+Actually, in mAP, if we write 4 rows per box with scores conf×p0, conf×p1, conf×p2, conf×p3, the AP for each class considers only the rows for that class. So for class c, the detection is (box, c, conf×p_c). If the box overlaps a ground truth of class c, it's a TP; otherwise it's a FP.
+
+The ranking within class c is by conf×p_c. So boxes where the model is confident about class c will rank higher. This seems reasonable.
+
+But what about boxes where the model is uncertain (all p_c are similar)? Then all 4 rows have similar scores, and the box contributes 4 FPs (one per class) if it's a background box. This is bad.
+
+What if we **suppress all rows for a box if max_prob < threshold**? This is a soft background rejection. For example, if max(p) < 0.3, we don't write any rows for that box.
+
+This is different from e005 (which trained a 5th background class) and e014 (which multiplied by max_prob). This is a hard threshold.
+
+Let me think about what threshold to use. If the model is well-calibrated, a background box should have max_prob around 0.25 (uniform). A true defect box should have max_prob > 0.5. A threshold of 0.3-0.4 might work.
+
+But we don't know the calibration without testing. And e014 (multiply by max_prob) and e029 (temperature) both hurt, suggesting that the probability distribution is already doing a reasonable job of ranking.
+
+Hmm, let me think about this differently. What if the issue is that **the detector confidence is not well-calibrated**? e026 tried histogram calibration and it hurt. So the raw conf seems to be fine.
+
+OK let me try a different approach. What about **training the model with a different architecture that's specifically designed for fine-grained classification**?
+
+Looking at the available models:
+- convnext_atto (0.3M) - very small
+- convnext_pico (1.2M) - small
+- convnext_nano (5M) - tried, hurt (e015)
+- efficientnet_b0 (4.1M) - current
+- efficientnet_b2 (7.7M) - tried, hurt (e013)
+- mobilenetv3_large_100 (5.4M) - tried, hurt (e022)
+- regnety_016 (0.9M) - timed out (e032)
+- resnet18 (11.7M) - too big
+- resnet26d (2.7M) - not tried
+- resnet34 (21.8M) - too big
+- resnet50 (25.6M) - too big
+- tf_efficientnetv2_b0 (8.2M) - tried, not confirmed (e021)
+
+The only untried models of reasonable size are:
+- convnext_atto (0.3M)
+- convnext_pico (1.2M)
+- resnet26d (2.7M)
+
+convnext_atto and convnext_pico are very small. They might be fast enough for many more training steps. But they might not have enough capacity.
+
+resnet26d is 2.7M params, smaller than efficientnet_b0 (4.1M). It might be faster per step.
+
+Actually, let me reconsider the regnety_016 timeout. The model is 0.9M params, which is smaller than efficientnet_b0. But it timed out. Why?
+
+Looking at the log:
+- e016 (efficientnet_b0): epoch 0: 411 steps, 94s total (77s for epoch 0)
+- e032 (regnety_016): epoch 0: 411 steps, 101s total (84s for epoch 0)
+
+So regnety_016 is actually SLOWER per step than efficientnet_b0! That's surprising for a smaller model. It might be because regnety has many small conv layers that are less efficient on GPU.
+
+Then:
+- e016: epoch 1: 249 more steps (660-411), 31s (125-94)
+- e032: epoch 1: 120 more steps (531-411), 24s (125-101)
+
+Wait, that's weird. e032 only did 120 steps in epoch 1 before hitting the time limit, while e016 did 249 steps. But the time for epoch 1 is similar (24s vs 31s). So regnety_016 is about 2x slower per step in epoch 1?
+
+Actually, I think the issue is that the time limit is T0 + 125s. For e016, epoch 0 ended at 94s, so epoch 1 had 31s left. For e032, epoch 0 ended at 101s, so epoch 1 had 24s left. The per-step time is similar (~0.19s for e016, ~0.20s for e032). So the issue is just that e032's epoch 0 was slower (84s vs 77s), leaving less time for epoch 1.
+
+But then why did e032 time out at 195s? Training ended at 125s. Prediction should take ~39s (like e016). So total should be ~164s. But it was killed at 195s.
+
+Unless the prediction phase is slower for regnety_016. Maybe the model's architecture makes inference slower (many small conv layers). Or maybe there's a memory issue.
+
+In any case, regnety_016 is not a good choice. Let me avoid it.
+
+What about **convnext_pico** (1.2M params)? It's small and should be fast. But convnext_nano (5M) hurt (e015: 0.5833). So convnext architectures might not work well for this task.
+
+What about **resnet26d** (2.7M params)? It's smaller than efficientnet_b0 and might be faster. ResNet architectures are well-established and should work well.
+
+Actually, let me think about this more carefully. The key constraint is: we need more training steps. The current model does 660 steps. If we could do 1500+ steps, that would be a big improvement.
+
+For 1500 steps at the current per-step time (~0.19s), we'd need 285s of training. But we only have ~108s. So we need a model that's ~2.6x faster per step.
+
+That's a lot. Even a 2.7M param model might not be 2.6x faster than a 4.1M param model.
+
+Alternatively, we could **reduce the input size**. At 160x160 instead of 224x224, the model is ~2.25x faster per step (fewer pixels). Combined with a smaller model, we might get the speedup we need.
+
+But e018 tried 192x192 and it hurt (0.6387). And the original e008 used 160x160 and got 0.6386. So 160x160 is worse than 224x224.
+
+What if we **train at 160x160 and infer at 224x224**? The model sees 160 during training (faster) but 224 during inference (more detail). This is a form of "train small, test large" which is sometimes used in practice.
+
+The risk is that the model might not generalize well from 160 to 224. But CNNs are generally robust to input size changes (the spatial dimensions just change, and the final pooling handles it).
+
+Let me estimate the speedup:
+- Training at 160: ~2.25x faster per step → ~0.084s per step
+- In 108s: ~1285 steps (vs 660)
+- That's 1.95 epochs (vs 1.6)
+
+Not a huge improvement, but it's something. And the inference at 224 gives the model more detail.
+
+Actually, wait. The model's spatial dimensions change with input size. For efficientnet_b0:
+- Input 224: feature map 7x7 → 512 features
+- Input 160: feature map 5x5 → 512 features
+
+The model uses global average pooling, so it handles different spatial dimensions. The pretrained weights are for 224, but the conv weights are the same regardless of input size.
+
+I think this is worth trying. Let me formulate the hypothesis:
+
+**Hypothesis**: Training at 160×160 (2.25× fewer pixels per step) while keeping inference at 224×224 will yield ~2× more training steps (≈1300 vs 660), improving convergence—especially for the weak pore and stain classes—while the higher-resolution inference preserves the detail that made 224 effective (e016).
+
+The change: add a separate TRAIN_SIZE and use it for training crops, keep IMG_SIZE=224 for inference.
+
+Wait, but the make_crop function uses IMG_SIZE for the resize. I need to parameterize this.
+
+Let me look at the code:
+
+```python
+def make_crop(img, r, context, train):
+    ...
+    return np.asarray(Image.fromarray(canvas).resize((IMG_SIZE, IMG_SIZE), Image.BILINEAR), dtype=np.float32) / 255.0
+```
+
+And in BoxDataset.__getitem__:
+```python
+x = make_crop(img, r, CONTEXT, self.train)
+```
+
+So I need to pass the target size to make_crop. Let me modify it to accept a size parameter.
+
+Actually, the simplest change: add a TRAIN_SIZE variable and use it in the training path.
+
+Let me write the code:
+
+```python
+IMG_SIZE = 224  # inference size
+TRAIN_SIZE = 160  # training size
+```
+
+And modify make_crop to accept a size:
+```python
+def make_crop(img, r, context, train, size):
+    ...
+    return np.asarray(Image.fromarray(canvas).resize((size, size), Image.BILINEAR), dtype=np.float32) / 255.0
+```
+
+And in BoxDataset.__getitem__:
+```python
+size = TRAIN_SIZE if self.train else IMG_SIZE
+x = make_crop(img, r, CONTEXT, self.train, size)
+```
+
+This should work. The model will see 160x160 during training and 224x224 during inference.
+
+Let me also check: will the DataLoader work correctly? The training batches will be 160x160 and the eval batches will be 224x224. Since they're separate DataLoaders, this should be fine.
+
+One concern: the model's first conv layer expects a specific input size? No, conv layers work with any spatial size. The only issue would be if there's a fixed-size layer, but efficientnet_b0 uses global average pooling, so it's fine.
+
+Let me write the SEARCH/REPLACE blocks.
+
+Actually, I need to be careful. The make_crop function is used in both training and inference. I need to modify it to accept a size parameter.
+
+Let me trace through the code:
+
+1. `make_crop` is defined with IMG_SIZE hardcoded
+2. `BoxDataset.__getitem__` calls `make_crop(img, r, CONTEXT, self.train)`
+3. The training DataLoader uses `BoxDataset(train_rows, images, True)`
+4. The eval DataLoader uses `BoxDataset(ev, images, False)`
+
+So I need to:
+1. Add TRAIN_SIZE = 160
+2. Modify make_crop to accept a size parameter
+3. Modify BoxDataset.__getitem__ to use TRAIN_SIZE for training and IMG_SIZE for eval
+
+Let me write the changes:
+
+Change 1: Add TRAIN_SIZE after IMG_SIZE
+```
+IMG_SIZE = 224
+```
+→
+```
+IMG_SIZE = 224
+TRAIN_SIZE = 160
+```
+
+Change 2: Modify make_crop signature and resize
+```
+def make_crop(img, r, context, train):
+```
+→
+```
+def make_crop(img, r, context, train, size):
+```
+
+And:
+```
+    return np.asarray(Image.fromarray(canvas).resize((IMG_SIZE, IMG_SIZE), Image.BILINEAR), dtype=np.float32) / 255.0
+```
+→
+```
+    return np.asarray(Image.fromarray(canvas).resize((size, size), Image.BILINEAR), dtype=np.float32) / 255.0
+```
+
+Change 3: Modify BoxDataset.__getitem__
+```
+        x = make_crop(img, r, CONTEXT, self.train)
+```
+→
+```
+        x = make_crop(img, r, CONTEXT, self.train, TRAIN_SIZE if self.train else IMG_SIZE)
+```
+
+These are 3 small changes. Let me verify each SEARCH string appears exactly once.
+
+1. `IMG_SIZE = 224` - appears once in the settings section
+2. `def make_crop(img, r, context, train):` - appears once
+3. `    return np.asarray(Image.fromarray(canvas).resize((IMG_SIZE, IMG_SIZE), Image.BILINEAR), dtype=np.float32) / 255.0` - appears once
+4. `        x = make_crop(img, r, CONTEXT, self.train)` - appears once
+
+Good, all unique.
+
+Let me also think about whether this will actually help. The concern is:
+- Training at 160: the model sees less detail, which might hurt classification of small defects (pore, stain)
+- But we get ~2x more training steps, which should help convergence
+- At inference, we use 224, so the model gets the full detail
+
+The net effect is uncertain. But it's a reasonable hypothesis and worth testing.
+
+Actually, I realize there might be an issue. The model is pretrained at 224x224. When we train at 160x160, the early layers see a different spatial frequency distribution. This might cause the early layers to be "confused" and take longer to adapt. But since we're fine-tuning (not training from scratch), the weights should be close enough.
+
+Also, I should consider: does the model's architecture handle 160x160 input correctly? EfficientNet-B0:
+- Stem: 3x3 conv, stride 2 → 80x80
+- Block 1: 3x3 conv, stride 1 → 80x80
+- Block 2: 3x3 conv, stride 2 → 40x40
+- Block 3: 5x5 conv, stride 1 → 40x40
+- Block 4: 3x3 conv, stride 2 → 20x20
+- Block 5: 5x5 conv, stride 1 → 20x20
+- Block 6: 3x3 conv, stride 2 → 10x10
+- Head: 1x1 conv + GAP → 4 classes
+
+At 160x160:
+- Stem: 3x3 conv, stride 2 → 80x80
+- Block 1: 3x3 conv, stride 1 → 80x80
+- Block 2: 3x3 conv, stride 2 → 40x40
+- Block 3: 5x5 conv, stride 1 → 40x40
+- Block 4: 3x3 conv, stride 2 → 20x20
+- Block 5: 5x5 conv, stride 1 → 20x20
+- Block 6: 3x3 conv, stride 2 → 10x10
+- Head: 1x1 conv + GAP → 4 classes
+
+Wait, that's the same! Because 160/2 = 80, and 224/2 = 112. Let me redo:
+
+At 224x224:
+- Stem: 3x3 conv, stride 2 → 112x112
+- Block 1: 3x3 conv, stride 1 → 112x112
+- Block 2: 3x3 conv, stride 2 → 56x56
+- Block 3: 5x5 conv, stride 1 → 56x56
+- Block 4: 3x3 conv, stride 2 → 28x28
+- Block 5: 5x5 conv, stride 1 → 28x28
+- Block 6: 3x3 conv, stride 2 → 14x14
+- Head: 1x1 conv + GAP → 4 classes
+
+At 160x160:
+- Stem: 3x3 conv, stride 2 → 80x80
+- Block 1: 3x3 conv, stride 1 → 80x80
+- Block 2: 3x3 conv, stride 2 → 40x40
+- Block 3: 5x5 conv, stride 1 → 40x40
+- Block 4: 3x3 conv, stride 2 → 20x20
+- Block 5: 5x5 conv, stride 1 → 20x20
+- Block 6: 3x3 conv, stride 2 → 10x10
+- Head: 1x1 conv + GAP → 4 classes
+
+So the spatial dimensions are different, but the model handles it fine with GAP.
+
+The computational cost is proportional to the number of pixels in the feature maps. At 160, the feature maps are (160/224)^2 ≈ 0.51 of the 224 feature maps. So the model is about 2x faster at 160.
+
+OK, I'm convinced this is a reasonable experiment. Let me finalize the changes.
+
+Wait, one more thought: should I also reduce the CONTEXT for training? At 160x160, a 2.5x context crop of a small box might be very small. But the MIN_CROP=16 handles that. And the crop is resized to 160x160 anyway.
+
+I think the changes are correct. Let me write them up.
+
+Actually, I want to double-check: the `make_crop` function creates a square crop of size `s` (the context-scaled box size), then resizes to (size, size). So the intermediate canvas size is `s`, and the final size is `size`. This is correct.
+
+One more consideration: the `BoxDataset` is used for both training and eval. The training dataset has `train=True` and the eval dataset has `train=False`. The `self.train` flag is used to determine the crop size. This should work correctly.
+
+Let me finalize.

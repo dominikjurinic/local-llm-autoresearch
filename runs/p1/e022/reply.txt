@@ -1,0 +1,125 @@
+===== attempt 1 (408s) =====
+BASE: last
+CATEGORY: data
+HYPOTHESIS: The remaining ~0.10 mAP loss is class confusion on true defects (pore→stain, deposit→stain), and the systematic model/label disagreement on hard classes suggests label noise (e.g. "stain" boxes that are really pores/deposits). After a short initial training I forward-pass every training box and drop boxes the model confidently mislabels (top-1 ≠ label and p(top-1)−p(label) > 0.25), then retrain one phase on the cleaned set — fundamentally different from the 13 architecture attempts, which all changed what the model sees/learns rather than which labels it learns from. Expected ~+0.01–0.02 mAP if a few % of hard-class labels are inconsistent. Note: the lead's "RESERVE_S=60" would time out (prediction alone takes ~73s), so I keep RESERVE_S=85 and instead cap the initial training at ~45% of the training budget, run the (forward-only, ~10s) cleaning pass, then retrain for the remainder with a dtype-safe SWA.
+<<<<<<< SEARCH
+    # Train until the budget minus the reserve is used up: 5% warm-up, then cosine decay.
+    t_start = time.time()
+    t_end = deadline - RESERVE_S
+    budget = max(1.0, t_end - t_start)
+    steps, epoch, done = 0, 0, False
+    swa_states = []  # SWA: collect weight snapshots during training
+    model.train()
+    while not done:
+        tot, nb = 0.0, 0
+        for views, y in dl_tr:
+            frac = min(1.0, (time.time() - t_start) / budget)
+            f = frac / 0.05 if frac < 0.05 else 0.5 * (1 + math.cos(math.pi * (frac - 0.05) / 0.95))
+            for pg in opt.param_groups:
+                pg["lr"] = LR * max(f, 1e-3)
+            views = [v.to(device, non_blocking=True).to(memory_format=torch.channels_last) for v in views]
+            y = y.to(device, non_blocking=True)
+            with torch.autocast(**amp):
+                loss = crit(model(views), y)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+            tot += loss.item(); nb += 1; steps += 1
+            if steps % 20 == 0:
+                swa_states.append({k: v.detach().cpu().clone() for k, v in model.state_dict().items()})
+            if time.time() >= t_end:
+                done = True
+                break
+        print(f"epoch {epoch}: loss {tot / max(nb, 1):.4f}, {steps} steps, {time.time() - T0:.0f}s", flush=True)
+        epoch += 1
+
+    # SWA: include the final weights, then average all snapshots and load them back.
+    swa_states.append({k: v.detach().cpu().clone() for k, v in model.state_dict().items()})
+    if len(swa_states) > 1:
+        avg_state = {k: torch.stack([s[k] for s in swa_states]).mean(0) for k in model.state_dict().keys()}
+        model.load_state_dict(avg_state)
+    # Classify every eval detection; one prediction per class with score = detector conf x class probability.
+=======
+    def snapshot():
+        return {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+    def swa_average(states):
+        # average only floating-point tensors (skip e.g. BatchNorm integer counters), else load crashed on Long
+        return {k: (torch.stack([s[k] for s in states]).float().mean(0) if states[0][k].is_floating_point() else states[-1][k])
+                for k in states[0]}
+
+    def train_phase(rows, t_lim, swa_collect=False):
+        nonlocal steps, epoch
+        ds = BoxDataset(rows, images, True)
+        dl = torch.utils.data.DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=workers,
+                                         pin_memory=True, drop_last=True, generator=g, worker_init_fn=worker_init)
+        model.train()
+        while time.time() < t_lim:
+            tot, nb = 0.0, 0
+            for views, y in dl:
+                frac = min(1.0, (time.time() - t_start) / budget)
+                f = frac / 0.05 if frac < 0.05 else 0.5 * (1 + math.cos(math.pi * (frac - 0.05) / 0.95))
+                for pg in opt.param_groups:
+                    pg["lr"] = LR * max(f, 1e-3)
+                views = [v.to(device, non_blocking=True).to(memory_format=torch.channels_last) for v in views]
+                y = y.to(device, non_blocking=True)
+                with torch.autocast(**amp):
+                    loss = crit(model(views), y)
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+                opt.step()
+                tot += loss.item(); nb += 1; steps += 1
+                if swa_collect and steps % 10 == 0:
+                    swa_states.append(snapshot())
+                if time.time() >= t_lim:
+                    break
+            print(f"phase loss {tot / max(nb, 1):.4f}, {steps} steps, {time.time() - T0:.0f}s", flush=True)
+            epoch += 1
+
+    def forward_probs(rows):
+        ds = BoxDataset(rows, images, False)
+        dl = torch.utils.data.DataLoader(ds, batch_size=256, shuffle=False, num_workers=workers, pin_memory=True)
+        model.eval()
+        outs = []
+        with torch.no_grad(), torch.autocast(**amp):
+            for views, _ in dl:
+                views = [v.to(device).to(memory_format=torch.channels_last) for v in views]
+                outs.append(torch.softmax(model(views).float(), 1).cpu())
+        return torch.cat(outs).numpy()
+
+    # Train until the budget minus the reserve is used up: 5% warm-up, then cosine decay.
+    t_start = time.time()
+    t_end = deadline - RESERVE_S
+    budget = max(1.0, t_end - t_start)
+    steps, epoch = 0, 0
+    swa_states = []  # SWA: collect weight snapshots during the retrain phase
+
+    # Phase A: initial training on all boxes (~45% of the training budget) to get a model that can flag bad labels.
+    t_A = t_start + 0.45 * budget
+    train_phase(crops, t_A)
+
+    # Phase B: label cleaning - drop boxes the model confidently mislabels (top-1 != label and margin > 0.25).
+    model.eval()
+    probs = forward_probs(crops)
+    label = np.array([r["cls"] for r in crops])
+    top1 = probs.argmax(axis=1)
+    p_label = probs[np.arange(len(crops)), label]
+    margin = probs.max(axis=1) - p_label
+    keep = ((top1 == label) | (margin <= 0.25))
+    kept = [r for r, k in zip(crops, keep) if k]
+    print(f"cleaning: kept {len(kept)}/{len(crops)} training boxes ({time.time() - T0:.0f}s)", flush=True)
+
+    # Phase C: retrain on the cleaned set for the remainder of the budget, collecting SWA snapshots.
+    if time.time() < t_end - 5:
+        train_phase(kept, t_end, swa_collect=True)
+
+    # SWA: include the final weights, then average all snapshots and load them back.
+    swa_states.append(snapshot())
+    if len(swa_states) > 1:
+        model.load_state_dict(swa_average(swa_states))
+    # Classify every eval detection; one prediction per class with score = detector conf x class probability.
+>>>>>>> REPLACE
+
+Two deviations from the plan, both forced by the measured time budget (load 13s, prediction ~73s):
+1. Kept RESERVE_S=85 instead of 60 — with 73s of prediction, a 60s reserve would push the run past 180s and time out. I instead cap initial training at 45% of the training budget, run the forward-only cleaning pass (~10s, since it classifies 6052 boxes vs 41879 for prediction), then retrain for the rest.
+2. SWA snapshots are collected every 10 steps during the retrain phase (not fixed global steps 20/40/60/80, which would land in the wrong phase) and averaged with a dtype-safe `swa_average` that skips non-float tensors (the exact e021 crash). If the cleaning pass overruns, the retrain is skipped (guarded by `time.time() < t_end - 5`) so the run still finishes.

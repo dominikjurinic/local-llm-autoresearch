@@ -1,0 +1,517 @@
+===== attempt 1 =====
+Let me analyze the current state and think about what to try next.
+
+Current best: e016, 5-seed mean 0.6411 mAP@0.5
+- Per-class AP: pore 0.537, deposit 0.635, discontinuity 0.780, stain 0.612
+- Architecture: EfficientNet-B0, single wide crop (2.5x), IMG_SIZE=224
+- Training: ~660 steps (2.5 epochs), AdamW LR=1e-3, cosine schedule
+- Inference: H-flip TTA, score = conf × prob[c]
+- Data: GT crops (high+low) + matched detector boxes (IoU≥0.5)
+
+What's been tried and rejected:
+- Background class (e005) - hurt
+- Focal loss (e006) - hurt
+- Mixup (e007) - hurt
+- B2 (e013) - hurt
+- ConvNeXt-Nano (e015) - hurt
+- tf_efficientnetv2_b0 (e021) - 0.6447 seed-0 but 0.6352 5-seed, not confirmed
+- MobileNetV3 (e022) - hurt
+- Label smoothing (e023) - hurt
+- SGD (e025) - crashed
+- Score modifications: prob², margin, max-prob, calibration, temperature - all hurt
+- TTA variations: adding V-flip (hurt), removing H-flip (hurt)
+- Jitter increase (hurt)
+- Batch size 32 (hurt)
+- Weighted sampler for weak classes (hurt)
+- Upweighting detector boxes (hurt)
+- Higher LR (hurt)
+- Lower min LR (hurt)
+- IMG_SIZE 192 (hurt), 256 inference (hurt)
+- Reserve reduction (hurt)
+
+What's worked:
+- Adding detector boxes to training (e002)
+- Adding low-res crops (e003)
+- Single wide crop (e008)
+- H-flip TTA (e009) - marginal
+- IMG_SIZE 224 (e016)
+
+Key observations:
+1. The model is undertrained - loss still dropping fast (0.52→0.29 in 2 epochs)
+2. Pore (0.537) and stain (0.612) are the weak classes
+3. The ceiling with perfect classes is 0.758, so there's room
+4. The one-step baseline is 0.638, we're at 0.641 - barely above
+
+Let me think about what hasn't been tried:
+
+1. **Two-crop input** - The original two-crop (tight 1.5x + wide 2.5x) was replaced by single wide crop in e008. But the background says "A crop classifier given perfect boxes reaches macro-F1 ~0.87 with the starting recipe (two-crop input)." So two-crop was better for classification. The switch to single was for speed. Maybe we can go back to two-crop but with a smaller model or different approach?
+
+Wait, actually looking more carefully: e008 switched from two-crop to single wide crop and it was a "new best" at 0.6386. But the background says two-crop reaches macro-F1 ~0.87. The issue is that two-crop doubles the forward pass cost.
+
+2. **Ensembling** - The background mentions "ensembling within the time budget" as in scope. We could train two models with different seeds and average their predictions. But we only have one seed per run...
+
+Actually wait, we could train two different architectures and ensemble them. But that would halve training time for each.
+
+3. **Multi-scale inference** - Try multiple crop contexts at inference (e.g., 2.0x, 2.5x, 3.0x) and average. This is a form of TTA that hasn't been tried.
+
+4. **Training with more epochs via smaller batch** - Tried batch 32 (e010) and it hurt. But what about batch 48?
+
+5. **Different augmentation** - CutMix, RandAugment, color jitter variations...
+
+6. **Training on detector boxes only** (no GT crops) - e001 tried adding background class and it hurt, but what about training ONLY on detector boxes (matched ones) without GT crops? This would make the training distribution exactly match inference.
+
+7. **Two-model ensemble with different architectures** - Train a small model (e.g., resnet18) and EfficientNet-B0, average predictions. But time budget...
+
+8. **Larger crop context** - Try 3.0x or 3.5x instead of 2.5x. More context might help distinguish stain from deposit (stain often confused with deposit and background).
+
+9. **Using the detector confidence as a training signal** - Instead of just using it in scoring, use it to weight training examples or as an auxiliary input.
+
+10. **Training with the actual detector box coordinates** - Currently we use the GT crop coordinates for GT boxes and detector box coordinates for matched dets. What if we use the detector box coordinates for ALL training (i.e., for GT boxes, use the matched detector box coordinates)?
+
+Wait, I think the most promising untried idea is **multi-context TTA at inference**. We try 2.5x at inference. What if we also try 2.0x and 3.0x and average? This gives the model multiple "views" of the box at different zoom levels, which could help with:
+- Small defects (pore) that need zoomed-in view
+- Large context-dependent defects (stain) that need wider view
+- The detector's box misplacement (different contexts partially compensate)
+
+The cost is 3x inference time instead of 2x (with H-flip). Currently prediction takes about 39s (164-125=39s). With 3 contexts × 2 (H-flip) = 6 forward passes instead of 2, it would be about 3× longer, so ~117s for prediction. That's too much.
+
+But we could do: 3 contexts, no H-flip = 3 forward passes. That's 1.5x current inference time, so ~58s. With RESERVE_S=55, that's tight. Or we could reduce to 2 contexts (2.0x and 3.0x) + H-flip = 4 forward passes, 2x current, ~78s. Still tight.
+
+Actually, let me reconsider. The current inference does 2 forward passes (original + H-flip) for 41879 eval boxes at batch 256. That's 164 batches. At 224×224 with EfficientNet-B0, each batch takes about 0.24s. So 164 × 0.24 × 2 = ~79s? No wait, the total time is 164s, training takes 125s, so inference+writing takes ~39s. With 2 forward passes that's ~20s for inference.
+
+With 3 contexts × 2 (H-flip) = 6 passes: ~60s for inference. That would push total to ~185s, over the 180s budget. Too much.
+
+With 3 contexts, no H-flip = 3 passes: ~30s for inference. Total ~155s. That works with margin.
+
+But e030 showed that removing H-flip and reducing reserve hurt (0.6374). So H-flip does help.
+
+Alternative: 2 contexts (2.0x and 3.0x) with H-flip = 4 passes: ~40s. Total ~165s. Tight but possible.
+
+Actually, let me think differently. What about training at multiple contexts? Currently we train at 2.5x only. What if we train at a random context between 2.0 and 3.0? This would make the model robust to the exact crop size, and at inference we could use 2.5x (the middle). This is a form of data augmentation.
+
+Actually, looking at the code, `CONTEXT = 2.5` is used for both training and inference. The jitter already varies the side by 0.85-1.2x, so effective context is 2.125-3.0x during training. So the model already sees a range of contexts.
+
+Let me think about what else...
+
+**Idea: Train at 2.5x but also include some 1.5x (tight) crops in training, and at inference use both 1.5x and 2.5x and average.**
+
+This is essentially going back to the two-crop idea but in a different way: instead of concatenating two crops, we train on a mix of tight and wide crops, and at inference average predictions from both. The training cost is the same (one crop per sample), and inference cost doubles (but we already do H-flip, so it's 4 passes total).
+
+Wait, but the training would need to assign a label to each crop. If we randomly choose tight or wide for each training sample, the model learns to classify from either context. At inference, we average both. This is cheaper than the original two-crop (which required a special architecture to handle two inputs).
+
+Actually, I think a simpler and more impactful idea would be:
+
+**Idea: Use a larger crop context (3.0x or 3.5x) for training and inference.**
+
+Rationale: Stain is often confused with deposit and background. A wider context gives the model more surrounding information to distinguish stain (which has a specific spatial relationship to the weld bead) from deposit (which is a different texture) and background. The current 2.5x might not show enough context.
+
+Cost: 3.0x vs 2.5x is a 44% larger crop, but since we resize to 224×224 anyway, the model computation is the same. The only cost is in the crop extraction (negligible). So this is essentially free!
+
+Wait, but the crop is resized to 224×224 regardless of the original crop size. So a 3.0x crop shows more surrounding area but the defect itself is smaller in the 224×224 image. This could actually hurt for small defects like pores.
+
+Hmm, but the jitter already varies the effective context by 0.85-1.2x. So the model already sees contexts from 2.125x to 3.0x. Training at 3.0x would shift the range to 2.55x-3.6x.
+
+Actually, I think the most promising idea that hasn't been tried is:
+
+**Idea: Train with a random context sampled uniformly from [1.5, 3.5] instead of fixed 2.5 with jitter.**
+
+This gives the model much more diversity in the crop context, making it robust to the detector's varying box sizes. At inference, use 2.5x (the middle). The model learns to classify defects regardless of how much context is shown.
+
+But wait, this is similar to what the jitter already does (0.85-1.2x of 2.5 = 2.125-3.0). Widening to 1.5-3.5 would be a bigger range.
+
+Let me think about other ideas...
+
+**Idea: Use the detector confidence as a training weight.**
+
+High-confidence detector boxes that match GT are more likely to be well-placed, so they should be trusted more. Low-confidence boxes are more likely to be false alarms or poorly placed. Weighting training examples by detector confidence (for matched dets) could help.
+
+But this was sort of tried in e024 (upweighting detector boxes) and hurt. Though that was a different weighting scheme.
+
+**Idea: Two-pass training - first train on GT crops only, then fine-tune on detector boxes.**
+
+This would let the model first learn clean class representations, then adapt to the detector's box misplacement. The two-phase approach might be better than training on both simultaneously.
+
+Actually, this is interesting. Currently we mix GT crops and matched detector boxes in the same training set. What if we:
+1. Phase 1: Train on GT crops only for ~60% of the budget
+2. Phase 2: Fine-tune on matched detector boxes (lower LR) for the remaining ~40%
+
+This curriculum might help because:
+- Phase 1: Model learns clean class boundaries
+- Phase 2: Model adapts to the noisier detector boxes without losing the clean representations
+
+The risk is that Phase 2 might overfit to the detector boxes or the lower LR might not be enough to adapt.
+
+**Idea: Use ResNet50 or ResNet34 instead of EfficientNet-B0.**
+
+ResNet architectures haven't been tried (only resnet18 was mentioned as available). ResNet50 has 25M params - way too big. ResNet34 has 21M - also too big. ResNet18 has 11M - bigger than EfficientNet-B0's 4M. ResNet26d has 16M.
+
+Actually, these are all bigger than EfficientNet-B0, so they'd train slower. Not helpful.
+
+**Idea: Use a smaller model (convnext_atto or convnext_pico) to get more training steps.**
+
+ConvNeXt-Pico has 0.6M params, ConvNeXt-Atto has 1.8M params. These are much smaller than EfficientNet-B0 (4M). They could train 2-6x faster, giving many more epochs. The question is whether the smaller model can still distinguish the 4 defect types.
+
+Given that the model is clearly undertrained (loss still dropping), more training steps might be very valuable. But e022 (MobileNetV3, 44% fewer FLOPs) only got 0.6380, suggesting that the extra steps didn't help enough.
+
+However, MobileNetV3-Large has 5.4M params (bigger than EfficientNet-B0's 4M), so it wasn't actually faster per step in terms of compute. ConvNeXt-Pico/Atto would be genuinely smaller.
+
+Actually wait, let me reconsider. The per-step cost depends on the model FLOPs AND the data pipeline. With a much smaller model, the bottleneck might shift to the data pipeline (crop extraction, resizing). In that case, the speedup might be less than expected.
+
+Let me think about what's most likely to help...
+
+**Most promising untried ideas:**
+
+1. **Curriculum training (GT first, then detector boxes)** - addresses the train/inference distribution gap in a structured way
+2. **Wider context (3.0x) for stain/deposit disambiguation** - free (same 224×224 input)
+3. **Random context during training (1.5-3.5x)** - more robustness to box size variation
+4. **ConvNeXt-Atto for more training steps** - addresses undertraining
+5. **Multi-context inference (2.0x + 3.0x, average)** - TTA variant
+
+I think **curriculum training** is the most principled and untried idea. The hypothesis is:
+
+"Training first on clean GT crops (to learn class representations) and then fine-tuning on detector boxes (to adapt to box misplacement) will improve mAP because the model won't be confused by the noisier detector boxes during the initial learning phase, leading to better class boundaries for the weak pore and stain classes."
+
+Implementation:
+- Phase 1: Train on GT crops only for 60% of the training budget
+- Phase 2: Fine-tune on matched detector boxes only for 40% of the training budget, with a lower LR (e.g., 0.3x)
+
+Let me code this up.
+
+Actually, wait. Let me reconsider. The current training set is 26347 boxes (14128 GT + 12219 det). If we split into phases:
+- Phase 1: 14128 GT crops, ~60% of budget → ~396 steps (at current speed)
+- Phase 2: 12219 det boxes, ~40% of budget → ~264 steps
+
+The issue is that Phase 2 only has 264 steps at a lower LR, which might not be enough to adapt. And the model might not have learned enough in Phase 1 (396 steps on 14128 samples = ~2.8 epochs).
+
+Alternatively:
+- Phase 1: 70% of budget on GT crops
+- Phase 2: 30% of budget on detector boxes with LR × 0.5
+
+Let me think about the LR schedule. Currently it's cosine over the full budget. For two phases, I could:
+- Phase 1: cosine from LR to 0.5×LR over 70% of budget
+- Phase 2: cosine from 0.5×LR to 0.1×LR over 30% of budget
+
+Or simpler:
+- Phase 1: constant LR for 70% of budget
+- Phase 2: cosine from 0.3×LR to 0.05×LR for 30% of budget
+
+Actually, the simplest approach: just change the dataset between phases. Use the same cosine schedule over the full budget, but switch the dataset at 60% of the time.
+
+Let me code this:
+
+```python
+# In the training loop:
+PHASE1_FRAC = 0.6  # fraction of budget for GT-only training
+
+# Create two dataloaders:
+# dl_gt: GT crops only
+# dl_det: matched detector boxes only
+
+# In the training loop:
+# - Use dl_gt for the first PHASE1_FRAC of the budget
+# - Use dl_det for the rest
+```
+
+The LR schedule stays the same (cosine over full budget), so the LR naturally decays during Phase 2, which acts as a gentle fine-tuning.
+
+Let me write the code changes:
+
+1. Create two separate dataloaders: one for GT crops, one for detector boxes
+2. In the training loop, switch dataloaders at the phase boundary
+
+Here's the plan:
+
+```python
+# After creating train_rows:
+gt_rows = crops  # GT crops only
+det_rows = matched_dets  # detector boxes only
+
+# Create two dataloaders:
+dl_gt = torch.utils.data.DataLoader(BoxDataset(gt_rows, images, True), batch_size=BATCH_SIZE, shuffle=True,
+                                     num_workers=workers, pin_memory=True, drop_last=True,
+                                     persistent_workers=True, generator=g)
+dl_det = torch.utils.data.DataLoader(BoxDataset(det_rows, images, True), batch_size=BATCH_SIZE, shuffle=True,
+                                      num_workers=workers, pin_memory=True, drop_last=True,
+                                      persistent_workers=True, generator=g)
+```
+
+And in the training loop:
+```python
+PHASE1_FRAC = 0.6
+# ...
+while not done:
+    # Determine which dataset to use
+    frac_elapsed = (time.time() - t_start) / budget
+    dl = dl_gt if frac_elapsed < PHASE1_FRAC else dl_det
+    for x, y in dl:
+        # ... rest same
+```
+
+Wait, but there's a subtlety. The dataloader iterates through the dataset in order (shuffled). If we switch mid-iteration, we'd lose the rest of that epoch. That's fine - we just start a new epoch with the new dataloader.
+
+Actually, the current code iterates through the dataloader in a while loop, and breaks when time runs out. If we switch dataloaders, we need to handle the transition carefully. Let me think...
+
+The simplest approach: in each iteration of the outer while loop, check the elapsed fraction and pick the appropriate dataloader. If we're in Phase 1, iterate dl_gt. If Phase 2, iterate dl_det. The inner for loop goes through one epoch of the chosen dataloader.
+
+But the issue is: if Phase 1 ends in the middle of an epoch, we've already consumed part of dl_gt. We should just start fresh with dl_det.
+
+Let me restructure:
+
+```python
+PHASE1_FRAC = 0.60
+t_start = time.time()
+t_end = deadline - RESERVE_S
+budget = max(1.0, t_end - t_start)
+steps, epoch, done = 0, 0, False
+model.train()
+while not done:
+    frac_elapsed = (time.time() - t_start) / budget
+    dl = dl_gt if frac_elapsed < PHASE1_FRAC else dl_det
+    tot, nb = 0.0, 0
+    for x, y in dl:
+        frac = min(1.0, (time.time() - t_start) / budget)
+        f = frac / 0.05 if frac < 0.05 else 0.5 * (1 + math.cos(math.pi * (frac - 0.05) / 0.95))
+        for pg in opt.param_groups:
+            pg["lr"] = LR * max(f, 1e-3)
+        x = x.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+        y = y.to(device, non_blocking=True)
+        with torch.autocast(**amp):
+            loss = crit(model(x), y)
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+        tot += loss.item(); nb += 1; steps += 1
+        if time.time() >= t_end:
+            done = True
+            break
+    print(f"epoch {epoch} ({'GT' if frac_elapsed < PHASE1_FRAC else 'DET'}): loss {tot / max(nb, 1):.4f}, {steps} steps, {time.time() - T0:.0f}s", flush=True)
+    epoch += 1
+```
+
+This should work. The key changes:
+1. Replace `train_rows = crops + matched_dets` with separate lists
+2. Create two dataloaders
+3. Switch dataloaders based on elapsed fraction
+
+Let me also consider: should Phase 2 use all detector boxes, or should it include some GT boxes too? I think pure detector boxes is the cleanest test of the hypothesis. If the model has already learned good class representations from GT, then fine-tuning on detector boxes should help it adapt to the inference distribution.
+
+One concern: 12219 detector boxes is a lot, and at batch 64, that's ~190 steps per epoch. With 40% of the budget (~50s), we'd get about 50/0.14 ≈ 350 steps... wait, let me recalculate.
+
+Current: 660 steps in ~108s (125-17s loading). So ~6.1 steps/s.
+Phase 1 (60% of 108s = 65s): ~397 steps on GT (14128/64 = 220 steps/epoch, so ~1.8 epochs)
+Phase 2 (40% of 108s = 43s): ~262 steps on DET (12219/64 = 191 steps/epoch, so ~1.4 epochs)
+
+That seems reasonable. The model gets ~2 epochs on GT and ~1.4 epochs on detector boxes.
+
+Actually, I realize I should double-check: is the hypothesis testable? Yes - if curriculum helps, we should see improved mAP, especially on pore and stain. If it doesn't help or hurts, we learn that mixing is better than sequential.
+
+Let me finalize the code changes. I need to:
+1. Change `train_rows = crops + matched_dets` to keep them separate
+2. Create two dataloaders instead of one
+3. Modify the training loop to switch dataloaders
+
+Let me write the SEARCH/REPLACE blocks carefully.
+
+Looking at the current code:
+
+```python
+    train_rows = crops + matched_dets
+    needed = {r["image"] for r in train_rows} | {d["image"] for d in ev}
+```
+
+I need to change this to:
+```python
+    gt_rows = crops
+    det_rows = matched_dets
+    train_rows = gt_rows + det_rows
+    needed = {r["image"] for r in train_rows} | {d["image"] for d in ev}
+```
+
+Then the dataloader creation:
+```python
+    g = torch.Generator().manual_seed(args.seed)
+    dl_tr = torch.utils.data.DataLoader(BoxDataset(train_rows, images, True), batch_size=BATCH_SIZE, shuffle=True,
+                                        num_workers=workers, pin_memory=True, drop_last=True,
+                                        persistent_workers=True, generator=g, worker_init_fn=worker_init)
+```
+
+Change to:
+```python
+    g = torch.Generator().manual_seed(args.seed)
+    dl_gt = torch.utils.data.DataLoader(BoxDataset(gt_rows, images, True), batch_size=BATCH_SIZE, shuffle=True,
+                                        num_workers=workers, pin_memory=True, drop_last=True,
+                                        persistent_workers=True, generator=g, worker_init_fn=worker_init)
+    dl_det = torch.utils.data.DataLoader(BoxDataset(det_rows, images, True), batch_size=BATCH_SIZE, shuffle=True,
+                                         num_workers=workers, pin_memory=True, drop_last=True,
+                                         persistent_workers=True, generator=g, worker_init_fn=worker_init)
+```
+
+And the training loop:
+```python
+    t_start = time.time()
+    t_end = deadline - RESERVE_S
+    budget = max(1.0, t_end - t_start)
+    steps, epoch, done = 0, 0, False
+    model.train()
+    while not done:
+        tot, nb = 0.0, 0
+        for x, y in dl_tr:
+```
+
+Change to:
+```python
+    t_start = time.time()
+    t_end = deadline - RESERVE_S
+    budget = max(1.0, t_end - t_start)
+    PHASE1_FRAC = 0.60
+    steps, epoch, done = 0, 0, False
+    model.train()
+    while not done:
+        frac_elapsed = (time.time() - t_start) / budget
+        dl_tr = dl_gt if frac_elapsed < PHASE1_FRAC else dl_det
+        phase_name = "GT" if frac_elapsed < PHASE1_FRAC else "DET"
+        tot, nb = 0.0, 0
+        for x, y in dl_tr:
+```
+
+And the print:
+```python
+        print(f"epoch {epoch}: loss {tot / max(nb, 1):.4f}, {steps} steps, {time.time() - T0:.0f}s", flush=True)
+```
+
+Change to:
+```python
+        print(f"epoch {epoch} [{phase_name}]: loss {tot / max(nb, 1):.4f}, {steps} steps, {time.time() - T0:.0f}s", flush=True)
+```
+
+Wait, I need to be careful with the variable name `dl_tr` since I'm reusing it. Let me use a different name for the phase dataloader.
+
+Actually, let me just use `dl_cur` for the current dataloader in the loop.
+
+Let me re-examine the code more carefully to get the exact lines.
+
+```python
+    train_rows = crops + matched_dets
+    needed = {r["image"] for r in train_rows} | {d["image"] for d in ev}
+    images = {p: np.asarray(Image.open(os.path.join(args.data, "images", p)).convert("RGB")) for p in needed}
+    print(f"train {len(train_rows)} boxes ({len(crops)} gt + {len(matched_dets)} det), eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
+```
+
+OK so I'll change `train_rows = crops + matched_dets` to keep them separate but still compute `train_rows` for the `needed` set.
+
+Let me write the final changes:
+
+Block 1: Change train_rows to keep separate lists
+```
+    train_rows = crops + matched_dets
+    needed = {r["image"] for r in train_rows} | {d["image"] for d in ev}
+```
+→
+```
+    gt_rows, det_rows = crops, matched_dets
+    train_rows = gt_rows + det_rows
+    needed = {r["image"] for r in train_rows} | {d["image"] for d in ev}
+```
+
+Block 2: Change dataloader creation
+```
+    g = torch.Generator().manual_seed(args.seed)
+    dl_tr = torch.utils.data.DataLoader(BoxDataset(train_rows, images, True), batch_size=BATCH_SIZE, shuffle=True,
+                                        num_workers=workers, pin_memory=True, drop_last=True,
+                                        persistent_workers=True, generator=g, worker_init_fn=worker_init)
+```
+→
+```
+    g = torch.Generator().manual_seed(args.seed)
+    dl_gt = torch.utils.data.DataLoader(BoxDataset(gt_rows, images, True), batch_size=BATCH_SIZE, shuffle=True,
+                                        num_workers=workers, pin_memory=True, drop_last=True,
+                                        persistent_workers=True, generator=g, worker_init_fn=worker_init)
+    dl_det = torch.utils.data.DataLoader(BoxDataset(det_rows, images, True), batch_size=BATCH_SIZE, shuffle=True,
+                                         num_workers=workers, pin_memory=True, drop_last=True,
+                                         persistent_workers=True, generator=g, worker_init_fn=worker_init)
+```
+
+Block 3: Change training loop to use curriculum
+```
+    t_start = time.time()
+    t_end = deadline - RESERVE_S
+    budget = max(1.0, t_end - t_start)
+    steps, epoch, done = 0, 0, False
+    model.train()
+    while not done:
+        tot, nb = 0.0, 0
+        for x, y in dl_tr:
+```
+→
+```
+    t_start = time.time()
+    t_end = deadline - RESERVE_S
+    budget = max(1.0, t_end - t_start)
+    PHASE1_FRAC = 0.60
+    steps, epoch, done = 0, 0, False
+    model.train()
+    while not done:
+        frac_elapsed = (time.time() - t_start) / budget
+        dl_tr = dl_gt if frac_elapsed < PHASE1_FRAC else dl_det
+        phase_name = "GT" if frac_elapsed < PHASE1_FRAC else "DET"
+        tot, nb = 0.0, 0
+        for x, y in dl_tr:
+```
+
+Block 4: Change print to show phase
+```
+        print(f"epoch {epoch}: loss {tot / max(nb, 1):.4f}, {steps} steps, {time.time() - T0:.0f}s", flush=True)
+```
+→
+```
+        print(f"epoch {epoch} [{phase_name}]: loss {tot / max(nb, 1):.4f}, {steps} steps, {time.time() - T0:.0f}s", flush=True)
+```
+
+This looks good. Let me verify the hypothesis is clear and the changes are focused.
+
+Hypothesis: Training first on clean GT crops (to learn class representations) and then fine-tuning on detector boxes (to adapt to box misplacement) will improve mAP because the model won't be confused by the noisier detector boxes during the initial learning phase, leading to better class boundaries for the weak pore and stain classes.
+
+Category: sampling (it's about how we order/structure the training data)
+
+Actually, is it "sampling" or "data"? It's about the order of training data, which is more of a sampling/training strategy. I'll go with "sampling".
+
+Let me double-check the SEARCH strings match exactly. Let me re-read the current file carefully.
+
+Looking at the file:
+
+```python
+    train_rows = crops + matched_dets
+    needed = {r["image"] for r in train_rows} | {d["image"] for d in ev}
+```
+
+Yes, that's exact.
+
+```python
+    g = torch.Generator().manual_seed(args.seed)
+    dl_tr = torch.utils.data.DataLoader(BoxDataset(train_rows, images, True), batch_size=BATCH_SIZE, shuffle=True,
+                                        num_workers=workers, pin_memory=True, drop_last=True,
+                                        persistent_workers=True, generator=g, worker_init_fn=worker_init)
+```
+
+Yes.
+
+```python
+    t_start = time.time()
+    t_end = deadline - RESERVE_S
+    budget = max(1.0, t_end - t_start)
+    steps, epoch, done = 0, 0, False
+    model.train()
+    while not done:
+        tot, nb = 0.0, 0
+        for x, y in dl_tr:
+```
+
+Yes.
+
+```python
+        print(f"epoch {epoch}: loss {tot / max(nb, 1):.4f}, {steps} steps, {time.time() - T0:.0f}s", flush=True)
+```
+
+Yes.
+
+All looks good. Let me finalize.

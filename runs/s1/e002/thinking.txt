@@ -1,0 +1,257 @@
+===== attempt 1 =====
+Let me analyze the current situation and diagnostics carefully.
+
+Current best: e000, 5-seed val mAP@0.5 = 0.6288, seed std 0.0049.
+
+The diagnostics tell us:
+- Class chosen on detector boxes that overlap a true defect by IoU > 0.5:
+  - pore: 63% right (weak)
+  - deposit: 78% right (weak-ish)
+  - discontinuity: 96% right (strong)
+  - stain: 88% right (moderate)
+
+- mAP@0.5 if every box had its correct class but kept your scores: 0.7461 (yours: 0.6288). The difference is what wrong classes cost.
+- The remaining gap to the perfect-classes ceiling (0.758) is what your scores cost compared with the detector's conf: 0.758 - 0.7461 ≈ 0.012.
+
+So the main loss is from **wrong class assignments** (~0.117 mAP lost), and a smaller loss from score ranking vs detector conf (~0.012 mAP).
+
+The key insight from history:
+- "No gain" families include scoring tweaks (product rule, argmax, etc.), training augmentation, focal loss, class-balanced sampling, low-res crops, bigger backbones, TTA, longer training...
+- Two accepted changes: extra third view (+0.005, mostly pore), and detector boxes as extra training data (+0.004).
+
+The biggest error source is wrong class assignment. The current classifier uses a two-crop (1.5x tight + 2.5x wide) EfficientNet-B0 with logits averaged. The weak classes are pore (63% right) and deposit (78% right). Stain is confused with deposit (stain: 46 to deposit, 15 to pore; deposit: 55 to stain, 2 to pore).
+
+What's the likely issue? The current architecture uses two crops but no real "multi-view" at different scales beyond 1.5x and 2.5x. The earlier experiment tried a third view (4x) and got +0.005 mostly on pore. Pore is the weakest class - maybe pores need higher resolution or more context.
+
+Let me think about what's fundamentally not yet explored:
+
+1. **The two-crop averaging is suboptimal**: Instead of average pooling logits, we could use a proper multi-scale feature fusion. But that's an architecture change.
+
+2. **Pore detection is very weak (63%)**: Pores are small defects. The 1.5x tight crop for a small box would be 1.5 * small side ≥ MIN_CROP=16, which is tiny. Actually MIN_CROP = 16 gives a minimum of 16px side - that's quite small. Maybe the tight crop is too small for pores? But the wide crop at 2.5x should help...
+
+3. **Class imbalance in training**: The loss is plain cross-entropy. The history says "class-weighted loss hurt classification every time it was tried" - so class weighting is bad. But maybe there's a smarter way to handle the imbalance, like using focal loss (tried, no gain) or using harder negative mining?
+
+4. **The most promising direction**: The gap between 0.7461 (perfect classes, your scores) and 0.758 (ceiling) is only ~0.012 - the score ranking issue. The bigger issue is wrong classes: from current 0.6288 to 0.7461 would be +0.117! That's huge.
+
+Wait, but let me re-read: "mAP@0.5 if every box had its correct class but kept your scores: 0.7461 (yours: 0.6288)". So the wrong classes cost ~0.117 mAP. That's massive - nearly everything.
+
+What can fix the wrong class assignments? The classifier needs to be much better at distinguishing pore from deposit, and stain from deposit.
+
+Let me think about what the current model lacks:
+- The two crops (1.5x and 2.5x) are both relatively tight. For small objects, even the 1.5x crop might not give enough context.
+- Maybe I should try a better training strategy: train on the *detector boxes* (IoU>0.5 with true box) instead of only perfect crops.csv boxes. That was accepted once (+0.004). But that's in the history already - it says "accepted twice". So maybe I could improve on that.
+
+Actually wait - the important thing is: what are the ideas *outside* these families? The brief says "Ideas outside these families have not been tried." Let me think about what hasn't been tried:
+
+1. **Different IoU-based labeling for training**: Train on detector proposals at different IoU thresholds (Cascade R-CNN style). Instead of using crops.csv boxes (perfect boxes) for training, use the stage-1 detector boxes that overlap true defects by IoU>0.5 and label them with the true class. That was tried (+0.004).
+
+2. **Better multi-scale fusion**: Instead of averaging logits from two crops, maybe a proper feature pyramid or attention mechanism.
+
+3. **Hard example mining**: Focus training on examples where the model makes mistakes (pore/deposit confusion).
+
+4. **Training on boxes at different IoU thresholds with the classifier matching box quality**: Cascade R-CNN idea - train the second stage to classify boxes of a specific quality range. But we don't control the IoU of eval boxes... though we could simulate by using detector boxes at different IoU levels for training.
+
+5. **Data augmentation on the defect type confusion**: E.g., mixup between pore and deposit examples? Probably not.
+
+6. **Using the detector conf differently**: The history shows the scoring rule doesn't matter much (AP depends only on order within class). Actually, wait - the product rule `conf * p(c)` re-ranks within a class. But the diagnostics say "The difference is what wrong classes cost; the remaining gap to the perfect-classes ceiling in the brief is what your scores cost compared with the detector's conf."
+
+So the two parts of error are:
+1. Wrong class assignment: 0.7461 - 0.6288 = 0.117 mAP
+2. Score ranking vs detector conf: 0.758 - 0.7461 = 0.012 mAP
+
+The wrong class is the dominant error! And per-class: pore 63% right, deposit 78% right, discontinuity 96%, stain 88%.
+
+For pores: 63% right means it's mostly confused with deposit or stain (6+1+20 = 27 wrong). For deposit: 78% right (confused with stain 55, pore 2, discontinuity 2, no row 1 = 60 wrong).
+
+Hmm, actually wait. Looking at the confusion matrix more carefully - the "no row" column means boxes where no prediction row was written (score below MIN_SCORE) or... Actually "no row" likely means the box's highest-scoring row wasn't for a valid class? Let me re-read: "Class chosen (highest-scoring row) on detector boxes that overlap a true defect by IoU > 0.5". The columns are pore, deposit, discontinuity, stain, no row. So "no row" = no prediction rows were written at all for that box (all scores below MIN_SCORE). With the product rule and conf * p(c), some boxes might have low scores.
+
+Actually wait, with e001's change `s = max(d["conf"], float(p[c]))` - that crashed. But the scoring part is in the current best (e000) which uses the product rule. The "no row" column means the box got no predictions at all (all scores below MIN_SCORE=0.001). With conf ~0.5 and p(c) small, this can happen.
+
+But for the current analysis: the dominant problem is wrong classes.
+
+What would fix wrong classes?
+
+**Idea 1: Better feature extraction - multi-scale at inference AND training.** The two crops (1.5x and 2.5x) don't include much context beyond the box. For distinguishing pore vs deposit vs stain, texture matters. Maybe a larger context or multiple scales would help. The third-view experiment (+0.005 mostly pore) suggests more views help but add time.
+
+**Idea 2: Use the detector boxes for training (IoU-based).** This matches the test distribution better. Already tried once. Could try harder - e.g., train on boxes at IoU 0.3-0.7 with the true class, and use those for classification instead of crops.csv boxes. The rationale: our eval boxes are detector outputs, not perfect boxes; a classifier trained on near-perfect boxes may be overfit to box quality. This could give a big gain since we're training on 6052 boxes from crops.csv but the eval boxes are detector boxes which are often slightly off.
+
+Actually wait - that's already in history (accepted twice, +0.004). So I need something different.
+
+**Idea 3: Hard example mining / focused training on misclassified examples.** Train specifically to fix pore-deposit and deposit-stain confusion. E.g., use focal loss with specific class weights for the confused pairs. Focal loss was tried (2 attempts, no gain). Class-weighted loss hurt every time. So probably not.
+
+**Idea 4: Two-stage cascade where the second stage refines.** We can't do that - we only control stage 2.
+
+**Idea 5: Different training data composition.** The current best uses crops.csv boxes at "high" resolution. The history mentions `TRAIN_ON = ("high",)` - so only high-res. Maybe low-res also helps? "Low-resolution crops added to training" - tried, no gain. But maybe a *mix*?
+
+**Idea 6: Better use of context for small pores.** Pore is the weakest class (63% right). Pores are tiny. The tight crop at 1.5x MIN_CROP=16 gives a very small image for a pore. Maybe the issue is that for small boxes, the crop is too small to see the texture. What if we use a *fixed* minimum context based on image resolution, or use larger crops for small boxes? The "resolution and small-box handling" family was tried (no gain). Hmm.
+
+Actually let me think about this differently. What does the perfect-classes ceiling tell us: with 0.758 vs stage-agnostic 0.755, the box quality/ranking is basically at ceiling already. The current model at 0.6288 has massive room for improvement (0.117 mAP loss from wrong classes).
+
+The reference numbers say:
+- one-step 4-class detector baseline: 0.638 (to beat)
+- stage-1 boxes with perfect classes + your scores: 0.7461
+- stage-1 boxes perfect classes ceiling: 0.758
+- stage-1 class-agnostic: 0.755
+
+The current best at 0.6288 is *below* the one-step baseline of 0.638! So we're actually losing to the simple one-step detector. The task says "the baseline to beat" is 0.638.
+
+Wait, that's important. The current best (0.6288) is BELOW the one-step 4-class detector (0.638). So the two-stage approach with the current classifier is actually *worse* than a simple one-step detector! That means the classifier is quite bad.
+
+Now, what's the right approach? The most obvious fix given the diagnostics: **improve the classifier to reduce wrong class assignments**.
+
+The biggest confusion: pore vs deposit and stain vs deposit. 
+
+Let me think about what could be fundamentally different from all previous experiments:
+
+**Idea A: Multi-class training with harder negatives.** Currently trained with cross-entropy on 4 classes. What if we train with a contrastive loss or triplet loss to push pore and deposit apart? That's a "loss" family change - but focal loss was tried. Contrastive/triplet losses haven't been tried explicitly.
+
+**Idea B: Multi-scale feature fusion in the model.** Instead of two independent crops through the same model with logit averaging, we could use a proper multi-scale architecture like a pyramid. But timm models are fixed... We could try EfficientNetV2 or other backbones? That's "bigger or other backbone" - tried (no gain).
+
+**Idea C: Train on detector boxes at varying IoU levels.** Already tried (+0.004). 
+
+**Idea D: Use the *full image* context around each box for classification.** Instead of cropping, maybe use a crop that includes more of the surrounding weld bead? For instance, using a larger crop (like 5x) to capture the full bead and its surroundings. Stain vs deposit distinction might need the full bead context.
+
+**Idea E: Test-time / inference improvements.** TTA was tried (no gain). 
+
+**Idea F: Ensemble of classifiers with different views.** Ensembles were partially tried ("2-3 model ensembles" under "bigger or other backbone") - no gain. But maybe an ensemble of the *same* model with different crops?
+
+Hmm, let me think about the time budget more carefully. The current run uses 162s for training+prediction on 41879 eval boxes. Budget is 180s. That's very tight (RESERVE_S=55). Wait, the log says "done: 5 epochs, 433 steps, 53606 prediction rows, 162s total". So 162s total for training+prediction. Budget is 180s. So we have ~18s slack.
+
+Actually wait - the current best has 5-seed mean 0.6288 which is *below* the one-step baseline of 0.638. That's a red flag that something might be off, but it's "accepted" as best. The goal is to beat 0.638, and ultimately maximize mAP@0.5 on hidden test images.
+
+Let me focus: what's the biggest lever? Wrong classes cost 0.117 mAP. Getting perfect classes with current scores gives 0.7461. So if I could fix the classifier to get near-perfect class assignment, we'd jump from 0.6288 to ~0.74+.
+
+The two weak classes are pore (63%) and deposit (78%). What's special about them?
+- Pore: tiny, circular, inside the bead
+- Deposit: larger, raised material on the bead
+- Stain: discoloration around/inside the bead
+- Discontinuity: crack-like, very distinct
+
+The confusion patterns:
+- pore → 6 confused to deposit, 1 to discontinuity, 20 to stain (wait, that's odd)
+- deposit → 55 to stain!
+- stain → 46 to deposit!
+
+So deposit↔stain is a big confusion. And pore→stain too.
+
+This suggests the model needs *better texture discrimination*. The current two-crop setup with EfficientNet-B0 at 160px might not capture fine texture well enough.
+
+**Key insight**: For distinguishing visually similar classes (pore/deposit/stain), *high-resolution input* and *fine texture* matter most. The brief says "Distinguishing visually similar classes usually depends on fine texture; input resolution and how much of the crop the object fills both matter."
+
+The current IMG_SIZE is 160. The model is efficientnet_b0 which was trained at 224px (or 240px for B0? Actually EfficientNet-B0 default is 224x224). Using 160px means we're below the pretraining resolution, and timm will resize. "Fixing the train-test resolution discrepancy" suggests using the resolution the model was pretrained at, or fine-tuning resolution.
+
+**A promising idea: Increase IMG_SIZE to 224 (the natural resolution for EfficientNet-B0)**. This would give better texture detail for the fine-grained discrimination. But it costs more compute per crop... Actually no - the crops are resized to IMG_SIZE, and the model is efficientnet_b0 with default input size 224. So training at 160 means timm uses a smaller input size than expected; increasing to 224 gives better use of the backbone. The cost: per-batch time increases by (224/160)^2 ≈ 1.97x for forward/backward on the model. That would reduce the number of steps we can do in the budget... but each step is more valuable.
+
+Hmm, but "resolution and small-box handling" family was tried (no gain: best 5-seed 0.634). That included 224px? It says "224 px, larger MIN_CROP, enlarged tight crops for small boxes" - so 224px WAS tried and no gain. Hmm.
+
+Wait, but that was tried in the earlier runs with slightly different base setups maybe. Let me check: "Resolution and small-box handling (224 px, larger MIN_CROP, enlarged tight crops for small boxes)" - no gain. So 224px was already tried at some point. Hmm.
+
+OK let me think about what's *fundamentally* different from everything in the history:
+
+The family of "detector boxes as training data" got +0.004. The third view got +0.005. Both small gains. The history shows that all families had at most ~+0.005 gain, and many had no gain.
+
+Given that wrong classes cost 0.117 mAP, there must be a *big* fix available. What could it be?
+
+Actually, let me reconsider: the confusion between deposit and stain (55/46 swapped) and pore-deposit-stain triangle... These are all "surface texture" differences. A classifier at 160px with two crops might not distinguish them well. But what if the *crops* themselves don't show enough of the defect? For small defects, the tight crop (1.5x) with MIN_CROP=16 might be only 24px for a tiny pore - the defect fills almost nothing. The wide crop at 2.5x would be 40px.
+
+Hmm wait, but "share of those boxes with the right class by size: small 80%, medium 91%, large 93%" - so actually small boxes are *worse* classified than larger ones. That's interesting - it means for small boxes, the classifier fails more. But wait, small 80% right? That contradicts pore being 63% right... unless pores tend to be in the small box category but are confused with other classes.
+
+Actually the size thirds are "small 80%, medium 91%, large 93%" - that's the share of boxes with the right class, overall (averaged across classes). So all classes do better on larger boxes. Pore is likely small by nature.
+
+So for pores: they're small AND confused. The tight crop at 1.5x for a very small box gives MIN_CROP=16 → only 16px image with the pore being maybe 3-5px. Even the wide crop at 2.5x is only 40px.
+
+What's fundamentally new I could try?
+
+**Idea: Train a classifier on *multi-scale crops* that includes a high-resolution view of the defect.** Like, instead of two crops (1.5x and 2.5x), use a crop at a fixed resolution that always fills the image with the defect region at a reasonable size. E.g., for small boxes, use a large context; for large boxes, use a tight crop. The key: ensure the defect occupies a consistent fraction of the input image.
+
+Actually, that's close to "resolution and small-box handling" which was tried... but maybe not exactly. The earlier experiment included "enlarged tight crops for small boxes". Hmm.
+
+**Idea: Use a different training signal entirely.** Instead of classifying the crop, train on *pairs* or use *metric learning*. Not tried yet.
+
+**Idea: Multi-view ensemble at inference with different crops per box size.** The third view experiment (+0.005) suggests more views help. Maybe an ensemble of 3 models with different scales?
+
+**Idea: Use the detector conf + a better combination rule.** But scoring families were exhausted (16 attempts, no gain). Actually wait - e001 crashed and tried `max(conf, p(c))` which is a scoring change. The "fewer or re-weighted score rows" family had 16 attempts with no gain. So scoring changes are exhausted.
+
+OK here's my strongest idea, I think: **The dominant error is wrong classes (0.117 mAP), primarily from pore-deposit and deposit-stain confusion. The most promising untried direction is to use the detector proposals themselves for training the classifier at matching IoU levels, combined with a multi-scale crop strategy that ensures fine texture is visible.**
+
+But wait - "detector boxes as extra training data (IoU > 0.5)" was already tried (+0.004). So that's exhausted-ish.
+
+Hmm, let me think about what's really *new*:
+
+1. **Cascade-style training**: Train the classifier on detector boxes at IoU ranges [0.3, 0.7] and also on perfect crops, using a curriculum from easy to hard. Not exactly the same as just adding detector boxes - it changes the distribution of training examples.
+
+2. **Multi-scale input where each scale is optimized**: Instead of two fixed contexts (1.5x, 2.5x), sample the context randomly during training and use a fixed set of contexts at inference. This makes the model robust to different box qualities. Not tried.
+
+3. **A "hard" negative mining strategy**: Use the detector boxes that are false alarms for background training? That's the "background class from detector false alarms" family (9 attempts, no gain). Exhausted.
+
+4. **Feature pyramid / attention**: Architecture change within the model, not a different backbone. Like using a ConvNeXt with multi-scale features. Not tried in this family... but "bigger or other backbone" was tried.
+
+Hmm. Let me reconsider the situation. The harness says: "A direction where three or more attempts gave no confirmed gain is exhausted: do not propose another variant of it unless you can say what is fundamentally different."
+
+Families with no gain:
+- scoring tweaks (16 attempts) - exhausted
+- 5th background class (9 attempts) - exhausted
+- detector boxes as training data (6 attempts, accepted twice at +0.004, rejected 3 times) - partially successful but diminishing
+- third wide view (3 attempts, +0.005 mostly pore) - small gain, close to time limit
+- low-res crops in training (4 attempts, no gain) - exhausted
+- bigger/other backbone (8 attempts, no confirmed gain) - exhausted
+- resolution and small-box handling (9 attempts, no gain) - exhausted
+- TTA (8 attempts, no gain) - exhausted
+- longer training (6 attempts, no gain) - exhausted
+- class-balanced sampling / weighted loss (4 attempts, no gain) - exhausted
+- training augmentation (5 attempts, no gain) - exhausted
+- focal loss (2 attempts, no gain) - exhausted
+- box size/aspect ratio as input (4 attempts, 2 crashes, never properly tested) - this one "never properly tested"!
+
+Hmm! "Box size and aspect ratio as an extra model input" was NEVER properly tested due to crashes. That's a family where the idea might be good but wasn't actually tested. But that's about the box itself as input to the classifier... The hypothesis would be: the classifier knows the box size/shape, which helps (e.g., pores are small and circular, deposits are larger). This could help with the pore-deposit confusion!
+
+But it's "inference"-ish or "scoring"? It's more of an architecture input. Hmm.
+
+Actually, let me think about this from a different angle. What's the most important thing that hasn't been done:
+
+**The current classifier is trained on perfect crops.csv boxes, but evaluated on detector boxes.** There's a domain shift between these. The "detector boxes as training data" family tried to close this gap (+0.004). But maybe a *better* way to close it is to train the classifier to be invariant to box quality by using multi-scale random context crops during training - i.e., simulate the test distribution of detector boxes more faithfully.
+
+Actually, here's an idea that might be big and hasn't been tried properly: **Train with a randomized crop scale** where during training, the crop context is sampled from a wide range (e.g., 1.0x to 4.0x), so the classifier sees defects at many "box qualities" including tight, noisy detector-like boxes. This would make the classifier robust to the exact box placement that happens at test time. The current model uses fixed 1.5x and 2.5x crops for both training and inference - it might overfit to those specific contexts.
+
+But wait - "resolution and small-box handling" included "larger MIN_CROP, enlarged tight crops for small boxes". So some variants of this were tried. But *randomized* context during training is different from fixed two-crop. Hmm.
+
+Let me step back and think about what's most likely to give a *big* gain given the 0.117 mAP loss from wrong classes:
+
+Actually, I wonder if there's something structurally wrong. Let me re-examine: the current model averages logits from two crops (1.5x and 2.5x). For the wide crop at 2.5x, a small defect is even smaller relative to the image. So the wide crop helps with context but hurts with fine texture resolution for small defects. The tight crop at 1.5x might have the defect large enough. Averaging them might blur the decision.
+
+What if instead of averaging logits from two independent forward passes, we use a **single multi-scale feature extraction** or a **hierarchical input**? E.g., input both crops into the model simultaneously via a proper architecture? But timm models take single images...
+
+OK here's another thought: **ensemble**. The history says "2-3 model ensembles" under "bigger or other backbone" - no gain. So ensemble of models was tried. But an ensemble of *views* (not models) is different - the third-view experiment did that within one model (logits averaged). That gave +0.005.
+
+Hmm, what about **a smarter multi-scale approach**: at inference, instead of two fixed contexts, use 3-4 contexts with better spacing (e.g., 1.5x, 2x, 3x) and average. The third-view experiment only added a 4x view. Maybe 2x and 3x are better spacings? But that's in the "third wide view" family which gave +0.005 mostly pore.
+
+Let me think about **what's really unique about pores**. Pore: small, ~1-3px diameter, inside the weld bead. Deposit: larger raised region. Stain: discoloration, larger area. The confusion pore→stain (20) and pore→deposit (6): a pore might look like a tiny deposit or a tiny stain depending on context.
+
+What if the issue is that **the tight crop for a pore includes too much of the surrounding bead**, making it look like a stain? Or the wide crop makes the pore too small to see?
+
+Actually, here's an important thought: what does "pore" actually look like? It's probably a small dark spot inside the bead. If the crop is 16-40px and the pore is ~2-3px, the pore occupies 5-15% of the image - it should be visible. But distinguishing it from a tiny stain or deposit requires fine texture.
+
+OK, I think I need to consider **the most promising untried direction with a big potential effect**. Let me reconsider:
+
+**Idea: Multi-scale crops at training where one crop always shows the defect at high resolution.** Specifically: for each training box, use a tight crop that ensures the *defect* fills a fixed fraction of the image (e.g., 50%), rather than a fixed context multiplier. This is different from "enlarged tight crops for small boxes" because it's adaptive - based on the defect size within the box, not just the box area.
+
+Hmm, but that family was tried...
+
+**Idea: Train with the true class labels at IoU thresholds and simulate the full detector pipeline.** The "detector boxes as extra training data" family only used IoU>0.5 boxes. What about using *all* boxes (IoU>0.3) plus true positives? Not tried in that form.
+
+Hmm, I'm going in circles. Let me focus on the single most promising lever: **the classifier's wrong-class assignments cost 0.117 mAP**. The biggest confusions are pore-stain and deposit-stain. These need *better texture discrimination*.
+
+What if I try a **larger model at the native resolution**? The current best uses efficientnet_b0 at IMG_SIZE=160. The earlier "bigger or other backbone" family used EfficientNet-B2, ResNet-50 - no gain. But maybe those were tried at 160px too, with fewer steps fitting in the budget.
+
+Actually, let me reconsider the time budget carefully. Current: 433 steps in ~107s of training (162s total minus 13s load minus ~42s prediction?). Wait: log says "train 6052 boxes... (13s)", then epoch 0 at 59s, epoch 1 at 77s, ..., done at 162s. So training took ~103s (59 to 162), prediction took ~42s? Actually the last line says "done: ... 162s total" and it ran from T0. Let me compute: prediction of 41879 boxes at batch size 256 = ~164 batches. Hmm, that's a lot. Wait no - the eval dataset is `ev` (eval detections) which includes crops? No - `ev = [d for d in dets if d["split"] == "eval"]`. And the BoxDataset for eval uses `ev` rows. So 41879 eval detections, batch size 256 → ~164 batches. Each batch needs 2 forward passes (tight + wide). At 41879/256 ≈ 164 batches, and if each is ~0.2s, that's 33s. Plausible.
+
+So we have a tight budget. The key question: what change gives the biggest gain per second?
+
+Let me now think about a completely different angle: **the scoring / ranking**. Wait no - that's been exhausted (16 attempts).
+
+OK here's another thought experiment. The reference ceiling numbers:
+- perfect classes + your scores = 0.7461
+- perfect classes + detector conf = 0.758
+- class-agnostic (just conf) = 0.755
+
+The gap between 0Thinking budget reached. Stop thinking now and write the reply in the required format.

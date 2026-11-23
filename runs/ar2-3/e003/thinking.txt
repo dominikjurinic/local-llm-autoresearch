@@ -1,0 +1,229 @@
+===== attempt 1 =====
+Let me analyze the situation carefully.
+
+**Current state:**
+- Best: e000, 5-seed val mAP@0.5 = 0.6311
+- e001: crashed (type bug)
+- e002: rejected, seed-0 score 0.5172 (much lower than best)
+
+**Key observations:**
+1. The baseline (e000) trains on GT crops only, no background class. Score = 0.6311.
+2. The ceiling (stage-1 boxes with perfect classes) = 0.758.
+3. The one-step 4-class detector baseline = 0.638.
+4. Per-class AP: pore 0.506, deposit 0.630, discontinuity 0.780, stain 0.608.
+
+**What went wrong with e002:**
+e002 tried to train on detector boxes with a background class. It got 0.5172 on seed 0, which is much worse. Let me think about why.
+
+The issue is likely that when you train on detector boxes:
+- Many detector boxes are false alarms (background)
+- The class distribution is heavily skewed toward background
+- The model learns to predict "background" a lot
+- But the scoring is mAP@0.5, which rewards correct class predictions on true detections and good ranking
+
+Wait, but the problem says "Class-weighted loss hurt classification every time it was tried." And the background class approach... let me think more carefully.
+
+Actually, the key issue might be simpler. When you add a background class, the model now has 5 classes (0-3 + background). But the output format expects cls 0-3. So how does the background class map to predictions?
+
+Looking at e002's approach: it trains on detector boxes labeled by IoU>0.5 overlap with GT crops, with background for non-overlapping. But the output still needs to be 4 classes (0-3). So presumably the background probability is used to modulate the score, or the background class is excluded from output.
+
+The score dropped to 0.5172, which is quite bad. This could be because:
+1. The model is now 5-class, diluting the learning for the 4 defect classes
+2. The background class dominates training (many false alarms)
+3. The scoring mechanism might be wrong
+
+Let me think about what would actually help. The key insight from the brief:
+- "mAP@0.5 rewards, per class: (a) the right class on boxes that overlap a true defect, and (b) good ranking: true detections should score higher than false ones."
+- "Detector boxes include false alarms (background) and slightly misplaced boxes"
+- "the starting classifier was trained only on perfect boxes and has no notion of 'not a defect'"
+
+So the idea of adding background is sound, but the implementation in e002 was flawed. Let me think about what went wrong.
+
+Actually, I think the main problem with e002 might be:
+1. It changed the model to 5 classes (adding background)
+2. But the scoring still outputs 4 classes
+3. The background probability might be used to scale down scores
+4. But if the model is too aggressive about background (because background is the majority class), it might suppress true detections too much
+
+Or maybe the issue is that training on detector boxes (which are noisier than GT boxes) with the same augmentation pipeline doesn't work well. The detector boxes might be misaligned, and the crops look different.
+
+Let me think about what to try next. The brief says:
+- "Tuning hyperparameters alone helped little in earlier experiments; changes of method helped more."
+- "Class-weighted loss hurt classification every time it was tried."
+
+Ideas in scope:
+- Train on detector boxes with background class (tried, failed)
+- Combine detector conf and classifier probabilities differently
+- Robustness to box misplacement (jitter)
+- Use of low-res training crops
+- Test-time augmentation
+- Ensembling
+- Architecture changes
+
+Given that e002 failed badly, I should go back to BASE: best (e000) and try something different.
+
+Let me think about what's most promising:
+
+1. **Using low-res training crops**: The TRAIN_ON is currently ("high",). If we include "low" resolution crops, we get more training data. The brief mentions "use of low-res training crops" as an idea in scope. This is a simple change that could help.
+
+2. **Different scoring**: Currently score = detector_conf * class_probability. Maybe we should use a different combination, like detector_conf^alpha * class_probability^beta, or use the log of probabilities.
+
+3. **Test-time augmentation**: At inference time, average over multiple augmentations (flips, etc.)
+
+4. **Architecture change**: Try a different backbone.
+
+5. **Training on detector boxes but keeping 4 classes**: Instead of adding a background class, train on detector boxes but only use the ones that overlap with GT (i.e., filter to true positives). This gives more training data with the same class structure.
+
+Actually, let me reconsider. The e002 failure was dramatic (0.5172 vs 0.6311). Let me think about why.
+
+If e002 added a 5th class (background) and the model was 5-class, but the output was still 4 classes... The model would learn to be uncertain about all 4 classes because it's splitting probability mass with background. If background is, say, 50% of training samples, the model would assign ~50% to background on average, leaving only ~50% split across 4 classes. This would reduce the class probabilities significantly.
+
+But wait, the score is detector_conf * class_probability. If class probabilities are halved, scores are halved. But mAP is about ranking, not absolute scores. So halving all scores shouldn't matter for ranking... unless the background probability is used to modulate.
+
+Actually, I think the issue might be more fundamental. If the model is trained on detector boxes (which include false alarms), and the false alarms are labeled as "background" (class 4), then:
+- The model learns to distinguish background from defects
+- But the 4 defect classes are now in competition with background
+- The model might become less confident about all defect classes
+- The ranking within defect classes might be affected
+
+But more importantly, if the training data is now detector boxes (not GT boxes), the boxes are noisier. The crops might look different. The model might not learn as well.
+
+Let me think about what's the safest, most promising next step.
+
+**Option A: Include low-res crops in training**
+- Simple change: TRAIN_ON = ("high", "low")
+- More training data
+- Low-res crops might be noisier but provide more examples
+- Low risk, potentially moderate gain
+
+**Option B: Change scoring to use log-probabilities or different combination**
+- Instead of score = conf * p[c], use score = conf^a * p[c]^b
+- Or use log(conf) + log(p[c]) = log(conf * p[c]) which is the same ranking
+- Actually, conf * p[c] is already a product. The ranking is the same as log(conf) + log(p[c]).
+- Maybe use conf^0.5 * p[c] to reduce the influence of detector confidence?
+- Or p[c] / (1 - p[bg]) if we had a background class...
+
+**Option C: Train on detector boxes but keep 4 classes (filter to TP only)**
+- Use dets.csv train, but only keep boxes that overlap (IoU > 0.5) with GT crops
+- Label them with the GT class
+- This gives more training data (detector boxes that are true positives)
+- No background class, same 4-class structure
+- The boxes are slightly noisier than GT but still labeled correctly
+
+**Option D: Test-time augmentation**
+- At inference, average over horizontal flip, vertical flip, and original
+- 3x inference cost but more robust predictions
+- Simple to implement
+
+**Option E: Architecture change**
+- Try convnext_nano or efficientnet_b2
+- Might help with the weak classes (pore, stain)
+
+Let me think about which is most promising given the constraints.
+
+The per-class APs are: pore 0.506, deposit 0.630, discontinuity 0.780, stain 0.608. Pore is the weakest. The brief says "Pore and deposit are the weak classes; stain is often confused with deposit and background."
+
+I think **Option A (include low-res crops)** is the safest next step. It's a simple change, low risk, and directly addresses the data limitation. More training data should help, especially for the weak classes.
+
+Actually wait, let me reconsider. The brief says "Tuning hyperparameters alone helped little in earlier experiments; changes of method helped more." Including low-res crops is a data change, not a hyperparameter change. It's a method change (using different data).
+
+But actually, I want to be more strategic. Let me think about what the biggest lever is.
+
+The ceiling is 0.758 (perfect classes on stage-1 boxes). We're at 0.6311. The gap is 0.127. The one-step detector is at 0.638, so we're basically at the one-step detector level.
+
+The main sources of error:
+1. Wrong class assignments (the model misclassifies)
+2. False positives (the model assigns high scores to background boxes)
+3. Missed detections (the model assigns low scores to true defects)
+
+For (2) and (3), we need the model to distinguish background from defects. The current model has no background class, so it always assigns some probability to one of the 4 defect classes. This means background boxes get non-zero scores.
+
+But e002 tried adding background and failed. Why? Let me think more carefully.
+
+Actually, I wonder if the e002 failure was because of the specific implementation. Let me think about what a better background approach would look like:
+
+Instead of adding a 5th class to the model, we could:
+1. Keep the 4-class model
+2. Train on detector boxes, but for background boxes, use a "soft" label or a different loss
+3. Or: train a separate binary classifier (defect vs background) and combine with the 4-class classifier
+
+Actually, the simplest approach that might work: **train on detector boxes, keep 4 classes, but for background boxes, use a very low learning rate or exclude them from the class loss and only use them for a separate binary head.**
+
+But that's complex. Let me think simpler.
+
+**What about just including low-res crops?** This is the simplest change and directly increases training data. Let me go with this.
+
+Actually, let me reconsider the e002 failure more carefully. The score was 0.5172, which is dramatically lower. This suggests something went wrong, not just "the idea didn't work." 
+
+Possible issues with e002:
+1. The 5-class model might have been confused by the background class being dominant
+2. The scoring might have been wrong (e.g., including background in the output)
+3. The training data distribution might have been very different from the eval distribution
+
+Given the dramatic failure, I should be cautious about trying the background class approach again. Let me go with a safer change.
+
+**My choice: Include low-res training crops (TRAIN_ON = ("high", "low"))**
+
+Hypothesis: Including low-resolution training crops increases the training set size, providing more examples of each defect type (especially the weak pore and stain classes), which should improve classification accuracy and mAP.
+
+This is a simple, low-risk change. If it works, we can build on it. If it doesn't, we lose little.
+
+Wait, but I should also consider: the low-res crops might be significantly different from the high-res crops in terms of appearance. If the model is trained on a mix of high and low res, it might be confused. But the crops are resized to IMG_SIZE=160 anyway, so the resolution difference is mainly in the detail/quality.
+
+Actually, the low-res crops might be from a different camera or resolution, and the appearance might be quite different. This could hurt rather than help. But it's worth trying.
+
+Let me also consider: the current training uses 6052 boxes from high-res. If low-res adds, say, 3000 more boxes, that's a 50% increase in training data. That should help.
+
+OK, I'll go with including low-res crops. Simple change, clear hypothesis.
+
+Let me write the edit:
+
+```
+SEARCH: TRAIN_ON = ("high",)    # resolutions of crops.csv used for training
+REPLACE: TRAIN_ON = ("high", "low")  # resolutions of crops.csv used for training
+```
+
+That's it. One line change.
+
+Wait, but I should also think about whether the low-res crops have the same format. The brief says crops.csv has columns: id, res ("high"/"low"), image, x1, y1, x2, y2, img_w, img_h, cls. So the format is the same, just different resolution. The images are in the same images/ directory.
+
+One concern: the low-res images might be smaller, so the crops might be smaller in pixel space. But since we resize to IMG_SIZE=160, this should be fine. The context (1.5x, 2.5x) is relative to the box size, so it should work the same.
+
+Another concern: the low-res crops might have different aspect ratios or be from a different viewpoint. But since they're from the same weld beads, they should be similar.
+
+I think this is a reasonable next step. Let me go with it.
+
+Actually, let me reconsider one more time. The brief says:
+- "A crop classifier given perfect boxes reaches macro-F1 ~0.87 with the starting recipe (two-crop input)"
+- "Pore and deposit are the weak classes; stain is often confused with deposit and background."
+
+So the classifier is already pretty good (0.87 F1) on perfect boxes. The main issue is:
+1. The detector boxes are not perfect (they're slightly misplaced, some are false alarms)
+2. The model doesn't handle background well
+
+For (1), the jitter in make_crop already handles some misplacement. For (2), we need a background concept.
+
+But e002 failed at (2). So maybe I should focus on (1) more, or on improving the classification itself.
+
+Actually, 0.87 F1 on perfect boxes is good but not great. If we can push it to 0.90+, that would help. More training data (low-res crops) could help with this.
+
+Also, the per-class APs suggest pore (0.506) and stain (0.608) are the weak points. More data for these classes would help.
+
+OK, I'm going with low-res crops. Final answer.
+
+Let me also double-check: the change is minimal, it's a data category change, and the hypothesis is clear.
+
+BASE: best
+CATEGORY: data
+HYPOTHESIS: Including low-resolution training crops in addition to high-resolution ones increases the training set size, providing more examples of each defect type (especially the weak pore and stain classes), which should improve classification accuracy and overall mAP.
+
+The edit:
+```
+<<<<<<< SEARCH
+TRAIN_ON = ("high",)    # resolutions of crops.csv used for training
+=======
+TRAIN_ON = ("high", "low")  # resolutions of crops.csv used for training
+>>>>>>> REPLACE
+```
+
+This is clean and focused. One line change.

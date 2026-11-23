@@ -1,0 +1,251 @@
+===== attempt 1 =====
+Let me analyze the situation.
+
+Current best: e000, 5-seed val mAP@0.5 0.6302.
+- e001 (scoring): single-row prediction (argmax class only) → 0.5749, rejected. So outputting one row per box with argmax is worse than outputting 4 rows. Interesting.
+- e002 (data): training on high+low resolution → seed 0 0.6383, 5-seed mean 0.6293, not confirmed (essentially the same as 0.6302). So adding low-res crops didn't help.
+
+Per-class val AP: pore 0.502, deposit 0.628, discontinuity 0.781, stain 0.610. Pore is the weakest class.
+
+Reference numbers:
+- One-step 4-class: 0.638
+- Stage-1 boxes with perfect classes: 0.758 (upper bound)
+- Class-agnostic single class: 0.755
+
+So the gap between 0.630 and 0.758 is about 0.128, and this is due to class misassignment (and scoring). The classifier with perfect boxes reaches macro-F1 ~0.87 with the starting recipe. So there is headroom.
+
+Where is the error?
+1. Misclassification of boxes that overlap with true defects (wrong class).
+2. Ranking of false alarms (boxes that don't overlap with any true defect) — these get some class assigned and become FPs in that class.
+3. Box placement (stage 1 is fixed, so not much we can do here... actually we can't change stage 1 boxes).
+
+Key insight: when outputting 4 rows per box, a box that's a true detection for class c also becomes a FP in classes d≠c. In mAP@0.5, a prediction is a hit if it overlaps an unmatched true box of that class with IoU>0.5. So a box that truly matches a pore box, when predicted as stain with some score, becomes a FP in stain if it doesn't overlap a stain box. This pollutes stain's precision.
+
+e001 tried argmax only: 0.5749, worse. Why? Because when the argmax class is wrong, we lose the correct class entirely (the box becomes a FP in the wrong class and a miss in the correct class). With 4 rows, even if the top class is wrong, the correct class might be 2nd, and if its score is high enough relative to other predictions of that class, it can still be a hit. So multi-row is better on recall, but hurts precision.
+
+Better scoring idea: output rows with a threshold — only output rows where p(c) is sufficiently high, or output rows with a score that properly balances. Actually, the score is conf × p(c). Ordering within a class is by p(c) (conf is fixed per box). AP depends only on ordering. So multiplying by conf doesn't change per-class AP... wait, but conf differs per box, and per-class ordering is by conf×p(c). Hmm, per class c, all predictions of class c across all boxes are sorted by score = conf×p(c). So conf does affect per-class ordering, because different boxes have different confs.
+
+Wait, but actually, if we output all 4 rows per box, the set of predictions for class c is all boxes (each with score conf_b × p_c(b)). The order is by conf_b × p_c(b). If instead we output only boxes with p_c(b) above some threshold, we remove some predictions from class c. Removing predictions changes AP: removing a FP helps precision at all recall levels above its recall position; removing a TP hurts recall.
+
+The question is which is better. e001 (argmax only, 1 row per box) was much worse (0.5749 vs 0.6302). So keeping multi-row is good.
+
+What about a middle ground: output rows only where p(c) > p(argmax) × some factor, or p(c) > 0.1? Let me think about what would help.
+
+Actually, let me think about the error decomposition more carefully.
+
+Upper bound with perfect classes: 0.758. There, false alarms are kept as class 0 with detector conf, and boxes that overlap with true defects get the correct class. So the upper bound includes the FP pollution of false alarms (as class 0). The gap from 0.630 to 0.758 is:
+- Wrong classes on true boxes (the main part)
+- False alarms assigned to wrong classes (they're class 0 in the upper bound, but in our system they get whatever class the classifier says; if the classifier says "deposit" for a false alarm, it pollutes deposit instead of pore).
+
+Hmm wait, in the upper bound false alarms are all class 0 (pore). Pore is the weakest class (0.502). Interesting — maybe assigning false alarms to the class where they're most "harmless" matters.
+
+Actually, let me think about the metric more carefully. For a given class c, AP depends on the ordering of all predictions of class c (both TPs and FPs). A false alarm predicted as class c is a FP in class c. The upper bound puts all false alarms in class 0. So in the upper bound, classes 1, 2, 3 have zero FPs from false alarms — only true boxes of those classes (all correctly classified). That's why the upper bound is so high.
+
+In our system, false alarms get distributed across classes by the classifier. If the classifier is confident about a false alarm (high conf from stage 1, and the crop classifier also high prob), it becomes a high-scoring FP in whatever class it's assigned to.
+
+So one lever: for boxes that are false alarms (don't overlap any true defect), we'd like to either (a) assign them to a class where they do least damage, or (b) lower their score so they rank below TPs. But we can't know at test time which are false alarms.
+
+However, the classifier's confidence could correlate: false alarms (non-defect regions) might get lower max prob from the crop classifier. Actually, the crop classifier is trained only on defect crops, so it has no "background" class. A non-defect crop would still get some class assigned. Hmm.
+
+What about using the stage-1 conf? False alarms might have lower conf on average. The score is already conf × p(c), so low-conf false alarms rank lower within their class.
+
+Let me think about the biggest lever: improving classification accuracy on true boxes. Pore is weakest (0.502). Pore and deposit are the weak classes; stain is often confused with deposit.
+
+Ideas to improve classification:
+1. Better model: try a bigger model (efficientnet_b2, convnext_nano, etc.) — but budget. Current run: 432 steps in ~110s of training, 162s total. Model is efficientnet_b0 at 160px. A bigger model would be slower per step.
+
+2. Better input: currently two crops (tight 1.5x + wide 2.5x), logits averaged. Maybe add a third view, or use different contexts.
+
+3. Training data: 6052 high-res boxes. e002 showed low-res didn't help (0.6293 vs 0.6302, within noise).
+
+4. Class imbalance: class-weighted loss hurt every time. So no.
+
+5. Test-time augmentation: flip averaging. Currently 2 views (tight, wide). Could add flipped versions at test time (4 or 8 views). This is inference category. Would improve classification stability. Cost: 2x or 4x prediction time. Prediction is currently fast (41879 boxes, 52653 rows, total 162s including 13s load and ~110s training... wait let me compute: load 13s, training from ~13s to ~125s = ~112s, then prediction + writing from 125s to 162s = ~37s). So prediction is ~37s. TTA with 2x views → ~74s, total ~199s > 180s budget. Too much. Hmm, budget is 180s default but harness passes --seconds T. The log shows 162s total with T presumably 180. RESERVE_S=55. So training ends at deadline - 55 = 125s. Prediction takes 37s, finishing at 162s, 18s margin.
+
+If I double prediction cost, I'd need to reduce training. But training more might help. Tradeoff.
+
+Actually, wait — let me reconsider. The per-class AP numbers: pore 0.502 is the weak one. Let me think about what specifically hurts pore.
+
+Pore: small, round defects. Maybe the tight crop (1.5x) captures them well but they're small in the image. Deposit and stain confusion.
+
+Let me think about a fundamentally different approach that could gain ≥0.01.
+
+Option A: Improve the classifier architecture/capacity.
+- The classifier reaches macro-F1 ~0.87 with perfect boxes. But our mAP is 0.630 vs upper bound 0.758. So we're far from the classifier's potential. The gap is both misclassification AND false-alarm handling.
+
+Actually, let me reconsider. With perfect classes (upper bound 0.758), the classifier isn't even involved — boxes overlapping true defects get correct class, false alarms get class 0. Our 0.630 is 0.128 below that. If our classifier had macro-F1 0.87 on true boxes, we'd expect to be much closer to 0.758. The discrepancy suggests:
+- The classifier on actual stage-1 boxes (not perfect boxes) is worse than 0.87, because stage-1 boxes are slightly misplaced and include false alarms.
+- The false alarms pollute classes.
+
+Let me estimate. Suppose fraction of boxes that are true (overlap a defect) is f. False alarms are (1-f). In the upper bound, false alarms are all class 0. In our system, they're spread out.
+
+Hmm, I think the biggest lever might actually be handling false alarms better. Let me think.
+
+Actually, here's a cleaner way to think. Let me reconsider the scoring. Currently score = conf × p(c), output all 4 rows. 
+
+The issue: a true box for class c with p(c)=0.5, p(other)=0.5/3 each. It's a TP in class c (if it ranks high enough) but also a FP in the other 3 classes. Those FPs hurt precision in those classes.
+
+e001 (argmax only) removed the cross-class FPs but lost recall when argmax is wrong. Net: worse.
+
+What if we output rows with a soft threshold: output row for class c only if p(c) > some threshold τ, OR if c is argmax. This keeps the argmax always (so recall when argmax is right) but prunes low-probability cross-class FPs. This is a middle ground between e000 (all 4) and e001 (argmax only).
+
+But wait — would pruning help? A FP in class d (d≠true class) with low score ranks low in class d, so it only hurts precision at low recall (i.e., when we've already found most TPs, this FP is at the tail). Actually FPs always hurt: they reduce precision at every recall level below the TP's recall. But a low-scoring FP is at the end of the ranking, so it only affects the tail of the PR curve (high recall region). Hmm, actually in AP (area under PR curve), a FP at the very end (lowest score) barely matters because by then recall is maxed. So pruning low-prob rows might help little.
+
+Conversely, a high-prob wrong-class row (p(c)=0.4 for wrong c) is a high-scoring FP that hurts a lot.
+
+This is getting complicated. Let me think about what's the highest-leverage, most-likely-to-work change.
+
+Let me reconsider the problem from the error-decomposition angle the prompt wants.
+
+Reference:
+- 0.638 one-step (baseline to beat)
+- 0.758 perfect classes (upper bound)
+- 0.755 class-agnostic
+
+Our 0.630. Gap to upper bound = 0.128.
+
+The upper bound keeps false alarms as class 0. So the "class-agnostic" 0.755 is basically the same as upper bound (0.758) — makes sense, because if all one class, false alarms and true boxes are all "defect", and 0.755 reflects detector quality. The 0.758 (perfect classes, 4 classes) is slightly higher than 0.755 (1 class) — interesting, because with 4 classes and perfect assignment, each class's FPs are only the false alarms assigned to that class (all to class 0 in upper bound), so classes 1,2,3 have no FPs → high AP, and class 0 has all false alarms as FPs. Averaging gives 0.758.
+
+OK here's the key realization: In the upper bound, false alarms are dumped into class 0 (pore). Pore is already the weakest class. If instead we could dump false alarms into a class that has few true boxes (so the FPs are a smaller fraction), or better, if we could reduce false alarms' scores...
+
+But we can't identify false alarms at test time directly. However — the crop classifier's max probability might be lower for false alarms (non-defect regions look less like any defect). Actually not necessarily, since there's no background class.
+
+Alternatively, stage-1 conf: false alarms might have lower conf. Let me check — actually I don't have that data directly.
+
+Let me step back and think about the most robust, high-leverage experiment.
+
+Given:
+- Pore is weakest (0.502).
+- Pore/deposit weak, stain confused with deposit.
+- Class-weighted loss hurt.
+- Low-res data didn't help.
+- Argmax-only scoring hurt.
+
+The classifier is the core. To improve mAP, I should improve classification accuracy, especially for pore and the deposit/stain confusion.
+
+Idea: Improve the input representation. Currently tight (1.5x) + wide (2.5x), averaged. 
+
+For pore (small round holes), the tight crop is important. For deposit/stain (larger, texture), wide context helps. Averaging logits treats them equally. Maybe a weighted average, or a better model that can attend to both.
+
+Alternatively, use a stronger backbone. Let me consider budget.
+
+Current: efficientnet_b0, 160px, 2 views, batch 64, 432 steps in ~112s training. Per step ~0.26s. If I switch to efficientnet_b2 (bigger), per step maybe 2-3x → ~0.5-0.8s. In 112s that's ~140-220 steps. Fewer steps but bigger model. Unclear if net win.
+
+convnext_nano or resnet50? Let me think about which is best for this.
+
+Actually, a cleaner high-leverage idea: the two views are averaged in LOGIT space. But maybe concatenating features or using a better fusion helps. That's architecture change.
+
+Alternatively — and I think this is strong — add a third view or change contexts. But that's incremental.
+
+Let me reconsider. The prompt says "changes of method helped more" and "ideas that change what the model sees or learns from usually matter more than turning one more knob."
+
+What does the model see? Two crops per box. What if the issue is that for small pores, the 160px resize of a 1.5x crop loses detail? Pores are small. If the box is small (say 20px), 1.5x = 30px crop, resized to 160px = upsampling 5x. That's blurry. Maybe higher IMG_SIZE for the tight crop would help pore.
+
+But that's one knob.
+
+Let me think about the deposit/stain confusion and pore weakness from a different angle: maybe the model needs to see the box relative to the weld bead structure. The wide crop (2.5x) provides that. 
+
+Actually, let me reconsider the whole thing. I think the highest-leverage, most defensible experiment is to improve the classifier's discriminative power via a better backbone, because:
+1. It directly targets misclassification (the main gap to upper bound).
+2. It's a "method" change, not a knob.
+3. Pore and deposit/stain confusion should improve with more capacity.
+
+But budget is a concern. Let me estimate carefully.
+
+Actually, wait. Let me reconsider whether the gap is really misclassification or false-alarm handling. Let me estimate the false-alarm fraction.
+
+We have 41879 eval detections. How many are true (overlap a defect)? I don't have that number directly. But the class-agnostic single-class AP is 0.755. That's the detector's quality. If the detector has, say, 75% precision at some recall... hard to say.
+
+Let me think about it differently. The upper bound (perfect classes) is 0.758, essentially equal to class-agnostic 0.755. This means: when classes are perfect, the 4-class mAP ≈ 1-class mAP. The only difference is that in 4-class, false alarms are all class 0, so class 0 (pore) AP is dragged down by false alarms, but classes 1,2,3 are clean. The average is 0.758.
+
+Now our system: 0.630. The drop from 0.758 comes from:
+(a) True boxes misclassified → they become FPs in wrong class and misses in right class.
+(b) False alarms assigned to classes 1,2,3 (instead of all to class 0 as in upper bound) → adds FPs to those classes.
+(c) Scoring differences (we use conf×p, upper bound uses conf for true and conf for false-alarms-as-class-0).
+
+Hmm, (b) is interesting: in the upper bound, false alarms are ALL class 0. In our system, a false alarm the classifier calls "deposit" becomes a FP in deposit. If the classifier is fairly confident about false alarms (which it might be, since no background class), this adds substantial FPs to deposit, stain, discontinuity.
+
+Wait, but actually in the upper bound, false alarms are class 0 with score = detector conf. In our system, false alarms are class argmax(p) with score = conf × p(argmax). So our false alarms have LOWER score (conf × p < conf) and spread across classes. 
+
+So actually our false alarms are "softer" (lower score) and spread out. Spreading them out means each class gets fewer false alarms than if they were all in one class, but the upper bound has them all in class 0. So for classes 1,2,3, the upper bound has ZERO false alarms, while our system has some. That's a real disadvantage for classes 1,2,3. For class 0, the upper bound has ALL false alarms, our system has fewer.
+
+So the net effect of false-alarm handling: our system is better on class 0 (fewer FPs) but worse on classes 1,2,3 (some FPs instead of zero). Since pore (class 0) is already weak and deposit/stain/discontinuity are stronger, moving FPs from pore to the others might be net negative or positive depending on magnitudes.
+
+This is getting too deep without data. Let me just pick a strong, defensible experiment.
+
+I'll go with improving the backbone. But let me reconsider budget and which model.
+
+Actually, let me reconsider. Let me reconsider a cheaper, higher-leverage idea: test-time augmentation (TTA) by averaging over flips. This directly improves classification accuracy (reduces variance, handles the deposit/stain confusion better by seeing both orientations). It's an "inference" change.
+
+Current prediction: 2 views per box (tight, wide). With TTA flips, 4 views (tight, wide, tight-flip, wide-flip) or 8 views. Prediction currently ~37s for 2 views × 41879 boxes. 4 views → ~74s. Total would be ~13 (load) + 112 (train) + 74 (pred) = 199s > 180s. Over budget!
+
+Unless I reduce training. But training more is good. Hmm.
+
+Wait, let me recompute. Actually the prediction includes moving data, forward pass, softmax. The forward pass dominates. 2 views = 2 forward passes per box (batched). Actually the model does 2 forward passes per box (tight and wide), batched together. So "2 views" = 2 forward passes. Adding 2 flipped views = 4 forward passes = 2x prediction time.
+
+Current prediction ~37s → 2x = ~74s. Total 13 + 112 + 74 = 199s. Over 180.
+
+To fit, I'd reduce RESERVE or training. If I set RESERVE_S higher... no, reserve is for prediction. Actually the reserve is subtracted from deadline to get t_end (training end). If prediction takes 74s, I need reserve ≥ 74 + margin. Currently reserve 55, prediction 37. If prediction becomes 74, I need reserve ~85, leaving training budget = 180 - 85 = 95s instead of 125s. So 30s less training. Tradeoff: 30s less training for TTA.
+
+Is TTA worth 30s of training? TTA typically gives 1-3% relative improvement in classification. On a 0.63 mAP... could be 0.005-0.01. Borderline.
+
+Alternatively, do TTA only at test with fewer views, or do it more cheaply.
+
+Hmm, let me reconsider. Actually, maybe a cleaner high-leverage move: increase IMG_SIZE. Pores are small; 160px might be too low-res for the tight crop. Going to 224px would give more detail. But that's ~2x compute per forward (224/160 = 1.4x linear, ~2x area). Training would be ~2x slower → half the steps. And prediction 2x. Total budget issue again.
+
+Let me think about what's most likely to give ≥0.01 and fit budget.
+
+Actually, you know what, let me reconsider the problem. The classifier reaches macro-F1 0.87 with perfect boxes. Our mAP 0.630. The upper bound is 0.758. So even with a perfect classifier on true boxes, we'd get... let me think. If the classifier perfectly classifies all true boxes and we keep the scoring, we'd be close to 0.758 minus the false-alarm pollution. Actually the upper bound 0.758 assumes false alarms are class 0. If our perfect classifier also dumps false alarms somewhere, we'd get slightly different. Roughly, a perfect classifier ≈ 0.758 (maybe a bit less due to false-alarm class assignment). So the gap 0.630 → 0.758 is mostly classifier error on true boxes (misclassification) plus false-alarm effects.
+
+If macro-F1 is 0.87, that's 13% error on true boxes. That could account for a big chunk of the 0.128 gap. So improving the classifier is the lever.
+
+Given the classifier is the lever, and it's a method change, I'll improve the backbone. Let me pick a model that's stronger but fits budget.
+
+Options: efficientnet_b2 (bigger than b0), convnext_nano, resnet50, tf_efficientnetv2_b0.
+
+tf_efficientnetv2_b0 is a good modern model, similar size to b0 but better. It might be slightly slower. Let me think — efficientnetv2_b0 has more params and FLOPs than efficientnet_b0. Per step maybe 1.5x. 432 steps → ~280 steps in same time. Bigger model, fewer steps. Could be a wash or a win.
+
+convnext_nano: ~12M params, similar to efficientnet_b0 (~4M? no, efficientnet_b0 is ~4M, convnext_nano is ~12M). So convnext_nano is ~3x params. Per step ~2-3x slower. 432 → ~150-200 steps. Fewer steps but much bigger model. Risky for budget but the model quality gain might be worth it.
+
+Hmm. Actually, let me reconsider. The training is only ~112s and the model is fine-tuned from pretrained. With few steps, a bigger model might not fully train. But pretrained weights are strong; fine-tuning a bigger model for fewer steps could still beat a smaller model for more steps.
+
+Actually, I realize I should think about whether the bottleneck is model capacity or something else. The classifier at 0.87 macro-F1 — is that good or bad? For 4 classes with pore/deposit/stain confusion, 0.87 is decent but not great. A bigger model might push it to 0.90+.
+
+Let me go with a backbone upgrade. I'll pick efficientnet_b2 as a safe-ish upgrade (same family, 2x params, well-suited to 160px... actually b2 is designed for 260px, but works at 160). Or tf_efficientnetv2_b0.
+
+Hmm, let me reconsider budget more carefully and pick something that definitely fits.
+
+Actually, let me reconsider the whole approach. Let me reconsider whether there's a cheaper, higher-leverage change.
+
+Wait — here's a thought. The two views (tight + wide) are averaged. What if instead of averaging in logit space, I train the model to take BOTH views as a single input (concatenate along a new dimension, or as a 2-channel-per-view)? No, that changes architecture significantly.
+
+Alternatively, what if the wide crop is hurting? For pore (small), the wide crop (2.5x) dilutes the pore signal. Maybe the tight crop alone is better for pore, and wide helps deposit/stain. A per-class weighting could help but that's complex.
+
+Let me reconsider. I think the cleanest, highest-leverage, method-level change that fits budget is: upgrade the backbone to a stronger one. Let me go with tf_efficientnetv2_b0 or convnext_nano.
+
+Actually, let me reconsider the budget arithmetic for convnext_nano at 160px.
+
+efficientnet_b0 at 160px: 432 steps in 112s → 0.259s/step.
+convnext_nano at 160px: convnext_nano is ~12.9M params vs efficientnet_b0 ~4.1M. FLOPs: efficientnet_b0 ~0.4B at 224, convnext_nano ~0.9B at 224. At 160px, scale by (160/224)^2 = 0.51. So efficientnet_b0 ~0.2B, convnext_nano ~0.46B FLOPs. Ratio ~2.3x. So ~0.6s/step. In 112s → ~187 steps. Plus prediction 2x → but prediction is forward-only, similar ratio 2.3x → 37s × 2.3 = 85s. Total: 13 + 112 + 85 = 210s. Over budget!
+
+So convnext_nano would need reduced training. If prediction is 85s, reserve needs ~95, training budget = 180-95 = 85s → ~140 steps. Total fits at ~180s but tight. Risky.
+
+efficientnet_b2: ~7.7M params, ~1.0B FLOPs at 260. At 160px: 1.0 × (160/260)^2 = 0.38B. efficientnet_b0 at 160px ~0.2B. Ratio ~1.9x. ~0.49s/step. 112s → ~228 steps. Prediction 37 × 1.9 = 70s. Total 13 + 112 + 70 = 195s. Over budget slightly. Need reserve ~80, training 100s → ~204 steps.
+
+tf_efficientnetv2_b0: ~0.2B FLOPs at 224? Actually efficientnetv2_b0 is ~0.2B params... let me recall. efficientnetv2_b0: 0.2B params? No. Let me recall: efficientnetv2_b0 has 7.9M params? No. Hmm. Actually I think efficientnetv2_b0 is ~0.2B FLOPs at 224, similar to efficientnet_b0 but with better accuracy. Let me not rely on exact numbers.
+
+This is getting uncertain. Let me pick a model I'm fairly confident fits budget and is a clear upgrade.
+
+Actually, maybe the safest high-leverage move that DEFINITELY fits budget is to keep the same model but improve the input/training in a way that's cheap.
+
+Let me reconsider. What about increasing IMG_SIZE to 224 (from 160)? That's (224/160)^2 = 1.96x compute. Same as efficientnet_b2 roughly. Same budget issue.
+
+What about a cheaper change: add data augmentation that helps pore/deposit. E.g., color jitter, or random erasing. But "tuning hyperparameters alone helped little."
+
+Hmm, let me reconsider the scoring angle, since it's cheap (no retraining needed for the scoring change itself, but we retrain anyway).
+
+Actually, here's a clean scoring idea I haven't tried: instead of score = conf × p(c) for all 4 rows, use a score that better separates. But e001 showed argmax-only is worse. 
+
+What about: keep all 4 rows but change the score to conf × p(c) / (sum of p) — no, that's the same as conf × p(c) since sum p = 1.
+
+What about using p(c)^2 or a temperature to sharpen? A monotone function of score doesn't change per-class ordering... wait, but the score is conf × p(c), and conf differs per box. If I change to conf × p(c)^γThinking budget reached. Stop thinking now and write the reply in the required format.

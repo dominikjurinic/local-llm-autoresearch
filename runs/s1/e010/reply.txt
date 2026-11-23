@@ -1,0 +1,239 @@
+===== attempt 1 (287s) =====
+Looking at the diagnostics: wrong-class assignment on true defects costs ~0.117 mAP (current 0.6288 → 0.7461 if classes were perfect), with pore (63% right) and deposit (78%) being the weak classes — mostly confused with stain. All major architecture/score/timing families have been tried. The remaining gap is dominated by classifier accuracy on fine-grained texture, so I should target the training data distribution: e009 showed the stage-1 detector boxes at test time are a different distribution from GT boxes (+0.0017 hint), but it only kept matched positives as training examples — it never learned to reject false alarms (a key part of the loss since high-scoring false alarms re-rank true positives).
+
+This idea is fundamentally different: e009 was "train on detector positives"; here I train on *all* detector boxes with proper pseudo-labels, including the unmatched ones as class-0 background negatives. This directly targets the 0.117 mAP classification loss by teaching the classifier to distinguish true defects from artifacts while matching the test-time box distribution — no time budget increase (same model/epochs), and it's a data-level change that hasn't been attempted in this form.
+
+BASE: best
+CATEGORY: data
+HYPOTHESIS: The 0.117 mAP classification loss is driven by a classifier trained only on ground-truth boxes yet scoring noisy detector boxes; e009's gain (+0.0017) came from matching positive boxes but left false alarms unlabeled. Training the classifier on *all* stage-1 detector boxes — positives matched to GT classes (IoU>0.5), unmatched boxes labeled as background class 0 — teaches the model to reject artifacts and matches the test-time input distribution exactly, which should raise pore/deposit accuracy substantially without adding compute.
+<<<<<<< SEARCH
+    # Train on the stage-1 detector boxes themselves (what we classify at test time), labelled by
+    # overlap with ground truth. This matches the test-time input distribution exactly.
+    def iou(a, b):
+        ix1, iy1 = max(a["x1"], b["x1"]), max(a["y1"], b["y1"])
+        ix2, iy2 = min(a["x2"], b["x2"]), min(a["y2"], b["y2"])
+        iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+        inter = iw * ih
+        ua = (a["x2"] - a["x1"]) * (a["y2"] - a["y1"]) + (b["x2"] - b["x1"]) * (b["y2"] - b["y1"]) - inter
+        return inter / ua if ua > 0 else 0.0
+
+    gt_by_img = {}
+    for r in crops:
+        gt_by_img.setdefault(r["image"], []).append(r)
+    det_tr = []
+    for d in dets:
+        if d["split"] != "train":
+            continue
+        best, best_iou = None, 0.0
+        for g in gt_by_img.get(d["image"], []):
+            i = iou(d, g)
+            if i > best_iou:
+                best, best_iou = g, i
+        if best_iou > 0.5:
+            row = dict(d)
+            row["cls"] = best["cls"]
+            det_tr.append(row)
+    crops = det_tr
+    print(f"train {len(crops)} detector boxes, eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
+=======
+    # Train on the stage-1 detector boxes themselves (what we classify at test time), labelled by
+    # overlap with ground truth. This matches the test-time input distribution exactly. Positives keep
+    # their GT class; unmatched boxes are background (class 0, i.e. "not a defect of interest"), which
+    # teaches the classifier to reject false alarms as well as name defects — that rejection learning is
+    # what e009's positive-only variant lacked and where the wrong-class loss mainly lives.
+    def iou(a, b):
+        ix1, iy1 = max(a["x1"], b["x1"]), max(a["y1"], b["y1"])
+        ix2, iy2 = min(a["x2"], b["x2"]), min(a["y2"], b["y2"])
+        iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+        inter = iw * ih
+        ua = (a["x2"] - a["x1"]) * (a["y2"] - a["y1"]) + (b["x2"] - b["x1"]) * (b["y2"] - b["y1"]) - inter
+        return inter / ua if ua > 0 else 0.0
+
+    gt_by_img = {}
+    for r in crops:
+        gt_by_img.setdefault(r["image"], []).append(r)
+    det_tr = []
+    for d in dets:
+        if d["split"] != "train":
+            continue
+        best, best_iou = None, 0.0
+        for g in gt_by_img.get(d["image"], []):
+            i = iou(d, g)
+            if i > best_iou:
+                best, best_iou = g, i
+        row = dict(d)
+        # class 0 (background/pore-agnostic) is used for unmatched boxes; matched boxes keep GT class.
+        row["cls"] = best["cls"] if best_iou > 0.5 else 0
+        det_tr.append(row)
+    crops = det_tr
+    print(f"train {len(crops)} detector boxes (incl. false alarms as bg), eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
+>>>>>>> REPLACE
+===== attempt 2 (87s) =====
+<search>import time
+
+T0 = time.time()  # the time budget counts from here
+
+import argparse
+import csv
+import math
+import os
+import random
+
+import numpy as np
+import timm
+import torch
+import torch.nn as nn
+from PIL import Image
+</search>
+<replace>import time
+
+T0 = time.time()  # the time budget counts from here
+
+import argparse
+import csv
+import math
+import os
+import random
+
+import numpy as np
+import timm
+import torch
+import torch.nn as nn
+from PIL import Image
+
+
+# ---------------------------------------------------------------- settings
+MODEL = "efficientnet_b0"
+PRETRAINED = True
+IMG_SIZE = 160
+CONTEXT = 2.5           # wide crop: side = CONTEXT * long side of the box
+TIGHT_CONTEXT = 1.5     # tight crop
+MIN_CROP = 16
+TRAIN_ON = ("high",)    # resolutions of crops.csv used for training
+BATCH_SIZE = 64
+LR = 1e-3
+WEIGHT_DECAY = 0.05
+RESERVE_S = 55          # seconds kept free for prediction and writing
+MIN_SCORE = 0.001       # rows below this score are not written
+MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+
+def read_csv(path):
+    rows = list(csv.DictReader(open(path)))
+    for r in rows:
+        for k in ("x1", "y1", "x2", "y2", "conf"):
+            if k in r:
+                r[k] = float(r[k])
+        if "cls" in r:
+            r["cls"] = int(r["cls"])
+    return rows
+
+
+def make_crop(img, r, context, train):
+    h, w = img.shape[:2]
+    cx, cy = (r["x1"] + r["x2"]) / 2, r["y1"] + r["y2"]) / 2
+    side = max(max(r["x2"] - r["x1"], r["y2"] - r["y1"]) * context, MIN_CROP)
+    if train:  # light geometric jitter
+        cx += random.uniform(-0.1, 0.1) * side
+        cy += random.uniform(-0.1, 0.1) * side
+        side *= random.uniform(0.85, 1.2)
+    s = max(2, int(round(side)))
+    x0, y0 = int(round(cx - s / 2)), int(round(cy - s / 2))
+    canvas = np.full((s, s, 3), 114, dtype=np.uint8)  # gray padding outside the image
+    sx0, sy0, sx1, sy1 = max(0, x0), max(0, y0), min(w, x0 + s), min(h, y0 + s)
+    if sx1 > sx0 and sy1 > sy0:
+        canvas[sy0 - y0:sy1 - y0, sx0 - x0:sx1 - x0] = img[sy0:sy1, sx0:sx1]
+    return np.asarray(Image.fromarray(canvas).resize((IMG_SIZE, IMG_SIZE), Image.BILINEAR), dtype=np.float32) / 255.0
+
+
+class BoxDataset(torch.utils.data.Dataset):
+    def __init__(self, rows, images, train):
+        self.rows, self.images, self.train = rows, images, train
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __getitem__(self, i):
+        r = self.rows[i]
+        img = self.images[r["image"]]
+        fh = fv = False
+        bright = 1.0
+        if self.train:  # same flips and brightness for both views
+            fh, fv, bright = random.random() < 0.5, random.random() < 0.5, random.uniform(0.8, 1.2)
+        views = []
+        for ctx in (TIGHT_CONTEXT, CONTEXT):
+            x = make_crop(img, r, ctx, self.train)
+            if fh:
+                x = x[:, ::-1]
+            if fv:
+                x = x[::-1, :]
+            if self.train:
+                x = np.clip(x * bright, 0, 1)
+            x = (x - MEAN) / STD
+            views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))
+        return views[0], views[1], r.get("cls", -1)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data", default="/work/data")
+    ap.add_argument("--out", default="/work/out")
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--seconds", type=float, default=180)
+    args = ap.parse_args()
+    deadline = T0 + args.seconds
+    random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    crops = [r for r in read_csv(os.path.join(args.data, "crops.csv")) if r["res"] in TRAIN_ON]
+    dets = read_csv(os.path.join(args.data, "dets.csv"))
+    ev = [d for d in dets if d["split"] == "eval"]
+    needed = {r["image"] for r in crops} | {d["image"] for d in ev}
+    images = {p: np.asarray(Image.open(os.path.join(args.data, "images", p)).convert("RGB")) for p in needed}
+    print(f"train {len(crops)} boxes, eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
+
+    workers = min(8, os.cpu_count() or 2)
+</replace>
+===== attempt 3 (85s) =====
+BASE: best
+CATEGORY: data
+HYPOTHESIS: The 0.117 mAP classification loss is driven by a classifier trained only on ground-truth boxes yet scoring noisy detector boxes; e009's gain (+0.0017) came from matching positive boxes but left false alarms unlabeled. Training the classifier on *all* stage-1 detector boxes — positives matched to GT classes (IoU>0.5), unmatched boxes labeled as background class 0, i.e. "not a defect of interest" — teaches the model to reject artifacts as well as name defects, matching the test-time input distribution exactly without adding compute.
+<<<<<<< SEARCH
+    print(f"train {len(crops)} boxes, eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
+
+    workers = min(8, os.cpu_count() or 2)
+=======
+    # Train on the stage-1 detector boxes themselves (what we classify at test time), labelled by
+    # overlap with ground truth. Positives keep their GT class; unmatched boxes are background (class 0),
+    # which teaches the classifier to reject false alarms as well as name defects -- that rejection
+    # learning is what e009's positive-only variant lacked and where the wrong-class loss mainly lives.
+    def iou(a, b):
+        ix1, iy1 = max(a["x1"], b["x1"]), max(a["y1"], b["y1"])
+        ix2, iy2 = min(a["x2"], b["x2"]), min(a["y2"], b["y2"])
+        iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+        inter = iw * ih
+        ua = (a["x2"] - a["x1"]) * (a["y2"] - a["y1"]) + (b["x2"] - b["x1"]) * (b["y2"] - b["y1"]) - inter
+        return inter / ua if ua > 0 else 0.0
+
+    gt_by_img = {}
+    for r in crops:
+        gt_by_img.setdefault(r["image"], []).append(r)
+    det_tr = []
+    for d in dets:
+        if d["split"] != "train":
+            continue
+        best, best_iou = None, 0.0
+        for g in gt_by_img.get(d["image"], []):
+            i = iou(d, g)
+            if i > best_iou:
+                best, best_iou = g, i
+        row = dict(d)
+        row["cls"] = best["cls"] if best_iou > 0.5 else 0
+        det_tr.append(row)
+    crops = det_tr
+    print(f"train {len(crops)} detector boxes (incl. false alarms as bg), eval {len(ev)} detections, "
+          f"{len(images)} images ({time.time() - T0:.0f}s)", flush=True)
+
+    workers = min(8, os.cpu_count() or 2)
+>>>>>>> REPLACE

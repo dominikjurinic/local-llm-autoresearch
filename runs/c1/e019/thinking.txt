@@ -1,0 +1,154 @@
+===== attempt 1 =====
+Let me think carefully about where we are and what to try next.
+
+Current state:
+- Best: e000 (two-crop 160px EfficientNet-B0, logit averaging), 5-seed 0.6288
+- e018 crashed due to a negative stride bug in the flip code: `x[:, ::-1, :]` on a tensor — wait, the error says "step must be greater than zero". Actually `x[:, ::-1, :]` is a valid negative step. Hmm, the error is at line 139 `x = x[:, ::-1, :].contiguous()`. "ValueError: step must be greater than zero" — this is odd for `[::-1]`. Wait, actually the issue might be that `x` is a torch tensor from `torch.from_numpy` and `.contiguous()` on a negative-strided view... no, that works fine. Hmm, "step must be greater than zero" — this error message comes from numpy or torch? In torch, `x[:, ::-1, :]` is fine. Actually wait — in the diff, the flip is applied to `x` which is a torch tensor. `x[:, :, ::-1]` and `x[:, ::-1, :]` are both valid torch slices. The error "step must be greater than zero" is a numpy error message... Actually, torch's `contiguous()` on a negative-stride tensor is fine.
+
+Hmm, let me actually reconsider: the traceback shows `x = x[:, ::-1, :].contiguous()` raising `ValueError: step must be greater than zero`. This is strange. Maybe... `x` here is not a tensor? No, `make_composite` returns `torch.from_numpy(...)`. Hmm.
+
+Wait — actually the issue might be this: in `make_composite`, `tight = np.asarray(Image.fromarray(tight).resize((tw, th), Image.BILINEAR), dtype=np.uint8)` — if `tw` or `th` were ≤ 0... no, they're clamped to ≥ 2.
+
+Actually, "step must be greater than zero" — I recall this error occurs in numpy when doing fancy operations with negative strides? No... `np.ascontiguousarray` handles negative strides fine.
+
+Hmm, actually I think the error comes from torch: `torch.from_numpy` on an array... no wait, the line in question is `x[:, ::-1, :].contiguous()` where x is a tensor. In PyTorch, negative strides are allowed in views, and `.contiguous()` copies. This works.
+
+Could it be... the tensor was created with `torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1)))` — that's fine.
+
+Whatever the exact cause (maybe a quirk of the torch version), the practical lesson is: e018's composite idea crashed on the flip code. If I want to retry the composite idea, I should fix the flip to use `torch.flip(x, [1])` or `torch.flip(x, [2])` instead of negative slicing.
+
+But wait — should I even retry e018's idea? Let me think about what e018 was: a single 224×224 input with the native-scale tight region in the top-left corner and the wide context crop filling the rest. This is a hybrid of e001 (side-by-side 224) and "native scale tight crop" (resolution family). The resolution family was tried 9 times in the past run with no gain ("224 px, larger MIN_CROP, enlarged tight crops for small boxes" — no gain, best 0.634 unconfirmed). Hmm, but e018's specific formulation is different: it keeps the tight region at native scale (no upscaling blur) while providing wide context in the same image.
+
+Actually, let me step back and think about the error structure:
+
+Diagnostics:
+- 0.6288 vs 0.7461 with perfect classes → 0.117 lost to wrong classes.
+- vs 0.758 ceiling (perfect classes + detector conf scores... actually the brief says 0.758 is the ceiling with detector conf; the diagnostic says "mAP@0.5 if every box had the correct class but kept your scores: 0.7461". So the remaining gap to the 0.758 ceiling is what your score costs compared to detector conf — small, ~0.012).
+- Class confusion: pore is weakest (63% correct; 20 pore→stain, 6 pore→deposit), deposit 78% (55 deposit→stain), stain 88% (46 stain→deposit), discontinuity 96%.
+- Small defects: 80% correct class (vs 91-93% for medium/large).
+
+So the dominant error is wrong class, concentrated in the stain↔deposit↔pore tangle, and worse for small boxes.
+
+What has been tried (this run + past runs):
+- Score row manipulation: exhausted, no gain.
+- Background class: no gain.
+- Train-split detector boxes as extra data: +0.004, accepted twice in the past but not confirmed here (e003: 0.6356 seed 0, 5-seed 0.6295 — not confirmed). Hmm, e003 was "not confirmed" — close.
+- Third wide view (4x): accepted twice in the past (+0.005, mostly pore). In this run, e013 tried a 1.0x texture crop (rejected, 0.6267). The 4x wide view was not tried in this run! Wait, the past run tried "third, very wide view (4x the box)" and accepted twice at 5-seed 0.6342 (+0.005), gain almost entirely from pore. But today's acceptance rule is stricter (counts validation image noise), and +0.005 might not pass. Hmm. But e018 was trying a 4.0 context crop in composite form.
+- Low-res crops: no gain.
+- Bigger backbone / ensemble: no gain.
+- Resolution / small boxes: no gain (past run).
+- TTA: no gain.
+- Longer training: no gain.
+- Class-balanced sampling / weighted loss: no gain.
+- Training augmentation: no gain.
+- Focal loss: no gain.
+- Box size / aspect as input: never properly tested (2 crashes, 1 edit failure, 1 run at 0.629). e002 crashed, e007 was rejected (0.6215).
+
+This run's attempts:
+- e001 side-by-side 224: 0.6323 seed 0, 5-seed 0.6275 not confirmed.
+- e003 detector train boxes: 0.6356 seed 0, 5-seed 0.6295 not confirmed.
+- e005 (detector boxes with...? "add detector..." cut off): 0.6310, 0.6301 not confirmed.
+- e008 multi-label BCE: 0.6298, 0.6296 not confirmed.
+- e012 feature concatenation: 0.6365 seed 0, 5-seed 0.6313 not confirmed.
+- e015 copy-paste pore: 0.6355 seed 0, 5-seed 0.6269 not confirmed.
+- e017 SGD: 0.6409 seed 0 (!), 5-seed 0.6318 not confirmed. Interesting — SGD seed 0 was 0.6409 but 5-seed 0.6318. So seed 0 was lucky.
+
+Pattern: many seed-0 scores in the 0.631-0.641 range, but 5-seed means cluster around 0.627-0.632. The acceptance bar is strict: must beat the best by more than the uncertainty (seed noise ±0.005 plus validation image noise). Best is 0.6288 with std 0.0049. So a new 5-seed mean needs to be roughly > 0.6288 + ~0.007-0.01 or so? The harness says "a gain from a handful of images or one small class usually doesn't hold". So we need a real, broad gain of ≥ ~0.01.
+
+What hasn't been tried and could plausibly yield ≥0.01?
+
+Ideas:
+
+1. **Fix e018's composite (native-scale tight + wide context in one 224 image)**. The crash was a bug in the flip code. The idea: small defects are blurry because the tight crop upscales a small region to 160px; keeping native scale preserves texture. But the past run's "resolution" family (9 attempts, no gain) included "enlarged tight crops for small boxes" and "224 px" — those rescaled to 224. e018's native-scale approach is different, but is it fundamentally different enough? The past family was about changing input resolution/scale; e018 keeps native scale. Hmm. The composite also changes what the model sees (one image with both scales, spatially related). e001 tried side-by-side (both rescaled to 112) — no gain. e012 tried feature concatenation — no gain. The "two views combined" family has 3+ attempts (e001, e011/e012, e013, e018) with no confirmed gain. Per the rules, "directions where 3+ attempts yielded no confirmed gain are exhausted: do not propose another variant unless you can say what is fundamentally different". e018's native-scale tight is arguably fundamentally different (no upscaling blur), but the family is crowded and 4 attempts have failed. Also 224px costs ~2x compute per view... actually e018 is one 224 image vs two 160 images: 224² = 50176 vs 2×160² = 51200 — same pixel count, similar cost. OK on budget. But I'm leaning away from retrying e018; the view-combination family looks exhausted.
+
+2. **Use detector conf as a training signal / sample weighting**? Not clearly different from class weighting.
+
+3. **Train on both high and low res crops** — TRAIN_ON = ("high",) currently. The past run? "add data from different sources or resolutions can help or hurt". Was "train on low-res crops" tried? The past family "low-res crops added to training: 4 attempts, no gain". So no.
+
+4. **Two-stage within stage 2: coarse-to-fine**. E.g., first classify with a wide crop, then refine? Costs compute.
+
+5. **Pseudo-label / self-training with detector train-split boxes** — e003/e005 tried adding detector boxes; +0.004, not confirmed under the strict rule. Hmm, but wait: in the past run it was accepted twice at 5-seed 0.6337/0.6342 (+0.004) under the looser rule. Under today's rule, +0.004 is below the ~0.005 noise floor and won't be accepted. So that direction is effectively dead for acceptance.
+
+6. **Better use of the 180-second budget**: currently 433 steps in ~149s, 162s total. Prediction: 53606 rows, 41879 eval boxes × 2 views. What's the prediction time? Total 162s, training ends at ~149s (125s at epoch 4, then epoch 5 partial until t_end=125? Let me compute: T=180, RESERVE=55, so t_end = T0+125. Log: epoch 4 done at 125s, then "done: 5 epochs, 433 steps, 162s total". So prediction took ~37s. Training had 125s budget, used up to 125s (epoch 5 was cut off? "done: 5 epochs" — epoch counter incremented after print; the loop broke mid-epoch-5? Actually the print shows "epoch 4: ... 125s" then done at 162s. So training ran epochs 0-4 fully, and epoch 5 started and broke immediately? 433 steps = 94+94+94+94+57. Yes, epoch 5 had 57 steps before the time check. So training used the full 125s budget.
+
+Can we speed up training to get more steps? Options:
+- channels_last + AMP already on.
+- Reduce num_workers overhead? Data loading: 6052 boxes, 94 steps/epoch at batch 64 → 6052/64 = 94.5 batches. Step time: 125s / 433 steps ≈ 0.29s/step. That's slow for a 160px EfficientNet-B0 on GPU — suggests data loading is the bottleneck (crop generation in workers: PIL resize ×2 per sample, plus image dict lookup). In fact, images are loaded into memory as numpy arrays; workers do crop + resize + normalize. 8 workers. 0.29s/step × 64 samples = 18.5 samples/s. That's slow — probably CPU-bound in crop generation (PIL bilinear resize of 2 crops per sample).
+
+If we can 2-3x the throughput, we get 800-1200 steps instead of 433. More steps with a cosine schedule that decays to zero by the budget end... but the schedule is time-based (frac of budget), so more steps in the same time just means smaller steps per unit time; the LR schedule is the same. More optimization steps at the same LR schedule generally helps (the budgeted training paper: more steps helps if the schedule ends at zero). But is the model undertrained? Loss at 433 steps is 0.2189 and still dropping. With 2x steps, final loss would be lower. This could be a real gain!
+
+How to speed up data loading:
+- Precompute crops? 6052 train boxes × 2 views = 12104 crops of 160×160×3 float32 = 12104 × 76800 × 4 bytes ≈ 3.7 GB. Too much? Maybe OK but risky. Actually we can precompute uint8 crops (12104 × 160×160×3 = 930 MB) — feasible. But training-time augmentation (jitter, flip, brightness) needs per-epoch randomness; if we precompute base crops (without jitter), we can still apply flip/brightness on the small 160px array cheaply. The expensive part is the PIL resize of the variable-size canvas to 160×160. Precomputing the jittered canvas per epoch is also possible but... simpler: precompute the 2 views (no jitter) once at load time (12104 resizes, ~1-2s each? no — PIL resize of a small image is fast, ~0.1-0.5ms each → 12104 × 2 × 0.3ms ≈ 7s). Then per-sample work is just flip/brightness/normalize on a 160×160 array — cheap. This could cut step time dramatically.
+
+But wait: the jitter (cx, cy shift, side scale) is part of the augmentation. If we precompute without jitter, we lose that augmentation. We could precompute multiple jittered variants per box (e.g., 4 variants) and cycle through them. Or keep light jitter by precomputing a slightly larger canvas and random-cropping? Simpler: precompute 2-3 jittered variants per box at load time (12104×3×2 resizes ≈ 25s? maybe too slow). Hmm, load time is currently 13s. Budget: 180s total, 55s reserve → 125s for training. Load is included in the 180s total. If precompute takes 20s, training gets 105s.
+
+Alternative speedups:
+- Reduce per-sample Python overhead: use a single canvas resize instead of two? The two views are two different canvases.
+- Use torchvision transforms? Similar cost.
+- Batch the resizes with numpy? Hard.
+- Increase batch size to 128: fewer, bigger steps; GPU utilization improves; data loading per sample is the same but GPU work per step doubles. If CPU-bound, bigger batch helps amortize. Currently 0.29s/step; if CPU-bound at ~18.5 samples/s, batch 128 → ~6.9s/step for 128 samples = same sample rate but fewer optimizer steps (bad: 433→~216 steps). Hmm, if CPU-bound, batch size doesn't change sample throughput, and fewer steps is bad. So we want to speed up per-sample work.
+
+Actually, let me reconsider: is it really CPU-bound? 160px EfficientNet-B0 forward+backward on a decent GPU with batch 64, AMP, channels_last: maybe 5-15ms. 0.29s/step is way above that → yes, CPU/data-bound.
+
+Precomputation plan:
+- At load time, for each train box, generate the 2 view canvases (tight 1.5x, wide 2.5x) at a fixed jitter (no jitter, or 1 variant), resize to 160×160, store as uint8 (or float32 normalized? uint8 saves memory; normalize per-sample is cheap: (x/255 - mean)/std on 160×160×3 = 76800 elements — numpy ~0.1ms, fine).
+- Keep flip + brightness augmentation per-sample (cheap on 160×160).
+- Drop the geometric jitter (cx/cy/side) — or emulate it with random crop from a slightly larger precomputed canvas? We could precompute the canvas at, say, 1.2x the final size and random-crop 160×160 from it per sample — cheap random crop gives positional jitter. That's a nice trick: precompute the canvas at side*1.25 (or 200px), then per sample random-crop 160 from 200 (cheap numpy slice), resize 200→160 (one small PIL resize, ~0.1ms). Hmm, still a resize per sample. Or precompute the final 160 and only do flip/brightness — losing jitter. Jitter has probably been contributing modestly.
+
+Simpler and safer: precompute the final 160×160 views (no jitter), keep flip/brightness. The loss of jitter is a small risk; the gain in steps (probably 2-3x) is a bigger potential. Actually wait — can we keep jitter cheaply? Jitter shifts center by ±10% of side and scales side by 0.85-1.2. Instead of precomputing, we could precompute the canvas at 1.35x side (i.e., side*1.35) and resize to 160 once per epoch? No...
+
+Alternative: precompute per box the canvas at the max jitter size (side*1.2) as uint8, and per sample: random offset within the allowed range, slice a side-sized square, PIL resize to 160 (one resize, ~0.1-0.2ms), then flip/brightness. Per sample: 2 slices + 2 resizes + normalize ≈ maybe 1-2ms total. Currently probably 5-10ms per sample (2 canvas builds from full image + 2 resizes + normalize + torch conversion). Hmm, canvas build: `np.full((s,s,3))` + copy from image — s can be large (side*2.5 could be hundreds of px). That's the expensive part. Precomputing the canvas at load time removes that.
+
+Actually, the simplest big win: precompute everything (canvas + resize) once at load time as float32 normalized 160×160×3, per box, per view, no jitter; per-sample work = flip/brightness/normalize... wait, if we store normalized float32, per-sample is just flip/brightness (multiply) + to_tensor. Memory: 6052 × 2 × 160×160×3 × 4B = 3.74 GB. Risky but probably OK? The images dict already holds 1022 images in memory. Image sizes unknown; "high-res" weld images could be ~2000×2000×3 = 12MB each → 1022 × 12MB ≈ 12GB?? That seems too much; maybe smaller. Hmm, risky. Store uint8 (930MB) and normalize per sample: (u8/255 - mean)/std = 76800×2 ops per view ≈ 0.15ms. Fine.
+
+Even better: store uint8, and per sample do: flip (view), brightness (multiply), then normalize + to_tensor. All cheap.
+
+Load-time cost: 6052 boxes × 2 views × (canvas build + PIL resize). Canvas build is ~ms for large s; resize ~0.3ms. Say 2-4ms per view → 6052×2×3ms ≈ 36s. Too slow! Load is currently 13s (just image decoding + CSV). Adding 36s eats the training budget (125→89s). Hmm. That's bad.
+
+Wait, but the current per-step cost already includes canvas build in workers (8 parallel). Total crop work over the whole run: 433 steps × 64 samples × 2 views = 55,552 crop generations in ~125s of wall time (8 workers) → ~2.2ms per crop amortized. If we precompute 12,104 crops at load time with 8 threads... Python threads don't parallelize numpy/PIL (GIL). We can use multiprocessing Pool for precompute: 12104 crops / 8 procs × 2.2ms ≈ 3.3s + overhead. Feasible! But complexity + risk.
+
+Alternative simpler speedup: **reduce the number of resizes by precomputing per-image downsampled versions**? No.
+
+Hmm, let me think differently. What about **using fewer, cheaper views**? The two views are 1.5x and 2.5x. What if we drop to one view (the 2.5x wide crop) and use the saved time for more steps? That's a big change to what the model sees; the two-crop setup was the starting recipe (macro-F1 0.87 with perfect boxes). Dropping a view probably loses accuracy. No.
+
+**What about a smaller/faster backbone?** convnext_atto/pico/nano, regnety_016, resnet18 — much faster per step → more steps. But the past run tried "bigger or other backbones" (8 attempts, no gain) — that included bigger; smaller/faster backbones for more steps? The family is "bigger or other backbone (EfficientNet-B2, ResNet-50, 2-3 model ensembles)" — "other backbone" might include smaller ones, but the listed examples are bigger. Hmm, "other backbone" is ambiguous. A smaller backbone (convnext_atto ~5x faster) would give ~4x steps. But a weaker backbone probably has lower accuracy; the question is whether more steps compensates. Given the model is undertrained (loss still dropping, 0.22), this is plausible. But it's a risky bet and the "other backbone" family is marked exhausted-ish (8 attempts, no confirmed gain). The rule says don't repeat a family with 3+ failed attempts unless fundamentally different. "Faster backbone to buy more steps" is a different hypothesis (compute allocation, not capacity) but the same family label. Risky for acceptance of my own reasoning, but the rule is about not wasting runs. Hmm.
+
+Let me reconsider the precompute idea more carefully, since "more steps at the same budget" directly targets undertraining and is a clean, testable hypothesis. Actually wait — is the model really undertrained, or is 0.22 loss near the irreducible error? With 4 classes and ~10% confusion, the Bayes error could be ~0.15-0.2. Loss 0.219 might be near the floor. Hmm. The past run tried "longer training (smaller reserve)": 6 attempts, no gain, best 0.6355 unconfirmed. That's the same idea (more training time)! 6 attempts, no gain → exhausted. Ugh.
+
+But those attempts just reduced the reserve (more time for the same slow data pipeline). If the bottleneck is data loading, more time doesn't help much beyond the extra steps you get... well, it does give more steps (6 attempts with best 0.6355 unconfirmed — close but not confirmed). So "more steps" has been tried 6 times in the past + implicitly here. The family is exhausted.
+
+OK, so what's genuinely untried and could yield ≥0.01?
+
+Let me re-examine the error: 0.117 lost to wrong classes. Confusion: stain is a magnet (absorbs deposit 55, pore 20), deposit↔stain 46+55=101, pore→stain 20. Small boxes are worse (80% vs 91-93%).
+
+Ideas targeting stain/deposit/pore discrimination:
+
+A. **High-frequency / texture emphasis**: stain vs deposit differ by texture. Preprocessing like local contrast (e.g., divide by a blurred version / unsharp mask) could emphasize texture. Untried? The "training augmentation" family included stronger color/geometry — not unsharp. "Per-crop normalization" (e009) timed out. A unsharp-mask / high-pass preprocessing is a method change (what the model sees), untried. Could help pore (small bright spots) and stain/deposit texture. Cost: one Gaussian blur per crop (cheap with cv2? no cv2; numpy/scipy? scipy not listed — packages: stdlib, numpy, torch, torchvision, timm, PIL. PIL has GaussianBlur! PIL ImageFilter.GaussianBlur — available). Per-crop: blur at radius ~2-3 on 160px ≈ 1ms. Feasible. But does it help? Uncertain. Effect size unknown. Hmm.
+
+B. **Color information**: stain (discoloration) is largely a color/contrast cue; deposit is a 3D bump (brightness/texture); pore is a dark spot. The images are RGB; the model sees color. Grayscale would lose stain cues — bad.
+
+C. **Multi-scale feature fusion within one backbone** (e.g., use intermediate features)? Architecture family is crowded.
+
+D. **Train the classifier to rank, not to classify**: the metric is per-class AP; we output 4 rows per box with scores conf×p_c. What if we train with a loss that directly optimizes ranking between the true class and the confused classes? e010 tried a class-margin loss — rejected (0.6183). Loss family: 2 attempts (BCE, margin) no gain. Focal loss: 2 attempts no gain. Loss family looks exhausted (4 total).
+
+E. **Use the detector's train-split boxes for training** (e003, +0.004, not confirmed under strict rule). Dead for acceptance.
+
+F. **Ensemble of 2 models** — past: no gain (and ensembles cost training time per member). Dead.
+
+G. **Snapshot ensemble / SWA** — untried! SWA: average weights over the last part of training. Under a fixed budget with a cosine schedule to zero, SWA on the plateau... our schedule decays to zero at the end, so late weights are all near the final point; SWA would help if there's a plateau. With cosine to zero, there's no plateau. Snapshot ensemble (cyclical LR) is a bigger change. Hmm, weak.
+
+H. **Test-time augmentation** — 8 attempts, no gain. Dead.
+
+I. **Different crop strategy for small boxes** — resolution family, 9 attempts, dead.
+
+J. **Use both high and low res crops in training** — "low-res crops added to training: 4 attempts, no gain". Dead.
+
+K. **Curriculum / sampling** — class-balanced sampling: 4 attempts, no gain. Dead.
+
+L. **Fix the score**: "remaining gap to perfect-class ceiling is what your score costs" = 0.758 - 0.746 = 0.012. The score is conf × p_c. What if we use only the argmax class per box with score conf × p_argmax? The "fewer rows" family tried argmax-only: 16 attempts, no gain (and removing rows loses recall). Dead.
+
+M. **Two-model refinement: a second classifier trained on the first model's errors?** Too complex for the budget.
+
+N. **Better use of context: the wide crop is 2.5x; what about an even wider 4x view?** Past run: "third, very wide view (4x the box)" accepted twice at 5-seed 0.6342 (+0.005), gain almost entirely from pore. Under today's strict rule, +0.005 might not pass (uncertainty ~0.005+). But wait — that was on top of the same e000 baseline. If we add the 4x view, expected gain ~+0.005, which is below the acceptance bar. Not worth it.
+
+O. **Pore-specific**: pore AP 0.502, 63% correct class, mostly →stain. Pores are small dark/bright spots. The small-box error (80% correct) suggests small defects are hard. What specifically helps small defects? Higher effective resolution for small boxes: e.g., for boxes below a size threshold, crop a smaller region (less context) so the defect fills more of the 160px frame. Wait — the tight crop is 1.5x the box; for a small box (say 20px), the tight canvas is 30px upscaled to 160px — blurry. "Enlarged tight crops for small boxes" was tried (resolution family, no gainThinking budget reached. Stop thinking now and write the reply in the required format.

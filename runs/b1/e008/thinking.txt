@@ -1,0 +1,354 @@
+===== attempt 1 =====
+Let me analyze the situation.
+
+Current best: e002, 5-seed mean 0.6337. Per-class AP: pore 0.515, deposit 0.627, discontinuity 0.781, stain 0.611.
+
+Ceiling: 0.758 (perfect classes on stage-1 boxes). Class-agnostic: 0.755. One-step baseline: 0.638.
+
+So we're at 0.6337, just below the one-step baseline of 0.638. The gap to the ceiling is 0.124, all class-decision error.
+
+Experiments so far:
+- e001: data (train on detector boxes) - crashed (IoU bug)
+- e002: fixed IoU bug, train on detector boxes - new best 0.6337
+- e003: architecture (224px tight crop) - crashed (NameError)
+- e004: fixed name, 224px tight crop - 0.6325, rejected (no gain)
+- e005: data (higher res?) - 0.6366 seed 0, 5-seed mean 0.6315, not confirmed
+- e006: augmentation - 0.6241, rejected
+- e007: scoring (empirical hit-rate lookup) - timeout (killed at 195s, budget 180s)
+
+Lessons:
+- data: 3 ideas, 2 ran, 1 new best, 1 close but not confirmed, 1 crashed
+- architecture: 2 ideas, 1 ran, 0 new best, 1 crashed
+- augmentation: 1 idea, 1 ran, 0 new best
+- scoring: 1 idea, 0 ran, 1 timeout
+
+Now, the most recent experiment e007 (scoring) timed out. It ran 2 epochs (95s + 125s = ~130s for training), then it needed to do the scoring lookup which requires classifying all train_dets (12219 boxes) through the model. That added too much time.
+
+Let me think about what to do next.
+
+The scoring idea (e007) is interesting but timed out because it needed to run inference on all train_dets to build the lookup. That's expensive.
+
+Let me think about the actual problem. The gap is class-decision error. The per-class APs:
+- pore 0.515 (weakest)
+- stain 0.611
+- deposit 0.627
+- discontinuity 0.781
+
+The ceiling is 0.758. So if classes were perfect, we'd get 0.758. We're at 0.6337.
+
+Key insight: mAP@0.5 depends only on the ORDER of predictions within each class. So the detector conf is fixed (it's the stage-1 conf), and we multiply by class probability. The rank order within a class is determined by conf * p_c.
+
+Wait, actually the score is conf * p_c. For a fixed class c, the rank order is by conf * p_c. Since p_c is the model's probability for class c, and conf is the detector confidence.
+
+Now, the key question: where is the error?
+
+The reference numbers:
+- one-step 4-class: 0.638
+- ceiling (perfect classes on stage-1 boxes): 0.758
+- class-agnostic (single class): 0.755
+
+So the detector boxes are good (0.755 class-agnostic). If we had perfect classes, we'd get 0.758. We're at 0.6337.
+
+The gap 0.758 - 0.6337 = 0.124 is class decision error. This means either:
+1. Wrong class assigned to a box that overlaps a true defect (the box is a true positive for the detector but wrong class → counts as false positive for that class, and the true box is missed).
+2. The ranking of false alarms vs true detections.
+
+Actually, let me think carefully. mAP per class. For class c, predictions of class c are sorted by score. A prediction is a hit if it overlaps an unmatched true box of class c.
+
+If the model assigns the wrong class to a box, then:
+- For the true class: the box is not predicted (or predicted with low score), so the true box may be missed → recall drops.
+- For the predicted (wrong) class: the box is a false positive → precision drops.
+
+So wrong-class assignments hurt both the precision and recall of affected classes.
+
+The main lever is improving classification accuracy, especially for the weak classes (pore, stain, deposit).
+
+Now, what's been tried:
+- Training on detector boxes (e002) - helped (it's the current best)
+- Higher res tight crop (e004) - no gain
+- More data / higher res (e005) - not confirmed (0.6315 vs 0.6337, slightly worse)
+- Augmentation (e006) - rejected (0.6241)
+- Scoring (e007) - timeout
+
+So the classification model is the bottleneck. The model is EfficientNet-B0 at 160px with two crops.
+
+Let me think about what could actually help.
+
+Idea 1: Better model. The current model is EfficientNet-B0. Could try a bigger/better model. But budget is tight (180s). Training a bigger model takes longer. Let me check the budget.
+
+The log shows:
+- loading: 14s
+- epoch 0: 285 steps, 97s
+- epoch 1: 424 steps, 125s
+- total: 162s
+
+So training is ~110s for 424 steps (about 0.26s/step). The budget is 180s with 55s reserve for prediction. So training gets ~125s.
+
+Wait, RESERVE_S = 55. t_end = deadline - 55. So training stops at deadline - 55. With 180s budget, training runs until 125s, then prediction takes the rest.
+
+Actually the log shows total 162s, so prediction took ~37s.
+
+If I switch to a bigger model, training step time increases. EfficientNet-B0 at 160px. Let me think about alternatives:
+- efficientnet_b2: bigger, slower
+- convnext_nano: similar
+- regnety_016: small
+- resnet50: bigger
+
+But a bigger model might not help much if the bottleneck is the input resolution / information content. The e004 experiment (224px tight crop) didn't help, suggesting resolution isn't the main issue.
+
+Actually wait, e004 was 224px tight crop and got 0.6325 (rejected, no gain). So higher resolution didn't help. That suggests the model isn't resolution-limited.
+
+Hmm, but maybe the model capacity is limited. Let me think.
+
+Actually, let me reconsider. The macro-F1 of the crop classifier with perfect boxes is ~0.87. Pore and deposit are weak. Stain confused with deposit.
+
+So the classifier itself has ~0.87 macro-F1 on perfect boxes. With detector boxes (slightly misplaced), it's a bit worse.
+
+To improve, we need a better classifier. Options:
+1. Bigger model (capacity).
+2. Better training (more epochs? but budget-limited).
+3. Better input (what the model sees).
+4. Better scoring (re-ranking).
+
+Let me think about the scoring idea more. The e007 idea was to re-rank using an empirical hit-rate lookup. That's a legitimate idea but it timed out because it needed to run inference on all train boxes.
+
+Actually, there's a subtle issue with the scoring. The score is conf * p_c. Within class c, the rank is by conf * p_c. Now, conf is the detector confidence. Is conf correlated with whether the box is a true detection? Probably yes (higher conf = more likely real defect). But conf is class-agnostic.
+
+Actually, here's a thought: the detector conf might be a better indicator of "is this a real defect" than the class probability. But for ranking within a class, we want to rank true detections above false alarms.
+
+Hmm, but the key issue is: for a box that IS a true detection of class c, we want it ranked high. For a box that's a false alarm (no true defect), we want it ranked low (so it doesn't get counted as a TP for class c).
+
+Actually, the problem is more subtle. Let me think about what determines mAP.
+
+For class c:
+- True boxes of class c (let's say N_c of them).
+- Predictions of class c, sorted by score.
+- A prediction is TP if it matches an unmatched true box of class c (IoU > 0.5).
+- AP = average precision over the sorted predictions.
+
+To maximize AP for class c:
+- Rank true matches as high as possible.
+- Rank false alarms (predictions that don't match any true box of class c) as low as possible.
+
+The score conf * p_c: p_c is high when the model thinks it's class c. conf is high when the detector is confident.
+
+Now, a false alarm box (no true defect nearby): the model might still assign some class. If it assigns class c with high p_c, and the detector conf is high, it'll be ranked high → false positive.
+
+A true box of class c that's slightly misplaced: the model should assign class c with high p_c.
+
+So the ranking is: conf * p_c. This seems reasonable. The issue is whether p_c is well-calibrated.
+
+The e007 idea was to replace conf * p_c with an empirical hit-rate estimate. That could help if the raw product is miscalibrated. But it timed out.
+
+Let me think about whether I can do the scoring idea more cheaply. The expensive part was running inference on all 12219 train_dets. 
+
+Actually, wait. Do we even need to run inference on train_dets? The lookup was: for class c and a box with (conf, p_c), the score is the fraction of train boxes in the same (conf decile, p decile) cell that are true class-c boxes.
+
+To build this, we need p_c for each train box. That requires running the model on train boxes. That's 12219 boxes. At batch 256, that's ~48 batches. Each batch takes... let me estimate. The eval has 41879 detections and prediction took ~37s. So 41879 boxes in 37s = ~1132 boxes/s. 12219 boxes would take ~11s. Plus the overhead.
+
+Hmm, actually the timeout was because the whole thing took 195s. Training took ~130s (2 epochs: 95s + 125s... wait that doesn't add up). Let me re-read.
+
+e007 log:
+- train 18271 boxes, 14s
+- epoch 0: 285 steps, 95s
+- epoch 1: 440 steps, 125s
+- killed at 195s
+
+So training: epoch 0 ended at 95s, epoch 1 ended at 125s. Then it started the scoring phase (running inference on train_dets + building lookup + running inference on eval + writing). It got killed at 195s. So the scoring phase had 195 - 125 = 70s but took more than 70s.
+
+Wait, but the reserve is 55s. t_end = deadline - 55 = 180 - 55 = 125s. So training stops at 125s. Then the scoring phase runs from 125s until killed at 195s (70s available, but it needed more).
+
+The scoring phase needs:
+1. Run inference on train_dets (12219 boxes): ~11s
+2. Build lookup: fast
+3. Run inference on eval (41879 boxes): ~37s
+4. Write: fast
+
+Total ~48s + overhead. Should fit in 70s. But it timed out. Maybe the train_dets inference was slower, or the lookup building (Python loop over 12219 boxes) was slow.
+
+Actually, the lookup building has a Python loop:
+```python
+for i in range(len(train_dets)):
+    lookup[c, cb[i], pb[i]] += hit[i]; lookup_n[c, cb[i], pb[i]] += 1
+    conf_only[c, cb[i]] += hit[i]; conf_only_n[c, cb[i]] += 1
+```
+That's 4 * 12219 = 48876 iterations in Python. That's not too slow, maybe 1-2s.
+
+Hmm, the main cost is the inference. Let me reconsider. Maybe the train_dets inference was slower than expected because... actually, the eval inference on 41879 boxes took 37s in e002. In e007, the train_dets is 12219 boxes. So train inference ~11s, eval inference ~37s. Total ~48s. Plus writing 54447 rows.
+
+Wait, but in e007, the writing might be different. Actually the writing is the same (one row per class per eval box, ~4 * 41879 = 167516 rows max, but MIN_SCORE filters some). Actually in e002 it wrote 54447 rows. So writing is fast.
+
+Hmm, why did it time out? Let me think. Maybe the model inference was slower in e007 because... no, same model.
+
+Actually, maybe the issue is that the train_dets inference uses a new DataLoader with num_workers=8, and creating that + persistent workers adds overhead. Or maybe the vstack in the loop is slow.
+
+Actually, looking at the code:
+```python
+tr_probs = np.zeros((len(train_dets), 4), dtype=np.float32)
+...
+for xt, xw, _ in dl_tr_sc:
+    ...
+    tr_probs = np.vstack([tr_probs, ...]) if len(tr_probs) else ...
+tr_probs = tr_probs[:len(train_dets)]
+```
+Wait, `len(tr_probs)` is always len(train_dets) = 12219 (it's initialized to that size). So the condition `if len(tr_probs)` is always True, and it does `np.vstack([tr_probs, new_batch])` every time, growing the array. That's O(n^2) memory operations! For 48 batches, vstacking a 12219-row array 48 times... that's slow and memory-heavy. Actually no, it vstacks [tr_probs (12219 rows), new_batch (256 rows)] = 12475 rows, then reassigns. Next iteration, vstacks [12475, 256] = 12731. So it's growing. This is very inefficient.
+
+Actually wait, `len(tr_probs)` after the first vstack would be 12475, not 12219. So the condition is always true. This is a bug/inefficiency. But it would still work, just slowly.
+
+Anyway, the point is e007 timed out. I could fix it, but the idea itself (empirical hit-rate lookup) is a re-ranking that might or might not help. And it's complex.
+
+Let me step back and think about the highest-value experiment.
+
+The per-class APs:
+- pore 0.515
+- stain 0.611
+- deposit 0.627
+- discontinuity 0.781
+
+The ceiling is 0.758. If pore were at ceiling level (say 0.75), the overall would go up. Let me estimate: if pore went from 0.515 to 0.75, that's +0.235/4 = +0.059. That's a big gain.
+
+So improving pore classification is the highest-value target.
+
+Why is pore weak? Pores are tiny dark holes. In the crop, they might be small. The model might struggle to distinguish pore from deposit/stain.
+
+Idea: What if I give the model more information about the box? Like, the box size? Pores are small, deposits might be larger. Actually, the box is the detector's box, which is class-agnostic. But the box size might correlate with class.
+
+Hmm, but the model already sees the crop, which includes the box region. The box size relative to the crop is fixed (tight crop is 1.5x the box). So the model sees the box at a fixed relative size.
+
+Wait, actually the crop size in pixels is fixed (160px), but the box within it is 1.5x the box's long side. So a small box (pore) would be a small region in the 160px crop, while a large box (deposit) would be a larger region. So the model does see the relative size.
+
+Let me think differently. What about the input? The model sees two crops: tight (1.5x) and wide (2.5x). The wide crop gives context.
+
+Idea: What if the issue is that the model isn't using the detector conf as a feature? The detector conf might carry information about the class or about whether it's a real defect. But the model doesn't see conf.
+
+Actually, for scoring, we multiply by conf. But the model's class decision doesn't use conf. Maybe conf could help the class decision? Probably not directly.
+
+Let me think about the model. EfficientNet-B0 at 160px. The pretrained weights are for 224px typically. At 160px, we're downscaling. e004 tried 224px for the tight crop and it didn't help.
+
+Hmm, wait. Let me reconsider e004. It was "rendering the tight view at 224px". But the wide view was still 160px? Or both? Let me not assume. The result was 0.6325, rejected (no gain over 0.6337). So higher res tight crop didn't help.
+
+Let me think about model capacity. EfficientNet-B0 has ~4M params. Maybe a bigger model would help. But budget is tight.
+
+Actually, let me reconsider the budget. The current training takes ~110s for 424 steps. If I use a bigger model, say EfficientNet-B2 (~8M params, ~2x compute), step time doubles, so I'd get ~212 steps. Fewer steps but bigger model. Net effect unclear.
+
+Alternatively, I could use a model with a better inductive bias for this task. But I don't know which.
+
+Let me think about the data. The training data has 18271 boxes (6052 GT crops + 12219 detector boxes). Wait, crops.csv has high-res crops. Let me check: "train 18271 boxes (12219 detector boxes)". So 18271 - 12219 = 6052 GT crops.
+
+Hmm, wait, TRAIN_ON = ("high",). So only high-res GT crops are used. Plus the 12219 detector boxes (labeled by overlap).
+
+Idea: What about using low-res crops too? The TRAIN_ON is currently ("high",). If I add "low", I get more training data. But low-res might be noisier. Actually, the detector runs on the images, and the boxes are in image coordinates. The "res" field is the resolution of the crop source. Hmm.
+
+Actually, let me reconsider. The crops.csv has a "res" column ("high"/"low"). The current code uses only high-res. Maybe using both would give more data. But e005 was a "data" experiment that got 0.6315 (not confirmed). What was e005 exactly? The hypothesis mentions "whose look depends on surrounding texture that a 160px downscale of a 1.5-2..." So e005 was about higher resolution / context. It got 0.6366 seed 0 but 0.6315 5-seed mean (not confirmed, slightly worse).
+
+So more data / higher context didn't help.
+
+Let me think about the class imbalance. Pore might be rare. If pore is rare, the model under-predicts it. But class-weighted loss hurt every time (per "What is already known"). So I can't use class weighting.
+
+Hmm. Let me think about what's fundamentally different.
+
+Actually, let me reconsider the scoring. The score is conf * p_c. Within class c, rank by conf * p_c. 
+
+Here's a key insight: the detector conf is class-agnostic. A false alarm (no real defect) might have a high conf if it looks like a defect. But a real defect of class c that's hard to see might have a lower conf.
+
+For ranking within class c, we want real class-c defects ranked above false alarms. The score conf * p_c does this partially: p_c is high for real class-c defects, and conf is high for real defects (of any class).
+
+But there's a subtlety: a false alarm that looks like a pore would get high p_pore and maybe high conf → ranked high → false positive for pore. This hurts pore's precision.
+
+The e007 idea was to calibrate this. But it's complex and timed out.
+
+Let me think of a simpler scoring improvement. What if I use a different combination of conf and p_c? Like, p_c only (drop conf)? Or conf^a * p_c^b for some a, b?
+
+Wait, but the metric says: "Any change that keeps the order of a class's predictions (for example multiplying all its scores by a constant, or a monotone function of the score) leaves its AP unchanged." So within a class, only the ORDER matters. If I change score = conf * p_c to score = conf^2 * p_c, that changes the order (because conf^2 re-ranks differently). So it could matter.
+
+But would it help? If conf is a good indicator of "real defect", then using conf^2 would push real defects higher relative to false alarms. But if conf is noisy, it might hurt.
+
+Hmm, this is a re-ranking experiment. The e007 idea was a more sophisticated version. Let me think about whether a simpler version is worth trying.
+
+Actually, let me reconsider. The main issue is class decision error. The ranking within a class matters for precision (false alarms), but the class assignment matters for recall (missing true boxes).
+
+Let me decompose the error:
+1. A true box of class c is not predicted as class c (predicted as another class or low score) → recall loss for class c.
+2. A box is predicted as class c but doesn't match a true class-c box → precision loss for class c.
+
+Error 1 is about the model assigning the wrong class. Error 2 is about false alarms and misassignment.
+
+Both are driven by classification accuracy. So improving the classifier is the main lever.
+
+Given that augmentation (e006), higher res (e004, e005), and more data (e005) didn't help, and class weighting hurt, what's left?
+
+Let me think about the model architecture. The current model uses two crops through the SAME EfficientNet-B0, then averages the logits. This is a simple design.
+
+Idea: What if the two crops should be treated differently? The tight crop (1.5x) focuses on the defect, the wide crop (2.5x) gives context. Maybe concatenating the features (instead of averaging logits) would help. Or using a different combination.
+
+Actually, averaging logits is a form of ensemble. It might dilute the signal. Maybe concatenating the logits (8-dim → 4-dim via a linear layer) would be better. But that requires training the linear layer, which needs more data.
+
+Hmm, let me think about the number of views. Currently 2 views. What if I add a third view? But that increases compute.
+
+Actually, let me reconsider the whole approach. The model sees crops of the box. But the box is from a class-agnostic detector. The crop includes the box region and some context.
+
+Wait, here's an idea I haven't tried: what if I include the detector conf as an input feature to the model? The conf might carry information. But it's a scalar, and the model expects images. I could add it as a 4th channel or a separate branch. But this is a stretch.
+
+Let me think about what's most likely to give a 0.01+ gain.
+
+Option A: Bigger model (capacity). Risk: budget. Let me estimate.
+
+Current: EfficientNet-B0 at 160px, ~0.26s/step, 424 steps in ~110s.
+
+If I use EfficientNet-B2 at 160px: ~2x compute → ~0.5s/step → ~220 steps in 110s. Fewer steps but bigger model. The model might be better but undertrained. Unclear.
+
+If I use convnext_nano: similar to B0.
+
+Actually, maybe I should keep the model but train it better. The current training is 2 epochs with cosine LR. The loss goes 0.4582 → 0.2468. It's still decreasing. More training might help. But budget limits it.
+
+Wait, the LR schedule: 5% warmup, then cosine decay. With 2 epochs, the LR decays from 1e-3 to near 0. If I train for more epochs (by making steps faster or using a smaller model), the model might converge better.
+
+Hmm, but the model might be overfitting. The loss 0.2468 on training data. If it's overfitting, more training won't help.
+
+Let me think about the input resolution again. e004 tried 224px tight crop and it didn't help. But maybe the issue is the WIDE crop. The wide crop is 2.5x the box. For a large box, that's a big region, downscaled to 160px. Maybe the wide crop loses too much detail.
+
+Actually, I'm going in circles. Let me think about the most impactful, untried idea.
+
+Let me reconsider the per-class APs and the ceiling:
+- ceiling 0.758, class-agnostic 0.755.
+- So the boxes are good. The issue is purely class assignment.
+
+The macro-F1 of the classifier on perfect boxes is ~0.87. On detector boxes, it's lower. The detector boxes are slightly misplaced, so the crop might not perfectly center the defect.
+
+Idea: What if I make the crop more robust to misplacement? The current crop centers on the box center with jitter during training. At test time, no jitter. Maybe I should use TTA (test-time augmentation) at inference: average over multiple crop positions/scales. This would make the prediction more robust to box misplacement.
+
+But TTA increases inference time. The eval has 41879 boxes. Current inference ~37s. If I do 2x TTA (e.g., flip), that's ~74s. Plus training ~110s. Total ~188s + loading 14s = 202s > 180s. Too much.
+
+Hmm, budget is tight. Let me reconsider.
+
+Actually, wait. Let me recompute the budget. The total budget is 180s. Loading 14s. Training ~110s (until t_end = 125s). Then inference + writing ~37s. Total ~162s. So there's ~18s of slack.
+
+If I add TTA that doubles inference time (+37s), total would be ~199s > 180s. Timeout.
+
+So TTA is risky unless I reduce training time.
+
+Alternatively, I could reduce the reserve and train less, but that hurts the model.
+
+Let me think about a different angle. The scoring.
+
+Actually, here's a cleaner scoring idea that's cheap: instead of score = conf * p_c, use score = p_c only (drop conf). Or score = conf * p_c^2. These change the within-class order.
+
+Wait, but does dropping conf help? Let me think. Within class c, rank by conf * p_c vs rank by p_c.
+
+If conf is a good indicator of "real defect", then conf * p_c ranks real defects higher. If conf is noisy, p_c alone might be better.
+
+Actually, the detector conf is class-agnostic. For a real class-c defect, conf is high (detector is confident it's a defect). For a false alarm, conf is also high (detector thinks it's a defect). So conf doesn't distinguish real from false well within a class. But p_c does (real class-c → high p_c, false alarm → lower p_c, assuming the model is good).
+
+So maybe p_c alone is better for ranking within class c? Because p_c directly measures "is this class c", while conf measures "is this a defect" (which is already true for all boxes, roughly).
+
+Hmm, but conf might still help: a real defect with a clear appearance gets high conf AND high p_c. A marginal defect gets lower conf. A false alarm gets high conf (detector false positive) but lower p_c.
+
+Actually, I think the key is: the detector conf is a fixed quantity from stage 1. It's the same for all classes. So within class c, conf * p_c vs p_c: the difference is whether conf helps rank true vs false.
+
+Let me think about it from the AP perspective. For class c, we have true boxes and predictions. A prediction is TP if it matches a true box. The score determines the order. To maximize AP, we want TPs ranked above FPs.
+
+A TP for class c: a box that matches a true class-c box. The model assigns class c (high p_c), and the detector conf is whatever.
+
+An FP for class c: a box that doesn't match any true class-c box. Either it's a false alarm (no defect) or it matches a true box of a DIFFERENT class.
+
+Case: box matches a true box of class d (d ≠ c), but the model predicts class c. Then it's an FP for class c (and a TP for class d if the model predicted d... no, the model predicted cThinking budget reached. Stop thinking now and write the reply in the required format.

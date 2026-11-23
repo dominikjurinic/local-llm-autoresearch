@@ -1,0 +1,381 @@
+===== attempt 1 =====
+Let me carefully analyze the situation.
+
+Current best: e000, 5-seed mean 0.6288.
+
+History summary:
+- e001: adding low-res boxes → 0.6246 rejected
+- e002: bigger backbone → 0.6234 rejected
+- e003: higher resolution 224 → 0.6197 rejected
+- e004: train on detector boxes (train/test mismatch) → 0.6277 rejected
+- e005: score = conf * p_c, changing scoring → 0.6049 rejected
+- e006: emit box into all 4 classes → 0.5994 rejected
+- e007: TTA → 0.6237 rejected
+- e008: mixup → 0.6136 rejected
+- e009: change what model sees → 0.6264 rejected
+- e010: undertrained → 0.4363 suspicious bug
+- e011: scoring change → 0.6315 seed-0, 5-seed 0.6267 not confirmed
+- e012: ensemble timeout
+- e013: ensemble with convnext_atto → 0.6146 rejected
+- e014: class-balanced sampling → 0.6134 rejected
+- e015: background class → crashed
+- e016: background class fix → 0.0000 bug
+- e017: background class → 0.6288 not confirmed (same as best)
+
+So we've tried a lot of things. Let me think about what's fundamentally different that hasn't been tried.
+
+Key observations:
+1. The gap to the perfect-class ceiling (0.758) is ~0.13 mAP. This is class mis-assignment.
+2. The class-agnostic ceiling (0.755) is nearly equal to perfect-class ceiling (0.758). So the box detection is fine; the problem is class assignment.
+3. The classifier macro-F1 is ~0.87. Pore and deposit are weak. Stain confused with deposit.
+4. Per-class AP: pore 0.496, deposit 0.629, discontinuity 0.780, stain 0.609.
+
+Wait, but the reference numbers say:
+- one-step 4-class detector: 0.638 mAP@0.5
+- stage-1 boxes with perfect classes (ceiling): 0.758
+- stage-1 boxes scored as single class 'defect': 0.755
+
+And our current best is 0.6288, which is BELOW the one-step 4-class detector (0.638)! That's interesting. So we're actually worse than the baseline one-step detector.
+
+Wait, let me re-read. "one-step 4-class detector (the baseline to beat): 0.638 mAP@0.5". And our best is 0.6288. So we're below the baseline!
+
+Hmm, but the per-class numbers: pore 0.496, deposit 0.629, discontinuity 0.780, stain 0.609. Average = (0.496+0.629+0.780+0.609)/4 = 2.514/4 = 0.6285. Yes matches.
+
+So we need to beat 0.638 (the one-step). And the ceiling is 0.758.
+
+Now, the key insight: we're at 0.6288, below the one-step 0.638. The gap to the ceiling is 0.758 - 0.6288 = 0.129.
+
+Let me think about what's fundamentally different.
+
+What has been tried:
+- data: low-res boxes, detector box training, background class (e015/e016/e017)
+- architecture: bigger backbone, ensemble
+- data: higher resolution
+- scoring: various
+- inference: TTA
+- augmentation: mixup
+- sampling: class-balanced
+- optimisation: undertrained (bug)
+
+What's NOT been tried that could be fundamentally different?
+
+Let me think about the actual error mechanism more carefully.
+
+The metric: mAP@0.5 per class, averaged. For each class, predictions sorted by score. A prediction is a hit if it overlaps an unmatched true box of that class by IoU > 0.5.
+
+Key: We emit one prediction per class per box (4 rows per box). So for each box, we have 4 candidate predictions, one per class, each with score = conf * p_c.
+
+Now here's a subtle issue. Consider a true pore box. The detector gives it conf. The classifier gives p = [p_pore, p_dep, p_disc, p_stain]. We emit:
+- (box, pore, conf*p_pore)
+- (box, deposit, conf*p_dep)
+- (box, discontinuity, conf*p_disc)
+- (box, stain, conf*p_stain)
+
+Now, if the classifier correctly identifies it as pore (p_pore high), then the pore row has high score, and the other rows have low scores. Good.
+
+But the issue is: ALL boxes (including false alarms) emit 4 rows. So a false alarm box emits 4 rows too. If it's a false alarm, the classifier might still assign it some class with high probability (closed-set). So it pollutes all 4 class rankings.
+
+Wait, but the class-agnostic ceiling (0.755) keeps false alarms as class 0 with detector conf. And that gives 0.755. So false alarms are somewhat handled by the detector conf being low.
+
+Hmm, let me think about the actual mechanism of the 0.129 gap.
+
+Actually, let me reconsider. The perfect-class ceiling: every box overlapping a true defect gets correct class, false alarms kept as class 0 with detector conf, score = detector conf. That gives 0.758.
+
+Our approach: every box gets 4 rows (one per class), score = conf * p_c.
+
+The difference between our approach and the perfect-class ceiling:
+1. We assign the wrong class to some true boxes (classifier error).
+2. We assign non-zero scores to false alarms in all 4 classes (whereas the ceiling assigns them only to class 0).
+
+Wait, actually there's a subtle issue with the scoring. In the perfect-class ceiling, a true box gets score = detector conf (not conf * p_c). And it's assigned the correct class. So the ranking within a class is purely by detector conf.
+
+In our approach, a true box gets score = conf * p_c in its correct class (if classified correctly). Since p_c < 1, this is lower than conf. But that's fine for ranking within the class (it's a monotone-ish transform, though not exactly because different boxes have different p_c).
+
+Hmm, actually the key issue is: in our approach, a true box classified correctly as class c gets score conf * p_c. A false alarm classified as class c gets score conf * p_c (with its own p_c). These compete in the ranking.
+
+Let me think about the biggest lever.
+
+Actually, wait. Let me reconsider the whole thing. Let me re-examine: we're at 0.6288, below the one-step 0.638. 
+
+Actually, here's a thought. What if the problem is that we're emitting 4 rows per box, and this is hurting us? Consider: the per-image limit is 300 rows. We have 41879 detections, and emit 4 rows each = ~167k rows. Per image, if there are many boxes, we might exceed 300 rows and the lowest-scoring ones get cut.
+
+Actually, "per image at most the 300 highest-scoring rows count." So if an image has 100 boxes, that's 400 rows, and only the top 300 count. This means some rows get dropped. Which ones? The lowest-scoring. So for each box, the class with lowest p_c might get dropped. That's probably fine (we don't want low-probability classes anyway).
+
+But wait, there's a more subtle issue. Let me think about whether emitting all 4 classes is actually good.
+
+Actually, e006 tried "Every box is emitted in all 4 classes" and got 0.5994. Wait, but the current best ALSO emits all 4 classes. Let me re-read e006.
+
+e006: "The class-agnostic ceiling (0.755) is nearly equal to the perfect-class ceiling (0.758), so the ~0.13 gap to our 0.6288 is class-confusion damage, not box detection. Every box is emitted in all 4 classes, so a box the cl..." — score 0.5994, rejected.
+
+Hmm, so e006 was a scoring change that hurt. Let me not worry about exactly what it did.
+
+Let me think about what's fundamentally different.
+
+Idea: The classifier is a closed-set 4-class classifier. It's forced to assign one of 4 classes even to false alarms. This means false alarms get a "best guess" class with high probability, polluting that class's ranking. The background class experiments (e015/e016/e017) tried to address this by adding a 5th background class, but they didn't help (e017 = 0.6288, same as best).
+
+Wait, e017 added background and got exactly 0.6288, same as best. So background didn't help.
+
+Let me think differently. 
+
+What if the issue is that the classifier itself is good enough (macro-F1 ~0.87), but the SCORING is suboptimal?
+
+Actually, let me reconsider. The per-class AP: pore 0.496 is very low. That's the biggest drag. (0.758 - 0.6288) = 0.129 total gap. If pore were at the level of discontinuity (0.780), the average would go up by (0.780-0.496)/4 = 0.071. So pore is a huge part of the gap.
+
+Why is pore so low? Pore is a fine-grained texture. The classifier confuses it. e003 tried higher resolution (224) and it hurt (0.6197). e001 tried more data and hurt. e014 tried class-balanced sampling and hurt.
+
+Hmm. Let me think about what's different for pore.
+
+Actually, wait. Let me reconsider the whole setup. The classifier is trained on crops.csv (ground-truth boxes). At test time, it's fed detector boxes. The detector boxes are slightly misplaced. For pore (small holes), a misplacement might shift the crop significantly relative to the small pore, making it look different.
+
+Actually, here's a key insight I might be missing. Let me reconsider the two-crop input. The classifier takes a tight crop (1.5x) and a wide crop (2.5x), averages logits. This is the "starting recipe."
+
+What if I change the input representation? For example, what if pore detection benefits from seeing the box at its ACTUAL size rather than always resizing to 160? Or what if the issue is the crop context?
+
+Actually, e009 was "change what the model sees" and got 0.6264, rejected. So changing input was tried.
+
+Let me think about the ensemble idea. e012 (3-model ensemble) timed out. e013 (2-model with convnext_atto) got 0.6146, rejected. So ensembles didn't help (or were too slow).
+
+Hmm, what about a different approach to the whole problem? Let me think about the fundamental structure.
+
+Actually, here's a thought. What if I should NOT emit all 4 classes per box, but instead emit only the top-1 (or top-k) class per box? 
+
+Wait, e006 might have been about this. Let me not assume.
+
+Actually, let me reconsider. The metric says "AP depends only on this ORDER." So for each class, only the ordering of that class's predictions matters. 
+
+Here's a crucial realization: emitting a box as class c with score conf*p_c adds a prediction to class c's ranking. If that box is NOT a true class-c box (either it's a true box of another class, or a false alarm), then this prediction is a FALSE POSITIVE in class c's ranking. It pushes down the precision at its rank position.
+
+So emitting all 4 classes per box means each box adds 3 "wrong class" false positives (in addition to possibly 1 correct). This is a lot of false positives.
+
+But wait, the perfect-class ceiling emits each box in exactly ONE class (correct class for true boxes, class 0 for false alarms). So it has far fewer false positives per class.
+
+So maybe the issue is that we're emitting too many false positives by putting every box in all 4 classes.
+
+But here's the thing: if we emit only the top-1 class per box, then a true box classified as the wrong class becomes a false positive in that wrong class AND a miss in its true class. That's the same number of "errors" but distributed differently.
+
+Hmm, let me think about the math more carefully.
+
+Actually, let me reconsider. The key question is: what's the optimal scoring strategy given a fixed classifier?
+
+For each box, we have probabilities p = [p_0, p_1, p_2, p_3] (summing to 1) and detector conf. We need to assign scores to (box, class) pairs. The metric is mAP.
+
+The optimal strategy depends on the true class of the box. But we don't know it at test time.
+
+Intuition: For a box, the "best" thing is to put the highest score on the true class. Since we don't know the true class, we should put scores proportional to... something.
+
+Actually, here's a cleaner way to think about it. mAP@0.5 for class c: sort class-c predictions by score. Each prediction is either a TP (overlaps an unmatched true c-box) or FP. AP is the area under the precision-recall curve.
+
+To maximize AP for class c, we want true c-boxes to be ranked high (high score) and non-c predictions ranked low.
+
+Now, a true c-box gets score conf * p_c (in our scheme). A non-c prediction (either a true box of another class, or a false alarm) that we emit as class c gets score conf * p_c (with its own values).
+
+The problem: a false alarm might have high p_c (closed-set), so it gets a high score in class c, ranking above some true c-boxes.
+
+The background class idea (e017) tried to down-weight all classes by (1 - p_bg). But it didn't help.
+
+Hmm, let me think about whether there's a fundamentally different scoring approach.
+
+Actually, wait. Let me reconsider the problem from the perspective of: what if the classifier's probabilities are well-calibrated? Then p_c is a good estimate of "is this box class c." And conf is a good estimate of "is this box a defect at all." So conf * p_c is a reasonable score for "is this box a class-c defect." That's what we're doing.
+
+But the issue is the closed-set: for a false alarm, sum of p_c = 1, so it always has some class with high p_c. This means false alarms always contribute a high score to SOME class.
+
+The background class would fix this IF the model learns to assign high p_bg to false alarms. But e017 didn't help. Maybe the model doesn't learn p_bg well, or the down-weighting isn't enough.
+
+Let me think about a different angle entirely.
+
+What if I focus on the PORE class specifically, since it's the weakest (0.496)?
+
+Pore is a fine-grained texture (small holes). The classifier struggles with it. What's different about pore?
+
+Actually, here's an idea I haven't seen tried: what if the problem is that pore boxes are SMALL, and when we crop at 1.5x/2.5x and resize to 160, we're UPSCALING a small region, losing the fine detail? No wait, upscaling a small region to 160 would ADD pixels (interpolation), not lose detail. The detail is in the original pixels.
+
+Hmm, actually if the pore box is small (say 20x20 pixels), then a 1.5x crop is 30x30, resized to 160x160. That's upscaling by ~5x. The original 30x30 has the pore detail, and upscaling to 160 preserves it (bilinear). So the detail is there, just at lower effective resolution.
+
+But if the pore box is large (say 100x100), then 1.5x crop is 150x150, resized to 160x160. That's roughly 1:1. So the detail is preserved at full resolution.
+
+So the issue might be inconsistent: small pores get upscaled (detail preserved but blurry), large pores get ~1:1.
+
+Actually, I don't think resolution is the issue since e003 (higher res) hurt.
+
+Let me think about the ensemble again, but done right. The problem with e012/e013 was speed. What if I use a single model but a better one, or a model that's fast?
+
+Actually, all the architecture changes hurt. Let me step back.
+
+Let me reconsider: we're at 0.6288, below the one-step baseline of 0.638. That's a red flag. It suggests our two-stage approach, as currently implemented, is actually WORSE than just using the one-step detector. 
+
+Wait, but the one-step detector is 0.638 on the SAME validation images. And our two-stage is 0.6288. So we're 0.009 below the baseline. That's within noise (±0.005), but it's concerning.
+
+The ceiling is 0.758. So there's a lot of headroom. The question is why we're so far from the ceiling.
+
+Let me reconsider the error decomposition:
+- Ceiling (perfect classes): 0.758
+- Us: 0.6288
+- Gap: 0.129
+
+The gap is due to:
+1. Wrong class assigned to true boxes (classifier error).
+2. False alarms polluting rankings.
+
+We've tried to fix both (background class for #2, better classifier for #1) without success.
+
+Let me think about #1 more. The classifier macro-F1 is ~0.87. That means ~13% of boxes are misclassified. But the AP gap is 0.129, which is consistent with ~13% error.
+
+So the classifier is the bottleneck. But every attempt to improve it failed. Why?
+
+Maybe the classifier ISN'T the bottleneck in the way we think. Let me reconsider.
+
+Actually, wait. Let me reconsider the scoring. Here's a subtle point I might have missed.
+
+When we emit 4 rows per box, the per-image 300-row limit might be cutting off some rows. Let me estimate: 41879 detections over how many eval images? We have 1022 images total (train + eval). Let's say ~500 eval images. 41879 / 500 ≈ 84 boxes per image. 84 * 4 = 336 rows per image. That EXCEEDS 300! So the 300-row limit IS active, cutting ~36 rows per image.
+
+Which rows get cut? The lowest-scoring ones. For each box, the class with the lowest p_c gets cut (if its score is low enough). This is probably fine — we don't want low-probability predictions.
+
+But here's the subtle issue: the 300-row limit is GLOBAL per image, not per class. So if an image has many boxes, the global top-300 might cut off some legitimate predictions.
+
+Hmm, but this is a minor effect.
+
+Let me think about a fundamentally different idea.
+
+IDEA: What if I don't train a classifier at all, but instead use the detector's confidence and some other signal?
+
+No, that doesn't make sense.
+
+IDEA: What if the issue is that we're using the SAME box for all 4 class predictions, but the detector box might be better for one class than another? No, that doesn't make sense either.
+
+Let me reconsider the two-crop input. The classifier averages logits from a tight crop (1.5x) and a wide crop (2.5x). What if this averaging is hurting? What if for some classes the tight crop is better and for others the wide crop is better?
+
+Actually, here's an idea: what if I train TWO classifiers, one specialized per "regime," and use the detector conf or box size to decide which to use? That's complex.
+
+Let me think about what's truly untried and could have a big effect.
+
+Actually, let me reconsider the background class experiment (e017). It added a 5th background class and down-weighted all class scores by (1 - p_bg). It got 0.6288, same as best. So it didn't help. But maybe the way it was done was suboptimal.
+
+Wait, actually, let me reconsider. e017's approach: train with 5 classes (4 defects + background), where background = detector boxes that don't overlap any GT. Then at test time, multiply all class scores by (1 - p_bg). 
+
+The problem: the background class is defined by detector boxes not overlapping GT. But at test time, we don't have GT. The model learns to distinguish "defect" from "background" based on the crop appearance. If false alarms look different from true defects, the model can learn p_bg high for false alarms, down-weighting them. This is a reasonable approach.
+
+But it didn't help. Maybe because:
+- The background boxes (non-overlapping detector boxes) still look like defects (they're on defect images, just in wrong locations).
+- The down-weighting (1 - p_bg) isn't strong enough.
+- Adding a 5th class dilutes the 4-class learning.
+
+Hmm.
+
+Let me think about a COMPLETELY different approach to the scoring.
+
+Here's an idea: instead of score = conf * p_c, what if I use a score that's more aggressive about suppressing false alarms?
+
+Actually, wait. Let me reconsider the fundamental issue with emitting all 4 classes.
+
+Consider a false alarm box (not a defect). The classifier gives p = [0.3, 0.4, 0.2, 0.1]. We emit:
+- (box, 0, conf*0.3)
+- (box, 1, conf*0.4)
+- (box, 2, conf*0.2)
+- (box, 3, conf*0.1)
+
+The highest is class 1 with conf*0.4. This is a false positive in class 1's ranking.
+
+Now consider a true class-1 box. The classifier gives p = [0.1, 0.7, 0.1, 0.1]. We emit:
+- (box, 1, conf*0.7)
+
+This is a true positive in class 1.
+
+For the false alarm to rank above the true box, we need conf_fp * 0.4 > conf_tp * 0.7.
+
+Now, the detector conf for false alarms is usually lower (that's how detectors work). So conf_fp < conf_tp typically. This helps.
+
+But the classifier's p_c for false alarms is still substantial (0.4 in this example). So false alarms still contribute meaningful false positives.
+
+The background class would make p_bg high for false alarms, and (1 - p_bg) low, down-weighting all 4 classes. This is the right idea, but e017 didn't help.
+
+Let me think about WHY e017 didn't help. Maybe the model doesn't learn p_bg well because the background training boxes (non-overlapping detector boxes) are still on defect images and look like defects. So the model can't distinguish them.
+
+Alternatively, maybe the issue is that the background boxes are too few or too similar to defects.
+
+Hmm, let me think about a different way to get a "background" signal.
+
+IDEA: What if I use the detector conf ITSELF as a background signal? Low conf = likely false alarm. But we're already multiplying by conf, so low conf already down-weights.
+
+Actually, here's a cleaner idea. Let me reconsider the score.
+
+Currently: score_c = conf * p_c.
+
+What if the problem is that p_c is not well-calibrated? For true defects, p_c might be too low (underconfident), and for false alarms, p_c might be too high (overconfident). 
+
+Actually, the closed-set nature means that for false alarms, the p_c sum to 1, so one class always has high p_c. This is the core problem.
+
+The background class is the right fix, but it needs the model to actually learn to distinguish false alarms from true defects. 
+
+Let me think about how to make the background class learn better.
+
+IDEA: What if I use a HARDER background set? Instead of detector boxes not overlapping GT (which are on defect images), what if I use crops from NON-defect regions? But we don't have non-defect images...
+
+Actually, wait. The images are all weld images with defects. But within an image, most of the area is NOT a defect (it's the weld bead without defects, or background). So I could sample random crops from the images that don't overlap any GT box, and use those as background.
+
+But that's similar to what e017 did (detector boxes not overlapping GT). The difference is that random crops would be more diverse and clearly non-defect.
+
+Hmm, but e017 used detector boxes not overlapping GT, which are plausible false alarms. Random crops might be too easy (clearly background) and not match the test-time false alarms.
+
+Actually, the test-time false alarms ARE detector boxes (the detector fires on non-defect regions). So using detector boxes not overlapping GT (as e017 did) is the right training signal for the background class.
+
+Let me reconsider why e017 didn't help. Maybe the down-weighting (1 - p_bg) is applied but the model's p_bg isn't discriminative enough.
+
+Actually, you know what, let me step back and think about whether there's a fundamentally different lever.
+
+Let me reconsider the per-class AP: pore 0.496, deposit 0.629, discontinuity 0.780, stain 0.609.
+
+Discontinuity is the best (0.780). Pore is the worst (0.496). 
+
+What's special about pore? Pores are small holes in the weld. They're a texture. They might be:
+- Small (small boxes).
+- Visually similar to stain (both are small dark/light spots).
+- Confused with deposit.
+
+The background info says: "Pore and deposit are the weak classes; stain is often confused with deposit."
+
+So the confusion matrix has:
+- Pore: weak (0.496)
+- Deposit: weak (0.629)
+- Stain: confused with deposit (0.609)
+
+Hmm. What if I do a POST-HOC confusion correction? I.e., after the classifier gives probabilities, I adjust them based on known confusion patterns?
+
+For example, if the classifier tends to confuse stain with deposit, I could boost the stain score when the deposit score is high. But this is hacky and might not generalize.
+
+Actually, let me think about a cleaner idea.
+
+IDEA: What if I use a TWO-HEADING approach? First, a "defect vs background" classifier (binary), then a "which defect" classifier (4-class). The binary classifier could be more robust because it's a simpler task.
+
+But that's essentially the background class idea (e017), which didn't help.
+
+Let me think about the ensemble again, but done efficiently. The issue was speed. What if I use a single efficient model but train it better?
+
+Actually, all the "improve the classifier" attempts failed. Let me question the assumption that the classifier is the bottleneck.
+
+Wait, let me re-examine. The ceiling is 0.758 (perfect classes). We're at 0.6288. If the classifier were perfect, we'd be at 0.758. So the classifier error accounts for the full 0.129 gap. So the classifier IS the bottleneck.
+
+But every attempt to improve it failed. Why?
+
+Maybe because the attempts were all in the wrong direction. Let me think about what would actually improve the classifier.
+
+The classifier is an EfficientNet-B0 trained on 6052 boxes for ~5 epochs. It reaches macro-F1 ~0.87.
+
+What if the issue is that 5 epochs is not enough, OR that the learning rate is wrong, OR that the model needs a different training strategy?
+
+e010 (undertrained) was a bug. Let me not repeat that.
+
+Actually, wait. Let me reconsider. The training loss is still falling steeply (0.244 -> 0.220 in the last epoch). This suggests undertraining. But e010 tried to address this and was a bug.
+
+Let me think about what e010 did wrong. It was "undertrained" category, score 0.4363, suspicious bug. Maybe it changed the training loop in a way that broke something.
+
+Let me think about a clean way to train longer or better without breaking things.
+
+Actually, the current training runs until the budget minus reserve is used up. So it trains as long as possible. The issue is that within the budget, it only does ~5 epochs (435 steps). To train longer, I'd need to either:
+- Make each step faster (smaller batch, smaller model, fewer views).
+- Use more of the budget for training (reduce reserve).
+
+But making the model smaller or reducing views might hurt accuracy.
+
+Hmm. Let me think about the batch size. Currently 64. Each step processes 64 boxes * 2 views = 128 images. If I reduce to 32, I'd do more steps in the same time, but each step is faster. Actually, the total number of images processed per epoch is the same (6052), so the number of epochs is the same. Reducing batch size increases steps per epoch but doesn't change epochs.
+
+Wait, no. The number of steps per epoch = 6052 / batch_size. With batch 6Thinking budget reached. Stop thinking now and write the reply in the required format.

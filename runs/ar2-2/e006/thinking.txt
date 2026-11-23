@@ -1,0 +1,496 @@
+===== attempt 1 =====
+Let me analyze the situation carefully.
+
+Current best: e003 with 5-seed val mAP@0.5 of 0.6317.
+
+Per-class AP: pore 0.517, deposit 0.622, discontinuity 0.780, stain 0.608
+
+The weak classes are pore (0.517) and stain (0.608). Deposit is 0.622.
+
+What's been tried:
+- e001: Training on detector boxes with background class → 0.5691 (rejected, much worse)
+- e002: Adding matched detector boxes to GT crops → 0.6293 (new best at the time)
+- e003: Adding low-res GT crops → 0.6317 (current best)
+- e004: Squaring class probability in score → 0.6211 (rejected)
+- e005: Adding background class (5th class) with (1-bg) multiplier → 0.6039 (rejected)
+
+So the background class approach has been tried twice (e001 fully, e005 partially) and both failed. The scoring change (squaring) also failed.
+
+What ideas remain in scope?
+- Training on detector boxes with background: tried and failed
+- Combining detector conf and classifier probs differently: tried squaring, failed
+- Robustness to box misplacement: partially addressed by adding matched dets (e002)
+- Low-res training crops: tried (e003)
+- Test-time augmentation: not tried yet
+- Ensembling: not tried yet
+- Architecture changes: not tried yet
+- Class-weighted loss: explicitly noted as having hurt every time
+- Tuning hyperparameters: noted as helping little
+
+Let me think about what could actually help here.
+
+The key insight from the background: "When all types are merged into one class, the same detector reaches 0.77, so many errors are wrong types, not missed defects." This means the detector is finding the right boxes but the classifier is getting the type wrong.
+
+The per-class APs: pore 0.517, deposit 0.622, discontinuity 0.780, stain 0.608.
+
+Pore is the weakest. Stain is often confused with deposit and background.
+
+Let me think about what could help:
+
+1. **Test-time augmentation (TTA)**: At inference time, run multiple augmented versions of each crop and average the predictions. This could help with robustness. But it costs time - we have a budget.
+
+2. **Architecture change**: Try a different backbone. The current one is EfficientNet-B0. Maybe a larger model like EfficientNet-B2 or ConvNeXt would help. But training time would increase.
+
+3. **Training on detector boxes more aggressively**: We currently use GT crops + matched detector boxes. What if we train ONLY on detector boxes (with labels from overlap)? The issue is that e001 tried this and it was much worse (0.5691). But e001 also had a background class. What about training on detector boxes without background, but with proper labels?
+
+Wait, let me re-read e001: "Training on detector boxes (labelled by IoU≥0.5 overlap with ground truth, plus a 5th 'background' class for false alarms) instead of perfect crops will improve mAP because the classifier becomes robust to the detector's box misplacement while retaining clean class boundaries." Score: 0.5691. So it replaced GT crops with detector boxes AND added background. That's a big change.
+
+e002 added matched detector boxes ALONGSIDE GT crops (no background) → 0.6293.
+e003 added low-res GT crops on top → 0.6317.
+e005 added background class on top → 0.6039.
+
+So the pattern is: GT crops are important, adding matched dets helps a little, adding low-res helps a little, but background hurts.
+
+What about **test-time augmentation**? At inference, for each eval box, we could:
+- Use the current two-crop approach (tight 1.5x + wide 2.5x)
+- Add horizontal/vertical flips
+- Add slight jitter
+- Average all predictions
+
+This would make the classifier more robust without changing training. The cost is more forward passes at inference time.
+
+Let me think about the time budget. Current run: 162s total out of 180s. We have about 18s of slack. The prediction phase processes 41879 detections with batch size 256, so about 164 batches. If we do 4x TTA (original + hflip + vflip + both), that's 4x the forward passes. But the prediction phase is probably fast compared to training.
+
+Actually, let me look at the timing more carefully:
+- Loading: 17s
+- Training: ~125s (2 epochs)
+- Prediction + writing: 162 - 125 - 17 = ~20s
+
+So prediction takes about 20s. If we do 4x TTA, it would be ~80s, pushing total to ~222s which exceeds 180s. That's too much.
+
+But we could reduce training time (fewer epochs or smaller model) and use the saved time for TTA. Or we could do a lighter TTA (2x instead of 4x).
+
+Actually, wait. Let me reconsider. The RESERVE_S is 55s. The budget for training is deadline - RESERVE_S - start_time. With 180s budget and 17s loading, training budget is about 180 - 55 - 17 = 108s. But the log shows training took 125s (123s for epoch 0, 125s for epoch 1). Wait, that's 125s - 17s = 108s for training. Then prediction takes 162 - 125 = 37s.
+
+Hmm, actually the timing is:
+- T0 = start
+- 17s: loading done
+- Training starts, epoch 0 ends at 123s, epoch 1 ends at 125s
+- Prediction + writing: 162 - 125 = 37s
+
+So prediction takes 37s. With 4x TTA it would be ~148s, total would be ~273s. Way over budget.
+
+Even 2x TTA (original + hflip) would be ~74s for prediction, total ~199s. Still over.
+
+So TTA is expensive. Unless we reduce the number of crops or use a smaller model.
+
+What about **architecture change**? Let's think about what would help.
+
+The weak classes are pore (0.517) and stain (0.608). Pores are small, circular defects. Stains are often confused with deposit and background.
+
+A larger model might help with fine-grained discrimination. EfficientNet-B2 is about 2.4x the params of B0. But it would train slower.
+
+Actually, let me think about this differently. The issue is that the classifier is trained on perfect boxes (GT crops) + matched detector boxes. The matched detector boxes have IoU ≥ 0.5 with GT, so they're reasonably well-placed. But the eval boxes from the detector might be more misaligned.
+
+What if we increase the jitter during training to better match the detector's error distribution? Currently jitter is ±10% of side and 0.85-1.2x scale. What if we increase it?
+
+Actually, the brief says "Tuning hyperparameters alone helped little in earlier experiments; changes of method helped more." So jitter tuning is probably not the way to go.
+
+Let me think about **scoring** more carefully. The current score is `conf * prob[c]`. We tried `conf * prob[c]^2` and it was worse. What about other combinations?
+
+Actually, the key insight is: "mAP@0.5 rewards, per class: (a) the right class on boxes that overlap a true defect, and (b) good ranking: true detections should score higher than false ones."
+
+The detector boxes include false alarms (background). The classifier has no notion of "not a defect" (we tried adding it and it hurt). So for false alarm boxes, the classifier will still assign some probability to each class, and the score will be `conf * prob[c]`.
+
+The problem is: for a false alarm box, the detector conf might be moderate (say 0.3-0.5), and the classifier might assign 0.3 to the "most likely" class. So the score would be 0.09-0.15, which might compete with true detections that have lower conf but higher prob.
+
+What if we use the classifier's maximum probability as a "defect confidence" and multiply? Like `score = conf * max_prob * prob[c]`? This would downweight predictions where the classifier is uncertain (which tends to happen for background). But it would also downweight true detections where the classifier is uncertain.
+
+Hmm, but we tried background class and it hurt. The issue might be that the background class makes the classifier more conservative, reducing the probability for all defect classes.
+
+Let me think about another angle. What about **training the classifier differently**?
+
+Currently, we use a simple cross-entropy loss. What about:
+- Label smoothing? This could help with calibration.
+- Focal loss? This could help with the weak classes.
+- Mixup? This is an augmentation technique.
+
+Actually, **mixup** is interesting. It's a data augmentation technique that blends pairs of images and their labels. It's known to improve generalization and calibration. It's cheap to implement and doesn't require additional data.
+
+But wait, the brief says "Tuning hyperparameters alone helped little in earlier experiments; changes of method helped more." Mixup is a method change, not just a hyperparameter.
+
+Let me think about what's most likely to help given the constraints:
+
+1. The weak classes are pore and stain.
+2. Background class hurts.
+3. Scoring changes haven't helped.
+4. The classifier is trained on GT + matched dets + low-res GT.
+
+What about **focal loss**? Focal loss downweights easy examples and focuses on hard ones. This could help with the weak classes (pore, stain) by making the model pay more attention to the harder-to-classify examples.
+
+Actually, let me reconsider the problem. The per-class APs are:
+- pore: 0.517
+- deposit: 0.622
+- discontinuity: 0.780
+- stain: 0.608
+
+The overall mAP is 0.6317. The ceiling is 0.758. So there's a lot of room to improve.
+
+The fact that merging all classes gives 0.77 (from the original paper) means the detector is finding the right boxes. The classifier is the bottleneck.
+
+Let me think about **class imbalance**. How many of each class are there? If pore and stain are rare, the model might not learn them well. But the brief says "Class-weighted loss hurt classification every time it was tried." So class weighting is out.
+
+What about **data augmentation** specifically for the weak classes? Like, oversampling pore and stain examples? But that's a form of class weighting at the data level.
+
+Actually, let me re-read the brief: "Class-weighted loss hurt classification every time it was tried." This specifically refers to loss weighting. Data-level oversampling is different.
+
+Hmm, but the brief also says "Tuning hyperparameters alone helped little in earlier experiments; changes of method helped more." So we should focus on method changes.
+
+Let me think about **test-time augmentation** more carefully. The key constraint is time. But what if we:
+1. Reduce training to 1 epoch (saves ~50s)
+2. Use the saved time for 2x TTA at inference
+
+With 1 epoch, training would take ~50s instead of ~108s. Prediction with 2x TTA would take ~74s. Total: 17 + 50 + 74 = 141s. That fits in 180s.
+
+But reducing to 1 epoch might hurt the model quality. The loss goes from 0.4479 to 0.2744 in 2 epochs, so 1 epoch is still not fully converged.
+
+Alternatively, what about a **lighter TTA** that's more targeted? Instead of full flips, what about:
+- Slight scale variation (e.g., 0.9x and 1.1x of the crop)
+- This is cheaper than flips and more targeted at the box misplacement issue
+
+Actually, the most impactful TTA for this problem would be **crop position jitter** at test time. Since the detector boxes can be slightly misaligned, running the classifier on slightly shifted crops and averaging would help.
+
+But this is essentially what we're doing with training jitter. The question is whether test-time jitter helps beyond what training jitter already provides.
+
+Let me think about another approach: **ensemble of two different backbones**. Train two models (e.g., EfficientNet-B0 and ResNet18) and average their predictions. This is a method change that could help with robustness.
+
+But training two models would double the training time. With 180s budget and 17s loading, we have ~108s for training (with 55s reserve). Training one model takes ~108s. Training two would take ~216s, which is over budget.
+
+Unless we use a smaller/faster model for the second one. Like ConvNeXt-Pico or something.
+
+Actually, let me look at the available models:
+- convnext_atto, convnext_nano, convnext_pico
+- efficientnet_b0, efficientnet_b2
+- mobilenetv3_large_100
+- regnety_016
+- resnet18, resnet26d, resnet34, resnet50
+- tf_efficientnetv2_b0
+
+A lightweight ensemble of EfficientNet-B0 + ConvNeXt-Nano or ResNet18 could work if we reduce training epochs.
+
+But this is getting complicated. Let me focus on a single, clear hypothesis.
+
+Actually, I think the most promising untried idea is **test-time augmentation with horizontal and vertical flips**. Here's why:
+
+1. It's a method change, not a hyperparameter tweak.
+2. It directly addresses the robustness issue (the classifier should be invariant to flips).
+3. It's cheap to implement.
+4. The time cost can be managed by reducing training.
+
+But the time budget is tight. Let me calculate more carefully.
+
+Current timing:
+- Loading: 17s
+- Training (2 epochs): 108s (123s - 17s for epoch 0, then 2s for epoch 1... wait that doesn't add up)
+
+Actually, looking at the log:
+- 17s: loading done
+- 123s: epoch 0 done (so training epoch 0 took 106s)
+- 125s: epoch 1 done (so training epoch 1 took 2s? That can't be right)
+
+Wait, the log says:
+```
+train 26347 boxes (14128 gt + 12219 det), eval 41879 detections, 2255 images (17s)
+epoch 0: loss 0.4479, 411 steps, 123s
+epoch 1: loss 0.2744, 421 steps, 125s
+done: 2 epochs, 421 steps, 56767 prediction rows, 162s total
+```
+
+So:
+- 0-17s: loading
+- 17-123s: epoch 0 (106s, 411 steps)
+- 123-125s: epoch 1 (2s, 421 steps) -- this seems wrong, 421 steps in 2s?
+
+Wait, I think the times are cumulative from T0. So:
+- 17s: loading
+- 123s: end of epoch 0 (106s of training)
+- 125s: end of epoch 1 (2s of training??)
+
+That doesn't make sense. 421 steps in 2s would be ~210 steps/s, which is impossibly fast.
+
+Oh wait, I think the "125s" in the epoch 1 line is the total time from T0, not the time for that epoch. So:
+- Epoch 0: 123s - 17s = 106s
+- Epoch 1: 125s - 123s = 2s
+
+That's still weird. Unless the DataLoader with persistent_workers is caching and the second epoch is much faster? No, that doesn't make sense either.
+
+Actually, I think I'm misreading. Let me re-read:
+```
+epoch 0: loss 0.4479, 411 steps, 123s
+epoch 1: loss 0.2744, 421 steps, 125s
+```
+
+The "123s" and "125s" are `time.time() - T0`, i.e., total elapsed time. So:
+- After loading (17s), epoch 0 runs for 123-17 = 106s
+- Epoch 1 runs for 125-123 = 2s
+
+That's impossible for 421 steps. Unless... the training loop is checking time and breaking early? Let me look at the code:
+
+```python
+while not done:
+    tot, nb = 0.0, 0
+    for xt, xw, y in dl_tr:
+        frac = min(1.0, (time.time() - t_start) / budget)
+        ...
+        if time.time() >= t_end:
+            done = True
+            break
+    print(f"epoch {epoch}: loss {tot / max(nb, 1):.4f}, {steps} steps, {time.time() - T0:.0f}s", flush=True)
+    epoch += 1
+```
+
+So it breaks out of the inner loop when time runs out, but still prints the epoch line. So epoch 1 might have only run a few steps before hitting the time limit. The "421 steps" is the cumulative step count, not the steps in that epoch.
+
+Wait, `steps` is incremented inside the loop: `steps += 1`. And the print shows `{steps} steps` which is the total. So epoch 0 had 411 steps total, and epoch 1 had 421 - 411 = 10 steps. That makes more sense. 10 steps in 2s is still fast but more plausible if the DataLoader is already loaded.
+
+Actually no, 10 steps in 2s is still 5 steps/s which is very fast for a 160x160 image with EfficientNet-B0. Unless it's on a very fast GPU.
+
+Anyway, the key point is: training takes about 108s (17s to 125s), and prediction takes 162-125 = 37s.
+
+For TTA, if I do 2x (original + hflip), prediction would take ~74s. Total: 17 + 108 + 74 = 199s. Over budget.
+
+If I reduce training to 1 epoch (~50s), total: 17 + 50 + 74 = 141s. Fits.
+
+But 1 epoch might not be enough. The loss is 0.4479 after 1 epoch vs 0.2744 after 2 epochs (well, 10 steps of epoch 2).
+
+Hmm, this is tricky. Let me think of another approach.
+
+What about **reducing the number of crops per sample**? Currently we use 2 crops (tight 1.5x + wide 2.5x). What if we use just 1 crop (the wide one) and use the saved time for TTA?
+
+With 1 crop, training would be ~50s faster (half the forward passes). And prediction with 2x TTA would be ~37s * 2 = 74s. Total: 17 + 50 + 74 = 141s. Fits.
+
+But using 1 crop instead of 2 might hurt quality. The two-crop approach was specifically designed to capture both local and global context.
+
+Actually, let me reconsider. The most impactful change might be **architecture**. Let me think about what architecture would help.
+
+The problem is fine-grained classification of weld defects. Pores are small, circular. Stains are diffuse. Deposit is... I don't know exactly. Discontinuity is a gap.
+
+A model with better local feature extraction might help. ConvNeXt models are known for good local features. ResNet models are also good.
+
+What about **ResNet18**? It's lightweight and fast. If we use it, training would be faster, leaving more time for TTA or more epochs.
+
+But would ResNet18 be better than EfficientNet-B0 for this task? Hard to say. EfficientNet has compound scaling which might be better for fine-grained classification.
+
+What about **tf_efficientnetv2_b0**? It's a newer variant with better architecture. It might be slightly better than efficientnet_b0 for the same size.
+
+Actually, let me think about this from a different angle. The per-class APs are:
+- pore: 0.517
+- deposit: 0.622
+- discontinuity: 0.780
+- stain: 0.608
+
+The gap between discontinuity (0.780) and pore (0.517) is large. Pores are probably the hardest to classify because they're small and can look like noise.
+
+What if the issue is that pores are small and the crop is too large? The tight crop is 1.5x the box side, and the wide crop is 2.5x. For a small pore, the 2.5x crop might include too much background, making it hard to distinguish from a stain or deposit.
+
+What about **adding a very tight crop** (1.0x or 1.2x) in addition to the existing two? This would give the model a closer look at small defects.
+
+But this adds another forward pass, increasing training and inference time.
+
+Hmm, let me think about what's most likely to give a measurable improvement.
+
+Actually, I just realized something. The current training uses `TRAIN_ON = ("high", "low")` which includes both high-res and low-res GT crops. The e003 experiment added low-res crops. But the detector operates on... what resolution? The dets.csv has boxes, and the images are loaded at their native resolution.
+
+Wait, the crops.csv has a "res" column with "high" or "low". The dets.csv doesn't have a res column. So the detector boxes are on the images at their native resolution.
+
+The key question is: what resolution are the eval images? If they're high-res, then the detector is running on high-res images, and the crops should be high-res. If they're low-res, then the crops should be low-res.
+
+The fact that adding low-res GT crops helped (e003) suggests that the eval images might include low-res ones, or that the detector's boxes are more aligned with low-res features.
+
+OK, I think I'm overthinking this. Let me focus on a specific, testable hypothesis.
+
+**Hypothesis: Test-time augmentation with horizontal flip will improve mAP by making the classifier's predictions more robust to the orientation of the defect, reducing variance in the probability estimates.**
+
+Implementation:
+- At inference time, for each eval box, compute predictions on the original crop and its horizontal flip.
+- Average the logits (or probabilities) from both.
+- This doubles the inference time but doesn't change training.
+
+Time impact:
+- Training: unchanged (~108s)
+- Inference: ~37s * 2 = ~74s
+- Total: 17 + 108 + 74 = 199s
+
+This is over the 180s budget. So I need to reduce training time.
+
+Option 1: Reduce RESERVE_S from 55 to 30. This gives more time for training but less buffer. Risky.
+
+Option 2: Reduce training to 1 epoch. Saves ~50s. Total: 17 + 50 + 74 = 141s.
+
+Option 3: Reduce batch size to increase steps per epoch (more training in the same time). But this doesn't save time.
+
+Option 4: Use a smaller/faster model. Like convnext_pico or regnety_016.
+
+Actually, let me reconsider. The RESERVE_S is 55s. The actual prediction takes 37s. So the reserve is more than enough. What if I reduce RESERVE_S to 40s? Then the training budget would be 180 - 40 - 17 = 123s instead of 108s. That gives more training time.
+
+But the issue is that with 2x TTA, prediction takes 74s, which exceeds the 40s reserve. So I need RESERVE_S >= 74s, which means training budget = 180 - 74 - 17 = 89s. That's less than the current 108s, so training would be shorter.
+
+Hmm, this is getting complicated. Let me think about a different approach.
+
+What if instead of full TTA, I do a **lighter form of TTA** that's cheaper? For example:
+- Only flip the tight crop, not the wide crop
+- Or only do one flip (horizontal, not vertical)
+
+Actually, the simplest TTA is just horizontal flip. It's one extra forward pass per crop. With 2 crops, that's 2 extra forward passes per sample (4 total instead of 2).
+
+Wait, currently we do 2 forward passes per sample (tight + wide). With hflip TTA, we'd do 4 (tight, tight_hflip, wide, wide_hflip). That's 2x the inference time.
+
+Alternatively, I could do TTA only on the tight crop: 3 forward passes (tight, tight_hflip, wide). That's 1.5x the inference time.
+
+Or I could do TTA only on the wide crop: 3 forward passes. Same cost.
+
+Let me go with the simplest: hflip on both crops, 4 forward passes total. Inference time: ~74s.
+
+To fit in budget, I'll reduce RESERVE_S to accommodate the longer inference. Let me set RESERVE_S = 80s. Then training budget = 180 - 80 - 17 = 83s. That's about 77% of the current training time, so we'd get ~1.5 epochs instead of 2.
+
+Actually, the current training does 411 steps in epoch 0 and 10 steps in epoch 1 (total 421). With 77% of the time, we'd get ~325 steps, which is most of epoch 0. That's a significant reduction.
+
+This is risky. The model might not be well-trained enough.
+
+Let me think of another approach entirely.
+
+**What about changing the scoring to use the classifier's confidence more cleverly?**
+
+The current score is `conf * prob[c]`. The issue is that for false alarms, the classifier still assigns some probability to each class. The detector conf for false alarms is usually lower, but not always.
+
+What if we use `conf * (prob[c] - mean_prob)` where mean_prob is the average probability across classes? This would center the probabilities around 0, making the score negative for classes that are less likely than average. But negative scores would be problematic.
+
+What about `conf * (prob[c] / sum(prob))`? That's just `conf * prob[c]` since the probabilities sum to 1. So that's the same thing.
+
+What about using the **margin** between the top-1 and top-2 probabilities as a confidence factor? Like `score = conf * prob[c] * (prob[top1] - prob[top2])`. This would downweight predictions where the classifier is uncertain.
+
+But this is similar to what we tried with the background class (multiplying by 1-bg). And that hurt.
+
+Let me think about **focal loss** again. Focal loss is:
+`FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)`
+
+Where p_t is the probability of the true class. When gamma > 0, easy examples (high p_t) get downweighted, and hard examples (low p_t) get upweighted.
+
+This could help with the weak classes (pore, stain) by making the model focus more on the harder-to-classify examples. And it's a method change, not a hyperparameter tweak.
+
+Implementation:
+```python
+class FocalLoss(nn.Module):
+    def __init__(self, gamma=2.0, alpha=None):
+        super().__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+    
+    def forward(self, inputs, targets):
+        ce_loss = nn.functional.cross_entropy(inputs, targets, reduction='none')
+        pt = torch.exp(-ce_loss)
+        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
+        if self.alpha is not None:
+            alpha_t = self.alpha[targets]
+            focal_loss = alpha_t * focal_loss
+        return focal_loss.mean()
+```
+
+But the brief says "Class-weighted loss hurt classification every time it was tried." Focal loss with alpha is a form of class weighting. But focal loss without alpha (just gamma) is not class weighting - it's difficulty weighting. So it should be fine.
+
+Let me go with **focal loss (gamma=2.0, no alpha)** as the next experiment.
+
+Hypothesis: Focal loss will improve mAP by focusing training on the harder-to-classify examples (particularly pore and stain), which are the weak classes, without the negative effects of class weighting.
+
+This is a clean, focused change. It only modifies the loss function. No time budget issues. No data changes. No architecture changes.
+
+Let me write the code.
+
+Current loss:
+```python
+crit = nn.CrossEntropyLoss()
+```
+and
+```python
+loss = crit((model(xt) + model(xw)) / 2, y)
+```
+
+New loss:
+```python
+def focal_loss(logits, targets, gamma=2.0):
+    ce = nn.functional.cross_entropy(logits, targets, reduction='none')
+    pt = torch.exp(-ce)
+    return ((1 - pt) ** gamma * ce).mean()
+```
+
+And in the training loop:
+```python
+loss = focal_loss((model(xt) + model(xw)) / 2, y)
+```
+
+Wait, I need to be careful. The cross_entropy function expects logits, not probabilities. The current code passes logits to crit (CrossEntropyLoss), which is correct. For focal loss, I need to compute CE first, then apply the focal weighting.
+
+Let me write this properly:
+
+```python
+def focal_loss(logits, targets, gamma=2.0):
+    ce = nn.functional.cross_entropy(logits, targets, reduction='none')
+    pt = torch.exp(-ce)
+    return ((1 - pt) ** gamma * ce).mean()
+```
+
+This should work. The `cross_entropy` with `reduction='none'` gives per-sample CE loss. Then `pt = exp(-ce)` gives the probability of the true class. Then `(1-pt)^gamma * ce` is the focal loss per sample.
+
+Let me also consider: should I use a different gamma? gamma=2.0 is the standard value. Let me stick with that.
+
+One concern: focal loss changes the scale of the loss, which might affect the learning rate. But since we're using AdamW with a fixed LR, this should be fine. The optimizer adapts to the gradient scale.
+
+Another concern: focal loss might make training less stable, especially in the early epochs. But with a pretrained model, this should be OK.
+
+Let me finalize the change:
+
+1. Replace `crit = nn.CrossEntropyLoss()` with a focal loss function.
+2. Replace `loss = crit((model(xt) + model(xw)) / 2, y)` with `loss = focal_loss((model(xt) + model(xw)) / 2, y)`.
+
+Actually, I should define the focal loss as a function or a module. Let me use a simple function to keep it clean.
+
+Here's my plan:
+
+SEARCH: `    crit = nn.CrossEntropyLoss()`
+REPLACE: 
+```python
+    def focal_loss(logits, targets, gamma=2.0):
+        ce = nn.functional.cross_entropy(logits, targets, reduction='none')
+        pt = torch.exp(-ce)
+        return ((1 - pt) ** gamma * ce).mean()
+```
+
+SEARCH: `                loss = crit((model(xt) + model(xw)) / 2, y)`
+REPLACE: `                loss = focal_loss((model(xt) + model(xw)) / 2, y)`
+
+Wait, I need to check the exact indentation. Let me look at the code again:
+
+```python
+    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
+    model = model.to(device).to(memory_format=torch.channels_last)
+    crit = nn.CrossEntropyLoss()
+    opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+```
+
+And:
+```python
+            with torch.autocast(**amp):
+                loss = crit((model(xt) + model(xw)) / 2, y)
+```
+
+OK so the indentation is:
+- `    crit = nn.CrossEntropyLoss()` (4 spaces)
+- `                loss = crit((model(xt) + model(xw)) / 2, y)` (16 spaces)
+
+Let me write the SEARCH/REPLACE blocks carefully.
+
+Actually, I realize I should double-check: will focal loss work with autocast? The `cross_entropy` with `reduction='none'` should work fine with autocast. The `torch.exp` and power operations are also fine.
+
+One more thought: should I also try a different gamma? The standard is 2.0, but for this task, a lower gamma (like 1.0) might be more appropriate since the class imbalance isn't extreme. But let me stick with 2.0 for the first test.
+
+Let me finalize.

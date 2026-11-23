@@ -1,0 +1,391 @@
+===== attempt 1 =====
+Let me carefully analyze the current state and the plan.
+
+**Current state:**
+- e000 (current best): 0.6288 5-seed val mAP@0.5
+- Per-class: pore 0.502, deposit 0.624, discontinuity 0.780, stain 0.609
+- Main error: pore→stain (20), deposit→stain (55), stain→deposit (46), stain→pore (15)
+- 117 mAP is lost to classification errors
+
+**The lead's plan:**
+Replace logit averaging with a cross-attention fusion head:
+1. Use `timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=0)` to get features
+2. `CropFuser` module:
+   - Project both features (B, 1280) to D=512 with 1x1 conv + GELU
+   - q = f_t_proj, k = f_w_proj, v = f_w_proj
+   - attn = softmax(QK^T/sqrt(D)) V → (B, D)
+   - output = cat([f_t_proj, attn, f_w_proj], dim=-1) → MLP to (B, 512)
+3. Final fc: Linear(512, 4)
+4. Training loop: `model(views[0], views[1])` returns logits
+5. Keep everything else
+
+Let me think about the implementation details:
+
+For `num_classes=0` in timm's efficientnet_b0, the model returns features after global pooling. Actually, let me think about what timm returns with `num_classes=0`. In timm, when you create a model with `num_classes=0`, the forward returns the output of the global pooling layer (before the classifier). For EfficientNet-B0, that's a (B, 1280) tensor.
+
+Actually, let me be careful. In timm, `num_classes=0` means the classifier is removed and the model returns the pooled features. For efficientnet_b0, the feature dimension is 1280.
+
+So the plan is:
+1. Create model with `num_classes=0` → returns (B, 1280) features
+2. CropFuser takes two (B, 1280) tensors and produces (B, 512)
+3. Linear(512, 4) → logits
+
+Let me write the CropFuser:
+
+```python
+class CropFuser(nn.Module):
+    def __init__(self, in_dim=1280, d=512):
+        super().__init__()
+        self.proj_t = nn.Linear(in_dim, d)
+        self.proj_w = nn.Linear(in_dim, d)
+        self.act = nn.GELU()
+        self.scale = math.sqrt(d)
+        self.mlp = nn.Sequential(
+            nn.Linear(d * 3, d),
+            nn.GELU(),
+            nn.Linear(d, d),
+        )
+    
+    def forward(self, f_t, f_w):
+        q = self.act(self.proj_t(f_t))  # (B, D)
+        k = self.act(self.proj_w(f_w))  # (B, D)
+        v = k  # reuse
+        # attention: (B, D) x (B, D)^T -> (B, D, D) ... wait, that's not right
+        # Actually for a single query per sample, we need a different formulation
+        ...
+```
+
+Wait, the plan says:
+- q = f_t_proj, k = f_w_proj, v = f_w_proj
+- attn = softmax(QK^T/sqrt(D)/dim) V → (B, D)
+
+Hmm, this is a bit confusing. If q is (B, D), k is (B, D), v is (B, D), then QK^T would be (B, D, D) which doesn't make sense for standard attention.
+
+Actually, I think the intent is:
+- Treat f_t_proj as a single query vector (B, D)
+- Treat f_w_proj as a key-value vector (B, D)
+- The "attention" here is more like an element-wise interaction
+
+Actually, re-reading: "attn = softmax(QK^T/sqrt(D)/dim) V → (B, D)"
+
+I think the intent is that we have D "keys" and D "values" (treating the D-dimensional vector as D scalar keys/values), and 1 query (the D-dimensional f_t_proj). But that's unusual.
+
+Wait, let me re-read more carefully:
+"q = f_t_proj, k = f_w_proj, v = f_w_proj; attn = softmax(QK^T/sqrt(D)/dim) V → (B, D)"
+
+I think the interpretation is:
+- q: (B, 1, D) — one query per sample
+- k: (B, D, 1) — D keys per sample (each dimension is a key)
+- v: (B, D, 1) — D values per sample
+
+Then QK^T: (B, 1, D) @ (B, D, 1) = (B, 1, 1) — that gives a single scalar attention weight, not (B, D).
+
+Hmm, that doesn't work either.
+
+Let me think differently. Maybe the intent is:
+- q: (B, D) — the tight feature
+- k: (B, D) — the wide feature  
+- The attention is computed as: for each dimension d, the "relevance" of wide-dim to tight-dim
+
+Actually, I think the simplest interpretation that gives (B, D) output is:
+- Treat the D dimensions as D "tokens"
+- q: (B, 1, D) — single query
+- k: (B, D, D) — D keys, each D-dim... no that's too many params
+
+OK let me just think about what makes architectural sense and gives the right shapes:
+
+Option 1: Element-wise gating
+- q = f_t_proj (B, D), k = f_w_proj (B, D)
+- gate = sigmoid(q * k / sqrt(D)) (B, D) — element-wise relevance
+- attn = gate * v where v = f_w_proj (B, D)
+- output = cat([q, attn, k], dim=-1) → (B, 3D) → MLP → (B, D)
+
+This is simple, efficient, and captures "the tight crop attends to context weighted by relevance."
+
+Option 2: Multi-head attention with D as sequence length
+- This would require reshaping and is more complex
+
+I'll go with Option 1 as it's the simplest interpretation that gives (B, D) output and captures the cross-attention idea. The "softmax(QK^T/sqrt(D))" in the plan likely means element-wise dot product normalized, which for 1D vectors is just a scalar... 
+
+Actually wait. Let me re-read: "attn = softmax(QK^T/sqrt(D)/dim) V → (B, D)"
+
+Maybe the intent is:
+- Q: (B, D, 1) — D queries (one per dimension of tight)
+- K: (B, 1, D) — 1 key (the wide feature)
+- V: (B, 1, D) — 1 value
+
+Then QK^T: (B, D, 1) @ (B, 1, D) = (B, D, D)
+softmax over last dim: (B, D, D)
+@ V: (B, D, D) @ (B, D, 1)... no, that's (B, D, 1)
+
+Hmm, that gives (B, D, 1) not (B, D).
+
+OK I think the cleanest interpretation that works and makes sense is:
+
+Treat it as: the tight feature (B, D) queries the wide feature (B, D). The "attention" is a learned interaction between the two D-vectors. The simplest form:
+
+```python
+class CropFuser(nn.Module):
+    def __init__(self, in_dim=1280, d=512):
+        super().__init__()
+        self.proj_t = nn.Linear(in_dim, d)
+        self.proj_w = nn.Linear(in_dim, d)
+        self.act = nn.GELU()
+        self.scale = math.sqrt(d)
+        self.out_mlp = nn.Sequential(
+            nn.Linear(d * 3, d),
+            nn.GELU(),
+        )
+    
+    def forward(self, f_t, f_w):
+        q = self.act(self.proj_t(f_t))  # (B, D)
+        w = self.act(self.proj_w(f_w))  # (B, D)
+        # Cross-attention: element-wise relevance gating
+        # Each dim of q attends to corresponding dim of w
+        relevance = torch.sigmoid(q * w / self.scale)  # (B, D)
+        attn = relevance * w  # (B, D) - wide features weighted by tight's need
+        out = self.out_mlp(torch.cat([q, attn, w], dim=-1))  # (B, D)
+        return out
+```
+
+This is clean, efficient, and captures the idea. The sigmoid gating is a soft attention mechanism where the tight crop "decides" how much of each context dimension to use.
+
+Actually, let me reconsider. The plan specifically says "cross-attention" and "softmax(QK^T/sqrt(D)/dim) V". Let me try to honor that more literally while making it work:
+
+If we think of it as:
+- The D-dimensional tight feature provides D "queries"
+- The D-dimensional wide feature provides D "keys" and D "values"
+- But each query/key/value is a scalar (1-dim)
+
+Then:
+- Q: (B, D, 1)
+- K: (B, D, 1)  
+- V: (B, D, 1)
+- QK^T: (B, D, 1) @ (B, 1, D) = (B, D, D) — attention matrix
+- softmax over D (last dim): (B, D, D)
+- @ V: (B, D, D) @ (B, D, 1) = (B, D, 1) → squeeze → (B, D)
+
+This works! And it's a proper cross-attention where each dimension of the tight feature attends to all dimensions of the wide feature.
+
+But this requires (B, D, D) intermediate which for D=512 and B=64 is 64*512*512 = 16.7M floats = 67MB. That's fine.
+
+Actually wait, let me reconsider the shapes:
+- q = f_t_proj: (B, D) → reshape to (B, D, 1) for D queries
+- k = f_w_proj: (B, D) → reshape to (B, 1, D) for... 
+
+No wait. If I have D queries and D keys:
+- Q: (B, D, 1) — D queries, each 1-dim
+- K: (B, D, 1) — D keys, each 1-dim
+- QK^T: (B, D, 1) @ (B, 1, D) = (B, D, D) — attention scores
+- softmax(-1): (B, D, D)
+- V: (B, D, 1) — D values, each 1-dim
+- attn @ V: (B, D, D) @ (B, D, 1) = (B, D, 1) → (B, D)
+
+Yes! This works. And it's a proper attention mechanism. Let me use this.
+
+```python
+class CropFuser(nn.Module):
+    def __init__(self, in_dim=1280, d=512):
+        super().__init__()
+        self.proj_t = nn.Linear(in_dim, d)
+        self.proj_w = nn.Linear(in_dim, d)
+        self.act = nn.GELU()
+        self.scale = math.sqrt(d)
+        self.out_mlp = nn.Sequential(
+            nn.Linear(d * 3, d),
+            nn.GELU(),
+        )
+    
+    def forward(self, f_t, f_w):
+        q = self.act(self.proj_t(f_t)).unsqueeze(-1)  # (B, D, 1)
+        k = self.act(self.proj_w(f_w)).unsqueeze(-1)  # (B, D, 1)
+        v = k  # (B, D, 1)
+        # Cross-attention: (B, D, 1) @ (B, 1, D) -> (B, D, D)
+        attn = torch.softmax(q @ k.transpose(-2, -1) / self.scale, dim=-1)  # (B, D, D)
+        ctx = attn @ v  # (B, D, 1)
+        ctx = ctx.squeeze(-1)  # (B, D)
+        q_flat = q.squeeze(-1)  # (B, D)
+        k_flat = k.squeeze(-1)  # (B, D)
+        out = self.out_mlp(torch.cat([q_flat, ctx, k_flat], dim=-1))  # (B, D)
+        return out
+```
+
+Wait, but `q @ k.transpose(-2, -1)` where q is (B, D, 1) and k.transpose is (B, 1, D):
+(B, D, 1) @ (B, 1, D) = (B, D, D) ✓
+
+Then softmax over last dim: (B, D, D) ✓
+Then (B, D, D) @ (B, D, 1) = (B, D, 1) ✓
+
+Great, this works.
+
+Now, the full model:
+
+```python
+class TwoCropClassifier(nn.Module):
+    def __init__(self, backbone, fuser, head):
+        super().__init__()
+        self.backbone = backbone
+        self.fuser = fuser
+        self.head = head
+    
+    def forward(self, x_t, x_w):
+        f_t = self.backbone(x_t)  # (B, 1280)
+        f_w = self.backbone(x_w)  # (B, 1280)
+        fused = self.fuser(f_t, f_w)  # (B, 512)
+        return self.head(fused)  # (B, 4)
+```
+
+Now let me think about the timm model. With `num_classes=0`, timm's efficientnet_b0 returns the pooled features. Let me verify: in timm, when `num_classes=0`, the `forward` method returns the output after `global_pool` but before the classifier. For EfficientNet-B0, this is a (B, 1280) tensor.
+
+Actually, I need to double-check. In timm, the EfficientNet forward looks like:
+```python
+def forward_features(self, x):
+    x = self.conv_stem(x)
+    ...
+    x = self.global_pool(x)
+    x = self.flatten(x)
+    return x
+
+def forward(self, x):
+    x = self.forward_features(x)
+    x = self.classifier(x)
+    return x
+```
+
+When `num_classes=0`, the classifier is `nn.Identity()`, so `forward` returns the flattened pooled features (B, 1280). 
+
+Now let me write the full implementation. I need to:
+1. Replace the model creation
+2. Add the CropFuser class
+3. Add the TwoCropClassifier wrapper
+4. Update training loop to pass both views
+5. Update eval loop
+
+Let me look at the current code structure:
+
+Current model creation:
+```python
+model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
+model = model.to(device).to(memory_format=torch.channels_last)
+```
+
+Current training forward:
+```python
+with torch.autocast(**amp):
+    loss = crit((model(xt) + model(xw)) / 2, y)
+```
+
+Current eval forward:
+```python
+probs.append(torch.softmax(((model(xt) + model(xw)) / 2).float(), 1).cpu())
+```
+
+New model creation:
+```python
+backbone = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=0)
+fuser = CropFuser(in_dim=1280, d=512)
+head = nn.Linear(512, 4)
+model = TwoCropClassifier(backbone, fuser, head)
+model = model.to(device).to(memory_format=torch.channels_last)
+```
+
+New training forward:
+```python
+with torch.autocast(**amp):
+    loss = crit(model(xt, xw), y)
+```
+
+New eval forward:
+```python
+probs.append(torch.softmax(model(xt, xw).float(), 1).cpu())
+```
+
+Now, there's a subtlety with `memory_format=torch.channels_last`. This applies to 4D tensors (images). The backbone will handle this internally. The fuser and head operate on 2D tensors so they don't need channels_last.
+
+Let me also think about the optimizer. The backbone has pretrained weights, and the fuser/head are randomly initialized. The current LR is 1e-3 with AdamW. This should be fine - the backbone will be fine-tuned and the new layers will learn from scratch.
+
+Actually, wait. Should I use different learning rates for backbone vs. new layers? The plan says "Keep all other hyperparameters (LR 1e-3, WD 0.05, cosine decay, 160 px)". So I'll keep the same LR for everything. This is simpler and the plan explicitly says to keep hyperparameters.
+
+Let me now write the SEARCH/REPLACE blocks.
+
+**Block 1: Add CropFuser and TwoCropClassifier classes (after BoxDataset)**
+
+I'll insert after the BoxDataset class definition. Let me find a good anchor point.
+
+The BoxDataset class ends with:
+```python
+        return views[0], views[1], r.get("cls", -1)
+```
+
+Then `def main():` starts. I'll insert the new classes between them.
+
+**Block 2: Replace model creation**
+
+Current:
+```python
+    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
+    model = model.to(device).to(memory_format=torch.channels_last)
+```
+
+New:
+```python
+    backbone = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=0)
+    fuser = CropFuser(in_dim=1280, d=512)
+    head = nn.Linear(512, 4)
+    model = TwoCropClassifier(backbone, fuser, head)
+    model = model.to(device).to(memory_format=torch.channels_last)
+```
+
+**Block 3: Replace training forward**
+
+Current:
+```python
+            with torch.autocast(**amp):
+                loss = crit((model(xt) + model(xw)) / 2, y)
+```
+
+New:
+```python
+            with torch.autocast(**amp):
+                loss = crit(model(xt, xw), y)
+```
+
+**Block 4: Replace eval forward**
+
+Current:
+```python
+            probs.append(torch.softmax(((model(xt) + model(xw)) / 2).float(), 1).cpu())
+```
+
+New:
+```python
+            probs.append(torch.softmax(model(xt, xw).float(), 1).cpu())
+```
+
+Let me verify the shapes end-to-end:
+1. Dataset returns `views[0], views[1], cls` where each view is (3, 160, 160) tensor
+2. DataLoader batches: xt (B, 3, 160, 160), xw (B, 3, 160, 160), y (B,)
+3. `model(xt, xw)`:
+   - backbone(xt) → (B, 1280)
+   - backbone(xw) → (B, 1280)
+   - fuser(f_t, f_w) → (B, 512)
+   - head(fused) → (B, 4)
+4. `crit(logits, y)` where logits (B, 4), y (B,) ✓
+
+For eval:
+1. Same batching
+2. `model(xt, xw)` → (B, 4)
+3. `torch.softmax(..., 1)` → (B, 4) ✓
+
+Looks good.
+
+Now let me think about the time budget. The current run does 433 steps in ~150s training. The backbone forward is called twice (same as before - once for xt, once for xw). The fuser adds:
+- 2 Linear(1280, 512): negligible
+- Attention: (B, 512, 512) matmul: for B=64, that's 64*512*512 = 16.7M ops for QK^T, and same for attn@V. Very fast.
+- MLP: Linear(1536, 512) + Linear(512, 512): negligible
+
+So the time overhead is minimal (< 1s per epoch). The run should still fit in budget.
+
+Let me also check: does `timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=0)` work correctly? Yes, this is standard timm API. With `num_classes=0`, the classifier head is replaced with `nn.Identity()`.
+
+One more thing: the `memory_format=torch.channels_last` on the full model. The `TwoCropClassifier` contains the backbone (which has conv layers that benefit from channels_last) and the fuser/head (which are linear layers on 2D tensors). Calling `.to(memory_format=torch.channels_last)` on the whole model should be fine - it onlyThinking budget reached. Stop thinking now and write the reply in the required format.

@@ -1,0 +1,273 @@
+===== attempt 1 =====
+Let me think carefully about this.
+
+**Current situation:**
+- Best: e000, 5-seed mean 0.6288, std 0.0051
+- Baseline to beat: 0.638 (one-step detector)
+- Ceiling (stage-1 boxes with perfect classes): 0.758
+- Class-agnostic stage-1: 0.755
+- Per-class: pore 0.496, deposit 0.629, discontinuity 0.780, stain 0.609
+
+**History:**
+- e001 (data): add low-res boxes → 0.6246, rejected
+- e002 (architecture): bigger backbone → 0.6234, rejected
+- e003 (data): IMG_SIZE 224 → 0.6197, rejected
+- e004 (data): train on detector boxes (domain adaptation) → 0.6277, rejected
+- e005 (scoring): temperature on normalized class likelihood → 0.6049, rejected
+
+So 5 experiments, all rejected. Data category is "EXHAUSTED?" per harness. Architecture and scoring each have 1 attempt.
+
+**Where is the error?**
+
+Let me think about the reference numbers:
+- Stage-1 boxes with perfect classes: 0.758
+- Stage-1 boxes scored as single class: 0.755
+- Our current: 0.6288
+
+The gap between 0.6288 and 0.758 is ~0.13. That's the class-decision error. The class-agnostic score (0.755) tells us that the detector boxes themselves are nearly at ceiling — the boxes are good. So the loss is almost entirely in class assignment (and maybe ranking within class).
+
+Wait, but there's a subtlety. In the two-stage setup, we output one row per class per box (4 rows per box). The mAP is computed per class. So for each class, all predictions of that class across all boxes are sorted by score. A prediction is a hit if it overlaps an unmatched true box of that class.
+
+Now here's a key insight: when we output 4 rows per box (one per class), for a given class c, the predictions are all boxes scored by conf * p_c(box). A box that is a true pore but gets classified as stain will appear in the stain class with high score (false positive for stain) AND in the pore class with low score (missed pore, or low-ranked). 
+
+Actually, the critical issue: by outputting all 4 classes per box, we're creating 4x as many predictions as there are boxes. For each class, we have ~41879 predictions (one per box). But the number of true boxes of each class is much smaller. So there are tons of false positives per class.
+
+The metric: per class, predictions sorted by score, hit if overlaps unmatched true box of that class by IoU>0.5. AP depends only on the ORDER.
+
+So for class c, we rank all boxes by conf * p_c. The true boxes of class c should be ranked high. The problem is that boxes which are true defects of OTHER classes but get high p_c will be false positives for class c, and boxes which are false alarms (no true box) but get high p_c will also be false positives.
+
+The key realization from e005: the closed-set classifier is confident (softmax sums to 1) even on false alarms and misassigned boxes. So p_c is a noisy ranking signal.
+
+Let me think about what actually determines AP here.
+
+For a single class, AP = integral of precision at each recall. The predictions are sorted by score. A true box of class c is "found" when we reach it in the ranking. Precision at that point = (number of true hits so far) / (number of predictions so far).
+
+The number of predictions per class is huge (~41879). The number of true boxes of class c is maybe a few hundred. So precision is very low unless the true boxes are ranked at the very top.
+
+So the ranking quality within each class matters a lot. We want true class-c boxes ranked above:
+1. false alarms (no true box)
+2. true boxes of other classes (which are false positives for class c)
+
+Now, here's a thought. The detector conf is a class-agnostic confidence. It's high for real defects and low for false alarms. So conf already does a lot of the "is this a real defect" work. The p_c adds the class-specific info.
+
+But the problem: p_c for a false alarm — the classifier still assigns some class with high probability. So a false alarm with high detector conf gets a high score in whatever class the classifier picks. That's a false positive.
+
+Conversely, a true pore with the classifier picking stain (p_stain high, p_pore low) → the pore box gets low score in pore class (missed/low ranked) and high score in stain class (false positive for stain).
+
+So the two error sources:
+1. Within-class ranking: conf * p_c needs to rank true class-c boxes above FPs and other-class boxes.
+2. Class confusion: pore↔stain, deposit↔stain.
+
+Now, what's the biggest lever? Let me think about the per-class APs: pore 0.496, deposit 0.629, discontinuity 0.780, stain 0.609.
+
+Discontinuity is good (0.780). Pore is bad (0.496). Stain 0.609, deposit 0.629.
+
+The weak classes are pore and stain. Pore is a fine-grained texture. Stain is confused with deposit.
+
+Let me think about what change could give 0.01+.
+
+Ideas tried:
+- More data (low-res): no
+- Bigger backbone: no
+- Higher res: no
+- Domain adaptation (train on det boxes): no
+- Score temperature: no (hurt)
+
+What hasn't been tried?
+- Different crop strategy (e.g., multi-scale, or the "two-crop" is fixed; maybe a third crop, or different context)
+- Ensembling / test-time augmentation
+- Training strategy: longer training, different optimizer, label smoothing
+- The scoring: maybe output only the top class per box (argmax) instead of all 4? That would reduce false positives dramatically. But wait — the metric allows multiple rows per box. But if we output only argmax, then for each class, we have fewer predictions (only boxes where that class is argmax). Hmm, but that changes the ranking.
+
+Actually wait. Let me reconsider the "output all 4 classes" vs "output argmax only" question.
+
+If we output all 4 classes per box: for class c, predictions = all boxes, ranked by conf*p_c. Number of preds per class = N_boxes (~41879).
+
+If we output only argmax (1 row per box, the class with max conf*p_c): for class c, predictions = only boxes where c is argmax, ranked by conf*p_c. Number of preds per class = N_boxes/4 roughly (less, since classes imbalanced).
+
+Which is better for AP? AP depends on the order and on precision at each recall. If we output fewer false positives (by not emitting the non-argmax classes), then for class c, the false positives from "other-class boxes that happen to have high p_c" are removed. That should improve precision.
+
+But there's a catch: a true class-c box where c is NOT the argmax (because the classifier misclassified it) would be dropped entirely → missed detection. So argmax-only trades off: fewer FPs but more FN.
+
+Hmm, but actually in the all-4-classes scheme, a true class-c box that's misclassified still appears in class c (with low p_c), so it's not missed, just low-ranked. In argmax-only, it's dropped.
+
+Let me think about which is better. This is actually a known consideration. Let me think about the math.
+
+Actually, the reference number "stage-1 boxes scored as a single class 'defect': 0.755" is interesting. That means if there were only ONE class, and we score all boxes by conf, we get 0.755. That's the class-agnostic mAP. It's very high because there's no class confusion — every box that overlaps a true defect is a hit regardless of type.
+
+Now with 4 classes and perfect class assignment, we get 0.758 (slightly higher than 0.755, interesting — because with 4 classes, a box overlapping a true defect of the right class is a hit, and there are 4x the "slots"... actually the ceiling is computed differently).
+
+Wait, let me re-read: "stage-1 boxes with perfect classes (ceiling for stage 2): 0.758 mAP@0.5. Every detector box that overlaps a true defect (IoU > 0.5) gets the correct class; every other box (false alarms) is KEPT, as class 0, with its detector conf."
+
+So the ceiling keeps ALL boxes (including FPs as class 0). And gets 0.758. So even with perfect class assignment, we get 0.758, and the FPs are kept as class 0. So the FPs hurt the class-0 (pore) AP in the ceiling too.
+
+Our current is 0.6288. The gap to ceiling is 0.758 - 0.6288 = 0.129. That's the class-decision error.
+
+So the question: how do we close that 0.129 gap? The classifier macro-F1 is ~0.87. So ~13% of boxes are misclassified. That roughly matches the 0.129 gap.
+
+To close it, we need better class assignment. Options:
+1. Better classifier (more accurate) — tried bigger backbone, higher res, more data, domain adaptation. All failed.
+2. Better scoring that's robust to misclassification.
+
+Hmm. Let me think differently. 
+
+Actually, wait. Let me reconsider whether the problem is really class assignment or ranking.
+
+Let me reconsider. The macro-F1 ~0.87 is on "perfect boxes" (crop classifier given perfect boxes). But at test time we have detector boxes (imperfect). And the ranking also matters.
+
+Let me think about what's the single biggest lever.
+
+Actually, here's a thought I haven't fully explored: **the training objective and the test-time use of the classifier.**
+
+Currently: score = conf * p_c, where p_c = softmax(classifier). We output all 4 classes.
+
+The issue with conf * p_c: the softmax p_c is a probability that sums to 1. For a false alarm, the classifier still picks some class with high p. So conf * p_c is high for FPs in the class they're misclassified as.
+
+What if instead we think about it as: we want to rank, within each class, true boxes above FPs and other-class boxes. The detector conf ranks real defects above FPs (class-agnostic). The classifier p_c should rank true class-c boxes above other-class boxes.
+
+But p_c for a true class-d box (d≠c) might be non-negligible (confusion). And p_c for a false alarm might be high.
+
+Alternative: use a "class-agnostic realness" score × "class-specific" score, but the class-specific should be a relative measure.
+
+Hmm, e005 tried normalizing p_c by its mean and applying temperature. That hurt (0.6049). So that direction is bad.
+
+Let me think about a fundamentally different idea.
+
+**Idea: train the classifier to also predict "is this a real defect" — i.e., add a background/false-alarm class, or use the detector boxes (which include FPs) as training data with a "not a defect" label.**
+
+Wait, e004 tried "train on detector boxes (domain adaptation)" — that was about train/test input mismatch. Let me re-read e004's hypothesis: "The classifier is trained on ground-truth crop boxes (crops.csv) but at test time it is fed detector boxes (dets.csv), which are slightly misplaced and include false alarms — a train/test input-distribution mismatch." So e004 trained on detector boxes instead of crop boxes. That's about the input distribution (misplaced boxes), not about adding FPs as a class. It got 0.6277, rejected (basically no change).
+
+So a different idea: **add false alarms as a training class (background)**. Train the classifier on both crop boxes (4 classes) AND detector boxes that don't overlap any true crop (label = "background" / 5th class). Then at test time, a box that looks like a false alarm gets high "background" probability, and we can use that to suppress its score across all classes.
+
+This directly targets the FP ranking problem. The false alarms are kept in the output (we can't drop them entirely without risk), but we can rank them lower.
+
+Wait, but can we drop them? The contract says "leaving a box out drops it." If we're confident a box is a false alarm, we could drop it (not emit any row for it). That would reduce FPs. But it's risky — if we wrongly drop a true box, we lose it.
+
+Actually, let me think about the metric again. For class c, AP depends on ranking. If we drop a false alarm, we remove a false positive from all classes → precision improves everywhere. If we drop a true box, we lose a detection in its class.
+
+The safest: don't drop, but rank FPs low. To rank FPs low, we need a "realness" signal. The detector conf is already a realness signal (high for real defects). So conf already ranks FPs low-ish. The problem is the class-specific part.
+
+Hmm, let me reconsider. Let me reconsider the actual decomposition of the error.
+
+Let me reconsider: maybe the issue isn't FPs at all. Let me reconsider the per-class numbers.
+
+pore 0.496 — very low. Why? Pore is a fine texture. The classifier confuses pore with stain and background. So true pores get misclassified → low p_pore → low rank in pore class → missed. And they become FPs in stain.
+
+stain 0.609 — stain is confused with deposit. So true stains get misclassified as deposit → low p_stain, and true deposits get some p_stain.
+
+deposit 0.629 — similar.
+
+discontinuity 0.780 — the easiest class, well separated.
+
+So the weak classes are the fine-grained texture ones (pore) and the confused pair (stain/deposit).
+
+To improve pore: better texture discrimination. Tried higher res (e003, failed), bigger backbone (e002, failed), more data (e001, failed). Hmm.
+
+Wait, all the "make the classifier better" ideas failed. That's suspicious. Maybe the classifier is not the bottleneck — maybe the scoring/ranking is.
+
+Let me reconsider. The macro-F1 ~0.87 is given. If the classifier had F1 0.87 and we scored perfectly, what mAP would we get? Hard to say directly.
+
+Let me think about the scoring more carefully. score = conf * p_c, output all 4 classes.
+
+Consider a true pore box. conf = 0.8 (say). Classifier: p_pore = 0.5, p_stain = 0.3, p_deposit = 0.1, p_disc = 0.1. So in pore class, score = 0.8*0.5 = 0.4. In stain class, score = 0.8*0.3 = 0.24 (this is a FP for stain). Etc.
+
+Now consider a false alarm. conf = 0.3. Classifier: p_stain = 0.6, p_pore = 0.2, ... So in stain class, score = 0.3*0.6 = 0.18. This FP for stain (0.18) might rank above the true pore's stain-FP (0.24)? No, 0.18 < 0.24. But it ranks among stain predictions.
+
+The issue: for the stain class, we have true stains (scored by conf*p_stain), true pores misclassified as stain (conf*p_stain), true deposits misclassified as stain, and false alarms misclassified as stain. All mixed.
+
+To improve stain AP, we want true stains ranked above all those. conf helps (true defects have higher conf than FPs). p_stain helps (true stains have higher p_stain than pores/deposits/FPs, hopefully).
+
+OK here's a cleaner idea. Let me reconsider the **number of predictions per class**.
+
+Currently we emit 4 rows per box. So per class, ~41879 predictions. The true boxes per class are maybe ~1000-2000. So precision is inherently low. But AP is recall-weighted, so what matters is the ranking of the true boxes relative to everything else.
+
+Now, a key insight: **emitting all 4 classes means each true box of class c competes in class c against ALL other boxes (including all true boxes of other classes and all FPs).** If instead we emit only the top-1 (argmax) class per box, then in class c, a box only appears if c is its argmax. This removes the "other-class boxes with moderate p_c" from class c's ranking, which are pure FPs for class c.
+
+But it also removes true class-c boxes that were misclassified (argmax ≠ c). 
+
+Trade-off. Which wins? Let me think. If the classifier has F1 0.87, then ~13% of true boxes are misclassified. In all-4 scheme, those 13% are still present in their true class (low-ranked). In argmax scheme, they're dropped (FN). Meanwhile, in all-4 scheme, every other-class box is a FP in class c (even if its p_c is tiny, it's still a prediction, just low-ranked). In argmax scheme, only boxes where c is argmax appear.
+
+Hmm, I think argmax-only might actually be better for AP because it drastically cuts the FP count per class. Let me think about a concrete example.
+
+Actually, let me reconsider. The number of predictions per class in all-4 is N (all boxes). In argmax, it's N/4 (roughly, the boxes where c is argmax). The true boxes of class c: in all-4, all of them appear (N_c true). In argmax, only the correctly-classified ones appear (~0.87 * N_c).
+
+Precision at the top: In all-4, the top predictions for class c are the highest conf*p_c. These include true class-c boxes AND other-class boxes with high conf and high p_c (confused) AND FPs with high conf and high p_c. In argmax, the top predictions for class c are the highest conf*p_c among boxes where c is argmax. These are true class-c boxes (correctly classified) AND FPs where c is argmax. The other-class boxes (where c is not argmax) are excluded.
+
+So argmax removes the "other-class boxes where c is not argmax" — but those are boxes where c is NOT the top class, so their p_c is relatively low, so they'd be low-ranked in all-4 anyway. So excluding them doesn't change the top ranking much. Hmm.
+
+Wait, that's the key. In all-4, a box where c is not argmax has p_c < p_{argmax}, so its score conf*p_c is lower than its score in the argmax class. So in class c's ranking, these boxes are naturally lower. So excluding them (argmax) doesn't remove high-ranked FPs; it removes low-ranked ones. So argmax might not help much, and it hurts by dropping misclassified true boxes.
+
+Hmm, so argmax-only is probably not a clear win. Let me not go there.
+
+Let me reconsider. What's the biggest error component?
+
+Let me reconsider the reference: class-agnostic (single class) = 0.755. 4-class perfect = 0.758. 4-class ours = 0.6288.
+
+The jump from 0.755 (1 class) to 0.758 (4 class perfect) is tiny (+0.003). This tells us: adding class labels (perfectly) barely changes mAP. That's because in the 1-class case, a box overlapping ANY true defect is a hit. In the 4-class-perfect case, a box overlapping a true defect of the matching class is a hit. Since every true box has a class, and perfect assignment matches, the hits are the same set! The only difference is FPs: in 1-class, all FPs are FPs; in 4-class-perfect, FPs are assigned class 0 (pore), so they're FPs for pore but "hits" for... no wait, they don't overlap true boxes so they're FPs in all interpretations. 
+
+Actually the difference 0.755 vs 0.758: in 1-class, the single class has N boxes, all true defects are hits, FPs are FPs. mAP = some value. In 4-class-perfect, each class has its true boxes as hits and FPs-as-class0 as FPs (for pore). The per-class APs differ but average to ~same. The +0.003 is just noise/different distribution. So essentially, **class assignment, when perfect, does not change mAP much** — the mAP is dominated by the box-level detection (which boxes overlap true defects), not the class labels.
+
+Wait, that's a huge insight! If perfect classes give 0.758 and no classes (single class) gives 0.755, then the class labels contribute almost nothing to mAP — what matters is which boxes overlap true defects (the box-level detection quality), which is fixed by stage 1.
+
+But our 4-class score is 0.6288, way below 0.755. So the loss is NOT in the box detection (that's fixed). The loss must be in how our class assignment + scoring interacts with the metric.
+
+Hold on. Let me reconsider. In the single-class case (0.755), we output 1 row per box (class "defect"), score = conf. AP for that single class: boxes sorted by conf, hit if overlaps a true defect. This is the standard detector mAP. = 0.755.
+
+In our 4-class case (0.6288), we output 4 rows per box. For each class c, boxes sorted by conf*p_c. The issue: by splitting into 4 classes, we've introduced class confusion as a source of error. A true pore classified as stain becomes: a FP in stain, and a low-ranked (or missed) pore.
+
+So the 0.6288 vs 0.755 gap (0.126) is exactly the class-confusion damage. And perfect classes recover it (0.758).
+
+So to improve, we must reduce class confusion's damage to mAP. Two ways:
+(a) Reduce actual confusion (better classifier) — tried, failed.
+(b) Make the scoring robust so that even when confused, the mAP damage is minimized.
+
+For (b): the damage comes from (i) true boxes misclassified → low rank in true class (FN-ish) and (ii) misclassified boxes becoming FPs in wrong class.
+
+Hmm, how to make scoring robust? 
+
+Idea: **For each box, instead of a single class probability, consider that the "realness" (conf) should dominate and the class should be a tiebreaker.** But that's basically what conf*p_c does, with p_c as a soft class weight.
+
+Wait, actually, let me reconsider. What if the problem is that p_c is too "peaked"? The softmax is confident. For a true pore, p_pore might be 0.5 and p_stain 0.3. The score in pore = 0.5*conf, in stain = 0.3*conf. The ratio is 0.5:0.3. If we made the class probabilities flatter (more uniform), then a true pore would get score ~0.25*conf in every class, and the FP-in-stain would be less damaging... no wait, that would make it a FP in ALL classes, which is worse.
+
+Alternatively, make it more peaked (sharper softmax): true pore gets p_pore ~0.9, p_stain ~0.05. Then in pore, score = 0.9*conf (high rank, good). In stain, score = 0.05*conf (low rank, less FP damage). This is better! Sharper softmax = more confident class assignment = less cross-class FP damage.
+
+But e005 tried a temperature (SCORE_T=0.3 on normalized p_c). Let me check: score = conf * (p_c/mean_c)^0.3. Exponent 0.3 < 1 makes it FLATTER (less peaked), since (p/mean)^0.3 is closer to 1 for all c. That's the wrong direction — it flattens, increasing cross-class FP damage. And it hurt (0.6049). Consistent with my analysis!
+
+So the fix might be the OPPOSITE: make the class probabilities SHARPER (exponent > 1, i.e., sharpen the softmax). This would concentrate each box's score in its predicted class, reducing cross-class FPs.
+
+But wait, does sharper softmax help the true-class ranking? For a true pore with p_pore=0.5, p_stain=0.3, p_dep=0.1, p_disc=0.1. Sharpening (exponent 2): p_pore^2/(sum p^2)... let me compute. Actually if we apply exponent to p_c directly: p_c^2 = 0.25, 0.09, 0.01, 0.01, sum=0.36, normalized: 0.69, 0.25, 0.03, 0.03. So pore score goes from 0.5 to 0.69 (higher rank in pore — good), stain FP from 0.3 to 0.25 (lower — good, less FP damage). 
+
+So sharpening helps both: raises true-class score and lowers wrong-class score. This directly reduces class-confusion damage to mAP.
+
+But hold on — is sharpening just a monotone transform? No! Because we apply the exponent per class and the scores for different classes change relative to each other. Within a single class c, the scores are conf * (p_c)^t. For a fixed class c, is (p_c)^t a monotone function of p_c? Yes, for t>0. And conf is fixed per box. So within class c, score = conf * (p_c)^t. Is the ORDER of predictions in class c preserved compared to score = conf * p_c? 
+
+score_old = conf * p_c, score_new = conf * p_c^t. For t>1, p_c^t is a monotone transform of p_c, BUT conf varies per box. So the order of (conf * p_c) vs (conf * p_c^t) is NOT preserved in general, because conf and p_c vary independently. E.g., box A: conf=0.9, p_c=0.5 → old=0.45, new=0.9*0.25=0.225. Box B: conf=0.5, p_c=0.9 → old=0.45, new=0.5*0.81=0.405. Old: A=B (tie). New: B>A. So order changes! Good, so it's not a no-op. It changes the ranking within class c.
+
+So sharpening (t>1) is a legitimate scoring change that can affect mAP. And my analysis says it should help by reducing cross-class FP damage and boosting true-class confidence.
+
+Wait, but I need to double check the direction of the effect on mAP more carefully, because it's subtle.
+
+Let me reconsider. The mAP damage from class confusion has two parts:
+1. A true class-c box misclassified (argmax ≠ c): in all-4 scheme, it still appears in class c with score conf*p_c (low, since p_c is not the max). So it's a low-ranked detection in class c. Sharpening lowers p_c further (since p_c < argmax prob, p_c^t < p_c for t>1 when p_c<1). So it gets even lower rank in class c. That's BAD for part 1 — it makes misclassified true boxes even lower ranked (more missed).
+
+Hmm wait, that's a concern. Let me reconsider.
+
+Actually, a misclassified true box (argmax = d ≠ c) has p_c < p_d. In class c, its score is conf*p_c. Sharpening: conf*p_c^t. Since p_c < 1, p_c^t < p_c for t>1, so the score decreases. So it ranks lower in class c. That's bad — we want it ranked as high as possible in class c (it IS a true c box).
+
+But wait, in the all-4 scheme, this box is ALSO present in class d (its argmax) with high score conf*p_d^t. And it's a true c box, so in class d it's a FP. Sharpening raises its class-d score (p_d is the max, p_d^t relatively high) → more FP damage in class d. Bad.
+
+So sharpening has mixed effects:
+- Correctly classified true boxes: higher rank in true class (good), lower FP in other classes (good).
+- Misclassified true boxes: lower rank in true class (bad), higher FP in argmax class (bad).
+- False alarms: their argmax class score rises (more FP damage, bad), other classes lower (good).
+
+So sharpening amplifies the classifier's confidence. If the classifier is right, sharpening helps; if wrong, sharpening hurts. Since F1 is 0.87 (87% right), sharpening might help on net, but it's a gamble and the effect might be small.
+
+Hmm, this is getting complicated. Let me step back and think about what's the most promising, clearly-different, potentially-large effect.
+
+Let me reconsider the whole thing. The key facts:
+- Box detection is fixed and good (0.755 class-agnostic).
+- Class confusion causes 0.126 mAP loss.
+- Making the classifier better (data, res, backbone, domain) all failed to move the needle (all ~0.62, within noise of 0.6288).
+
+Wait, that's really interesting. ALL the "improve classifier" attempts failed. Even adding 2x data, 2x resolution, bigger backbone — none helped. This strongly suggests the classifier's error is NOT the main bottleneck, OR that the scoring is so dominated by something else that classifier improvements don'tThinking budget reached. Stop thinking now and write the reply in the required format.

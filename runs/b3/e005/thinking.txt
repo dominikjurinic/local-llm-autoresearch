@@ -1,0 +1,398 @@
+===== attempt 1 =====
+Let me analyze the situation:
+
+**Current state:**
+- Best: e004, 5-seed mean 0.6342
+- Baseline to beat: 0.638 (one-step 4-class)
+- Ceiling (perfect classes on stage-1 boxes): 0.758
+- Class-agnostic score: 0.755
+
+Per-class AP: pore 0.522, deposit 0.624, discontinuity 0.780, stain 0.611
+
+**Key observations:**
+1. The gap from 0.634 to 0.758 is ~0.124. This is almost entirely class misassignment (since class-agnostic is 0.755, nearly matching the ceiling).
+2. Pore is the weakest class at 0.522. Stain and deposit are confused with each other.
+3. The crop classifier with perfect boxes reaches macro-F1 ~0.87. So the classifier itself is decent but not great.
+
+**What's been tried:**
+- e001 (scoring): single-class prediction instead of 4 rows → rejected (0.5749). So outputting all 4 classes is better.
+- e002 (data): adding low-res crops → not confirmed (0.6293)
+- e003 (architecture): raising classification accuracy → not confirmed (0.6313). What was the specific change? "raise the class..." - probably a bigger model or more training.
+- e004 (data): pseudo-labeling detector boxes → new best (0.6342)
+
+**Where is the error?**
+- Pore 0.522 is the weakest. Stain 0.611 and deposit 0.624 are also weak. Discontinuity 0.780 is good.
+- The class-agnostic score is 0.755, so the boxes are mostly fine. The problem is class assignment.
+- With perfect boxes, macro-F1 is ~0.87. But we're using detector boxes (slightly off), which e004 helped with.
+
+**What could help?**
+
+Let me think about what's fundamentally different from what's been tried:
+
+1. **The scoring approach**: Currently score = conf × p(c), and all 4 classes are output. e001 tried single-class and it was worse. So multi-class output is good. But maybe the score calibration matters - perhaps we should use a different scoring function.
+
+2. **The classifier itself**: 
+   - e003 tried architecture changes (not confirmed)
+   - The model is EfficientNet-B0 at 160px with two views (1.5x tight + 2.5x wide)
+   - Pore is weakest - maybe pore needs different context or the classifier confuses it with other classes
+
+3. **Training approach**:
+   - Currently uses AdamW with cosine LR, 2 epochs in ~140s
+   - The loss goes from 0.44 to 0.24 in 2 epochs - still learning
+   - Maybe more training would help? But time budget is limited.
+
+4. **Key insight**: The per-class scores show pore at 0.522 which is very weak. The paper says "Pore and deposit are the weak classes; stain is often confused with deposit." 
+
+Let me think about what would give 0.01+ gain:
+
+**Idea 1: Better handling of the pore class specifically**
+- Pore at 0.522 is the biggest drag. If we could improve pore to ~0.65, that's +0.0325 in mAP (0.128/4 ≈ 0.032).
+- But what's fundamentally different?
+
+**Idea 2: Use the detector confidence more intelligently**
+- Currently score = conf × p(c). The detector conf is class-agnostic.
+- Maybe we should use the detector conf differently - e.g., for ranking purposes, use a calibrated score.
+- But e001 showed single-class is worse...
+
+**Idea 3: Train with a different loss or training schedule**
+- The model is still learning (loss 0.24 at end). Maybe a longer training or different schedule would help.
+- But "Tuning hyperparameters alone helped little in earlier experiments"
+
+**Idea 4: Use a better classifier architecture**
+- e003 tried architecture and wasn't confirmed. What was it? "raise the clas..." - probably a bigger model.
+- The available models include convnext_nano, efficientnet_b2, resnet50, etc.
+- But if e003 already tried a bigger model and it wasn't confirmed...
+
+**Idea 5: Multi-scale / multi-crop at inference**
+- Currently uses 1.5x and 2.5x crops. Maybe adding more scales or using a different approach.
+- This would increase prediction time though.
+
+**Idea 6: Use the wide crop more effectively**
+- The wide crop (2.5x) gives context. Maybe the tight crop is hurting for some classes.
+
+**Idea 7: Train on both high AND low res**
+- e002 tried this and it wasn't confirmed (0.6293 vs 0.6342). So low-res doesn't help.
+
+**Idea 8: Better pseudo-labeling**
+- e004 added pseudo-labels from detector boxes. Maybe we can improve this:
+  - Use a lower IoU threshold (0.3?) to get more pseudo-labels
+  - Use soft labels (weighted by IoU)
+  - Filter pseudo-labels by detector conf (only use high-conf ones)
+
+**Idea 9: Test-time augmentation**
+- Average predictions over multiple crops/scales at inference
+- This could help but costs time
+
+**Idea 10: Use a different model**
+- The current model is efficientnet_b0. Maybe a different architecture would help.
+- But e003 tried architecture...
+
+Wait, let me re-read e003: "The gap from 0.630 to the 0.758 perfect-class ceiling is dominated by the crop classifier mis-assigning types on boxes that do overlap real defects (pore 0.502 is weakest; stain/deposit confuse), so I will raise the clas..." - it was cut off. It was "architecture" category and got 0.6389 seed-0, 0.6313 5-seed. So it was close but not confirmed.
+
+**Idea 11: Focus on the scoring/ranking**
+- The mAP depends on the ORDER of predictions. Currently score = conf × p(c).
+- For a given class, the order is determined by conf × p(c). Since conf is the same for all 4 classes of a box, the order within a box is by p(c), and across boxes it's by conf × p(c).
+- Maybe we should use a different scoring: e.g., p(c) only (ignore conf), or conf^α × p(c) for some α.
+- Actually wait - the metric says "AP depends only on this ORDER. Any change that keeps the order of a class's predictions leaves its AP unchanged."
+- So for class c, the order is by score = conf × p(c). If I change to conf^2 × p(c), the order changes (boxes with high conf get relatively more weight).
+- This could matter! If high-conf detector boxes are more likely to be true positives, then weighting them more in the score would improve ranking.
+
+Actually, let me think more carefully. For class c, predictions are sorted by score. A prediction is a hit if it overlaps an unmatched true box of class c. The AP is the area under the precision-recall curve as we go down the sorted list.
+
+If we use score = conf × p(c):
+- A box with conf=0.9, p(c)=0.3 → score 0.27
+- A box with conf=0.5, p(c)=0.8 → score 0.40
+
+The second ranks higher. Is that good? The second has higher class confidence but lower detector confidence. The detector confidence indicates how likely the box is a real defect at all.
+
+If we use score = conf^2 × p(c):
+- 0.81 × 0.3 = 0.243
+- 0.25 × 0.8 = 0.20
+
+Now the first ranks higher. This weights detector confidence more.
+
+Since the class-agnostic score is 0.755 (very close to the 0.758 ceiling), the detector boxes are mostly well-placed. The main issue is class assignment. So maybe we should weight the class probability more heavily relative to conf.
+
+Actually, let me think about this differently. The issue is:
+1. Some boxes are false alarms (no true defect) → they should score low for all classes
+2. Some boxes overlap true defects but get the wrong class → they should score high for the right class, low for others
+3. Some boxes overlap true defects and get the right class → they should score high
+
+For false alarms: the classifier should give low probability to all classes (or at least not high to any one). The detector conf might be high for false alarms though (YOLO can be confident about false positives).
+
+For the ranking within a class: we want true positives to rank above false positives. The score conf × p(c) does this: if p(c) is low for false alarms, they rank low. If conf is low for some true positives, they might rank lower than they should.
+
+Hmm, but actually the key question is: does the ORDER matter more than the absolute values? Since AP only depends on order, we just need the right relative ordering.
+
+Let me think about what would be a good experiment with expected gain ≥ 0.01:
+
+**Best idea: Improve the classifier's accuracy on the weak classes (pore, stain, deposit)**
+
+The per-class F1 with perfect boxes is ~0.87 macro. But with detector boxes it's worse. The main confusion is:
+- Pore (weakest at 0.522 AP)
+- Stain confused with deposit
+
+What if I use a **larger image size**? Currently 160px. The defects might be small and losing detail. Let me check the budget:
+- Current: 285+397=682 steps in ~140s → ~0.2s/step
+- At 160px, batch 64
+- At 224px, the compute is (224/160)^2 ≈ 1.96x more → ~0.4s/step
+- In 140s budget: ~350 steps instead of 682
+- That's fewer steps but each step sees more detail
+
+Actually, the prediction time also increases. Currently prediction is in the 55s reserve. 41879 eval boxes / 256 batch = 164 batches. At 160px this takes maybe 10-15s. At 224px it would be ~30s. That's tight.
+
+Hmm, maybe 192px would be a safer middle ground. (192/160)^2 = 1.44x compute.
+
+Actually wait - let me reconsider. The "two-crop" approach uses the same model for both crops. The tight crop (1.5x) and wide crop (2.5x) are both resized to 160x160. If the original box is, say, 40x40 pixels, the tight crop is 60x60 and the wide crop is 100x100, both resized to 160x160. The wide crop is actually being UPsampled from 100 to 160, losing no info. The tight crop is upsampled from 60 to 160.
+
+If I increase to 224, I'm upsampled more, which doesn't help. The issue is the original resolution of the crop, not the input size to the network.
+
+Actually, for small defects, the crop might be very small (e.g., 16x16 minimum). Resizing a 16x16 crop to 160x160 is a lot of upsampling. Increasing to 224x224 doesn't add information.
+
+So increasing IMG_SIZE probably won't help much.
+
+**What about the number of views?** Currently 2 views (1.5x and 2.5x). What if I add a 3rd view at a different scale? This would average over more scales and might help with robustness. But it increases compute by 50% for both training and inference.
+
+**What about using the detector confidence as a feature?**
+- Currently the classifier doesn't see the detector confidence.
+- If I add conf as an additional input (e.g., as a 4th channel or concatenated to the logits), the classifier could learn to be more uncertain for low-conf boxes.
+- But this is a small change and might not help much.
+
+**What about a different approach to the two views?**
+- Currently: logits averaged. What if I use a weighted average, or concatenate the features?
+- Or what if I train the two views separately and combine?
+
+**Let me think about what's most likely to give 0.01+ gain:**
+
+The biggest error source is class misassignment. Pore at 0.522 is the weakest. If I could fix pore, that's potentially +0.03 in mAP.
+
+Why is pore so weak? Pores are small, dark spots in the weld. They might be:
+- Hard to see in the crop (small, low contrast)
+- Confused with other small defects
+- The crop might not contain enough context
+
+**Idea: Use a higher-resolution crop specifically for the tight view**
+
+What if the tight crop uses a higher resolution (e.g., 224) and the wide crop stays at 160? But the model takes a fixed input size...
+
+Actually, I could use a different approach: instead of resizing both crops to the same size, I could:
+- Use the tight crop at native resolution (padded to square) and resize to 160
+- Use the wide crop at native resolution and resize to 160
+
+But that's what's already happening.
+
+**Idea: Multi-crop at inference (test-time augmentation)**
+
+At inference, instead of one tight + one wide crop, use multiple:
+- Tight at 1.0x, 1.5x, 2.0x
+- Wide at 2.5x, 3.5x
+Average the logits.
+
+This would improve robustness to box placement errors. The detector boxes are "slightly misplaced" according to the problem statement.
+
+Cost: 5 views instead of 2 → 2.5x inference time. Current inference is maybe 15s, so 37s. Training would also be 2.5x if I use all 5 during training. But I could train with 2 views and use 5 at inference (the model just averages more views).
+
+Wait, but the model is trained to output logits from a single view. If I average 5 views at inference, that's fine - it's just ensemble averaging.
+
+Actually, the current approach already does this: it averages 2 views at both train and test. Adding more views at test time is a form of TTA.
+
+Let me estimate the budget:
+- Training: 2 views, ~140s (same as now)
+- Inference: 5 views × 41879 boxes / 256 batch = 164 batches × 5 = 820 forward passes
+- Current: 164 × 2 = 328 forward passes in maybe 15s → 0.046s/pass
+- New: 820 × 0.046 = 38s
+- Total: 18 (load) + 140 (train) + 38 (infer) + 5 (write) = 201s > 180s budget!
+
+Too tight. Let me try 3 views at inference (1.5x, 2.5x, 3.5x):
+- 164 × 3 = 492 passes × 0.046 = 23s
+- Total: 18 + 140 + 23 + 5 = 186s. Still too tight.
+
+What about keeping 2 views but changing the scales? E.g., 1.0x and 3.0x instead of 1.5x and 2.5x?
+
+Or: use 2 views at training but 3 at inference:
+- 164 × 3 = 492 × 0.046 = 23s
+- Total: 18 + 140 + 23 + 5 = 186s. Tight but maybe OK with the 55s reserve... wait, the reserve is 55s for prediction and writing. So training gets 180-55 = 125s. Currently training takes ~125s (103+125-18 = 110s? Let me recheck).
+
+Actually from the log:
+- Load: 18s
+- Epoch 0: ends at 103s → 85s for epoch 0
+- Epoch 1: ends at 125s → 22s for epoch 1
+- Total: 162s
+
+So training took 125-18 = 107s. The reserve is 55s, so t_end = 180-55 = 125s. Training ran until 125s. Then prediction + writing took 162-125 = 37s.
+
+So I have 55s for prediction + writing. Currently it takes 37s. If I add one more view, prediction time increases by ~50% (from 2 to 3 views): 37 × 1.5 = 55.5s. That's right at the limit. Too risky.
+
+What if I reduce the prediction batch size or use a faster approach?
+
+Actually, let me reconsider. The prediction loop:
+```python
+for xt, xw, _ in dl_ev:
+    xt = xt.to(device).to(memory_format=torch.channels_last)
+    xw = xw.to(device).to(memory_format=torch.channels_last)
+    probs.append(torch.softmax(((model(xt) + model(xw)) / 2).float(), 1).cpu())
+```
+
+Each batch does 2 forward passes. If I add a 3rd view, it's 3 forward passes per batch. The time per batch increases by 50%.
+
+Current prediction: 41879/256 = 164 batches, 2 passes each = 328 passes. Takes 37s → 0.113s/pass.
+With 3 views: 492 passes × 0.113 = 55.6s. Too tight.
+
+So TTA with 3 views is too expensive. Let me think of something else.
+
+**Idea: Use a larger model**
+
+e003 tried architecture and got 0.6389/0.6313 (not confirmed). What was the specific change? The hypothesis was cut off but it was "architecture" category. Let me assume it tried a bigger model.
+
+Available models: convnext_atto, convnext_nano, convnext_pico, efficientnet_b0, efficientnet_b2, mobilenetv3_large_100, regnety_016, resnet18, resnet26d, resnet34, resnet50, tf_efficientnetv2_b0
+
+If e003 tried efficientnet_b2 or resnet50 and it wasn't confirmed, then bigger models might not help (or the specific one tried didn't work).
+
+But wait - e003 was based on e000 (no pseudo-labels). Now we're on e004 (with pseudo-labels). Maybe a bigger model + pseudo-labels would work better?
+
+Let me estimate compute:
+- efficientnet_b0: ~4M params, fast
+- efficientnet_b2: ~7.7M params, ~1.5x slower
+- resnet50: ~25M params, ~3x slower
+- convnext_nano: ~12M params, ~2x slower
+
+With pseudo-labels, training data is 18271 boxes. At batch 64, that's 285 steps/epoch.
+
+Current: 285 steps in 85s → 0.30s/step (with 2 views, so 0.15s/forward)
+With 2x slower model: 0.60s/step → 285 steps in 171s. Too long for 1 epoch in 107s budget.
+Would only get ~178 steps in 107s. That's less than 1 epoch.
+
+Hmm, that's a lot less training. Might not be worth it.
+
+What about convnext_nano (2x slower)?
+- 0.30s/step → 0.60s/step
+- 107s / 0.60 = 178 steps. Still less than 1 epoch.
+
+What about a lighter model? convnext_atto or convnext_pico?
+- These are smaller than efficientnet_b0.
+- But they might be less accurate.
+
+Actually, the issue is that with 2 views, each step does 2 forward + 2 backward passes. The model size matters.
+
+Let me think differently.
+
+**Idea: Improve the pseudo-labeling**
+
+Currently, pseudo-labels use IoU > 0.5 threshold. What if I:
+1. Lower the threshold to 0.3 to get more pseudo-labels?
+2. Use soft labels (weight by IoU)?
+3. Filter by detector confidence (only use conf > 0.3)?
+
+More pseudo-labels = more training data = better generalization. But lower IoU threshold means more noisy labels.
+
+Actually, the current pseudo-labeling adds boxes that overlap true boxes with IoU > 0.5. These are "correct" labels. If I lower to 0.3, I get more boxes but some might be partially overlapping the wrong box (if two defects are close). This could hurt.
+
+What about using the detector conf as a weight? High-conf pseudo-labels are more reliable. I could use weighted cross-entropy where the weight is the detector conf.
+
+**Idea: Use label smoothing**
+
+Cross-entropy with label smoothing (e.g., 0.1) can improve generalization. This is a small change but might help.
+
+But "Tuning hyperparameters alone helped little in earlier experiments."
+
+**Idea: Different augmentation**
+
+Current augmentation:
+- Geometric jitter: center shift ±10% of side, scale 0.85-1.2
+- Horizontal flip (50%)
+- Vertical flip (50%)
+- Brightness 0.8-1.2
+
+What about:
+- Color jitter (saturation, contrast)
+- Random erasing
+- Mixup / CutMix
+
+Mixup could be interesting: it creates synthetic examples that are blends of two classes. This could help the decision boundary. But it's a well-known technique and might not give 0.01+.
+
+**Idea: Use the wide crop differently**
+
+The wide crop (2.5x) gives context. But maybe for some defect types, more context is better. What if I use a 3.0x or 3.5x wide crop?
+
+This is a small change. Let me estimate: it changes what the model sees but not the compute. It might help if the current 2.5x context is too narrow for some defects.
+
+But this is a "tuning" change and might not give 0.01+.
+
+**Idea: Use a second model / ensemble**
+
+Train two different models (e.g., efficientnet_b0 and resnet18) and average their predictions. This would double training time but might improve accuracy.
+
+Budget: 2 models × 107s training = 214s. Way over budget.
+
+What about training one model for 50s and another for 50s? Each gets half the training. This might not be better than one model with full training.
+
+**Idea: Focus on the scoring function**
+
+Currently: score = conf × p(c), output all 4 classes.
+
+What if I use: score = conf^α × p(c)^β for some α, β?
+
+The metric only cares about order. For class c, the order is by conf × p(c). 
+
+If I change to conf^0.5 × p(c), the order changes: boxes with moderate conf and high p(c) would rank higher relative to boxes with high conf and moderate p(c).
+
+Actually, let me think about what the "right" scoring is:
+- We want true positives to rank above false positives
+- A true positive has: high conf (detector found it), high p(c) (classifier says it's class c)
+- A false positive has: maybe high conf (detector false alarm), low p(c) (classifier isn't sure)
+- A wrong-class detection has: high conf, low p(c) for this class, high p(c') for another class
+
+The score conf × p(c) already handles this reasonably. But maybe the detector conf is noisy and the classifier probability is more reliable. What if I use p(c) only (ignore conf)?
+
+But wait - if I ignore conf, then a box with p(c)=0.9 but conf=0.01 (very uncertain detection) would score the same as a box with p(c)=0.9 and conf=0.9. The first is more likely a false alarm.
+
+Hmm, but the classifier should already account for this: if the crop looks like a false alarm, p(c) should be low for all classes.
+
+Actually, let me reconsider. The classifier is trained on true boxes (and pseudo-labels from detector boxes). It never sees a "false alarm" crop during training. So for a false alarm crop, the classifier might still assign some probability to each class (since it's forced to pick one of 4). The sum of probabilities is 1.
+
+So for a false alarm: p(0)+p(1)+p(2)+p(3) = 1, and each might be ~0.25 (uniform) or skewed.
+For a true pore: p(0) might be 0.7, others 0.1 each.
+
+The score for class 0: conf × p(0). For a false alarm with conf=0.8: 0.8 × 0.25 = 0.20. For a true pore with conf=0.6: 0.6 × 0.7 = 0.42. Good, true positive ranks higher.
+
+But what if a false alarm has conf=0.95 and the classifier assigns p(0)=0.3? Score = 0.285. And a true pore with conf=0.4 and p(0)=0.6: score = 0.24. Now the false alarm ranks higher! This is a problem.
+
+Using p(c) only: false alarm 0.3, true pore 0.6. True positive ranks higher. Better!
+
+But what about a true pore with conf=0.95, p(0)=0.6 (score 0.57 with conf, 0.6 without) vs a false alarm with conf=0.95, p(0)=0.55 (score 0.52 with conf, 0.55 without). With conf: 0.57 > 0.52. Without: 0.6 > 0.55. Both correctly rank the true positive higher, but the margin is different.
+
+The key question is: does the detector conf provide useful information for ranking beyond what the classifier already captures? If the classifier is good, it should already be "seeing" whether the crop looks like a real defect. The conf might be redundant.
+
+But if the classifier is imperfect, the conf might help break ties or provide additional signal.
+
+I think using p(c) only (or p(c) with a weak conf factor) might be worth trying. But e001 tried single-class output and it was worse. That's different - e001 only output the argmax class, not all 4.
+
+Let me think about this more carefully. The current approach outputs all 4 classes with score = conf × p(c). This means each box appears in all 4 classes' prediction lists. For class c, the box's score is conf × p(c).
+
+If I change to score = p(c) (drop conf), the order within each class changes. Boxes with low conf but high p(c) move up; boxes with high conf but low p(c) move down.
+
+This is a "scoring" category change. e001 was also scoring but tried a different approach (single class). This is different.
+
+Expected gain: hard to say. Could be +0.005 to +0.02 if the conf is hurting the ranking. Or could be negative if conf is helping.
+
+Actually, I realize there's a subtlety. The mAP@0.5 metric: for each class, predictions are sorted by score. A prediction is a TP if it matches an unmatched GT box of that class (IoU > 0.5). The AP is the area under the precision-recall curve.
+
+If I use score = p(c) instead of conf × p(c):
+- For a class's prediction list, the relative order of boxes changes
+- Boxes that are true positives for class c but have low detector conf will move up
+- False alarms with high detector conf but low p(c) will move down (good)
+- True positives with high conf and high p(c) stay high (good)
+
+I think this could help, especially for the weak classes where the detector might be less confident (smaller defects like pores).
+
+Let me go with this: **Change score from conf × p(c) to p(c) only.**
+
+Wait, but there's a risk: if I drop conf entirely, a box that's a false alarm but the classifier is very confident (p(c)=0.9) would score very high. This could hurt precision at the top of the list.
+
+A compromise: score = conf^0.5 × p(c). This reduces the weight of conf but doesn't eliminate it.
+
+Or: score = (conf + p(c)) / 2. This averages the two signals.
+
+Actually, let me think about what makes most sense. The detector conf indicates "is this box a real defect?" The classifier p(c) indicates "is this box class c?" The product conf × p(c) approximates "is this box a real defect of class c?" which is exactly what we want.
+
+But the issue is that the detector conf is class-agnostic and might be miscalibrated. If the detectorThinking budget reached. Stop thinking now and write the reply in the required format.

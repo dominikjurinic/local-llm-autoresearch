@@ -1,0 +1,501 @@
+===== attempt 1 =====
+Let me analyze the current state carefully.
+
+Current best: e016, 5-seed val mAP@0.5 = 0.6411, seed std 0.0019
+
+Per-class AP: pore 0.537, deposit 0.635, discontinuity 0.780, stain 0.612
+
+Key observations from the experiment history:
+1. The model is clearly undertrained - only 2 epochs (660 steps) in ~164s
+2. Many architecture changes were tried (B2, ConvNeXt, MobileNet, RegNet, tf_efficientnetv2_b0) - most rejected
+3. e021 (tf_efficientnetv2_b0) got 0.6447 on seed 0 but only 0.6352 on 5-seed mean - not confirmed
+4. e034 (BCE sigmoid heads) got 0.6447 on seed 0 but 0.6401 on 5-seed - not confirmed
+5. e036 (random erasing) got 0.6426 on seed 0 but 0.6400 on 5-seed - not confirmed
+6. Scoring changes mostly hurt (e004, e014, e019, e026, e029 all rejected)
+7. The "not confirmed" experiments (e021, e034, e036) all got seed-0 scores of 0.6447 or 0.6426, which is above the 5-seed mean of 0.6411, but their 5-seed means were below. This is interesting - seed 0 seems to be a lucky seed.
+
+Let me think about what hasn't been tried yet:
+
+1. **Ensembling**: The brief mentions "ensembling within the time budget" as an in-scope idea. We could train two models (e.g., EfficientNet-B0 + another architecture) and average their probabilities. But time is tight - 660 steps for one model. Two models would halve the steps each.
+
+2. **Training on detector boxes with background class**: e001 tried this and got 0.5691 (rejected). e005 tried adding a 5th background class and got 0.6039 (rejected). So background class approaches have failed.
+
+3. **Different scoring**: Most scoring changes failed. The current score = conf × prob[c] seems to work well.
+
+4. **Data augmentation**: 
+   - Mixup (e007): rejected
+   - Random erasing (e036): not confirmed (0.6400 5-seed)
+   - Jitter increase (e028): rejected
+   - Context reduction (e037): rejected
+
+5. **Optimization**:
+   - Batch size 32 (e010): rejected
+   - LR doubling (e017): rejected
+   - SGD (e025): suspicious/bug
+   - Constant LR (e035): rejected
+   - Min LR raise (e020): rejected
+
+6. **Architecture**:
+   - B2 (e013): rejected
+   - ConvNeXt-Nano (e015): rejected
+   - MobileNetV3 (e022): rejected
+   - RegNetY-016 (e032): timeout
+   - tf_efficientnetv2_b0 (e021): not confirmed
+   - IMG_SIZE changes: 160→224 helped (e016), 224→192 hurt (e018), train 160 + infer 224 hurt (e033)
+
+7. **Inference**:
+   - H-flip TTA (e009): marginal gain
+   - V-flip TTA (e012): rejected
+   - Remove H-flip + more training (e030): rejected
+   - 256×256 inference (e027): rejected
+
+8. **Loss**:
+   - Focal loss (e006): rejected
+   - Class weights: known to hurt
+   - Label smoothing (e023): rejected
+   - BCE sigmoid (e034): not confirmed (0.6401)
+
+Let me think about what's most promising:
+
+The key issue is that the model is undertrained. 660 steps is very few. The loss is still dropping fast (0.52→0.29). 
+
+Ideas that could help:
+1. **Train at lower resolution for speed, infer at 224**: e033 tried this and got 0.6052 - rejected. So this doesn't work.
+
+2. **Use a faster model**: RegNetY-016 timed out (probably due to data loading overhead, not model speed). MobileNetV3 got 0.6380. 
+
+3. **Ensemble two models**: Train two different architectures, average probabilities. But this halves training steps per model.
+
+4. **Use the pretrained backbone more effectively**: Maybe freeze the backbone for the first few epochs, then unfreeze?
+
+5. **Two-stage training**: First train with frozen backbone (fast), then fine-tune with unfrozen backbone (slower but fewer steps needed).
+
+6. **Use both high and low res crops differently**: Currently both are used. Maybe weight them differently.
+
+7. **Increase training data**: Use all crops (already doing this with TRAIN_ON = ("high", "low")).
+
+8. **Different data loading strategy**: The data loading takes 17s. Could we precompute crops?
+
+Wait, let me re-read the time budget. Total is 180s. 17s for loading, then training until deadline - 55s reserve = 180 - 55 = 125s for training. So training gets about 125 - 17 = 108s. With 660 steps, that's about 0.16s per step.
+
+Actually, looking more carefully: T0 is set at import time. The deadline is T0 + 180. Training ends at deadline - 55 = T0 + 125. Loading takes 17s, so training has about 108s. 660 steps in 108s = 0.164s/step.
+
+For prediction: 41879 eval detections, batch 256, with TTA (2 forward passes). That's about 164 batches × 2 = 328 forward passes. At 0.164s/step for training (which includes backward), forward-only should be faster. The total is 164s, so prediction takes about 164 - 125 = 39s. That fits within the 55s reserve.
+
+What if I reduce the reserve? e030 tried reducing from 55 to 40 and removing H-flip TTA, got 0.6374 - rejected. So that didn't help.
+
+Let me think about what's really the bottleneck. The model is undertrained. To get more training:
+- Faster model (tried, mostly failed)
+- Lower resolution (tried, failed)
+- Smaller batch (tried, failed)
+- Remove TTA (tried, failed)
+
+What about **training efficiency improvements**:
+- **Gradient accumulation**: Use smaller effective batch but accumulate gradients. This doesn't help with speed.
+- **Mixed precision**: Already using bfloat16 on CUDA.
+- **Channel last**: Already using.
+
+What about **a different approach entirely**?
+
+Let me think about the scoring. The current score is `conf × prob[c]`. The per-class APs are:
+- pore 0.537 (weakest)
+- deposit 0.635
+- discontinuity 0.780 (strongest)
+- stain 0.612
+
+The gap between discontinuity and pore is 0.243. This suggests the model is much better at identifying discontinuities than pores.
+
+What if we apply **class-specific score adjustments**? For example, boost pore scores and reduce discontinuity scores? This is a form of score calibration per class.
+
+Actually, wait. Let me think about this differently. The mAP@0.5 is computed per class. For each class, we need the boxes with that class to be ranked correctly. The score `conf × prob[c]` means that for class c, the score is proportional to the probability of class c. 
+
+One idea: **use log(prob) instead of prob** in the score. This would amplify the difference between high and low probabilities. But e029 tried sharpening with T=0.7 and it hurt.
+
+Another idea: **use a per-class temperature**. For pore (the weakest class), use a lower temperature (sharper) to boost confident pore predictions. For discontinuity (the strongest), use a higher temperature (softer) to avoid overconfident predictions.
+
+Actually, let me think about what's really going on. The issue is that pore is the weakest class. Why? Pores are small circular holes - they might be visually similar to stains or background. The model might be confusing them.
+
+What if we **train a separate classifier for the weak classes**? For example, a two-stage approach within stage 2:
+1. First, classify into {pore, not-pore}
+2. If not-pore, classify into {deposit, discontinuity, stain}
+
+But this is complex and might not help.
+
+Let me think about **data-level changes**:
+- The training set has 14128 GT crops + 12219 matched detector boxes = 26347 total.
+- What's the class distribution? We don't know exactly, but pore and stain are likely underrepresented.
+
+Actually, e011 tried oversampling pore and stain by 1.5× and it was rejected (0.6305). So oversampling doesn't help.
+
+What about **using the detector confidence as a training signal**? The detector conf is available for training boxes. We could use it as a weight in the loss function - boxes with higher detector conf are more likely to be true defects, so weight them more. But this is similar to class weighting which has hurt.
+
+Let me think about **architecture changes more carefully**:
+- The current model is EfficientNet-B0 at 224×224
+- It's undertrained (660 steps)
+- Faster models were tried but didn't help (probably because the gain from more steps was offset by lower capacity)
+
+What about **a lighter version of EfficientNet-B0**? Like using fewer layers or a smaller stem?
+
+Actually, what about **using the pretrained model as a feature extractor** and training a simple classifier on top? This would be much faster per step. But the features from a frozen backbone might not be discriminative enough.
+
+Wait, here's an idea: **train with a frozen backbone for the first 30% of the budget, then unfreeze for the remaining 70%**. This way, the early training is fast (only classifier head updates), and the later training fine-tunes the backbone with a lower LR. This could effectively give us more "useful" training steps.
+
+Actually, that's a bit complex. Let me think of something simpler.
+
+**Idea: Use a learning rate warmup + constant LR instead of cosine decay.**
+e035 tried constant LR after warmup and got 0.6256 - rejected. So that's worse than cosine.
+
+**Idea: Reduce the number of classes to 3 (merge pore and stain) and then split at inference.**
+This is too complex and probably won't work.
+
+**Idea: Use the detector confidence to filter training data.**
+Only train on detector boxes with conf > some threshold. This would reduce noise in the training set. But it would also reduce the number of training examples.
+
+**Idea: Use a two-model ensemble with different architectures.**
+Train EfficientNet-B0 and MobileNetV3-Large in parallel (or sequentially), average their probabilities. But this halves the training steps per model.
+
+Actually, wait. Let me reconsider the time budget more carefully.
+
+Current: 17s loading + ~108s training + ~39s prediction = 164s total. Reserve is 55s, so training stops at 125s from start.
+
+If I train two models sequentially, each gets ~54s of training. That's about 330 steps each. That's probably too few.
+
+What about **training one model, saving it, then training a second model with the remaining time**? The first model gets ~54s, the second gets ~54s. Each gets ~330 steps. That's half the current training. Probably not enough.
+
+**Idea: Use a faster backbone for the second model in an ensemble.**
+Train EfficientNet-B0 for ~80s, then MobileNetV3 for ~28s. The second model gets fewer steps but adds diversity.
+
+This is getting complicated. Let me think about simpler ideas.
+
+**Idea: Use the pretrained model's intermediate features for a multi-scale classifier.**
+Instead of a single 224×224 crop, use multiple scales. But this is similar to the two-crop approach which was tried (and the single wide crop was better).
+
+**Idea: Use a different normalization or preprocessing.**
+The current normalization uses ImageNet mean/std. What if we compute the mean/std from the actual training data? This might help if the weld images have a different color distribution.
+
+Actually, this is a good idea. The weld images are likely grayscale or have a very different color distribution than ImageNet. Using ImageNet normalization might not be optimal. Let me compute the mean and std from the training crops.
+
+Wait, but the crops are already normalized to [0,1] and then (x - MEAN) / STD. If the weld images are mostly gray, the mean would be around 0.5 and std around 0.15 or so, quite different from ImageNet's [0.485, 0.456, 0.406] and [0.229, 0.224, 0.225].
+
+Let me estimate: if the images are grayscale (R=G=B), then the mean would be [m, m, m] and std would be [s, s, s] where m and s are the mean and std of the grayscale values. This would be quite different from ImageNet.
+
+**Hypothesis: Computing the normalization constants (mean and std) from the actual training data instead of using ImageNet defaults will improve classification because the weld images have a very different color distribution from ImageNet, and proper normalization is critical for pretrained models to work well on out-of-distribution data.**
+
+This is a simple, focused change. Let me implement it.
+
+Actually, wait. The images are loaded as RGB. If they're grayscale images converted to RGB, all three channels are the same. The ImageNet normalization would then be inappropriate.
+
+Let me write the code to compute mean and std from the training data:
+
+```python
+# Compute normalization from training data
+all_pixels = []
+for r in train_rows[:2000]:  # sample for speed
+    img = images[r["image"]]
+    crop = make_crop(img, r, CONTEXT, False)
+    all_pixels.append(crop)
+all_pixels = np.concatenate(all_pixels, axis=1)  # (3, N)
+MEAN = all_pixels.mean(axis=1)
+STD = all_pixels.std(axis=1) + 1e-6
+```
+
+But this adds time to the loading phase. Let me make it efficient.
+
+Actually, a simpler approach: just compute the mean and std of all pixels in the training images (not crops). This is faster and should give a good estimate.
+
+```python
+# Compute normalization from training images
+pixels = []
+for p in needed:
+    img = images[p]
+    pixels.append(img.reshape(-1, 3).mean(axis=0))
+    pixels.append(img.reshape(-1, 3).std(axis=0))
+# Actually, we need the global mean and std
+```
+
+Hmm, let me think about this more carefully. The proper way is:
+1. Compute the mean of all pixels across all training images
+2. Compute the std of all pixels across all training images
+
+But this requires iterating over all images, which takes time. Let me sample.
+
+Actually, the simplest approach: compute the mean and std from a random sample of crops. Since we're already computing crops for training, we could compute the stats during the first data loading pass.
+
+But wait, the crops are computed on-the-fly in the DataLoader. So we can't easily compute stats from them.
+
+Alternative: compute stats from the raw images. For each training image, compute the mean and std of all pixels. Then average across images.
+
+```python
+# Compute image-level stats
+means, stds = [], []
+for p in needed:
+    img = images[p].astype(np.float32) / 255.0
+    means.append(img.mean(axis=(0,1)))
+    stds.append(img.std(axis=(0,1)))
+MEAN = np.mean(means, axis=0)
+STD = np.mean(stds, axis=0) + 1e-6
+```
+
+This should be fast since it's just numpy operations on already-loaded images.
+
+But wait, I need to be careful. The images are loaded as uint8 (0-255). I need to convert to float [0,1] first.
+
+Let me write this properly:
+
+```python
+# Compute normalization from training images
+img_means, img_stds = [], []
+for p in needed:
+    img = images[p].astype(np.float32) / 255.0
+    img_means.append(img.mean(axis=(0, 1)))
+    img_stds.append(img.std(axis=(0, 1)))
+MEAN = np.mean(img_means, axis=0)
+STD = np.mean(img_stds, axis=0) + 1e-6
+print(f"data normalization: mean={MEAN}, std={STD}", flush=True)
+```
+
+This replaces the hardcoded MEAN and STD.
+
+Actually, I realize there's a subtlety. The crops include padding (gray 114/255 ≈ 0.447). So the crop statistics would be different from the image statistics. But using image statistics should still be a good approximation, and it's much faster to compute.
+
+Let me also consider: should I compute stats from crops specifically? The crops are the actual input to the model. But computing crop stats requires actually generating crops, which is slow.
+
+I think computing from raw images is a good compromise. The padding effect is small (crops are mostly image content, not padding).
+
+Let me also think about whether this could hurt. If the ImageNet normalization happens to work well (because the pretrained model was trained with it), changing it could hurt. But for out-of-distribution data like weld images, proper normalization should help.
+
+Actually, I just realized: the pretrained model's first layer (conv stem) was trained expecting ImageNet-normalized inputs. If we change the normalization, the first layer's weights are no longer optimal. However, since we're fine-tuning, the model should adapt. And the benefit of proper normalization for the rest of the network should outweigh the initial mismatch.
+
+Let me go with this idea. It's simple, focused, and has a clear hypothesis.
+
+Wait, but I should also consider: the images might already be roughly normalized. If they're grayscale with values around 100-200 (out of 255), the mean would be around 0.5 and std around 0.15. ImageNet mean is [0.485, 0.456, 0.406] and std is [0.229, 0.224, 0.225]. So the mean is similar but the std is much smaller (0.15 vs 0.23). This means the ImageNet normalization would spread the values too much, making the input to the first conv layer have larger variance than expected.
+
+This could definitely hurt performance. Proper normalization should help.
+
+Let me finalize my plan:
+
+1. Remove the hardcoded MEAN and STD
+2. Compute MEAN and STD from the training images after loading
+3. Everything else stays the same
+
+This is a clean, focused change. Let me write the SEARCH/REPLACE blocks.
+
+Actually, I need to be careful about where to put the computation. The images are loaded in the `main()` function. The MEAN and STD are used in `BoxDataset.__getitem__`. So I need to compute them after loading images but before creating the DataLoader.
+
+Let me look at the code structure:
+
+```python
+MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+```
+
+These are global constants. I need to either:
+1. Make them non-global and pass them to BoxDataset
+2. Or compute them in main() and assign to global variables
+
+Option 2 is simpler. Let me do:
+
+```python
+MEAN = None  # will be computed in main()
+STD = None   # will be computed in main()
+```
+
+And in main(), after loading images:
+```python
+# Compute normalization from training images
+img_means, img_stds = [], []
+for p in needed:
+    img = images[p].astype(np.float32) / 255.0
+    img_means.append(img.mean(axis=(0, 1)))
+    img_stds.append(img.std(axis=(0, 1)))
+global MEAN, STD
+MEAN = np.mean(img_means, axis=0).astype(np.float32)
+STD = (np.mean(img_stds, axis=0) + 1e-6).astype(np.float32)
+```
+
+Wait, but `needed` includes both training and eval images. For normalization, I should ideally use only training images. But using all images is a reasonable approximation, and it's simpler.
+
+Actually, let me use only training images for the stats:
+```python
+train_images = {r["image"] for r in train_rows}
+img_means, img_stds = [], []
+for p in train_images:
+    img = images[p].astype(np.float32) / 255.0
+    img_means.append(img.mean(axis=(0, 1)))
+    img_stds.append(img.std(axis=(0, 1)))
+```
+
+This is more principled. But it's a bit more code. Let me keep it simple and use all needed images - the difference should be negligible.
+
+Actually, let me just use all images in `needed`. It's simpler and the eval images are from the same distribution.
+
+Let me write the final code:
+
+SEARCH block 1: Replace the MEAN/STD definitions
+```
+MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+```
+
+REPLACE block 1:
+```
+MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)  # will be overwritten with data-driven values
+STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+```
+
+Actually, I should just remove the hardcoded values and compute them. But I need to keep the variables defined for the BoxDataset. Let me use a different approach:
+
+Keep the globals but compute them in main(). In Python, I can use `global` to reassign.
+
+SEARCH block 1:
+```
+MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+```
+
+REPLACE block 1:
+```
+MEAN = None  # computed from data in main()
+STD = None   # computed from data in main()
+```
+
+SEARCH block 2: After image loading, add the computation
+```
+    print(f"train {len(train_rows)} boxes ({len(crops)} gt + {len(matched_dets)} det), eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
+```
+
+REPLACE block 2:
+```
+    # Compute normalization constants from the actual image data
+    _means, _stds = [], []
+    for _p in needed:
+        _img = images[_p].astype(np.float32) / 255.0
+        _means.append(_img.mean(axis=(0, 1)))
+        _stds.append(_img.std(axis=(0, 1)))
+    global MEAN, STD
+    MEAN = np.mean(_means, axis=0).astype(np.float32)
+    STD = (np.mean(_stds, axis=0) + 1e-6).astype(np.float32)
+    print(f"train {len(train_rows)} boxes ({len(crops)} gt + {len(matched_dets)} det), eval {len(ev)} detections, {len(images)} images, norm mean={MEAN}, std={STD} ({time.time() - T0:.0f}s)", flush=True)
+```
+
+This looks good. Let me verify the SEARCH strings match exactly.
+
+Looking at the current file:
+```
+MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+```
+
+Yes, that's exact.
+
+And:
+```
+    print(f"train {len(train_rows)} boxes ({len(crops)} gt + {len(matched_dets)} det), eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
+```
+
+Yes, that's exact.
+
+Let me double-check: the `global MEAN, STD` statement needs to be before any use of MEAN/STD in the function. Since I'm putting it right after the image loading and before the DataLoader creation, it should be fine.
+
+Actually, wait. In Python, `global` must appear before any use of the variable in the function. But MEAN and STD are not used in main() directly - they're used in BoxDataset.__getitem__. So the `global` statement in main() is just to reassign the module-level variables. This should work fine.
+
+Let me also make sure the computation is fast. We have 2255 images. For each, we compute mean and std over all pixels. If each image is, say, 1000×1000, that's 1M pixels × 3 channels = 3M values. Computing mean and std over 3M values is fast in numpy. 2255 images × ~1ms = ~2s. That's acceptable.
+
+Actually, the images might be larger. Weld images could be 2000×2000 or larger. Let me check: the code uses `img_w` and `img_h` from the CSV. I don't know the exact sizes, but even at 4000×4000, that's 16M pixels × 3 = 48M values. Mean and std over 48M values is still fast (~10ms). 2255 × 10ms = 22s. That might be too slow!
+
+Hmm, that's a concern. Let me sample instead of computing over all images:
+
+```python
+    # Compute normalization constants from a sample of images
+    _sample = list(needed)[:500]
+    _means, _stds = [], []
+    for _p in _sample:
+        _img = images[_p].astype(np.float32) / 255.0
+        _means.append(_img.mean(axis=(0, 1)))
+        _stds.append(_img.std(axis=(0, 1)))
+```
+
+500 images should give a good estimate and be fast enough.
+
+Actually, even better: I can subsample the pixels within each image. But that's more complex. Let me just use 500 images.
+
+Wait, actually, I can be even more efficient. Instead of computing per-image stats and then averaging, I can compute the global mean and std directly:
+
+```python
+    _sample = list(needed)[:500]
+    _all = np.concatenate([images[_p].astype(np.float32).reshape(-1, 3) / 255.0 for _p in _sample])
+    MEAN = _all.mean(axis=0)
+    STD = _all.std(axis=0) + 1e-6
+```
+
+But this creates a huge array. If each image is 4000×4000, that's 16M×3 = 48M values per image. 500 images = 24 billion values. That's way too much memory.
+
+Let me stick with per-image stats:
+
+```python
+    _sample = list(needed)[:500]
+    _means, _stds = [], []
+    for _p in _sample:
+        _img = images[_p].astype(np.float32) / 255.0
+        _means.append(_img.mean(axis=(0, 1)))
+        _stds.append(_img.std(axis=(0, 1)))
+    global MEAN, STD
+    MEAN = np.mean(_means, axis=0).astype(np.float32)
+    STD = (np.mean(_stds, axis=0) + 1e-6).astype(np.float32)
+```
+
+This should be fast enough. 500 images × ~10ms = 5s. Acceptable.
+
+But wait, I need to be careful about the time budget. The current loading takes 17s. Adding 5s for normalization computation brings it to 22s. The training budget is 125s from start, so training gets 125 - 22 = 103s instead of 108s. That's about 5% less training time. Should be fine.
+
+Let me finalize the code. I'll use 500 images for the sample.
+
+Actually, I just realized: `needed` is a set, so `list(needed)` doesn't have a guaranteed order. But that's fine for sampling - we just need a subset.
+
+Let me also add a print statement to show the computed values, so we can verify they're reasonable.
+
+Here's my final plan:
+
+SEARCH 1:
+```
+MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+```
+
+REPLACE 1:
+```
+MEAN = None  # computed from data in main()
+STD = None   # computed from data in main()
+```
+
+SEARCH 2:
+```
+    print(f"train {len(train_rows)} boxes ({len(crops)} gt + {len(matched_dets)} det), eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
+```
+
+REPLACE 2:
+```
+    _sample = list(needed)[:500]
+    _means, _stds = [], []
+    for _p in _sample:
+        _img = images[_p].astype(np.float32) / 255.0
+        _means.append(_img.mean(axis=(0, 1)))
+        _stds.append(_img.std(axis=(0, 1)))
+    global MEAN, STD
+    MEAN = np.mean(_means, axis=0).astype(np.float32)
+    STD = (np.mean(_stds, axis=0) + 1e-6).astype(np.float32)
+    print(f"train {len(train_rows)} boxes ({len(crops)} gt + {len(matched_dets)} det), eval {len(ev)} detections, {len(images)} images, norm mean={MEAN.round(3)} std={STD.round(3)} ({time.time() - T0:.0f}s)", flush=True)
+```
+
+This looks good. Let me verify the hypothesis:
+
+Hypothesis: The weld images have a very different color/intensity distribution from ImageNet (likely grayscale or narrow dynamic range), so using ImageNet normalization constants suboptimally scales the input to the pretrained network. Computing the mean and std from the actual training images will provide proper normalization, improving the quality of the pretrained features and thus classification accuracy.
+
+This is a clean, testable hypothesis. The change is minimal and focused.
+
+Let me also consider potential issues:
+1. If the images are already well-normalized (unlikely for raw weld images), this change might not help.
+2. If the computation takes too long, it could eat into the training budget. (Mitigated by sampling 500 images.)
+3. If the `global` statement causes issues... (It shouldn't, since MEAN and STD are module-level variables.)
+
+I'm confident this is a good next experiment. Let me write the response.

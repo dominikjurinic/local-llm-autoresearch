@@ -1,0 +1,332 @@
+===== attempt 1 =====
+Let's analyze the situation.
+
+Current state:
+- Best: e000, 5-seed average 0.6302, std dev 0.0050
+- Per-class: pore 0.502, deposit 0.628, discontinuity 0.781, stain 0.610
+- Baseline (one-step 4-class detector): 0.638 mAP@0.5
+- Ceiling (stage-1 boxes with perfect classes): 0.758
+- Class-agnostic: 0.755
+
+So we're at 0.6302, slightly below the 0.638 baseline. The ceiling is 0.758. The gap from the ceiling is 0.758 - 0.630 = 0.128. The gap from class-agnostic (0.755) is 0.125.
+
+Where is the error? Let's think:
+- Class-agnostic score 0.755: the detector alone, treating everything as a single class.
+- Perfect classes: 0.758.
+- Our 4-class: 0.630.
+
+So the loss due to class decision is 0.755 - 0.630 = 0.125. This is huge. The crop classifier reaches macro-F1 ~0.87 on perfect boxes. But on actual detector boxes (which include false alarms and misplacements), the class decision degrades.
+
+Key insight: when the detector box is a false alarm (doesn't overlap with any true defect), what class do we assign? If we assign a class with high probability, that false alarm gets counted as a false positive for that class, hurting that class's AP. In the "perfect class" ceiling, false alarms are kept as class 0 (pore) with detector conf. Interestingly, they're all dumped into class 0.
+
+Wait, but in our approach, each box generates 4 rows (one per class) with score = conf × p(c). So each box generates up to 4 predictions. In mAP, for each class, all predictions of that class are sorted by score. A false-alarm box generates 4 predictions, one per class, each with score conf × p(c). Since p sums to 1, the total "mass" is conf. But each class sees its own prediction.
+
+Hmm, this is a known trick: multiple rows per box is allowed. But each class's AP is computed independently. A false alarm with p = [0.25, 0.25, 0.25, 0.25] generates 4 predictions, one per class, each with score 0.25×conf. These pollute each class's ranking.
+
+Actually, the standard approach: for each box, either emit one row with the argmax class, or emit multiple rows. Emitting multiple rows with proportional scores means each class's ranking includes that box at a reduced score. This can either help or hurt.
+
+Let's think about what's most impactful. The biggest gap is class decision (0.125). Per-class, pore is worst (0.502). Pore and deposit are weak classes. Stain is often confused with deposit.
+
+Ideas:
+1. Better crop / more context. The detector boxes might be misaligned; the crop might be off.
+2. Use both tight and wide crops (already done).
+3. Ensembling multiple models / augmentations at inference.
+4. Training on more data — currently TRAIN_ON = ("high",). There's also "low" resolution. Using both might help. Actually, let's check: crops.csv has res "high"/"low". We only train on "high". Adding "low" might increase data. But the images are at different resolutions. Hmm, actually "res" might refer to the image resolution. Let's consider adding low-res training data.
+
+Wait, but the eval images — which resolution are they? The dets.csv has image names. The eval images are probably high-res? Not sure. Let's think.
+
+Actually, let me reconsider. The most impactful thing: the class decision error. The crop classifier gets macro-F1 0.87 on perfect boxes. But our mAP is much lower than the ceiling. Why?
+
+Let's decompose the ceiling: 0.758 with perfect classes. That means if we knew the perfect class for each box, we'd get 0.758. We get 0.630. So the class decision costs 0.128.
+
+But macro-F1 0.87 on perfect boxes suggests the classifier is decent. The discrepancy might be because:
+- The detector boxes are misaligned, so even the crop is off.
+- False alarms: for false alarms, the "perfect class" is class 0 (pore) by the ceiling definition, but our classifier assigns based on appearance.
+
+Hmm wait, actually the ceiling keeps false alarms as class 0. So in the ceiling, all false alarms are pore. That's a specific choice. In our system, false alarms get whatever class the classifier says.
+
+Let me think about the scoring more carefully. mAP@0.5 per class. For class c, predictions sorted by score. A prediction is a hit if it overlaps an unmatched true box of class c with IoU > 0.5.
+
+The detector boxes are fixed (stage 1). So the set of boxes and their positions are fixed. What we control is the class assignment and the score.
+
+Key realization: since boxes are fixed, the "recall" of the detector is fixed. The only things that matter are:
+1. Which class each box is assigned (this determines which class's AP it contributes to).
+2. The score/ranking within each class (this determines precision at each recall level).
+
+For a box that overlaps a true defect of class c with IoU > 0.5: if we assign it class c with a good score, it's a true positive for class c. If we assign it the wrong class, it's a false positive for that class (and the true defect of class c is missed).
+
+For a false alarm (no overlap): it's a false positive for whatever class we assign.
+
+So the class decision directly determines TP/FP per class. The ranking determines the precision-recall curve shape.
+
+Now, the big lever: assign each box to the correct class as much as possible, and rank so that true detections come before false alarms within each class.
+
+Given macro-F1 0.87, the classifier is ~87% accurate on class. But mAP is much lower. Why?
+
+Possibility: the score = conf × p(c) ranking. For a true detection of class c, score = conf × p(c). If the classifier is confident (p(c) high), good. But conf is the detector's class-agnostic confidence, which for false alarms might be high or low. Actually, detector conf is class-agnostic, so it doesn't distinguish true vs false. Hmm.
+
+Wait, but the class-agnostic score is 0.755. That means ranking by conf alone (all as one class) gives 0.755. So conf is a decent ranking signal for true vs false. When we split into 4 classes, each class's ranking is by conf × p(c). Within a class, the relative order changes because of p(c).
+
+Let me think: within class c, we have true detections (of class c) and false alarms (of any box assigned class c). True detections of class c have p(c) high (classifier correct). False alarms assigned class c have p(c) = whatever. The ranking by conf × p(c)...
+
+Actually, I think the issue is more subtle. Let me think about what a strong approach would be.
+
+Option A: Assign each box to exactly one class (argmax), score = conf × p(argmax) or just conf. This is cleaner. Currently we emit 4 rows per box. Emitting 4 rows means each box appears in all 4 classes' rankings. This might dilute.
+
+Hmm, actually let me reconsider whether emitting multiple rows helps. In the "perfect class" ceiling, each box is ONE class. So the ceiling uses one row per box. Our approach uses 4 rows per box. 
+
+Let me think about whether 4 rows hurts. Consider a true detection of class 0 (pore). We emit rows (0, conf×p0), (1, conf×p1), (2, conf×p2), (3, conf×p3). For class 0, this box is at score conf×p0. For class 1, this box (which is actually pore) is a false positive at score conf×p1. So by emitting 4 rows, we're adding false positives to classes 1,2,3. That's bad! A pore detection becomes a false positive for deposit, discontinuity, stain.
+
+Wait, that's a significant issue. If we emit 4 rows per box, then every box is a candidate for every class. A true pore detection, if p1 is non-negligible, becomes a deposit false positive. This pollutes each class with false positives from all the other classes' true detections.
+
+Whereas if we emit only the argmax row, a true pore detection only appears in class 0's ranking. That's much cleaner.
+
+So the fix: emit one row per box with the argmax class (or a soft assignment), not 4 rows.
+
+But wait, the starting point says "each eval box becomes one prediction per class with score = detector conf x class probability." So the starting point deliberately emits 4 rows. And it got 0.630. Let me reconsider — maybe emitting 4 rows is intended to be a "soft" approach, but it might actually be hurting.
+
+Actually, let me reconsider the mAP computation with multiple rows. For class c, all rows with cls=c are sorted by score. Each row is a separate prediction. So a box with 4 rows contributes 4 predictions, one to each class. For class c, the box's prediction is at score conf×p(c). 
+
+Now, the true positive condition: a prediction is a hit if it overlaps an unmatched true box of class c with IoU>0.5. So for a true pore box, its class-0 row can be a hit (if it overlaps the pore GT). Its class-1 row is a false positive (it doesn't overlap any deposit GT, presumably, or even if it does, it's a pore box). Actually the box overlaps the pore GT. Does it overlap a deposit GT? Possibly not. So the class-1 row is a false positive.
+
+So yes, emitting 4 rows adds false positives. This is likely a major source of error. Let me estimate: if the classifier is 87% accurate, then for each true detection, ~13% of the time it's assigned the wrong argmax. But with 4 rows, even when it's correct, the other 3 rows are false positives. The false positive rate per class could be high.
+
+Hmm, but actually, the score matters. The false positive rows have score conf×p(wrong class), which is lower than conf×p(right class). So they rank lower. But they still count as false positives when they're reached in the ranking.
+
+Let me think about the magnitude. Suppose a class has N true detections and M false alarms. With 4-row emission, each box (true or false) contributes to all 4 classes. So class c has N_c true rows (from true c boxes) + (all other boxes) false rows. That's a lot of false positives.
+
+Actually, I realize the cleaner and likely better approach is to emit ONE row per box, with the argmax class and a score. Let me reconsider.
+
+But wait — there's a subtlety. If we emit only argmax, then a box that's a false alarm (no GT overlap) gets assigned to its argmax class and is a false positive there. That's fine, only one false positive. With 4 rows, it's 4 false positives (one per class). So argmax is better.
+
+But there's another consideration: what if we're uncertain? Emitting multiple rows with different classes could hedge. But given the analysis, I think argmax (one row) is cleaner and likely better.
+
+Actually, let me reconsider even more carefully. There's a well-known result: for mAP, emitting one row per box with the best class is standard. Emitting multiple rows is unusual and usually hurts because of the false positive pollution.
+
+However, there's a counterargument. Consider the ranking. If we emit one row per box with score = conf × p(argmax), then within class c, the ranking is by conf × p(c) for boxes assigned to c. This is fine.
+
+But here's the thing: the "perfect class" ceiling emits one row per box (the correct class) with score = conf. And gets 0.758. So one row per box with correct class and score=conf gives 0.758. We want to approach that. Our classifier gives the class (87% accurate) and we can use score = conf × p(c) or conf.
+
+If we use score = conf (not conf × p(c)), then within class c, the ranking is purely by conf, same as class-agnostic. That might be good because conf is a good true-vs-false signal. But then the class assignment is what matters, and the ranking within class is by conf.
+
+Hmm, let me think. If we assign the correct class (87%) and rank by conf, we'd get close to the ceiling but reduced by the 13% misassignment. The misassignment: a true c box assigned to class d becomes a false positive for d and a miss for c. 
+
+Actually, let me reconsider the score. The score should balance: we want true detections ranked above false alarms within each class. conf is a good signal for that (class-agnostic 0.755). p(c) is a signal for "is this really class c". 
+
+I think a good score is conf × p(c) but that's what we have (per row). The issue is the 4 rows.
+
+Let me reconsider: maybe the best single change is to emit one row per box (argmax class) instead of 4. Let me estimate the gain.
+
+Actually, let me reconsider whether the 4-row approach is really the problem, or if it's the classifier accuracy, or the crop.
+
+Let me look at the numbers again:
+- Ours: 0.630
+- Class-agnostic (conf only, 1 class): 0.755
+- Perfect class (conf only, correct class): 0.758
+
+The difference between class-agnostic (0.755) and perfect class (0.758) is tiny (0.003). That means: ranking by conf is almost as good whether you have the correct class or not (as a single class). This makes sense because conf is the dominant ranking signal.
+
+Now, our 4-class with 4 rows: 0.630. The gap from 0.755 is 0.125. This gap is due to:
+1. Wrong class assignment (13% errors).
+2. The 4-row false positive pollution.
+3. The score = conf × p(c) changing the ranking within class (possibly worse than conf alone).
+
+I think the 4-row pollution is a big factor. Let me estimate. Actually, let me just propose the experiment: emit one row per box with argmax class. This is a clean, testable change.
+
+Wait, but I should be careful. Let me reconsider. Actually, maybe I should think about what score to use. Let me consider emitting one row per box:
+- cls = argmax_c p(c)
+- score = conf × p(argmax)  OR  score = conf
+
+Let me think about which score. If score = conf, then within each class, ranking is by conf (good true-vs-false). The class assignment determines TP/FP. This is closest to the ceiling setup (which uses score=conf). So score=conf with argmax class might get us closest to the ceiling, limited only by class accuracy.
+
+If score = conf × p(argmax), then within a class, boxes where the classifier is very confident rank higher. This could help if confident boxes are more likely true. But it also down-weights boxes with low p(argmax), which might include some true detections where the classifier is uncertain.
+
+I think score = conf is safer and closer to the ceiling. But let me reconsider: the ceiling uses the CORRECT class. We use argmax (87% correct). So with score=conf and argmax class, we'd get roughly: for the 87% correct, it's like the ceiling; for the 13% wrong, it's a misassignment. 
+
+Actually, let me estimate the ceiling with imperfect classes. If class assignment is 87% accurate (per box), then:
+- 87% of boxes get the right class → contribute correctly.
+- 13% get wrong class → the true box is missed for its class (recall loss) and it's a false positive for the wrong class.
+
+The ceiling is 0.758 with perfect classes. With 87% class accuracy, we'd lose some. How much? It depends. If a pore box is misassigned to deposit, then: pore recall loses one TP, deposit gets one FP. 
+
+Rough estimate: macro-F1 0.87 means per-class F1 ~0.87. The mAP loss from misassignment... hard to estimate precisely, but maybe we'd get ~0.70-0.73? That's a big gain over 0.630.
+
+So the change from 4 rows to 1 row (argmax) could be worth ~0.07-0.10. That's a big, worthwhile experiment.
+
+But wait, I need to double check: is the current 0.630 really hurt by 4 rows, or is it hurt by something else? Let me reconsider.
+
+Actually, let me reconsider the possibility that the crop/classifier is the issue. The classifier gets macro-F1 0.87 on perfect boxes. But on the actual detector boxes (which are misaligned), it might be worse. Also, the crops use the box center and size; if the box is misplaced, the crop is off.
+
+But I think the 4-row pollution is the most clear-cut issue. Let me go with that.
+
+Actually, wait. Let me reconsider. Let me re-examine: is it possible that emitting 4 rows is actually beneficial in some way? 
+
+Consider: the mAP is per class. If I emit 4 rows, then for the correct class, the box is at score conf×p(c). For a true detection, p(c) is high, so it ranks well. The false positive rows (other classes) are at lower scores. In the per-class AP computation, false positives that rank below the true positives don't hurt as much (they're at the tail). But they do count.
+
+Actually, the key question: do the false-positive rows from 4-row emission rank above or below the true positives in their class? For class d (where a true c box emits a false row), the false row is at score conf×p(c→d). The true d boxes are at score conf×p(d). If p(d) for true d boxes is high (say 0.8) and p(c→d) for the false row is low (say 0.1), then the false row ranks below the true d boxes. So it's a tail false positive, less damaging. But it still adds to the FP count.
+
+Hmm, so the damage depends on the relative scores. It's not obviously catastrophic. But it's still adding FPs.
+
+Let me reconsider. Maybe the 4-row approach isn't the main issue. Let me think about what else.
+
+Actually, you know what, let me reconsider the whole thing. Let me reconsider the score. The current score is conf × p(c) per row. Within class c, the ranking is by conf × p(c). 
+
+Consider a false alarm (no GT). Its p(c) is whatever the classifier says. If the classifier is confused, a false alarm might get high p(c) for some class c. Then its row for class c is at score conf × p(c), which could be high. If conf is also high, this false alarm ranks high in class c, hurting precision.
+
+Whereas a true c detection: conf × p(c) where p(c) is high. 
+
+So the ranking within class c is by conf × p(c). This mixes the detector confidence and the class confidence. It's reasonable.
+
+OK here's my refined thinking. There are several candidate changes:
+1. Emit 1 row (argmax) instead of 4. Reduces FP pollution.
+2. Use score = conf instead of conf × p(c). Closer to ceiling ranking.
+3. Improve the classifier (better crops, more training, ensemble).
+4. Use both high and low res training data.
+
+I think the highest-leverage, clearest change is #1: emit one row per box. Let me reconsider if it's clearly better.
+
+Actually, let me reconsider by thinking about the "perfect class" ceiling more. It emits one row per box (correct class, score=conf) → 0.758. If I emit one row per box with argmax class (87% correct) and score=conf, I'd get something like 0.758 minus the misassignment penalty. That's likely 0.70+.
+
+If I emit one row per box with argmax class and score=conf×p(argmax), similar but with a different ranking.
+
+If I emit 4 rows (current), 0.630.
+
+So switching to 1 row should be a big gain. Let me go with 1 row, argmax class, and I'll use score = conf × p(argmax) — actually, let me think about which score.
+
+Hmm. Let me reconsider. With 1 row per box, the score determines the within-class ranking. Options:
+(a) score = conf: ranking purely by detector confidence.
+(b) score = conf × p(argmax): ranking by detector conf × class confidence.
+
+For (a), within class c, all boxes (true c and false alarms assigned to c) are ranked by conf. This is the same ranking as class-agnostic, just filtered to boxes assigned to c. This is clean and uses the strong conf signal.
+
+For (b), boxes where the classifier is confident about c rank higher. This could help if confident-c boxes are more likely to be true c. But it also means a true c box where the classifier is less confident (p(c)=0.5) ranks lower than a false alarm assigned to c where the classifier is confident (p(c)=0.9). That could hurt.
+
+I think (a) score=conf is safer and matches the ceiling. But (b) incorporates class info into ranking. 
+
+Let me go with a hybrid that's well-motivated: score = conf × p(argmax). Actually, no. Let me reconsider.
+
+Actually, the cleanest experiment: change to one row per box, argmax class, score = conf × p(argmax). This isolates the "one row vs four rows" change while keeping the score formula similar (just using argmax's p). 
+
+But actually, to isolate cleanly, maybe I should keep score = conf × p(c) but only for the argmax class. That's exactly score = conf × p(argmax). So yes.
+
+Hmm, but I worry that score = conf × p(argmax) vs conf matters. Let me think about which is more likely to be the issue.
+
+Actually, let me step back. The single most defensible change with a clear hypothesis: "Emitting one row per box (the argmax class) instead of four rows removes the cross-class false-positive pollution, where every true detection currently also appears as a false positive in the other three classes. This should raise per-class AP, especially for the weak classes (pore, stain), by cleaning up each class's precision-recall curve. Expected gain 0.05-0.10, moving us toward the 0.758 ceiling."
+
+That's a strong, testable hypothesis. Let me go with that.
+
+Now let me write the code change. The current prediction section:
+
+```python
+    model.eval()
+    probs = []
+    with torch.no_grad(), torch.autocast(**amp):
+        for xt, xw, _ in dl_ev:
+            xt = xt.to(device).to(memory_format=torch.channels_last)
+            xw = xw.to(device).to(memory_format=torch.channels_last)
+            probs.append(torch.softmax(((model(xt) + model(xw)) / 2).float(), 1).cpu())
+    probs = torch.cat(probs).numpy()
+    os.makedirs(args.out, exist_ok=True)
+    n = 0
+    with open(os.path.join(args.out, "preds.csv"), "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["det_id", "cls", "score"])
+        for d, p in zip(ev, probs):
+            for c in range(4):
+                s = d["conf"] * float(p[c])
+                if s > MIN_SCORE:
+                    w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+    print(f"done: {epoch} epochs, {steps} steps, {n} prediction rows, {time.time() - T0:.0f}s total", flush=True)
+```
+
+I'll change the inner loop to emit only the argmax class:
+
+```python
+        for d, p in zip(ev, probs):
+            c = int(np.argmax(p))
+            s = d["conf"] * float(p[c])
+            if s > MIN_SCORE:
+                w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+
+Wait, but I need to reconsider the score. If I use score = conf × p(argmax), then the ranking within a class is by conf × p(c). Let me reconsider whether I should use conf alone.
+
+Actually, let me reconsider. There's a subtle issue with score = conf × p(argmax): it changes the relative ranking compared to conf alone. But the metric says "any change that keeps the order of a class's predictions leaves its AP unchanged." So if I use a monotone function, it's the same. conf × p(argmax) is NOT a monotone function of conf alone, so it does change the order. So it's a real change.
+
+I think for the first experiment, I want to isolate the "one row" change. The cleanest isolation: keep the score formula as close to before as possible. Before, each row's score was conf × p(c). Now, one row with score conf × p(argmax). That's the natural extension. Let me go with that.
+
+But actually, I realize there might be an even better score. Let me think about what score best ranks true vs false within a class.
+
+The class-agnostic result (0.755) uses score = conf (all one class). So conf alone is a strong ranking. When we split into classes, if we keep score = conf, then within each class the ranking is by conf, which is strong. The class assignment (argmax) determines which class each box goes to.
+
+I think score = conf might actually be better than conf × p(argmax), because conf is the proven strong signal, and p(argmax) adds noise to the ranking. But p(argmax) could help by down-weighting uncertain boxes.
+
+Ugh, it's a judgment call. Let me go with conf × p(argmax) for this experiment because it's the minimal change from the current per-row score, isolating the "one row" effect. If it helps a lot, I can then try score=conf as a follow-up.
+
+Actually, wait. Let me reconsider. Let me reconsider whether to use argmax or to keep it soft in another way.
+
+Alternative: emit one row per box but with a "soft" class via... no, class must be an integer 0-3. So it's argmax (or some thresholding).
+
+Let me also consider: should I drop boxes where the classifier is very uncertain (max p low)? E.g., if max p < 0.3, maybe it's a false alarm and we should drop it or lower its score. But that's a separate change. Let me keep it simple.
+
+OK, let me also reconsider: the hypothesis says "expected gain 0.05-0.10". Let me make sure that's reasonable. Current 0.630, ceiling 0.758. If one-row gets us to ~0.70, that's +0.07. Reasonable.
+
+Let me also double check the budget. The change is only in the prediction writing (fewer rows: 41879 boxes × 1 row = 41879 rows instead of ~52653). This is faster, not slower. Training unchanged. So budget is fine.
+
+Wait, currently 52653 rows for 41879 boxes. That's ~1.26 rows/box (some dropped by MIN_SCORE). With one row/box, it'd be ~41879 rows (minus dropped). Faster. Good.
+
+Now let me write the SEARCH/REPLACE. I need to find the exact text.
+
+The current code:
+```python
+        for d, p in zip(ev, probs):
+            for c in range(4):
+                s = d["conf"] * float(p[c])
+                if s > MIN_SCORE:
+                    w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+
+I'll replace with:
+```python
+        for d, p in zip(ev, probs):
+            c = int(np.argmax(p))
+            s = d["conf"] * float(p[c])
+            if s > MIN_SCORE:
+                w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+
+Let me make sure the SEARCH text is unique. The lines:
+```
+        for d, p in zip(ev, probs):
+            for c in range(4):
+                s = d["conf"] * float(p[c])
+                if s > MIN_SCORE:
+                    w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+This should be unique. Let me use a shorter, safe SEARCH. I'll use:
+```
+            for c in range(4):
+                s = d["conf"] * float(p[c])
+                if s > MIN_SCORE:
+                    w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+And replace with:
+```
+            c = int(np.argmax(p))
+            s = d["conf"] * float(p[c])
+            if s > MIN_SCORE:
+                w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+
+That's clean. The indentation: the `for c in range(4):` is at 12 spaces (3 levels: function main → with → for d). Let me check the original indentation.
+
+Looking at the code:
+```python
+    with open(os.path.join(args.out, "preds.csv"), "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["det_id", "cls", "score"])
+        for d, p in zip(ev, probs):
+            for c in range(4):
+                s = d["conf"] * float(p[c])
+                if s > MIN_SCORE:
+                    w.writerow([d["Thinking budget reached. Stop thinking now and write the reply in the required format.

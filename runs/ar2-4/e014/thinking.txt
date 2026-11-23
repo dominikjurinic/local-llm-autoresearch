@@ -1,0 +1,562 @@
+===== attempt 1 =====
+Let me analyze the situation.
+
+Current best: e001, 5-seed mean 0.6302. Per-class: pore 0.517, deposit 0.622, discontinuity 0.776, stain 0.605.
+
+Reference numbers:
+- one-step 4-class baseline: 0.638
+- stage-1 boxes with perfect classes: 0.758 (ceiling)
+- class-agnostic: 0.755
+
+So the gap to the ceiling is 0.758 - 0.6302 = 0.128. The class decision is the main source of error.
+
+What's been tried:
+- e001: adding low-res training data → new best (0.6302 vs presumably 0.62-ish before)
+- e002/e003: single tight crop → rejected (0.6247)
+- e004: more training (architecture? probably more steps) → rejected 0.6296
+- e005: IMG_SIZE 128 → rejected 0.6217
+- e006: train on detector boxes instead of GT boxes → 0.6278, not confirmed
+- e007: duplicate pore/stain 2x → rejected 0.6280
+- e008: train on false alarms → 0.5635, rejected (big drop)
+- e009: scoring change (one row per box?) → 0.5710, rejected
+- e010: rotation + contrast augmentation → 0.6255, not confirmed
+- e011: tf_efficientnetv2_b0 → rejected 0.6301
+- e012: mixup → rejected 0.6141
+- e013: two separate heads → crashed (forward_features returns (B, C, H, W) spatial features for efficientnet_b0, not a pooled vector; need to use global_pool or apply pool)
+
+So many things have been tried. Let me think about what's fundamentally different and could yield ≥0.01.
+
+Key observations:
+1. The classifier given perfect boxes reaches macro-F1 ~0.87 with the starting recipe. But our mAP is 0.6302 vs ceiling 0.758. So there's a big gap between classifier F1 and mAP. Where does the error come from?
+
+Wait, actually the reference says "A crop classifier given perfect boxes reaches macro-F1 ~0.87 with the starting recipe (two-crop input)." So even with perfect boxes, the classifier only gets 0.87 F1. The ceiling of 0.758 assumes perfect classes. So the classifier's 0.87 F1 means ~13% of boxes get wrong class. That would explain the gap from 0.758 to ~0.63.
+
+Actually let me think about the mAP math. If a detector box overlaps a true defect (IoU>0.5) but we assign the wrong class, then:
+- For the true class: we miss a detection (recall loss).
+- For the predicted class: we add a false positive (precision loss).
+
+So wrong-class assignments hurt both. With 0.87 F1, roughly 13% of TP boxes are misclassified. That's a substantial hit.
+
+2. The per-class AP: pore 0.517 is the weakest. discontinuity 0.776 is strong.
+
+Let me think about what could give a big gain.
+
+Options to consider:
+- Fix e013 (two heads). The crash is because `model.forward_features` for efficientnet_b0 returns spatial features (B, 1280, H, W) not pooled. Wait, the error says mat1 is 409600x5 and mat2 is 1280x4. So forward_features returned shape (409600, 5)? That's weird. Actually 409600 = 256*1600? No. Let me think. Batch 256? No, batch for training is 64. Hmm, 409600 = 64 * 6400 = 64 * 80*80. Yes! 80x80 spatial = 6400, times 64 batch = 409600. And 5 channels? That doesn't match efficientnet_b0 which has 1280 channels at the end. Wait, but the error says mat1 is 409600x5. So forward_features returned (64, 5, 80, 80)? No...
+
+Actually wait. Let me reconsider. The head expects in_features=1280. The forward_features output has last dim 5? That's strange. Hmm, maybe efficientnet_b0's forward_features with default settings... Actually in timm, `forward_features` returns the raw spatial feature map before pooling. For efficientnet_b0, the final conv produces 1280 channels at 1/12 resolution. Input 160 → 160/12 ≈ 13.3 → 13x13. So it should be (64, 1280, 13, 13). That doesn't match 409600x5 either.
+
+Wait, 409600x5. If the tensor is (64, 1280, 13, 13), reshaped to (-1, 1280) it'd be (110912, 1280). Not matching.
+
+Hmm, let me reconsider. Maybe the model's forward_features returns something else. Actually, the shape 409600 x 5... 5 could be the number of channels if... no.
+
+Actually maybe I'm misreading. The Linear layer `head_tight` has weight (4, 1280). The input `ft` after forward_features... The error "mat1 and mat2 shapes cannot be multiplied (409600x5 and 1280x4)" means mat1 = ft reshaped to (409600, 5), mat2 = weight (4, 1280) transposed to (1280, 4). So ft has shape (..., 5) with total elements 409600*5 = 2048000. Hmm 2048000 = 64 * 32000 = 64 * 80 * 80 * 5. So ft is (64, 80, 80, 5)? That's weird for efficientnet.
+
+Wait, maybe the model isn't efficientnet_b0 in e013? No, e013 is based on e001 which uses efficientnet_b0.
+
+Hmm, actually maybe I'm overthinking. The point is forward_features returns spatial features, and we need to pool them. The fix: use `model.forward_features(x)` then apply global average pool, OR better, restructure to get the pooled feature.
+
+Actually, the cleanest fix: instead of forward_features, we can hook into the model to get the pooled feature before the classifier. In timm, the efficientnet has a `head` or the classifier is applied after global pool. Let me think about how to get the pooled feature.
+
+Actually, a simpler approach for the two-head idea: keep using `model(x)` for one and... no.
+
+Alternatively, maybe I should abandon the two-head idea since it's been a pain, and think of something else. But the rules say if a run crashed, read the log and fix the cause. And "Never repeat an experiment... unless it crashed or had a bug that you are now fixing." So fixing e013 is allowed.
+
+But is the two-head idea likely to help? The hypothesis was that tight and wide views operate at different scales so separate heads help. That's a reasonable but uncertain idea. The gain might be small.
+
+Let me think about bigger levers.
+
+Actually, let me reconsider the whole problem. The gap to ceiling is 0.128. The classifier F1 is 0.87. Let me think about what limits the classifier.
+
+The weak classes are pore and stain. Pore 0.517, stain 0.605. Deposit 0.622, discontinuity 0.776.
+
+Ideas that change what the model sees or learns:
+1. Better input representation. Currently two crops (1.5x and 2.5x). What about adding more context, or a different set of crops? What about including the full image or a larger crop to give global weld context?
+
+2. The images are weld beads. Defects have characteristic appearances. Pores are small circular holes. Stains are discolored regions. Deposits are raised material. Discontinuities are gaps.
+
+3. Multi-scale input: maybe the issue is that at 160px, small pores get lost. But e005 (128) hurt, so lower res is bad. Higher res (192, 224) would cost more steps. e004 (more training) was rejected though.
+
+Wait, e004 was "architecture" category with hypothesis about undertraining. Let me re-read: "The training loss is still falling fast at the end of the budget (0.31 after only ~2 epochs / 428 steps), so the classifier is undertrained rather than feature-limited". It was rejected (0.6296). So more training didn't help much. Hmm, but what exactly did e004 change? It's not shown. Probably increased steps somehow. It was rejected.
+
+Actually wait — the log shows only 2 epochs, 428 steps in 162s. That's a LOT of steps for 14128 boxes at batch 64 = 220 steps/epoch. So 428 steps ≈ 2 epochs. The budget is 180s, reserve 55s, so training budget ~111s. 14s loading. So ~97s for training = 428 steps. Each step ~0.23s. That's slow for efficientnet_b0 at 160px. Hmm.
+
+Actually the per-step cost is dominated by the two forward passes (tight + wide). So 2 forward passes per step.
+
+Let me reconsider. What if the model is actually well-trained but limited by input quality? The F1 0.87 with "perfect boxes" and "starting recipe" suggests the recipe itself caps at 0.87.
+
+Let me think about the biggest lever: the input. 
+
+Idea: Add a third view — a larger context crop (e.g., 4x or 5x) to capture the weld bead orientation and surrounding context. But that adds a third forward pass, cutting steps by 33%. Given e004/e005 showed more steps / lower res didn't help, adding compute per step is risky.
+
+Alternatively, replace one of the two views. Currently 1.5x and 2.5x. What if we use 1.5x and a much larger 4x? The wide crop gives context. Hmm.
+
+Actually, let me think about what's fundamentally different and high-impact.
+
+Another angle: the score. Currently score = conf × p_c, one row per class. e009 tried changing scoring (one row per box?) and it dropped to 0.5710. So the multi-row approach with conf×p_c is good.
+
+Wait, e009 hypothesis: "The current code writes one row per class per box (score = conf × p_c), so every detector box injects ~3 spurious false-positive rows into the other classes' lists". And it was rejected (0.5710). So they tried to write fewer rows (maybe only top class) and it hurt. That's interesting — it means writing all 4 rows per box is actually better than writing only the top class. Why? Because mAP at IoU 0.5: writing all 4 rows means for a true detection, the correct class row is present with a decent score, AND the wrong-class rows are also present (as false positives). But it seems keeping all rows is better. Hmm, actually that's a bit counterintuitive but the data says so.
+
+Wait, but actually maybe e009 did something else. Let me not over-interpret.
+
+Let me think about the ranking. Within a class, predictions are sorted by score. A hit if IoU>0.5 with unmatched true box. The AP depends on order. Score = conf × p_c. 
+
+For a true detection of class c, the row for class c has score conf × p_c where p_c is high (say 0.8). For the same box, rows for other classes have conf × p_other (lower). 
+
+The false alarms: boxes that don't overlap any true defect. They get 4 rows each. These pollute all classes.
+
+Hmm. The ranking within a class: true detections of class c have score conf × p_c (p_c high). False alarms have score conf × p_c (p_c could be anything). If a false alarm gets a high p_c from the classifier, it ranks high and hurts precision.
+
+So improving the classifier's ability to NOT assign high p_c to false alarms would help. But e008 (train on false alarms) hurt a lot (0.5635). So that's not the way.
+
+Let me reconsider. What's the largest part of the error?
+
+Let me estimate. Ceiling (perfect classes) = 0.758. Our score = 0.6302. Gap = 0.128. This gap is due to:
+(a) wrong class assigned to true detections (class decision error)
+(b) false alarms kept (but ceiling also keeps false alarms as class 0, so the class-agnostic score 0.755 is close to ceiling 0.758 — meaning false alarms matter little for the class-agnostic case)
+
+Wait, ceiling keeps false alarms as class 0. Class-agnostic scores all as one class 'defect' = 0.755. So false alarms reduce the class-agnostic mAP from 0.758-ish to 0.755. So false alarms are a small effect (0.003). The big effect is class assignment.
+
+So the gap 0.128 is almost entirely class misassignment. The classifier F1 0.87 → ~13% misassignment. That's the target.
+
+So I need to improve the classifier's accuracy, especially on pore and stain.
+
+What changes the classifier's accuracy most?
+1. Better features (architecture) — e011 (tf_efficientnetv2_b0) rejected, e003 (single crop) rejected, e013 (two heads) crashed.
+2. Better input (data/augmentation) — e010 (rotation+contrast) not confirmed, e012 (mixup) rejected.
+3. More/better data — e001 (add low-res) was the only confirmed gain, e006 (detector boxes) not confirmed, e007 (class dup) rejected.
+4. Training longer — e004 rejected.
+
+Hmm. Most directions have been tried. Let me look for something fundamentally different.
+
+Wait — the per-step cost. Currently 2 forward passes (tight + wide). What if the wide crop (2.5x) is actually hurting? e003 tried single tight crop (1.5x only) and it was rejected (0.6247, slightly below 0.6302). So the wide crop helps a little (0.6302 vs 0.6247). OK.
+
+Let me think about the input differently. The weld bead has a strong orientation (usually horizontal or diagonal). Defects like pores are small. Maybe the issue is that the crop is square and centered, losing the elongated bead context.
+
+Idea: Instead of square crops, use crops that preserve aspect ratio of the box? Or add the full image as a third view?
+
+Actually, let me reconsider the two-crop averaging. Currently logits averaged: (model(xt) + model(xw))/2. What if instead we concatenate the features and use a single head? That's different from two heads. Hmm, but that's similar to e013.
+
+Let me think about a fundamentally different idea: **test-time augmentation (TTA)**. At inference, for each eval box, average predictions over multiple augmentations (flips, the two crops already). But TTA at inference costs more forward passes. With 41879 eval boxes, currently 2 forward passes each = 83758 forward passes in the prediction phase. The prediction phase takes... total 162s, training ~97s, loading 14s, so prediction ~51s for 83758 passes ≈ 0.6ms/pass. Adding TTA (say 2 flips × 2 crops = 4 passes) would double prediction to ~100s, plus training 97s + loading 14s = 211s > 180s. Too much. Unless we reduce training.
+
+Hmm, TTA is risky on budget.
+
+Let me reconsider. What about the model architecture more carefully. The available pretrained models: convnext_atto, convnext_nano, convnext_pico, efficientnet_b0, efficientnet_b2, mobilenetv3_large_100, regnety_016, resnet18, resnet26d, resnet34, resnet50, tf_efficientnetv2_b0.
+
+We've tried efficientnet_b0 (current) and tf_efficientnetv2_b0 (rejected). What about a ConvNeXt? convnext_nano or convnext_atto. ConvNeXt has different inductive biases (depthwise convs, better for texture). Pores and stains are texture-based. This could be fundamentally different.
+
+But wait, the per-step cost matters. convnext_atto is tiny (fast), convnext_nano is small. Let me think about step count. Current: 428 steps in ~97s. If convnext_nano is faster, more steps. But e004 showed more steps didn't help (undertrained hypothesis rejected). Hmm, actually e004 was rejected but what did it do? If it just trained longer and was rejected, then the model isn't undertrained.
+
+Actually, let me reconsider e004. Its hypothesis was "undertrained" and it was rejected (0.6296, basically same as 0.6302). So more training = no gain. The model converges.
+
+So the model is feature/representation limited, not training limited. That points to architecture or input.
+
+Given tf_efficientnetv2_b0 was rejected, and the current is efficientnet_b0, maybe a ConvNeXt is worth trying. convnext_nano has ~5M params, similar to efficientnet_b0 (~4M). convnext_atto is ~2M (faster). 
+
+Actually, let me reconsider. The key question: what's the single highest-impact change?
+
+Let me reconsider the input. The two crops are 1.5x and 2.5x. What if the real issue is resolution of the defect within the 160px image? Pores are small. At 1.5x the box, a pore fills the crop. At 2.5x it's smaller. 
+
+Hmm, what about increasing IMG_SIZE to 192 or 224? e005 tried 128 (lower) and it hurt. Higher res would give more detail for small pores. But it costs more per step (224/160)^2 = 1.96x, halving steps. Given more steps didn't help (e004), halving steps to add resolution is a tradeoff. Could go either way. Risky.
+
+Let me think about what's most likely to give ≥0.01.
+
+Actually, here's a thought. The problem statement says "Pore and deposit are the weak classes; stain is often confused with deposit." And our per-class: pore 0.517 (weakest), stain 0.605, deposit 0.622, discontinuity 0.776.
+
+Stain confused with deposit. Pore is weak.
+
+What distinguishes pore? Small circular holes, dark. Stain? Discoloration, diffuse. Deposit? Raised, bright. Discontinuity? Gap, dark line.
+
+Idea: **Provide the model with a normalized / enhanced version of the crop.** Weld images have lighting variation. Normalizing each crop (e.g., per-crop mean/std, or CLAHE-like histogram equalization) could make the classifier more robust to lighting. This is a data-level change that changes what the model sees. It's cheap (no extra forward passes, just preprocessing). 
+
+Actually, per-crop normalization (zero-mean unit-variance per crop) is a strong idea for this kind of problem because weld lighting varies a lot and the global MEAN/STD normalization doesn't adapt to local lighting. This could help pore (dark holes) and stain (discoloration) which are contrast/lighting dependent.
+
+Let me think about whether this is likely to help ≥0.01. Per-crop normalization is a well-known trick for robustness to illumination. It changes the input distribution to be more consistent. I think this is a reasonable, cheap, fundamentally-different idea (we haven't tried any input normalization change). 
+
+But wait — there's a risk: per-crop normalization could remove global brightness cues that distinguish classes. E.g., stain might be brighter than pore. If we normalize per crop, we lose that. Hmm. But usually for texture classification, per-crop normalization helps.
+
+Alternatively, a milder version: apply a random brightness/contrast augmentation more aggressively during training (we have 0.8-1.2 brightness). e010 added rotation+contrast and was "not confirmed" (0.6255, slightly below). So more augmentation didn't clearly help.
+
+Let me reconsider. Actually, let me reconsider the per-crop normalization more carefully. The current pipeline: crop → resize to 160 → /255 → (x - MEAN)/STD (global ImageNet stats). 
+
+Per-crop normalization: crop → resize → /255 → (x - x.mean())/x.std(). This makes each crop zero-mean unit-var. This is a strong invariance to lighting. 
+
+I think this is worth trying. It's cheap, changes what the model sees, and targets the lighting variation that affects pore/stain.
+
+But let me also consider: maybe the bigger lever is the architecture. Let me weigh.
+
+Actually, let me reconsider the whole thing with fresh eyes.
+
+The reference: "A crop classifier given perfect boxes reaches macro-F1 ~0.87 with the starting recipe (two-crop input)." So even with PERFECT boxes, the recipe gives 0.87 F1. Our boxes are detector boxes (slightly off), and we get 0.6302 mAP. The ceiling with perfect classes is 0.758.
+
+So the recipe's 0.87 F1 is the fundamental limit of the classification given the input. To beat 0.638 (one-step baseline) and approach 0.758, we need to push F1 from 0.87 higher.
+
+What pushes F1 from 0.87 to, say, 0.93? Better features or better input representation.
+
+Let me think about the input representation again. The two crops (1.5x, 2.5x) are square, centered on the box. The box is a defect box. For a pore (small circle), the 1.5x crop shows the pore with a little context. For a stain (larger diffuse region), 1.5x shows part of it.
+
+What if we add a view that shows the whole weld bead (full image)? That gives global context — the orientation of the bead, the overall appearance. This could help distinguish stain (which is on the bead) from deposit. But it's a third forward pass.
+
+Alternatively, what if the wide crop (2.5x) should be wider (4x or 5x) to capture more of the bead? That's a cheap change (just change CONTEXT from 2.5 to 4.0 or 5.0). No extra compute. Let me consider this.
+
+Actually, changing CONTEXT is very cheap and changes what the model sees. Currently 2.5x. If we make it 4x, the wide crop shows more surrounding weld. For stain vs deposit discrimination, more context might help. For pore, more context shows the pore is small relative to the bead.
+
+Hmm, but e003 (single tight crop) was rejected, meaning the wide crop at 2.5x helps. Making it wider is a different thing.
+
+Let me think about which is more likely to help: per-crop normalization, or wider context, or ConvNeXt architecture.
+
+I'll go with... let me think about the expected magnitude.
+
+Per-crop normalization: could help if lighting variation is a big factor. Weld images likely have significant lighting variation. This is a strong candidate. Expected gain 0.01-0.03 if lighting is a factor, 0 if not.
+
+Wider context: uncertain, could help stain/deposit. Expected 0.005-0.015.
+
+ConvNeXt: architecture change, uncertain. e011 (efficientnetv2) was rejected, so maybe the efficientnet family is fine. ConvNeXt is a different family. Expected 0.005-0.02.
+
+Actually, let me reconsider. I want to pick the one most likely to give ≥0.01 and is fundamentally different from what's tried.
+
+Let me reconsider per-crop normalization. Actually, I realize there might be a subtlety. The two views (tight and wide) would each be normalized independently. That's fine.
+
+But here's a concern: if we normalize per-crop, and the crop is mostly background (weld bead) with a small defect, the normalization is dominated by the background. The defect's contrast relative to background is preserved (since it's a local operation). Actually per-crop normalization preserves local contrast, which is what we want for detecting the defect's appearance. Good.
+
+I think per-crop normalization is a solid, cheap, fundamentally-different idea. Let me go with it.
+
+Wait, but let me double check it's not already in the history. Looking at the history: e010 was rotation+contrast augmentation. e012 mixup. None did per-crop normalization. Good, it's new.
+
+Actually, hold on. Let me reconsider whether per-crop normalization might hurt. If classes have different inherent brightness (e.g., deposit is bright, pore is dark), per-crop normalization removes that global cue. But the classification is based on the crop which includes both defect and surrounding. If the whole crop is bright (deposit region) vs dark (pore region), normalization removes that. Hmm. But deposit and pore differ in texture/shape too, not just brightness. And stain vs deposit differ in texture. I think texture cues survive normalization.
+
+Actually, you know what, let me reconsider. There's a risk per-crop normalization is too aggressive. A milder alternative: normalize per-crop but blend with global stats. Or use a fixed per-channel normalization. Hmm, that's getting complicated.
+
+Let me consider a different, maybe stronger idea: **data augmentation with color jitter / photometric augmentation** is already partly there. 
+
+Actually, let me step back and think about the highest-leverage thing.
+
+The metric: mAP@0.5, macro over 4 classes. The gap is class misassignment. The weakest is pore (0.517). 
+
+What if I focus specifically on improving pore detection? Pores are small, dark, circular. They're confused with... what? Probably discontinuity (also dark) or stain. 
+
+Hmm, I don't have confusion matrix data. 
+
+Let me think about the input once more. Actually, here's a strong idea I haven't considered: **the box coordinates and size as input features**. The defect type correlates with box size/shape. Pores are small, discontinuities are elongated. We could feed the box aspect ratio and size (relative to image) as extra input features to the classifier head. This is cheap and provides a strong prior.
+
+But implementing that requires modifying the model head to accept extra features. Doable but a bit involved. And it's a modest effect probably.
+
+Let me reconsider. I think the cleanest high-value experiment is per-crop normalization OR a ConvNeXt. 
+
+Let me look at step budget again. If I switch to convnext_atto (very fast), I'd get many more steps. But e004 said more steps don't help. So a faster model just means more of the same. A stronger model (convnext_nano) at similar speed would be the play. But convnext_nano might be slower than efficientnet_b0.
+
+Hmm, actually, let me reconsider the per-step cost. Current 428 steps / 97s = 4.4 steps/s. That's 2 forward passes per step (tight+wide), so 8.8 forward passes/s. For efficientnet_b0 at 160px on... what device? Probably CPU or a small GPU. 8.8 passes/s for b0 at 160 is slow-ish, suggesting CPU or weak GPU.
+
+If it's CPU, then a faster backbone (convnext_atto) would give more steps but same quality. A stronger backbone would be slower.
+
+OK here's my decision. Let me go with **per-crop (per-image-crop) normalization** as the input change. It's cheap, fundamentally different (no one has tried input normalization), targets lighting variation which plausibly limits pore/stain, and has a reasonable chance of ≥0.01.
+
+Wait, actually, let me reconsider one more time. Let me reconsider whether the model is really representation-limited or if there's a simpler issue.
+
+The F1 is 0.87 with perfect boxes. That's the recipe's limit. To improve, we need better features or better input. Per-crop normalization improves input consistency. I'll go with it.
+
+Actually, let me reconsider the magnitude of lighting variation. In weld images captured by a robot with a fixed camera, lighting is probably fairly consistent (same setup). So per-crop normalization might not help much. Hmm.
+
+But there's still variation from the weld pool, reflections, etc. And the low-res vs high-res images might have different lighting. e001 added low-res and helped, suggesting distribution shift matters.
+
+Ugh, I'm going back and forth. Let me make a decision based on expected value and risk.
+
+Per-crop normalization:
+- Cheap (no compute change)
+- Low risk of crashing
+- Moderate chance of helping (0.01-0.03)
+- Fundamentally different (input normalization)
+- Risk: could hurt if global brightness is a class cue (0.00 to -0.01)
+
+ConvNeXt nano:
+- Compute change (maybe slower)
+- Low crash risk
+- Moderate chance (0.005-0.02)
+- Different family
+- Risk: budget if slower
+
+Wider context (CONTEXT 2.5→4.0):
+- Cheap
+- Low risk
+- Lower chance (0.005-0.01)
+- Changes what model sees
+
+I'll go with per-crop normalization. It's the most "changes what the model sees/learns" and cheap.
+
+Hmm wait, but actually let me reconsider. Let me re-examine: is there a chance per-crop normalization is essentially what ImageNet normalization partially does? No — global MEAN/STD is fixed; per-crop adapts to the crop's actual statistics. Different.
+
+Let me also reconsider: should I normalize per-crop in the training AND eval consistently? Yes, both. In the code, the normalization `(x - MEAN) / STD` is applied in BoxDataset.__getitem__. I need to change it to per-crop. But note: the two views (tight and wide) are separate crops, so each should be normalized independently. Currently they share the flip/brightness but the normalization is global. I'll make it per-crop.
+
+Let me look at the code:
+
+```python
+        views = []
+        for ctx in (TIGHT_CONTEXT, CONTEXT):
+            x = make_crop(img, r, ctx, self.train)
+            if fh:
+                x = x[:, ::-1]
+            if fv:
+                x = x[::-1, :]
+            if self.train:
+                x = np.clip(x * bright, 0, 1)
+            x = (x - MEAN) / STD
+            views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))
+        return views[0], views[1], r.get("cls", -1)
+```
+
+So `x` here is the crop (after resize, /255). To do per-crop normalization:
+```python
+            mu = x.mean(axis=(0,1), keepdims=True)
+            sd = x.std(axis=(0,1), keepdims=True) + 1e-6
+            x = (x - mu) / sd
+```
+
+But wait, there's a subtlety: the gray padding (114) outside the image. If a crop extends beyond the image, the padding is 114/255 = 0.447. This would affect the per-crop mean/std. For crops near image borders, the padding dominates. Hmm. Most defect boxes are probably interior, so padding is minimal. But to be safe, maybe I should handle it. Actually, for simplicity, I'll just normalize the whole crop including padding. The padding is gray (0.447), which is close to ImageNet mean (0.485, 0.456, 0.406). So it won't distort too much. OK.
+
+Actually, there's a concern: per-crop normalization makes the model ignore absolute brightness entirely. If the task benefits from knowing "this whole region is bright" (e.g., a bright deposit), we lose it. But I'll bet on texture cues.
+
+Hmm, let me reconsider once more. Actually, I worry per-crop normalization is a coin flip. Let me think about whether there's a more decisive experiment.
+
+Let me reconsider the architecture angle with a specific, high-value change: **use a larger backbone, efficientnet_b2**, which is available. It's stronger than b0. If the model is feature-limited, b2 could help. The cost: b2 is ~2x slower than b0. So steps halve (428 → ~200). But e004 said more steps don't help, so halving steps to get a stronger model is a reasonable tradeoff IF the stronger model is better per-step. 
+
+But wait, is the model undertrained? e004 rejected the undertraining hypothesis. So the model converges in ~428 steps. If we halve steps to 200, we might be undertrained again. Risky.
+
+Alternatively, convnext_atto is faster, so we could train it longer. But faster ≠ stronger.
+
+Hmm. Let me reconsider. I keep coming back to the input being the lever.
+
+Actually, let me reconsider the problem from the "what does the model see" angle more concretely. 
+
+The two crops: tight (1.5x) and wide (2.5x). Both square, centered. The model sees a 160x160 patch. For a pore (small), the tight crop shows it filling ~1/1.5 = 67% of the side. For a stain (larger), the tight crop shows part of it.
+
+What if the issue is that the square crop cuts off the elongated weld bead, so the model can't see the bead orientation? Adding a view that's the full image (or a very wide crop) would help. 
+
+I think adding a full-image view is actually a strong idea, but it's a third forward pass (33% fewer steps). Given e004 (more steps don't help), losing 33% of steps to add a full-image view is a tradeoff. The full-image view gives global context (bead orientation, overall lighting) that could help stain/deposit and pore (small relative to bead). 
+
+But 3 forward passes per step: current 428 steps → ~285 steps. And prediction: 41879 boxes × 3 passes = 125637 passes vs current 83758. Prediction time ~51s → ~77s. Total: loading 14 + training (285 steps × 0.23s = 66s) + prediction 77s = 157s < 180s. OK, fits with margin. Hmm, actually let me recompute. Current: 428 steps in 97s = 0.227s/step (2 passes). Per pass = 0.113s. For 3 passes/step = 0.34s/step. Training budget ~97s → 97/0.34 = 285 steps. Prediction: 41879 × 3 = 125637 passes × 0.113s = 14.2s? Wait, that doesn't match my earlier 51s.
+
+Let me recompute prediction. Total 162s. Loading 14s. Training: from log, epoch 0 ends at 85s, epoch 1 ends at 125s, done at 162s. So training is 125-14 = 111s? But the reserve is 55s and deadline is 180s, so t_end = 180-55 = 125s. Training runs until 125s. So training = 125 - 14 = 111s. Then prediction = 162 - 125 = 37s. For 83758 passes (2 per box × 41879) = 37s → 0.44ms/pass. 
+
+Wait, that's 83758 passes in 37s = 2264 passes/s. At 0.44ms/pass. OK.
+
+For 3 passes/box: 125637 passes × 0.44ms = 55s. Training 111s (but with 3 passes/step, fewer steps: 111s / (0.34s/step) = 326 steps... wait let me recompute per-pass time. 2 passes per step, 428 steps in 111s → 0.26s/step → 0.13s/pass. Hmm, that's different from prediction's 0.44ms/pass. 
+
+Oh, training includes backward pass, so it's slower per forward. Prediction is forward-only, faster. So:
+- Training: 0.13s per forward (with backward, ~0.26s/step for 2 forwards)
+- Prediction: 0.44ms per forward
+
+For 3 passes/step training: 0.39s/step, 111s → 285 steps.
+For 3 passes/box prediction: 41879 × 3 × 0.44ms = 55s.
+Total: 14 + 111 + 55 = 180s. Right at the limit! Too risky.
+
+So a third full-image view is too expensive on budget. Scrap that.
+
+OK so I'm back to cheap input changes: per-crop normalization, or wider context (CONTEXT 2.5→4).
+
+Let me reconsider wider context. Changing CONTEXT from 2.5 to 4.0 is free (same compute). The wide crop would show 4x the box's long side. For a pore (small box), 4x shows a lot of surrounding bead. For a stain (large box), 4x shows the whole stain plus context. This gives the model more context to distinguish classes. 
+
+But does more context help or hurt? For pore, seeing it's small and round in a field of bead helps. For stain, seeing the diffuse discoloration extent helps. I think more context is plausibly helpful. And it's a one-line change, zero compute cost, zero crash risk.
+
+But the expected gain might be small (0.005-0.01). And e003 showed the wide crop helps (vs no wide crop), so the wide crop is useful; making it wider is a natural extension.
+
+Hmm, between per-crop normalization and wider context, which has higher expected value?
+
+Per-crop normalization: bigger potential swing (0 to 0.03), but could hurt.
+Wider context: smaller swing (0 to 0.01), unlikely to hurt much.
+
+I want something with a good chance of ≥0.01. Let me think about which is more likely to actually move the needle.
+
+Actually, you know what, let me reconsider the lighting question. Let me look at the data. The images are "real robotic weld beads." Robotic welding typically has a fixed camera and consistent lighting (the robot moves, camera fixed, or camera on robot). If the camera is on the robot, lighting is very consistent. If fixed, also fairly consistent. So lighting variation might be modest. That reduces the appeal of per-crop normalization.
+
+But there's still variation: the weld pool glows, reflections, different weld parameters, high vs low res. e001 (adding low-res) helped, suggesting the high and low res have different distributions. Per-crop normalization would make them more consistent. That's a point in favor.
+
+I'll make a decision: I'll go with **per-crop normalization**. Rationale: it's the most likely to change the input distribution in a way that helps the weak texture-based classes, it's cheap, it's fundamentally different from everything tried, and the low/high res distribution shift (which e001 showed matters) is exactly what per-crop normalization addresses.
+
+Hold on, let me reconsider the risk of per-crop normalization hurting. If I normalize per-crop, the model's ImageNet pretraining is somewhat invalidated (ImageNet features expect global stats). But we fine-tune, so it adapts. The main risk is losing global brightness class cues. I'll accept that risk.
+
+Actually, wait. Let me reconsider a safer variant: instead of full per-crop zero-mean unit-var, I could do a "per-crop standardization" that's milder. But that's fiddly. Let me just do full per-crop normalization. It's clean.
+
+Hmm, but actually, I realize there's an even simpler and possibly more robust idea that I should weigh: **normalize per-crop but keep it per-channel, and clip.** Let me just do:
+```python
+mu = x.mean(axis=(0,1), keepdims=True)
+sd = x.std(axis=(0,1), keepdims=True) + 1e-5
+x = np.clip((x - mu) / sd, -3, 3)
+```
+The clip to [-3,3] prevents outlier crops from dominating. Good.
+
+Wait, but the padding (114/255=0.447) — for a crop mostly inside the image, padding is negligible. For a crop at the border, padding could be significant. But defects are usually interior. I'll accept it.
+
+Actually, let me reconsider whether to include the padding in normalization. If a crop is half padding, the mean is pulled toward 0.447 and std is reduced. This could distort. But such crops are rare (defects at image border). I'll accept the risk for simplicity.
+
+OK let me also reconsider: should I apply per-crop normalization to BOTH views independently? Yes. Each view is a separate crop.
+
+Let me now also reconsider: the flip and brightness are applied before normalization. With per-crop normalization, the brightness augmentation (0.8-1.2) becomes irrelevant (normalization removes it). That's fine — it just means brightness aug is a no-op, which is OK. Actually, it means we lose that augmentation's diversity. But per-crop normalization is a stronger invariance. Fine.
+
+Actually, wait — if brightness becomes a no-op, maybe I should keep it for the non-normalized parts? No, normalization removes it entirely. So brightness aug is pointless now. I could remove it, but it's harmless. I'll leave the code as is (it'll just be a no-op after normalization). Actually, to be clean, I'll keep it.
+
+Hmm, actually, let me reconsider. If I normalize per-crop, then the `bright` augmentation does nothing. That's a waste but not harmful. Fine.
+
+Let me write the edit.
+
+Current:
+```python
+            if self.train:
+                x = np.clip(x * bright, 0, 1)
+            x = (x - MEAN) / STD
+            views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))
+```
+
+New:
+```python
+            if self.train:
+                x = np.clip(x * bright, 0, 1)
+            mu = x.mean(axis=(0, 1), keepdims=True)
+            sd = x.std(axis=(0, 1), keepdims=True) + 1e-5
+            x = np.clip((x - mu) / sd, -3.0, 3.0)
+            views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))
+```
+
+That's the change. It's applied to both views in the loop. Good.
+
+Wait, I need to make sure MEAN and STD are no longer used, but they're defined at the top. That's fine, unused variables don't hurt. Actually, I should double check they're not used elsewhere. They're only used in this one place. So after the change, they're unused. That's fine (no error).
+
+Let me verify the SEARCH text is unique and exact.
+
+The lines:
+```
+            if self.train:
+                x = np.clip(x * bright, 0, 1)
+            x = (x - MEAN) / STD
+            views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))
+```
+
+Let me check this appears exactly once. In BoxDataset.__getitem__, yes. The `if self.train:` appears twice in the function (once for fh/fv/bright, once for bright). Let me check.
+
+```python
+        fh = fv = False
+        bright = 1.0
+        if self.train:  # same flips and brightness for both views
+            fh, fv, bright = random.random() < 0.5, random.random() < 0.5, random.uniform(0.8, 1.2)
+        views = []
+        for ctx in (TIGHT_CONTEXT, CONTEXT):
+            x = make_crop(img, r, ctx, self.train)
+            if fh:
+                x = x[:, ::-1]
+            if fv:
+                x = x[::-1, :]
+            if self.train:
+                x = np.clip(x * bright, 0, 1)
+            x = (x - MEAN) / STD
+            views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))
+        return views[0], views[1], r.get("cls", -1)
+```
+
+So `if self.train:` appears twice: once with comment "# same flips..." and once before `x = np.clip(x * bright, 0, 1)`. My SEARCH block includes the `x = np.clip(x * bright, 0, 1)` line which is unique. So the full 4-line block is unique. Good.
+
+Let me make the SEARCH block:
+```
+            if self.train:
+                x = np.clip(x * bright, 0, 1)
+            x = (x - MEAN) / STD
+            views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))
+```
+
+This is 4 lines, unique. Good.
+
+REPLACE:
+```
+            if self.train:
+                x = np.clip(x * bright, 0, 1)
+            mu = x.mean(axis=(0, 1), keepdims=True)
+            sd = x.std(axis=(0, 1), keepdims=True) + 1e-5
+            x = np.clip((x - mu) / sd, -3.0, 3.0)
+            views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))
+```
+
+Good.
+
+Now, CATEGORY: this is a data change (input preprocessing). I'll say "data". Actually it's about how the input is represented — could be "data" or "augmentation". It's a normalization of the input, which is data preprocessing. I'll use "data".
+
+HYPOTHESIS: I need 2-3 sentences: the change, why it should help (which part of error), expected gain, how it differs from earlier experiments.
+
+Let me write it:
+
+"Replace the fixed ImageNet (MEAN/STD) normalization with per-crop standardization: each crop is zero-mean unit-variance (clipped to [-3,3]) before the network. The 0.128 gap to the 0.758 ceiling is almost entirely class misassignment (the class-agnostic score 0.755 is nearly the ceiling), and the weak pore/stain classes are texture/contrast-based, so making the input invariant to the local lighting and exposure differences between high- and low-res images (the shift e001 showed matters) should sharpen the class decision. Expected gain ~0.01-0.03; unlike e010/e012 (augmentation/mixup) and e006 (box replacement), this changes the input statistics the backbone sees rather than the training procedure."
+
+That's good.
+
+Let me double check budget: no compute change, so same runtime ~162s. Safe.
+
+Let me reconsider if there's any risk this crashes. The per-crop mean/std is computed on x which is (160,160,3) float32 in [0,1]. mean/std along axes (0,1) gives (1,1,3). Division fine. Clip fine. No crash. Good.
+
+One more consideration: the padding value 114/255 = 0.447. For a crop fully inside the image, no padding. For a crop touching the border, some padding. The per-crop stats include padding. This is a minor distortion. Acceptable.
+
+Actually, wait. Let me reconsider: is there a risk that per-crop normalization makes the two views (tight and wide) too similar in statistics, reducing the benefit of having two views? No, they still have different content (different scales), just normalized stats. The model sees different spatial patterns. Fine.
+
+I'm confident in this choice. Let me also reconsider: should I worry that this is "just a knob" and won't move ≥0.01? The rules say avoid cosmetic tweaks. Per-crop normalization is a substantive change to the input representation, not a cosmetic knob. It's a legitimate method change. Good.
+
+Let me finalize.
+
+Actually, let me reconsider the category once more. The options: data, augmentation, architecture, loss, sampling, optimisation, inference, scoring, other. Per-crop normalization is a preprocessing of the input images. I think "data" fits best (it's about how the training/eval data is presented). Yes, "data".
+
+Let me write the final reply.
+
+Wait, I should double-check: does the normalization need to be consistent between train and eval? Yes, and it is — the code path is the same for both (the `if self.train` only guards the brightness, not the normalization). The normalization is applied unconditionally. Good.
+
+Also, I realize I should double check: in eval mode, `bright = 1.0` and no flip, so x is the raw crop. Then normalization. In train mode, x has flip+brightness, then normalization. Both normalized. Consistent enough (the model sees normalized crops in both). Good.
+
+Final answer.
+===== attempt 2 =====
+I need to keep the reply short. I was in the middle of proposing a per-crop standardization change. Let me make focused, short edits to the current best train.py (e001).
+
+The change: in BoxDataset.__getitem__, after building each view `x` (in [0,1]), standardize per-crop: x = (x - mean) / std, clip to [-3,3]. And remove the global (x - MEAN)/STD.
+
+Current code in __getitem__:
+```
+        views = []
+        for ctx in (TIGHT_CONTEXT, CONTEXT):
+            x = make_crop(img, r, ctx, self.train)
+            if fh:
+                x = x[:, ::-1]
+            if fv:
+                x = x[::-1, :]
+            if self.train:
+                x = np.clip(x * bright, 0, 1)
+            x = (x - MEAN) / STD
+            views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))
+```
+
+I'll replace `x = (x - MEAN) / STD` with per-crop standardization.
+
+Need to be careful: x is HxWx3 float32 in [0,1]. Per-crop: m = x.mean(), s = x.std() + 1e-6, x = np.clip((x - m)/s, -3, 3).
+
+Wait, but the brightness jitter is applied only in train, then standardization. The flip is applied before. That's fine.
+
+Let me write a short SEARCH/REPLACE.
+
+SEARCH:
+```
+            if self.train:
+                x = np.clip(x * bright, 0, 1)
+            x = (x - MEAN) / STD
+```
+REPLACE:
+```
+            if self.train:
+                x = np.clip(x * bright, 0, 1)
+            x = np.clip((x - x.mean()) / (x.std() + 1e-6), -3.0, 3.0)
+```
+
+That's the whole change. MEAN and STD become unused but that's fine (no need to remove, keep edit focused). Actually leaving unused globals is fine.
+
+Let me keep the hypothesis concise. The reply must be short to avoid cutoff.
+
+Let me make sure the SEARCH text appears exactly once. The lines:
+```
+            if self.train:
+                x = np.clip(x * bright, 0, 1)
+            x = (x - MEAN) / STD
+```
+Yes, appears once in __getitem__.
+
+Good. Keep it minimal.

@@ -1,0 +1,299 @@
+===== attempt 1 =====
+Let me analyze the situation.
+
+Current best: e000, 5-seed val mAP@0.5 0.6288.
+Per-class: pore 0.502, deposit 0.624, discontinuity 0.780, stain 0.609.
+
+Key diagnostic:
+- On boxes that overlap a true defect (IoU>0.5), class confusion matrix:
+  - pore: 63% correct. 20 of 75 true pores classified as stain, 6 as deposit.
+  - deposit: 78% correct. 55 of 269 true deposits classified as stain.
+  - discontinuity: 96% correct.
+  - stain: 88% correct. 46 classified as deposit, 15 as pore.
+- If every box had the correct class but kept my scores: 0.7461 vs my 0.6288. So the difference (0.117) is what wrong classes cost. The remaining gap to the perfect-class ceiling (0.758) is what my scores cost relative to detector conf.
+
+Wait, let me re-read: "mAP@0.5 if every box had its correct class but kept your scores: 0.7461 (yours: 0.6288). The difference is what wrong classes cost; the remaining gap to the perfect-classes ceiling in the brief is what your scores cost compared with the detector's conf."
+
+So the big loss is wrong classes. The dominant confusion is deposit→stain (55 cases) and pore→stain (20 cases). Stain is being over-predicted. Actually wait: true stain 540, true deposit 269. Stain is the most common class. The classifier over-predicts stain: it assigns stain to 20 pores, 55 deposits, 14 discontinuities = 89 wrong stains, while missing 61 stains (46→deposit, 15→pore, 9→discontinuity).
+
+So stain is the majority class and the model defaults to it. Pore is the weakest class (0.502 AP).
+
+Now, what has been tried:
+- Score rows manipulation: no gain (AP depends only on order within class; removing rows loses recall).
+- 5th background class: no gain.
+- Detector train boxes as extra data: accepted twice (+0.004), rejected 3 times. Mixed.
+- Third wide view (4x): accepted twice (+0.005), mostly from pore.
+- Low-res crops: no gain.
+- Bigger backbone/ensemble: no gain.
+- Resolution/small-box: no gain.
+- TTA: no gain.
+- Longer training: no gain.
+- Class-balanced sampling/weighted loss: no gain (and brief says class-weighted loss hurt every time).
+- Training augmentation: no gain.
+- Focal loss: no gain.
+- Box size/aspect as input: never properly tested (2 crashes, 1 edit fail, 1 run at 0.629).
+
+In THIS run's history:
+- e001 (architecture): side-by-side 224 single image → 0.6275, not confirmed.
+- e002 (data): size/aspect extra channels → crashed.
+- e003 (data): detector train boxes → 0.6295, not confirmed.
+- e004 (optimisation): EMA → 0.3561, likely bug.
+
+Let me think about the EMA bug. Score 0.3561. The EMA model was created with pretrained=False, then loaded state dict. That should be fine. But wait — the issue: `ema` is created with `timm.create_model(MODEL, pretrained=False, num_classes=4)`. Then `ema.load_state_dict(model.state_dict())`. That's fine. Then `ema.to(device).to(memory_format=torch.channels_last)`. Then `for p in ema.parameters(): p.requires_grad = False`.
+
+The update_ema function: for ep, sp in zip(ema.parameters(), model.parameters()): ep.mul_(d).add_(sp, alpha=1-d). For buffers, it copies floating point buffers with EMA and non-floating with copy_.
+
+Hmm, what could go wrong? The score dropped to 0.3561. That's a big drop. Let me think... Actually, one possibility: the EMA buffers. EfficientNet has batch norm / layer norm buffers. If the buffer update is wrong... Actually `eb.mul_(d).add_(sb, alpha=1-d)` for floating buffers. Running mean/var of batch norm. That should be fine.
+
+Wait, actually a more likely bug: The number of prediction rows is 69996 vs 53606 in the base. That's a big difference. Wait, why? In the base, MIN_SCORE = 0.001, and score = conf * p[c]. For 41879 eval boxes, 4 classes each = up to 167516 rows, but many are below 0.001. Base wrote 53606. EMA wrote 69996. That's more rows, meaning the EMA model produces higher probabilities (more mass above 0.001)? That's odd but not necessarily a bug.
+
+Actually, wait. Let me reconsider. The drop to 0.3561 is suspicious. Let me think about what's different.
+
+Actually, I bet the bug is that the EMA model's batchnorm running stats got corrupted, OR the issue is that `model.train()` is called but `ema` is in train mode too (since it was created and never set to eval until the end). But we only use ema at eval time, and we call `ema.eval()`. So that's fine.
+
+Hmm, wait. Actually, let me reconsider. During training, `model.train()` sets batchnorm to training mode. The ema model is separate and never used during training. At the end, `ema.eval()`. So ema's batchnorm uses running stats. The running stats were updated via EMA of the model's running stats. That should be approximately correct.
+
+Actually, the real issue might be: EMA with decay 0.999 over only ~400 steps means the EMA is essentially the initial (pretrained) weights for most of the training! Because 0.999^400 ≈ 0.67. So the EMA weights are a blend of ~67% initial + accumulated. Actually the EMA is a moving average, so it's not just initial. But with only 400 steps and decay 0.999, the effective window is ~1000 steps, so the EMA lags a lot behind. The EMA model would be undertrained / close to pretrained. That could explain a lower score but 0.3561 is really low.
+
+Actually, I don't need to fully diagnose EMA. The lesson is: EMA with decay 0.999 over 400 steps is too slow — the EMA barely moves from pretrained, and pretrained EfficientNet has 1000-class ImageNet head, not 4-class weld classes, so its output is garbage for our 4 classes. That's why 0.3561. So EMA needs a much faster decay or warmup. But honestly, EMA is unlikely to be the big win here.
+
+Let me focus on the biggest error: wrong classes, specifically stain over-prediction and pore under-prediction. The per-class AP: pore 0.502 is the weakest. Stain over-predicted.
+
+What hasn't been tried that could target the stain/pore confusion?
+
+Ideas:
+1. The confusion is deposit→stain and pore→stain. Stain is the majority class. This is a class-imbalance problem. But "class-balanced sampling or class-weighted loss" was tried (4 attempts, no gain) and "class-weighted loss hurt classification every time." So that's exhausted.
+
+2. Pore is the weak class. Pore vs stain confusion. What distinguishes pores from stains? Pores are small circular holes; stains are... Let me think. Actually the third wide view (4x) helped pore. So more context helps pore.
+
+Let me reconsider the diagnostic. The confusion is:
+- pore→stain: 20
+- deposit→stain: 55
+- stain→deposit: 46
+- stain→pore: 15
+
+So stain is both over-predicted (absorbing pore and deposit) and under-predicted (some go to deposit and pore). It's a bidirectional confusion between stain and deposit, and stain and pore.
+
+The biggest single cell is deposit→stain (55) and stain→deposit (46). So deposit and stain are confused with each other. And pore→stain (20) and stain→pore (15).
+
+Hmm. So the core confusion is stain vs deposit and stain vs pore.
+
+What method could help separate these? They are visually similar. The brief says "stain is often confused with deposit."
+
+Ideas not yet tried:
+- Fine-grained: higher resolution specifically for the confusing classes. But resolution was tried (9 attempts, no gain).
+- The third wide view helped pore. Maybe a different view helps.
+
+Wait, let me think about what's fundamentally different. The model averages logits of tight (1.5x) and wide (2.5x) crops. 
+
+Actually, let me reconsider the whole thing. The score = conf * p[c]. The diagnostic says "if every box had its correct class but kept your scores: 0.7461". So the scores themselves are decent (0.7461 vs ceiling 0.758). The main loss is wrong classes.
+
+So I should focus on improving the class decision. The class decision is a 4-way softmax. The confusion is stain/deposit and stain/pore.
+
+What could improve the class decision?
+
+Option A: Two-crop is already there. What about giving the model more signal about fine texture? The pore class is weak — pores are small. Maybe the tight crop at 1.5x is too zoomed or the wide crop is too zoomed for pores.
+
+Actually, let me reconsider. Let me think about what "pore" looks like. Pores are tiny holes in the weld. They might be hard to distinguish from stains (which could be small dark spots). 
+
+Hmm. Let me think about a fundamentally different approach.
+
+Idea: The model currently outputs 4 classes with softmax. The confusion is symmetric-ish between stain and others. What if the issue is that the model is not using the wide context well?
+
+Actually, let me reconsider the "third wide view (4x)" which helped pore by +0.005. That's a small gain. The pore class AP is 0.502. If I could improve pore a lot, that'd help.
+
+Let me think about what's fundamentally different and could give 0.01+.
+
+The biggest lever: the class confusion. Let me think about WHY stain and deposit are confused. 
+
+Actually, maybe the issue is that the two views (tight + wide) are both centered on the box. For stain vs deposit, the distinction might be in the surrounding context or in the texture. 
+
+Let me think about a different idea: instead of averaging logits of two crops, what if we use a single crop but at a better resolution, OR we train the model to be more discriminative?
+
+Wait, here's an idea that's fundamentally different and targets the class confusion directly: **train the classifier with a loss that specifically penalizes the stain/deposit and stain/pore confusions**, e.g., a confusion-aware loss. But that's a loss change, and focal loss was tried (no gain). A confusion-matrix-weighted loss is different from focal loss though. But "class-weighted loss hurt classification every time it was tried." A confusion-weighted loss is a form of class weighting in a sense. Risky.
+
+Let me think differently.
+
+Idea: **Use the detector confidence more cleverly, or combine with a second model.** Ensembles were tried (no gain).
+
+Idea: **The model is undertrained?** 433 steps. Longer training was tried (no gain, and timing bugs). 
+
+Let me reconsider. The per-class: pore 0.502 is really weak. The confusion pore→stain (20) is large relative to pore's total (75). So 27% of pores are misclassified as stain.
+
+What if pores are systematically small and the crop is too small, so the model sees mostly background and defaults to the majority class (stain)? The third wide view (4x) helped pore — consistent with "pores need more context." So maybe I should add an even wider view, or make the tight crop wider for small boxes.
+
+But resolution/small-box handling was tried (9 attempts, no gain). And third wide view helped only pore by +0.005 (small).
+
+Hmm, let me think about what's fundamentally different.
+
+Actually, wait. Let me reconsider the diagnostic more carefully. "Share of those boxes with the right class, by defect size (area thirds): small 80%, medium 91%, large 93%." So small defects are harder to classify. Pores are small. So the small-defect classification is the weak point.
+
+For small defects, the tight crop (1.5x) would be very small (near MIN_CROP=16), and when resized to 160x160, it's a big upscale of a tiny region — lots of interpolation artifacts, and the object fills the whole crop. The wide crop (2.5x) gives more context.
+
+Idea: For small boxes, the tight crop is nearly useless (mostly a 16px region upscaled to 160). What if we replace the tight crop with something more informative for small boxes? Or what if we add a third view that's specifically a "medium" context?
+
+Actually, the third wide view (4x) was tried and helped pore by +0.005. Let me think about whether adding a 4x view on top of the current best (e000) is worth it. But it was "accepted twice" in earlier runs with +0.005, "close to the time limit." In this run's acceptance rule (stricter), +0.005 might not be confirmed. And it's close to time limit. Risky.
+
+Let me think about a bigger lever.
+
+Actually, here's a thought. The model averages two crops' logits. What if the two crops are giving conflicting signals and the average is hurting? Or what if we should weight them?
+
+Let me reconsider. Actually, I think the most promising untried direction is about **how the model uses the two views** or **the input representation for the confusing classes**.
+
+Wait — let me reconsider the "box size and aspect ratio as extra input" which was "never properly tested" (2 crashes, 1 edit fail, 1 run at 0.629). The e002 in this run crashed. So this direction has a real chance of being untested. But the one run at 0.629 suggests it didn't help (0.629 < 0.6288). Hmm, actually 0.629 is essentially the same as 0.6288. So it's neutral. Not a big win.
+
+Let me think about what could give 0.01+.
+
+The class confusion is the main error. Let me think about stain vs deposit specifically. 55 deposit→stain and 46 stain→deposit. 
+
+What if I train a model that's better at this? The current model is EfficientNet-B0 fine-tuned. What if the issue is that fine-tuning from ImageNet isn't enough and the model needs more data or a different approach?
+
+Actually, let me reconsider the whole two-crop design. The tight crop is 1.5x and wide is 2.5x. What if instead of two crops at fixed contexts, we use a crop that shows the defect at a scale where its texture is most discriminative?
+
+Hmm, let me think about the pore class. Pores are small holes. At 1.5x context, a pore (small) fills a large part of the crop. At 2.5x, it's smaller with more context. The model needs to recognize the "hole" pattern.
+
+Idea: **Data augmentation specific to the weak classes** — but training augmentation was tried (5 attempts, no gain).
+
+Let me step back and think about the reference numbers:
+- one-step 4-class detector: 0.638 (the baseline to beat). Wait, but our current best is 0.6288, which is BELOW 0.638! So we haven't even beaten the one-step detector yet.
+
+Wait, let me re-read. "one-step 4-class detector (the baseline to beat): 0.638 mAP@0.5". And "start file scores 0.629-0.630 val mAP@0.5 (5-seed mean)". So the starting two-stage system (0.629) is below the one-step detector (0.638). Hmm, that's interesting. So the two-stage approach as configured is slightly worse than the one-step.
+
+Wait, but the ceiling (perfect classes on stage-1 boxes) is 0.758, and class-agnostic is 0.755. So the stage-1 detector is good; it's the class assignment that's weak.
+
+Actually the one-step detector at 0.638 already does class assignment. Our two-stage at 0.629 is slightly below. To beat 0.638, we need to improve the class assignment.
+
+OK so the goal is clear: improve class assignment, especially stain/deposit and pore.
+
+Let me think about what's fundamentally different and could give 0.01+.
+
+New idea: **The model currently treats all 4 classes symmetrically and outputs a softmax. The confusion is dominated by stain (majority class). What if we reframe: since stain is the majority and the "default," and the confusion is stain vs {pore, deposit}, maybe a hierarchical or one-vs-rest approach helps?** But that changes scoring and is complex.
+
+Actually, let me reconsider. Let me look at the confusion matrix again:
+```
+                         pore  deposit disconti    stain  no row
+  true pore                48        6        1       20        1
+  true deposit              2      210        2       55        1
+  true discontinuity        1        2      443       14        1
+  true stain               15       46        9      540        4
+```
+Total stain predicted: 20+55+14+540 = 629. True stain: 614. So 115 too many stains predicted, 61 too few (the stains that went elsewhere).
+Total deposit predicted: 6+210+2+46 = 264. True deposit: 269. Roughly balanced.
+Total pore predicted: 48+2+1+15 = 66. True pore: 75.
+Total discontinuity: 1+2+443+9 = 455. True: 457.
+
+So the main issue: stain is over-predicted by absorbing pore (20) and deposit (55). And stain loses 46 to deposit and 15 to pore.
+
+Net: stain→deposit is 46, deposit→stain is 55. So there's a net flow deposit→stain of 9, and stain→pore 15, pore→stain 20, net pore→stain 5.
+
+So the model has a bias toward stain. This is class imbalance (stain is 540/1361 ≈ 40% of overlapping boxes).
+
+But class-weighted loss hurt. Class-balanced sampling no gain. So direct rebalancing doesn't work.
+
+Hmm. What else?
+
+Let me think about the input. The two crops. What if the problem is that for stain vs deposit, the distinguishing feature is at a scale that neither 1.5x nor 2.5x captures well?
+
+Actually, you know what, let me reconsider. Let me think about a totally different lever: **the scores**. The diagnostic says keeping our scores but with perfect classes gives 0.7461. So our scores are decent. But the ceiling is 0.758 (perfect classes + detector conf). So our scores cost us 0.758 - 0.7461 = 0.012 relative to using detector conf with perfect classes. That's small.
+
+Wait, actually, let me re-read: "mAP@0.5 if every box had its correct class but kept your scores: 0.7461 (yours: 0.6288). The difference is what wrong classes cost; the remaining gap to the perfect-classes ceiling in the brief is what your scores cost compared with the detector's conf."
+
+So:
+- yours: 0.6288
+- perfect class, your scores: 0.7461 → wrong classes cost 0.117
+- perfect class, detector conf: 0.758 → your scores cost 0.012 (relative to detector conf)
+
+So the dominant error is wrong classes (0.117). I must fix class assignment.
+
+Now, how to fix class assignment with a 0.01+ gain?
+
+The confusion is stain vs deposit (91 boxes) and stain vs pore (35 boxes) and pore vs deposit (8 boxes).
+
+Let me think about what information distinguishes these. In welding:
+- Pore: gas hole, small, dark, often round, with a raised rim.
+- Deposit: excess weld metal, raised, shiny.
+- Discontinuity: crack or lack of fusion, linear.
+- Stain: discoloration, heat-affected zone, brownish, diffuse.
+
+Stain and deposit can look similar (both can be shiny/discolored). Pore and stain can look similar (both dark spots).
+
+The distinguishing feature might be fine texture / color. The model is a color model (RGB). So it should have the color info.
+
+Hmm. What if the model needs higher resolution to see the fine texture? Resolution was tried (no gain). But maybe specifically a higher-res crop for the confusing classes?
+
+Actually, let me reconsider. Let me think about the number of steps. 433 steps. The model is fine-tuned from pretrained. What if it's undertrained and a better optimizer/schedule helps? But "longer training" was tried (no gain) and "optimisation" — EMA crashed.
+
+Let me think about the learning rate. LR=1e-3 with AdamW, 5% warmup then cosine. That's a standard fine-tuning setup. 
+
+Hmm, what about the batch size? 64. 
+
+Let me think about a fundamentally different idea that targets the class confusion.
+
+**Idea: Use the wide crop's background to distinguish stain (which blends into background) from deposit (which is a distinct raised object).** Actually, the model already sees both crops.
+
+Let me think about **test-time augmentation** — tried, no gain.
+
+Let me reconsider the "third wide view (4x)" which helped pore. What if I add a 4x view AND it's the right direction? It's close to time limit though. Let me check the budget.
+
+Base: 162s total, reserve 55s, so training ends at ~125s, prediction ~37s. Adding a third view (4x) adds ~20s per run (per the earlier note). 162 + 20 = 182 > 180. That would time out! So I'd need to reduce something else. Actually the earlier note says "Adds ~20 s per run, close to the time limit." So it's risky.
+
+Hmm.
+
+Let me think about a different, cheaper idea.
+
+**Idea: The two crops are averaged. What if the tight crop is hurting for small boxes (pores)?** For a small pore, the 1.5x crop is tiny (near MIN_CROP) and upscaled to 160 — it's a blurry blob. The 2.5x crop is better. Averaging a bad tight crop with a good wide crop could hurt. What if we drop the tight crop and use two wide-ish crops (e.g., 2.5x and 4x)? Or what if we make the tight crop only as tight as useful?
+
+Actually, this is a form of "resolution and small-box handling" which was tried (9 attempts, no gain). Hmm.
+
+Let me think about what's genuinely untried.
+
+Untested families (from the brief, "Ideas outside these families have not been tried"):
+- The list of families all came up 3+ times. So basically everything "obvious" has been tried. I need something outside.
+
+Let me brainstorm outside the families:
+
+1. **Ensemble of crops via a single model with multiple heads** — no, that's architecture.
+
+2. **Use the detector's confidence as a feature to the classifier** — i.e., feed conf as an input channel. This is like "box size and aspect as extra input" (which was neutral). Feeding conf is similar. Probably neutral.
+
+3. **Train on eval-split detector boxes with pseudo-labels (self-training / pseudo-labeling).** Wait, that's using detector boxes. The "detector boxes from train split as extra training data" was tried (mixed, +0.004 accepted twice). But that used the TRUE class by overlap. What about using the model's OWN predictions on train-split detector boxes as pseudo-labels (self-training)? That's different — it's self-training / consistency. Hmm, but that's a stretch and might not help.
+
+4. **Two models: one for "is this a defect / which coarse group" and one for fine.** Too complex.
+
+5. **Knowledge distillation from the one-step detector?** We don't have the one-step detector's weights, only its numbers. Can't.
+
+6. **Use both high and low resolution crops for training.** TRAIN_ON = ("high",). What about including "low"? The "low-resolution crops added to training" was tried (4 attempts, no gain). So no.
+
+7. **A different backbone that's better at fine texture.** Bigger backbone tried (no gain). But what about a backbone that's specifically good at texture at low resolution? All the timm options are tried-ish. Actually, "bigger or other backbone" tried 8 times, best 0.636 not confirmed. So backbone changes are mostly neutral.
+
+8. **Change the crop to be non-square or to preserve aspect ratio.** Hmm.
+
+9. **Train the classifier to predict not just class but also a "defectness" score, and combine.** That's the background class idea (tried, no gain).
+
+10. **Post-hoc confusion correction: train the model, then apply a learned confusion-matrix correction (like a "temperature" or a learned 4x4 matrix) to the class probabilities.** This is interesting! After training, we have the model's softmax. We could learn a 4x4 matrix (or per-class temperature) that maps the raw probabilities to corrected ones, using... what? We can't use eval labels. But we could use the TRAIN labels: compute the model's predictions on train boxes, and fit a correction matrix to maximize accuracy on train. Then apply to eval. This is a form of "post-hoc calibration" but for class confusion, not temperature.
+
+Wait, but this is a "scoring" change and the lesson says "AP of a class depends only on the order of that class's rows." A 4x4 correction matrix changes the relative scores across classes, which re-orders rows within each class (because the correction changes p[c] for each c independently, and score = conf * p[c]). Actually, does it? Let me think.
+
+For a given box, score_c = conf * p_c (before correction). After a 4x4 matrix M, new_p_c = sum_k M[c,k] p_k, new score_c = conf * new_p_c. The order of rows within class c across boxes depends on new_p_c across boxes. Since M[c,:] is a fixed linear combination, and p_k vary across boxes, the order of new_p_c across boxes is generally different from the order of p_c across boxes. So yes, it re-orders within each class. So it could change AP. Good, it's not a no-op.
+
+But would it help? The confusion is stain over-prediction. A correction matrix learned on train could reduce stain's probability and boost pore/deposit. But the risk is overfitting to train's confusion pattern, and the train distribution might differ from eval. Also, this is a "scoring" category which had "no gain" for row manipulation. But a learned confusion matrix is different from dropping rows / temperature.
+
+Hmm, but actually, is it fundamentally different from "softmax temperature, other conf x p rules" (16 attempts, no gain)? Those were fixed transformations (temperature, margin, entropy). A learned 4x4 matrix is a learned transformation. It's different. But it's in the spirit of "scoring" manipulation which mostly failed.
+
+Actually, wait. Let me reconsider. The 16 attempts in "fewer or re-weighted score rows" were about dropping non-argmax rows, ranking by margin/entropy, softmax temperature, conf x p rules. A learned confusion matrix is a learned linear map on the class probabilities. It's arguably in the same family. Risky, and the family had no gain. I'll deprioritize.
+
+Let me think more carefully about the ROOT cause of the class confusion.
+
+The model is a 4-class softmax on two crops. The confusion is stain (majority) absorbing pore and deposit. 
+
+Actually, here's a cleaner idea: **The model is trained with standard cross-entropy, which is fine. But the issue is the INPUT. For stain vs deposit and stain vs pore, the distinguishing features are subtle texture/color. The current crops are 160x160. What if the model is losing fine detail in the resize?**
+
+The crops are resized to IMG_SIZE=160. The original box could be, say, 50px. The 1.5x crop is 75px, resized to 160 (upscale 2.1x). The 2.5x crop is 125px, resized to 160 (upscale 1.28x). So the tight crop is a 2x upscale — losing detail. The wide crop is 1.28x upscale.
+
+What if we increase IMG_SIZE to 192 or 224 to preserve more detail? Resolution was tried (9 attempts, no gain, best 0.634 not confirmed). So probably neutral. And it costs time.
+
+Hmm.
+
+Let me reconsider. What's the single biggest untried lever?
+
+Actually, let me reconsider the EMA idea but fixed. EMA with a proper decay (e.g., 0.999 is too slow for 400 steps; use a decay that gives a window of ~50-100 steps, like 0.99 or 0.995, or even SWA). ButThinking budget reached. Stop thinking now and write the reply in the required format.

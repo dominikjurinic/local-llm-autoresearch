@@ -1,0 +1,85 @@
+--- e000/train.py
++++ e001/train.py
+@@ -125,10 +125,40 @@
+     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+ 
+-    crops = [r for r in read_csv(os.path.join(args.data, "crops.csv")) if r["res"] in TRAIN_ON]
++    crops_all = read_csv(os.path.join(args.data, "crops.csv"))
+     dets = read_csv(os.path.join(args.data, "dets.csv"))
+     ev = [d for d in dets if d["split"] == "eval"]
+-    needed = {r["image"] for r in crops} | {d["image"] for d in ev}
++    dets_train = [d for d in dets if d["split"] == "train"]
++
++    # Label dets_train by IoU with crops (background = class 4 if no match)
++    crops_by_img = {}
++    for c in crops_all:
++        crops_by_img.setdefault(c["image"], []).append(c)
++
++    def _iou(r1, r2):
++        x1 = max(r1["x1"], r2["x1"]); y1 = max(r1["y1"], r2["y1"])
++        x2 = min(r1["x2"], r2["x2"]); y2 = min(r1["y2"], r2["y2"])
++        inter = max(0.0, x2 - x1) * max(0.0, y2 - y1)
++        a1 = (r1["x2"] - r1["x1"]) * (r1["y2"] - r1["y1"])
++        a2 = (r2["x2"] - r2["x1"]) * (r2["y2"] - r2["y1"])
++        return inter / max(1e-6, a1 + a2 - inter)
++
++    train_rows = []
++    for d in dets_train:
++        best_iou, best_cls = 0.0, 4
++        for c in crops_by_img.get(d["image"], []):
++            i = _iou(d, c)
++            if i > best_iou:
++                best_iou, best_cls = i, c["cls"]
++        d["cls"] = best_cls if best_iou >= 0.5 else 4
++        train_rows.append(d)
++
++    # Also include high-res crops (perfect boxes, no background among them)
++    crops = [r for r in crops_all if r["res"] in TRAIN_ON]
++    train_rows = train_rows + crops
++
++    needed = {r["image"] for r in train_rows} | {d["image"] for d in ev}
+     images = {p: np.asarray(Image.open(os.path.join(args.data, "images", p)).convert("RGB")) for p in needed}
+-    print(f"train {len(crops)} boxes, eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
++    n_bg = sum(1 for r in train_rows if r["cls"] == 4)
++    print(f"train {len(train_rows)} boxes ({n_bg} bg), eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
+ 
+     workers = min(8, os.cpu_count() or 2)
+@@ -139,5 +169,5 @@
+ 
+     g = torch.Generator().manual_seed(args.seed)
+-    dl_tr = torch.utils.data.DataLoader(BoxDataset(crops, images, True), batch_size=BATCH_SIZE, shuffle=True,
++    dl_tr = torch.utils.data.DataLoader(BoxDataset(train_rows, images, True), batch_size=BATCH_SIZE, shuffle=True,
+                                         num_workers=workers, pin_memory=True, drop_last=True,
+                                         persistent_workers=True, generator=g, worker_init_fn=worker_init)
+@@ -145,5 +175,5 @@
+                                         num_workers=workers, pin_memory=True)
+ 
+-    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
++    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=5)
+     model = model.to(device).to(memory_format=torch.channels_last)
+     crit = nn.CrossEntropyLoss()
+@@ -179,5 +209,5 @@
+         epoch += 1
+ 
+-    # Classify every eval detection; one prediction per class with score = detector conf x class probability.
++    # Classify every eval detection; score = conf * p(class) * (1 - p_bg)
+     model.eval()
+     probs = []
+@@ -188,4 +218,5 @@
+             probs.append(torch.softmax(((model(xt) + model(xw)) / 2).float(), 1).cpu())
+     probs = torch.cat(probs).numpy()
++    p_bg = probs[:, 4]  # background probability
+     os.makedirs(args.out, exist_ok=True)
+     n = 0
+@@ -194,6 +225,10 @@
+         w.writerow(["det_id", "cls", "score"])
+         for d, p in zip(ev, probs):
++            suppress = 1.0 - float(p_bg[probs.index(p)]) if False else 0.0  # placeholder
++        # vectorised:
++        for i, d in enumerate(ev):
++            bg = 1.0 - float(probs[i, 4])
+             for c in range(4):
+-                s = d["conf"] * float(p[c])
++                s = d["conf"] * float(probs[i, c]) * bg
+                 if s > MIN_SCORE:
+                     w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1

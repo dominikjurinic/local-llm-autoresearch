@@ -1,0 +1,342 @@
+===== attempt 1 =====
+Let me analyze the situation:
+
+Current best: e003 with 5-seed val mAP@0.5 0.6317
+- Per-class: pore 0.517, deposit 0.622, discontinuity 0.780, stain 0.608
+- Trains on high+low res GT crops + matched detector boxes
+- Two-crop input (1.5x tight + 2.5x wide) through EfficientNet-B0
+- Score = detector conf × class probability
+- ~2 epochs, 421 steps in ~125s, total 162s
+
+Key observations:
+1. The one-step baseline is 0.638, and we're at 0.6317. We need to beat 0.638.
+2. The ceiling (perfect classes on stage-1 boxes) is 0.758.
+3. Pore (0.517) and stain (0.608) are the weakest classes.
+4. e001 (background class) hurt performance - 0.5691. So adding a background class was bad.
+5. e002 (adding matched detector boxes) helped.
+6. e003 (adding low-res crops) helped slightly.
+
+What ideas are left?
+
+Looking at the ideas in scope:
+- Train on detector boxes with background class → tried (e001), hurt
+- Combine detector conf and classifier probabilities differently → not tried yet
+- Robustness to box misplacement (jitter) → partially addressed by adding matched det boxes
+- Low-res training crops → tried (e003), helped
+- Test-time augmentation → not tried
+- Ensembling → not tried
+- Architecture changes → not tried
+- Class-weighted loss → known to hurt
+
+Let me think about what could help the most:
+
+1. **Scoring strategy**: Currently score = conf × prob. This is a simple product. The issue is that for false positives (background boxes), the classifier will still assign some probability to each class. If we could better calibrate the scores...
+
+Actually, let me think about this more carefully. The mAP@0.5 scoring works like this:
+- For each class, we look at all predictions of that class
+- A prediction is a TP if it overlaps (IoU≥0.5) with a GT box of the same class AND that GT hasn't been matched yet
+- A prediction is a FP otherwise
+- AP is computed from the ranking (TPs should rank higher than FPs)
+
+The current scoring is `conf * prob[c]`. The problem is:
+- For a true defect box, conf might be moderate but prob should be high for the correct class
+- For a false alarm (background), conf might be high but prob should be... well, the classifier was trained only on defect crops, so it will still assign probabilities to defect classes even for background
+
+Wait, but e001 tried adding a background class and it hurt. So the classifier without background class is actually working okay for classification, but the scoring is the issue.
+
+2. **Test-time augmentation (TTA)**: At inference, we could flip the image horizontally and vertically, average the predictions. This is a common technique that can improve robustness. It costs 2x inference time but we have budget (162s out of 180s, with 55s reserve, so we have about 125s for training and 55s for prediction... wait, let me re-read).
+
+Actually looking at the code: `t_end = deadline - RESERVE_S` where RESERVE_S = 55. So training gets `deadline - 55 - T0` seconds. With T0 at start and deadline at 180s, training gets about 125s. Then prediction gets the remaining time.
+
+Current: training takes ~125s, prediction takes ~37s (162-125). So we have about 18s of slack in prediction.
+
+TTA with 4 flips (original, hflip, vflip, both) would 4x the inference time to ~148s... that's too much. Even 2 flips (hflip) would be ~74s for prediction, total ~199s... too much.
+
+Wait, let me recalculate. The prediction loop processes 41879 detections in batches of 256. That's about 164 batches. Each batch with 2 crops through EfficientNet-B0 at 160x160... 
+
+Actually, the total time is 162s for 180s budget. Training takes 125s, prediction takes 37s. If I add TTA with 2 views (original + hflip), the prediction would take ~74s, total would be ~199s. That's over budget.
+
+But wait - I could reduce the reserve. Currently RESERVE_S = 55. If I set it to 30, training gets 150s (more training) and prediction gets 30s... that's less time for prediction.
+
+Actually, let me reconsider. The budget is 180s total. Training currently uses 125s (out of 125s budget). Prediction uses 37s. Total 162s.
+
+If I want to do TTA, I need more time for prediction. I could:
+- Reduce RESERVE_S to give more training time, but that doesn't help prediction
+- Actually, the reserve is to ensure prediction finishes. The training loop stops at `t_end = deadline - RESERVE_S`. So if RESERVE_S = 55, training stops at 125s, leaving 55s for prediction. Prediction takes 37s, so there's 18s slack.
+
+For TTA with 2 views (original + hflip), prediction would take ~74s. That's within 55s? No, 74 > 55. So I'd need to increase the reserve or reduce training time.
+
+Hmm, actually let me think differently. What if I just do hflip TTA? The prediction loop would process each batch twice (once original, once flipped). That doubles prediction time to ~74s. With RESERVE_S = 55, that's too tight.
+
+What if I set RESERVE_S = 80? Then training gets 100s (about 340 steps instead of 421), and prediction gets 80s. TTA prediction would take ~74s, fitting in 80s. But we lose training steps.
+
+Actually, a simpler approach: what about just doing the TTA by processing the eval data with flips? The key insight is that the training already uses random flips, so the model should be somewhat flip-invariant. TTA at test time would help if the model isn't perfectly invariant.
+
+Let me think about other ideas:
+
+3. **Better scoring**: Instead of `conf * prob[c]`, what about:
+   - `conf^a * prob[c]^b` for some a, b
+   - Using the max probability as a "defect confidence" multiplier
+   - Normalizing scores within each image
+
+Actually, the scoring is crucial for mAP. The key insight from the brief: "mAP@0.5 rewards, per class: (a) the right class on boxes that overlap a true defect, and (b) good ranking: true detections should score higher than false ones."
+
+The current score `conf * prob[c]` means:
+- For a true defect of class c: score = conf * P(c|crop) where P(c) should be high
+- For a false alarm: score = conf * P(c|crop) where P(c) is whatever the classifier says
+
+The problem is that the classifier was trained on defect crops only, so for a background crop, it will still output probabilities that sum to 1 across 4 classes. The "most confident" class for a background crop might get a high probability, leading to high scores for false alarms.
+
+One idea: use `conf * prob[c] * max(prob)` or some other calibration. Or use `conf^0.5 * prob[c]` to reduce the dominance of conf.
+
+Actually, wait. Let me think about what happens with the multi-row output. For each box, we output 4 rows (one per class). The mAP computation for class c looks at all rows with cls=c across all boxes. A row is TP if the box overlaps a GT of class c. 
+
+So for a background box, all 4 rows are FPs. For a true pore box, the pore row is TP (if IoU≥0.5) and the other 3 rows are FPs.
+
+The ranking within class c matters: true pore boxes should have higher scores than false pore predictions (which include background boxes scored as pore, and true non-pore boxes scored as pore).
+
+Current scoring: `conf * prob[c]`. For background boxes, prob[c] is non-zero (maybe 0.1-0.3 for the "most likely" class). For true pore boxes, prob[pore] should be high (0.5-0.9).
+
+The issue might be that conf varies a lot and dominates. If a background box has conf=0.9 and prob[pore]=0.2, its score is 0.18. A true pore box with conf=0.5 and prob[pore]=0.7 has score 0.35. That's fine. But if a background box has conf=0.9 and prob[pore]=0.3, score=0.27, vs true pore conf=0.4, prob=0.6, score=0.24. The false alarm outranks the true detection!
+
+So the scoring could be improved. One approach: use `prob[c] / (sum of probs or something)` to make it more relative. Or use a power on conf to reduce its impact.
+
+Actually, a simpler and well-known approach: use `conf * prob[c]` but also multiply by `prob[c] / sum(prob)` which is just `prob[c]`... no that's circular.
+
+What about: score = `prob[c]` only (ignore conf)? Or `conf^0.5 * prob[c]`?
+
+Hmm, but conf from the detector is a useful signal - higher conf detections are more likely to be true. The product is reasonable.
+
+Let me think about another angle: **the number of rows per box**. Currently we output all 4 classes per box. What if we only output the top-1 or top-2 classes? This would reduce the number of FP rows.
+
+Wait, the brief says "Several rows per box (one per class) are allowed and often help." So multiple rows help. But maybe we should be smarter about which rows to output.
+
+Actually, for mAP, having more rows per box for the correct class doesn't help (only the highest-scoring row for that class on that box matters, since after matching, the box is "used"). But having rows for wrong classes creates FPs that hurt the ranking.
+
+Wait, actually in COCO-style mAP, each prediction is independent. If a box has two rows (class 0 and class 1), they're two separate predictions. If the box overlaps a GT of class 0, the class-0 row is TP and the class-1 row is FP (unless it also overlaps a GT of class 1, which is unlikely).
+
+So outputting all 4 classes means 3 FP rows per true detection. That's a lot of FPs! But the brief says it helps... maybe because the scores for wrong classes are low enough that they don't hurt ranking much.
+
+Let me think about what would have the biggest impact:
+
+4. **Architecture**: Try a different backbone. The current one is EfficientNet-B0. Options include:
+   - convnext_nano (slightly larger, might be better)
+   - regnety_016 (RegNet, good accuracy/speed)
+   - resnet50 (larger, might be too slow)
+   - efficientnet_b2 (larger EfficientNet)
+   
+   But changing architecture is risky - it might be slower and we'd need to retrain.
+
+5. **Learning rate / training duration**: Currently 2 epochs, 421 steps. The loss goes from 0.45 to 0.27. Maybe more training would help? But we're time-limited.
+
+6. **Data augmentation**: The current augmentation is light (jitter, flip, brightness). Could add:
+   - Color jitter
+   - Random erasing
+   - More aggressive geometric transforms
+
+7. **Inference: TTA** - as discussed, might be too slow.
+
+Let me focus on what's most likely to help given the constraints:
+
+The weakest classes are pore (0.517) and stain (0.608). The brief says "Pore and deposit are the weak classes; stain is often confused with deposit and background."
+
+For scoring, let me think about a specific change:
+
+**Idea: Use `conf * prob[c]^2` or `conf * prob[c] * max_prob` as the score.**
+
+Actually, let me think about this differently. The key problem is ranking. For mAP, what matters is:
+- Within each class, true detections should rank above false ones
+- The actual score values don't matter, only the ordering
+
+So we want a scoring function that separates true from false as well as possible.
+
+Current: `score = conf * prob[c]`
+
+For a true detection of class c: conf is moderate (0.3-0.9), prob[c] is high (0.5-0.9)
+For a false alarm scored as class c: conf is moderate (0.2-0.8), prob[c] is lower (0.1-0.4)
+
+The product might not separate them well if conf varies a lot.
+
+Alternative: `score = prob[c]` (ignore conf entirely). This might be better if the classifier is well-calibrated.
+
+Or: `score = conf * prob[c] / (1 - max_prob)` - this penalizes uncertain predictions.
+
+Or: `score = conf * prob[c] * prob[c]` = `conf * prob[c]^2` - this amplifies the difference between high and low probabilities.
+
+Let me go with a scoring change since it's low-risk and doesn't require retraining.
+
+Actually wait - I should think about what's most likely to give a >0.005 improvement.
+
+Let me reconsider the options:
+
+1. **Scoring change** (low risk, no retraining needed): Change `conf * prob[c]` to something better.
+2. **TTA** (medium risk, needs time budget adjustment): Add horizontal flip at inference.
+3. **Different architecture** (higher risk): Try convnext_nano or regnety_016.
+4. **More training** (low risk): Reduce reserve to get more training steps.
+5. **Data augmentation** (medium risk): Add more augmentation.
+
+I think the scoring change is the safest bet. Let me think about what specific change to make.
+
+Actually, let me reconsider. The brief says:
+"mAP@0.5 rewards, per class: (a) the right class on boxes that overlap a true defect, and (b) good ranking: true detections should score higher than false ones."
+
+And: "Detector boxes include false alarms (background) and slightly misplaced boxes; the starting classifier was trained only on perfect boxes and has no notion of 'not a defect'."
+
+So the classifier assigns probabilities to 4 defect classes even for background. The "background probability" is 1 - max(prob) or 1 - sum(prob)... well, sum(prob) = 1 always (softmax). So there's no explicit background probability.
+
+One idea from the brief: "combine detector conf and classifier probabilities differently (powers, background probability, ...)"
+
+What if I use: `score = conf * prob[c] * (prob[c] / max_prob)`? This is `conf * prob[c]^2 / max_prob`. When the classifier is confident about the correct class, max_prob ≈ prob[c], so the score ≈ conf * prob[c]. When uncertain, max_prob > prob[c], reducing the score.
+
+Or simpler: `score = conf * prob[c]^2`. This squares the probability, making high-probability classes stand out more.
+
+Actually, I think the simplest and most impactful change would be to try **test-time augmentation with horizontal flip**. Here's why:
+- The training already uses random horizontal flips (50% probability)
+- But at test time, we only use the original orientation
+- TTA with hflip would average the predictions, making them more robust
+- The cost is 2x inference time
+
+Let me check if the time budget works:
+- Current: training 125s + prediction 37s = 162s
+- With hflip TTA: training 125s + prediction ~74s = 199s → OVER BUDGET
+
+So I need to reduce training time. If I set RESERVE_S = 80, training gets 100s (~340 steps), prediction gets 80s. TTA prediction ~74s fits.
+
+But losing 80 training steps (421→340) might hurt. The loss at step 421 is 0.27. At step 340, it might be ~0.30. That's a small difference.
+
+Alternatively, I could reduce the number of crops per view. Currently 2 crops (tight 1.5x + wide 2.5x). What if I just use 1 crop at test time? That would halve inference time.
+
+Actually wait, let me re-examine. The inference processes 41879 detections in batches of 256. That's 164 batches. Each batch has 2 images per detection (tight + wide), so 512 images per batch. Through EfficientNet-B0 at 160x160.
+
+If I add hflip, it's 1024 images per batch. That doubles the time.
+
+What if I reduce batch size or use a smaller model? No, let's keep it simple.
+
+Let me try a different approach: **reduce RESERVE_S to 40 and add hflip TTA**.
+- Training: 180 - 40 = 140s → about 470 steps (vs 421)
+- Prediction: needs ~74s, but only 40s available → NOT ENOUGH
+
+Hmm. What about reducing the wide crop context? If I remove the wide crop at test time (only use tight crop), inference is halved.
+
+Actually, let me look at this from a different angle. What if I just change the scoring?
+
+**My choice: Change scoring from `conf * prob[c]` to `conf * prob[c]^2`**
+
+Hypothesis: Squaring the class probability will improve mAP by better separating true detections (high prob for correct class) from false alarms (lower prob for any class), improving the ranking that mAP depends on.
+
+This is a one-line change, no retraining needed, no time budget issues.
+
+Wait, but I need to think about whether this actually helps. Let's say:
+- True pore: conf=0.5, prob[pore]=0.7, prob[deposit]=0.15, prob[disc]=0.1, prob[stain]=0.05
+  - Current scores: pore=0.35, dep=0.075, disc=0.05, stain=0.025
+  - Squared: pore=0.245, dep=0.011, disc=0.005, stain=0.001
+  
+- Background: conf=0.6, prob[pore]=0.25, prob[deposit]=0.3, prob[disc]=0.25, prob[stain]=0.2
+  - Current scores: pore=0.15, dep=0.18, disc=0.15, stain=0.12
+  - Squared: pore=0.0375, dep=0.054, disc=0.0375, stain=0.024
+
+With current scoring:
+- Pore ranking: true=0.35, bg=0.15 → good separation
+- Deposit ranking: true=0.075, bg=0.18 → BAD! False alarm outranks true detection!
+
+With squared:
+- Pore ranking: true=0.245, bg=0.0375 → even better separation
+- Deposit ranking: true=0.011, bg=0.054 → still bad, but relatively less bad
+
+Hmm, the deposit case is still problematic. The issue is that for deposit, the true detection has low prob[deposit] (0.15) while background has high prob[deposit] (0.3). Squaring doesn't fix this because the relative ordering is the same.
+
+Actually wait, I made up those numbers. In reality, for a true deposit box, prob[deposit] should be the highest. Let me reconsider.
+
+For a true deposit: conf=0.5, prob[deposit]=0.6, prob[pore]=0.15, prob[disc]=0.15, prob[stain]=0.1
+For a background: conf=0.6, prob[deposit]=0.25, prob[pore]=0.25, prob[disc]=0.25, prob[stain]=0.25
+
+Current: true dep=0.30, bg dep=0.15 → good
+Squared: true dep=0.18, bg dep=0.0375 → even better
+
+OK so in realistic scenarios, squaring should help because true detections have higher prob for their class than background boxes do.
+
+But there's a subtlety: the scores are compared across ALL predictions of that class. So for class "deposit", we compare:
+- All true deposit boxes (scored as deposit)
+- All background boxes (scored as deposit)
+- All true pore/disc/stain boxes (scored as deposit)
+
+The last group is interesting: a true pore box scored as deposit. Its prob[deposit] might be 0.15, conf=0.7, so score=0.105 (current) or 0.0158 (squared). A background box scored as deposit: prob=0.25, conf=0.6, score=0.15 (current) or 0.0375 (squared).
+
+With current scoring, the true pore box (0.105) ranks below the background (0.15) for the deposit class. With squared, true pore (0.0158) still ranks below background (0.0375). So it doesn't fix this particular issue.
+
+But overall, squaring should help because it amplifies the correct class signal. Let me go with this.
+
+Actually, let me think of another option: **use `conf * prob[c]` but only output the top-1 class per box** (or top-2). This reduces FP rows.
+
+Wait, the brief says "Several rows per box (one per class) are allowed and often help." So outputting all 4 is the current approach and it helps. Let me not change that.
+
+Let me go with the scoring change: `conf * prob[c]^2`.
+
+Actually, I want to be more careful. Let me think about what power to use. `prob^2` might be too aggressive. What about `prob^1.5`?
+
+Or what about a different approach: `score = conf * prob[c] * (1 - (1-prob[c])^2)`? No, that's getting too complex.
+
+Let me just go with `prob^2`. It's a clean change.
+
+Wait, actually I realize there might be an even better approach. What about using the **log-odds** or **logit** instead of probability?
+
+`score = conf * exp(logit[c])` where logit is the raw model output before softmax.
+
+Or: `score = conf * prob[c] / (1 - prob[c])` (odds ratio). This amplifies high probabilities and compresses low ones.
+
+For prob=0.7: odds = 2.33
+For prob=0.3: odds = 0.43
+For prob=0.1: odds = 0.11
+
+vs prob^2:
+For prob=0.7: 0.49
+For prob=0.3: 0.09
+For prob=0.1: 0.01
+
+Both amplify the difference. The odds ratio is more extreme.
+
+I'll go with `prob^2` as it's simpler and less extreme.
+
+Let me write the change:
+
+In the prediction writing section:
+```python
+s = d["conf"] * float(p[c])
+```
+becomes:
+```python
+s = d["conf"] * float(p[c]) ** 2
+```
+
+Wait, but I should also consider: does this change the MIN_SCORE threshold meaning? Currently MIN_SCORE = 0.001. With squared probabilities, scores will be smaller. A score of 0.001 with squared prob means conf * prob^2 > 0.001, so prob > sqrt(0.001/conf) ≈ sqrt(0.001/0.5) ≈ 0.045. That's fine, most scores will be above this.
+
+Actually, let me reconsider. Maybe I should use a less aggressive change. What about `conf^0.5 * prob[c]`? This reduces the influence of conf.
+
+Hmm, I think `prob^2` is the cleanest change. Let me go with it.
+
+Let me write the SEARCH/REPLACE:
+
+SEARCH:
+```
+                s = d["conf"] * float(p[c])
+```
+
+REPLACE:
+```
+                s = d["conf"] * float(p[c]) ** 2
+```
+
+This is a one-line change. Let me verify it appears exactly once in the file.
+
+Looking at the file:
+```python
+        for d, p in zip(ev, probs):
+            for c in range(4):
+                s = d["conf"] * float(p[c])
+                if s > MIN_SCORE:
+                    w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+
+Yes, `s = d["conf"] * float(p[c])` appears exactly once.
+
+Let me finalize my response.

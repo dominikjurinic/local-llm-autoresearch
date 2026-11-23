@@ -1,0 +1,218 @@
+===== attempt 1 =====
+Let me carefully analyze the situation.
+
+**Current state:**
+- Best: e009, 5-seed val mAP@0.5 = 0.6359
+- Architecture: 4-scale crop pyramid (1.25x, 1.75x, 2.5x, 3.5x) with EfficientNet-B0, per-scale 1x1 projection, concat, MLP head
+- Per-class AP: pore 0.531, deposit 0.625, discontinuity 0.778, stain 0.610
+- Diagnostics: pore 63% right, deposit 77% right, discontinuity 95% right, stain 90% right
+- Main confusion: pore→stain (19 of 76), deposit→stain (55 of 271), stain→deposit (43 of 614)
+
+**What the lead wants:**
+Add a fixed 1.0× tight crop (the defect at full size) as a 5th view alongside the existing 4-scale pyramid. This gives the model a dedicated high-resolution view of the defect itself.
+
+**Key considerations:**
+
+1. **Time budget**: Currently 4 views at 160px. Adding a 5th view at 160px increases:
+   - Training: 5 backbone forward passes instead of 4 → ~25% more compute per step
+   - Prediction: 5 views instead of 4 → ~25% more prediction time
+   - Current: 157 steps in ~82s training, total 168s with 85s reserve
+   - New estimate: training steps will be ~20% slower (4→5 views), so maybe ~130 steps instead of 157
+   - Prediction: 41879 detections / 256 batch = ~164 batches, currently takes ~75s (168-95=73s roughly), so 5 views would take ~91s
+   - Total: ~13s load + ~95s training (fewer steps but same wall time since time-based) + ~91s prediction = ~199s — TOO LONG!
+
+Wait, let me re-read the log:
+- Load: 13s
+- Epoch 0: 94 steps, 72s (so 59s for epoch 0 after load)
+- Epoch 1: 157 steps, 95s (so 23s for epoch 1)
+- Total: 168s
+
+So training ran from 13s to 95s = 82s of training. With RESERVE_S=85, deadline is 180, so t_end = 180-85 = 95s. Training stops at 95s. Then prediction takes 168-95 = 73s.
+
+With 5 views instead of 4:
+- Each step is ~25% slower (one more backbone forward+backward)
+- In the same 82s training window, we'd get ~130 steps instead of 157
+- Prediction: 41879/256 ≈ 164 batches. Currently 73s for 4 views → ~91s for 5 views
+- Total: 13s + 82s + 91s = 186s — OVER BUDGET!
+
+So I need to adjust RESERVE_S. If prediction takes ~91s, I need RESERVE_S ≈ 95-100s. But that reduces training time.
+
+Actually wait — let me think more carefully. The training loop is time-based: it trains until `time.time() >= t_end` where `t_end = deadline - RESERVE_S`. So if I set RESERVE_S = 100, training gets 180-100-13 = 67s instead of 82s. With 25% slower steps, that's ~130 * 67/82 ≈ 106 steps.
+
+Prediction: 164 batches × (91/164) per batch... actually prediction time scales linearly with number of views. 4 views → 73s. 5 views → 73 * 5/4 = 91s.
+
+Total: 13 + 67 + 91 = 171s. That's within 180s with 9s margin. Tight but OK.
+
+Actually, let me be more careful. The prediction also includes the DataLoader overhead for 5 views. Let me estimate:
+- Current: 13s load + 82s train + 73s pred = 168s
+- New: 13s load + 67s train + 91s pred = 171s
+
+That's 9s margin. Should be safe but tight. Let me set RESERVE_S = 95 to be a bit safer:
+- Training: 180-95-13 = 72s → ~115 steps
+- Prediction: 91s
+- Total: 13 + 72 + 91 = 176s → 4s margin. Too tight.
+
+Let me set RESERVE_S = 100:
+- Training: 180-100-13 = 67s → ~106 steps
+- Prediction: 91s
+- Total: 13 + 67 + 91 = 171s → 9s margin. OK.
+
+Actually, I realize I should also consider: the 1.0x crop is the tightest crop. The current SCALES are (1.25, 1.75, 2.5, 3.5). Adding 1.0 makes it (1.0, 1.25, 1.75, 2.5, 3.5). The 1.0x crop at 160px means the defect fills the entire 160px input. This is the "full size" view.
+
+Wait, but the lead says "fixed 1.0× tight crop (the defect at full size)". Looking at make_crop:
+```python
+side = max(max(r["x2"] - r["x1"], r["y2"] - r["y1"]) * context, MIN_CROP)
+```
+
+So context=1.0 means the crop side equals the box side (the defect itself). At 160px input, the defect fills the entire image. This is indeed the highest resolution view of the defect texture.
+
+**Architecture change:**
+- SCALES becomes (1.0, 1.25, 1.75, 2.5, 3.5) — 5 views
+- MultiScaleClassifier takes num_scales=5
+- The per-scale projections and concat handle 5 automatically since they're parameterized by num_scales
+- The head input dimension changes from 4*256=1024 to 5*256=1280
+
+This is clean — just changing SCALES and the classifier will adapt.
+
+**But wait** — the lead's hypothesis says "fixed 1.0× tight crop" as a dedicated view. Just adding 1.0 to SCALES does exactly that. The model will learn to weight it.
+
+**Time budget check (more careful):**
+
+Current step time: 82s / 157 steps ≈ 0.52s/step
+With 5 views: 0.52 * 5/4 ≈ 0.65s/step (backbone is the dominant cost, scales roughly linearly with views)
+
+Actually, it's not exactly linear because there's fixed overhead per step (optimizer, loss computation, data loading). Let's say backbone forward is ~70% of step time. So:
+- Current: 0.52s = 0.36s backbone + 0.16s other
+- New: 0.36 * 5/4 + 0.16 = 0.45 + 0.16 = 0.61s/step
+
+In 67s: ~110 steps.
+
+Prediction: 41879 dets / 256 batch = 163.6 batches
+Current: 73s / 164 batches ≈ 0.445s/batch (for 4 views)
+New: 0.445 * 5/4 ≈ 0.556s/batch (backbone forward only, no backward)
+Actually prediction is just forward pass, so it should scale more linearly: 73 * 5/4 = 91s.
+
+Total: 13 + 67 + 91 = 171s. Margin: 9s. OK.
+
+Let me set RESERVE_S = 100.
+
+**Now let me write the actual code changes:**
+
+1. Change `SCALES = (1.25, 1.75, 2.5, 3.5)` to `SCALES = (1.0, 1.25, 1.75, 2.5, 3.5)`
+2. Change `RESERVE_S = 85` to `RESERVE_S = 100`
+3. The MultiScaleClassifier already handles variable num_scales via `num_scales=len(SCALES)` in main(). Let me verify:
+
+```python
+model = MultiScaleClassifier(backbone, num_scales=len(SCALES))
+```
+
+Yes, it uses `len(SCALES)`. And in `__init__`:
+```python
+self.scale_projs = nn.ModuleList([nn.Conv2d(C, proj_dim, 1) for _ in range(num_scales)])
+self.head = nn.Sequential(
+    nn.Linear(num_scales * proj_dim, hidden),
+    ...
+)
+```
+
+And in `forward`:
+```python
+for i, x in enumerate(views):
+    f = self.backbone.forward_features(x)
+    f = self.scale_projs[i](f)
+    f = f.mean(dim=[2, 3])
+    feats.append(f)
+f = torch.cat(feats, dim=1)
+return self.head(f)
+```
+
+This all works with 5 views. The dataset iterates over SCALES:
+```python
+for ctx in SCALES:
+    x = make_crop(img, r, ctx, self.train)
+```
+
+So it will naturally produce 5 views. Everything is parameterized correctly.
+
+**Let me double-check the dataset:**
+```python
+views = []
+for ctx in SCALES:
+    x = make_crop(img, r, ctx, self.train)
+    ...
+    views.append(torch.from_numpy(...))
+return views, r.get("cls", -1)
+```
+
+Yes, it returns a list of len(SCALES) views. The model's forward takes `views` and iterates. All good.
+
+**One concern:** With 5 views, the batch size is still 64. Memory usage per batch increases by 25% for the backbone. Current: 4 views × 64 × 3 × 160 × 160 float32 = 4 × 64 × 3 × 25600 × 4 bytes = 4 × 64 × 307200 = 78.6 MB per batch input. New: 5/4 × that = 98.3 MB. Should be fine on a 16GB GPU.
+
+The backbone intermediate features: EfficientNet-B0 at 160px has feature maps at various resolutions. The 1x1 projections are lightweight. The concat is 5×256=1280 dims. All fine.
+
+**Let me also check: does the 1.0x crop make sense for small boxes?**
+MIN_CROP = 16. For a box of size 10px, context=1.0 gives side=16 (clamped). The crop is then resized to 160px. So small boxes get upscaled. This is the same behavior as before for the 1.25x crop (side = 12.5 → clamped to 16). So no new issue.
+
+**Summary of changes:**
+1. `SCALES = (1.25, 1.75, 2.5, 3.5)` → `SCALES = (1.0, 1.25, 1.75, 2.5, 3.5)`
+2. `RESERVE_S = 85` → `RESERVE_S = 100`
+
+That's it. The architecture already handles variable number of scales. Clean and minimal.
+
+Wait, let me re-read the lead's plan more carefully:
+
+"PLAN: a concrete, numbered description of the code changes: which constants, functions, classes and loops of the current train.py change and how, what the new code must compute, and the time-budget arithmetic."
+
+The lead says to add a "fixed 1.0× tight crop" as a dedicated view. Just adding 1.0 to SCALES does this. The model learns to use it via the per-scale projection + concat + head.
+
+Actually, I want to make sure I'm not missing something. The lead says "forcing every training example through a fixed 1.0× tight crop (the defect at full size) alongside the multi-scale pyramid." This is exactly what adding 1.0 to SCALES does — every example gets a 1.0x crop in addition to the existing 4 scales.
+
+"Differences from e011/e019: those tried plain resolution increase or a second stream and crashed/timed out because EfficientNet-B0 at 256px with 4 views OOM'd; here the change is an architecture-level fusion that adds one tight crop without raising any other input size, keeping the time budget intact."
+
+Yes, we keep IMG_SIZE=160 and just add a 5th view. No OOM risk.
+
+"Expected gain: +0.015–0.03 mAP on the two weak classes if the tight crop re-anchors the classifier on actual defect texture rather than context heuristics."
+
+OK so my implementation is:
+1. SCALES: add 1.0 at the front
+2. RESERVE_S: increase to 100 to account for 5th view prediction time
+
+Let me write the SEARCH/REPLACE blocks.
+
+Block 1: Change SCALES
+```
+SEARCH: SCALES = (1.25, 1.75, 2.5, 3.5)  # multi-scale crop pyramid
+REPLACE: SCALES = (1.0, 1.25, 1.75, 2.5, 3.5)  # multi-scale crop pyramid (1.0x = tight defect view)
+```
+
+Block 2: Change RESERVE_S
+```
+SEARCH: RESERVE_S = 85          # seconds kept free for prediction and writing (4 crops ≈ 2x pred time)
+REPLACE: RESERVE_S = 100        # seconds kept free for prediction and writing (5 crops ≈ 2.5x pred time)
+```
+
+That's the minimal change. Let me verify there are no other places that hardcode 4 views or the old scales.
+
+Looking through the code:
+- `MultiScaleClassifier(backbone, num_scales=len(SCALES))` — uses len(SCALES), so 5 automatically
+- `for ctx in SCALES:` in BoxDataset — uses SCALES, so 5 views automatically
+- `for i, x in enumerate(views):` in forward — iterates over whatever views are given
+- No other hardcoded references to 4 or the specific scale values
+
+The comment in the docstring says "two-crop" but that's just documentation, not functional.
+
+I think this is correct and minimal. Let me finalize.
+
+Actually, one more thought: should I worry about the 1.0x crop being redundant with 1.25x? They're close but not identical. The 1.0x shows the defect filling the frame; the 1.25x shows 25% more context. For distinguishing pore (small circular voids) from stain (irregular discoloration), the tight view where the texture fills the frame could be meaningfully different from the slightly wider view. The model can learn to downweight redundant information.
+
+Also, I should note: the lead's hypothesis mentions "fixed 1.0× tight crop" — the word "fixed" might imply it should NOT get the training jitter (cx/cy offset, side scaling). But looking at make_crop, the jitter is:
+```python
+if train:
+    cx += random.uniform(-0.1, 0.1) * side
+    cy += random.uniform(-0.1, 0.1) * side
+    side *= random.uniform(0.85, 1.2)
+```
+
+This is applied to all views uniformly (same random values per example). The 1.0x crop will get the same jitter as others. This is fine — it's standard data augmentation. The "fixed" in the lead's language refers to the scale being fixed at 1.0 (not varying), not that it's un-augmented.
+
+I'm confident in the implementation. Two small changes, clean.

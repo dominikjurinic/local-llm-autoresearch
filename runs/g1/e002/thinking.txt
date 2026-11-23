@@ -1,0 +1,104 @@
+===== attempt 1 =====
+Let me analyze the situation:
+
+1. e001 crashed due to a broadcasting bug in the IoU calculation. The issue is that `ax2 - ax1` is shape (N,) and `(ay2 - ay1)[:, None]` is shape (N,1), but `(ax2 - ax1) * (ay2 - ay1)[:, None]` should give (N,1). Wait, let me re-read.
+
+Actually the issue is:
+- `A` is shape (n_trs, 4) - true boxes
+- `B` is shape (n_ds, 4) - det boxes
+- `_iou(B, A)` means A in the function is B (det boxes, shape (n_ds, 4)) and B in the function is A (true boxes, shape (n_trs, 4))
+
+So:
+- `ax1, ay1, ax2, ay2 = A[:, 0], A[:, 1], A[:, 2], A[:, 3]` - these are shapes (n_ds,)
+- `bx1, by1, bx2, by2 = B[:, 0], B[:, 1], B[:, 2], B[:, 3]` - these are shapes (n_trs,)
+
+Then:
+- `ix1 = np.maximum(ax1[:, None], bx1[None, :])` - shape (n_ds, n_trs) ✓
+- `inter` - shape (n_ds, n_trs) ✓
+- `(ax2 - ax1) * (ay2 - ay1)[:, None]` - (n_ds,) * (n_ds, 1) → broadcast error!
+
+The problem is that `(ax2 - ax1)` is shape (n_ds,) and `(ay2 - ay1)[:, None]` is shape (n_ds, 1). Multiplying them: (n_ds,) * (n_ds, 1) - numpy will try to broadcast (n_ds,) as (1, n_ds) against (n_ds, 1), giving (n_ds, n_ds) which doesn't match inter's shape (n_ds, n_trs).
+
+The fix: the area of A boxes should be `(ax2 - ax1) * (ay2 - ay1)` which is shape (n_ds,), and we need it as (n_ds, 1) for broadcasting with inter of shape (n_ds, n_trs). Similarly for B boxes: `(bx2 - bx1) * (by2 - by1)` shape (n_trs,) needs to be (1, n_trs).
+
+So the fix is:
+```python
+area_a = ((ax2 - ax1) * (ay2 - ay1))[:, None]  # (n_ds, 1)
+area_b = ((bx2 - bx1) * (by2 - by1))[None, :]  # (1, n_trs)
+union = area_a + area_b - inter
+```
+
+Now, the plan says to first consolidate the detector-box training data idea. e001 crashed, so I need to fix it. The rules say "If a run crashed or timed out, read the log and fix the cause." And "A bug: fix it once; a second failure: drop it."
+
+Since e001 crashed (first attempt at this idea), I should fix it. Let me use BASE: last to fix the crash.
+
+The fix is straightforward - the IoU broadcasting was wrong. Let me write the corrected version.
+
+Let me also check: the `needed` set includes images from `crops` after we've appended the extra rows. The extra rows use the same `image` field as the original crops, so those images should already be in `needed`. But wait - the extra rows are detector boxes on train images. The original `crops` list already has train images. So `needed` should already cover them. Actually, let me think again...
+
+The `crops` list is filtered to `TRAIN_ON` resolutions. The extra rows are appended to `crops` directly. The `needed` set is computed from `crops` (which now includes the extra rows) and `ev`. The extra rows have the same `image` values as the original train crops, so they should already be in `needed`. This should be fine.
+
+Wait, but there's another issue. The `crops` list is used to build the dataset, and the extra rows don't have a "res" field. Let me check if that matters... The `BoxDataset` class doesn't use "res" at all. The `make_crop` function doesn't use "res" either. The only place "res" is used is in the filter `r["res"] in TRAIN_ON`. Since we append after filtering, this is fine.
+
+But wait - the extra rows don't have "res" key. Does `read_csv` add it? No, `read_csv` only converts specific keys. The dict comprehension for `crops.append` doesn't include "res". But since we don't access "res" after the filter, this is fine.
+
+Actually, let me re-check: `needed = {r["image"] for r in crops} | {d["image"] for d in ev}`. The extra rows have "image" key, so this works.
+
+Let me write the fix. I'll use BASE: last since I'm fixing the crashed e001.
+
+The key fix in `_iou`:
+```python
+def _iou(A, B):
+    ax1, ay1, ax2, ay2 = A[:, 0], A[:, 1], A[:, 2], A[:, 3]
+    bx1, by1, bx2, by2 = B[:, 0], B[:, 1], B[:, 2], B[:, 3]
+    ix1 = np.maximum(ax1[:, None], bx1[None, :]); iy1 = np.maximum(ay1[:, None], by1[None, :])
+    ix2 = np.minimum(ax2[:, None], bx2[None, :]); iy2 = np.minimum(ay2[:, None], by2[None, :])
+    inter = np.clip(ix2 - ix1, 0, None) * np.clip(iy2 - iy1, 0, None)
+    area_a = ((ax2 - ax1) * (ay2 - ay1))[:, None]
+    area_b = ((bx2 - bx1) * (by2 - by1))[None, :]
+    union = area_a + area_b - inter
+    return inter / np.clip(union, 1e-9, None)
+```
+
+This should fix the broadcasting issue. Let me verify the shapes:
+- A is (n_ds, 4), B is (n_trs, 4)
+- ax1 etc. are (n_ds,), bx1 etc. are (n_trs,)
+- ix1 is (n_ds, n_trs) ✓
+- inter is (n_ds, n_trs) ✓
+- area_a is (n_ds, 1) ✓
+- area_b is (1, n_trs) ✓
+- union is (n_ds, n_trs) ✓
+- result is (n_ds, n_trs) ✓
+
+Then `j = I.argmax(1)` gives the best true box for each det box, shape (n_ds,).
+`best = I[np.arange(len(ds)), j]` gives the best IoU for each det box.
+
+This looks correct.
+
+Now let me think about whether there are any other potential issues:
+1. Memory: if an image has many boxes, the IoU matrix could be large. But for weld images, probably at most a few dozen boxes per image, so this should be fine.
+2. The `crops` list is modified in place, which is fine.
+3. The DataLoader uses `crops` which now includes the extra rows.
+
+I think the fix is clean. Let me write it up.
+
+For the SEARCH/REPLACE, I need to find the exact text in the current file (which is e001, the crashed version). Let me look at the diff to reconstruct e001's file.
+
+The e001 file is e000 with the added block. The `_iou` function in e001 has:
+```python
+        union = (ax2 - ax1) * (ay2 - ay1)[:, None] + (bx2 - bx1) * (by2 - by1)[None, :] - inter
+```
+
+I need to replace this with:
+```python
+        area_a = ((ax2 - ax1) * (ay2 - ay1))[:, None]
+        area_b = ((bx2 - bx1) * (by2 - by1))[None, :]
+        union = area_a + area_b - inter
+```
+
+Let me make sure the SEARCH text matches exactly. From the diff, the line in e001 is:
+```
+        union = (ax2 - ax1) * (ay2 - ay1)[:, None] + (bx2 - bx1) * (by2 - by1)[None, :] - inter
+```
+
+That should be unique in the file. Let me write the fix.

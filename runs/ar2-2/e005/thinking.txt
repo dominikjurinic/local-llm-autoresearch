@@ -1,0 +1,678 @@
+===== attempt 1 =====
+Let me analyze the current situation:
+
+**Current best (e003):** 5-seed val mAP@0.5 = 0.6317
+- Per-class: pore 0.517, deposit 0.622, discontinuity 0.780, stain 0.608
+- Trains on GT crops (high + low) + matched detector boxes (IoU≥0.5)
+- Two-crop input (tight 1.5x + wide 2.5x)
+- EfficientNet-B0, 160px
+- ~2 epochs in budget
+- Score = conf × prob (per class)
+
+**Reference numbers:**
+- One-step 4-class baseline: 0.638 mAP@0.5 (we're at 0.6317, close)
+- Stage-1 boxes with perfect classes (ceiling): 0.758
+- Stage-1 boxes scored as single class: 0.755
+
+**Key observations:**
+1. We're at 0.6317 vs baseline 0.638 - we're actually slightly below the baseline!
+2. The ceiling is 0.758, so there's a lot of room
+3. Pore (0.517) and stain (0.608) are the weak classes
+4. The classifier was trained on perfect boxes + matched detector boxes but NOT on false alarms (background)
+5. e001 tried adding background class but it hurt (0.5691)
+6. e004 tried prob² scoring which hurt (0.6211)
+
+**What's the bottleneck?**
+- The classifier needs to distinguish between defect types AND background
+- Currently it only sees defect classes (0-3), no background
+- When a detector box is a false alarm (background), the classifier will still assign it some class with some probability
+- The score = conf × prob means false alarms get scored based on their detector confidence × whatever class prob the classifier gives
+
+**Ideas to try:**
+
+1. **Add background class (class 4) but do it differently than e001:** e001 added background and it hurt. But maybe the issue was the scoring - if we add a 5th class "background", we could use the background probability to suppress scores. Score = conf × prob[class] / (1 + prob[background]) or score = conf × prob[class] × (1 - prob[background]). This is different from e001 which probably just used the raw probability.
+
+2. **Use detector confidence differently:** The detector conf might correlate with whether the box is a true defect. We could use it as a feature or weight.
+
+3. **Test-time augmentation (TTA):** Average predictions over multiple augmentations at test time. This could help with robustness.
+
+4. **Architecture change:** Try a different backbone. Maybe convnext_nano or efficientnet_b2 for better features.
+
+5. **More training data from detector boxes:** Currently we only use detector boxes with IoU≥0.5. What about using all detector boxes (including false alarms) but with a different approach?
+
+6. **Score calibration:** The current score = conf × prob. Maybe we should use a different combination. The issue is that false alarms (background boxes) will get non-zero probabilities for all classes. If we had a background class, we could use it to suppress.
+
+Let me think about what's most likely to help:
+
+The key insight is: **the classifier has no notion of "not a defect"**. When a false alarm comes in, it will be classified as one of the 4 classes with some confidence. The score = conf × prob means these false alarms get scored. If the detector conf is high for a false alarm, it could rank above true detections.
+
+The most impactful change would be to **add a background class** but with a **different scoring mechanism** than e001. In e001, the background class was added as class 4 and presumably the score was conf × prob[class] for classes 0-3. The problem might have been:
+- The background class diluted the training (too many background examples)
+- The scoring didn't properly use the background probability
+
+A better approach: Add background class (class 4), but score = conf × prob[class] × (1 - prob[background]) or score = conf × prob[class] / (prob[background] + 1).
+
+Actually wait, let me reconsider. e001 scored 0.5691 which is much worse. The issue might have been that adding background as a 5th class made the classifier worse at distinguishing the 4 defect types (it had to learn 5 classes instead of 4, and background might be a "harder" class to learn).
+
+Alternative: Instead of adding a 5th class, we could:
+- Train a separate binary classifier (defect vs not) alongside the 4-class classifier
+- Or use the 4-class classifier but with a scoring trick
+
+Actually, let me think about this differently. The problem is:
+1. False alarms get scored (they should score low)
+2. Cross-class errors (wrong type) reduce AP
+
+For (1), the detector conf already provides some signal. But the classifier doesn't know it's background.
+
+For (2), the classifier needs to be better at distinguishing pore vs deposit vs stain.
+
+Let me think about what would give the biggest bang for the buck:
+
+**Option A: TTA at test time**
+- Average predictions over horizontal flip, vertical flip, and maybe a few jittered crops
+- This is cheap (just more forward passes at test time)
+- Could improve robustness without changing training
+- Risk: might not help much if the model is already confident
+
+**Option B: Better backbone**
+- Try convnext_nano or efficientnet_b2
+- More parameters = better features
+- Risk: might not converge in 2 epochs with the same LR
+
+**Option C: Add background class with proper scoring**
+- 5-class classifier (0-3 defects + 4 background)
+- Score = conf × prob[class] × (1 - prob[background])
+- This explicitly penalizes boxes where the classifier thinks "this looks like background"
+- e001 failed, but it might have been because of the scoring, not the background class itself
+
+**Option D: Use detector conf as a training signal**
+- Weight training samples by detector conf (high conf detector boxes are more likely to be true)
+- Or use conf as a feature
+
+**Option E: More aggressive data augmentation**
+- Color jitter, random erasing, etc.
+- The current augmentation is just geometric jitter + flips + brightness
+
+Let me go with **Option C: Add background class with proper scoring**. 
+
+Wait, but e001 already tried this and it failed badly (0.5691). Let me think about why.
+
+In e001, the approach was:
+- Train on detector boxes labeled by IoU≥0.5 overlap with GT
+- Boxes with no overlap → class 4 (background)
+- 5-class classifier
+
+The issue might be:
+1. Too many background examples (most detector boxes might be false alarms)
+2. The background class is too easy/hard
+3. The scoring didn't use the background probability
+
+Actually, looking at the numbers: 12219 matched detector boxes out of how many total train dets? Let me check... The log says "train 26347 boxes (14128 gt + 12219 det)". So 12219 detector boxes matched. But how many total train dets are there? We don't know from the log, but if the detector has a high false alarm rate, there could be many more unmatched ones.
+
+The issue with e001 might have been the class imbalance: if there are 12219 matched and say 30000 unmatched, the background class dominates.
+
+A better approach: **Use the 4-class classifier but add a scoring mechanism that accounts for "background-ness"**. 
+
+One way: Train the 4-class classifier as before, but at scoring time, use the maximum probability as a confidence indicator. If the classifier is uncertain (all probs ~0.25), the box is likely background. Score = conf × (max_prob - 0.25) or something.
+
+Actually, a simpler and more principled approach: **Use the entropy of the class distribution as a background indicator**. Low entropy (confident) → likely a real defect. High entropy (uncertain) → likely background.
+
+Score = conf × prob[class] × (1 - entropy/scale) or Score = conf × prob[class]² / sum(probs²) ... hmm, this is getting complicated.
+
+Wait, let me reconsider. The e004 experiment tried prob² and it hurt. So making the score more peaked doesn't help.
+
+Let me think about what actually determines mAP@0.5:
+- For each class, we need true positives to rank above false positives
+- A "true positive" for class c is a box that overlaps a GT box of class c AND is predicted as class c
+- A "false positive" for class c is a box predicted as class c that either doesn't overlap any GT, or overlaps a GT of a different class
+
+The key issues:
+1. False alarms (background) predicted as class c → FP for class c
+2. True defects of class c predicted as class d → FP for class d, FN for class c
+3. True defects of class d predicted as class c → FP for class c, FN for class d
+
+For (1), we need to suppress background boxes. The classifier currently doesn't know about background.
+For (2) and (3), we need better class discrimination.
+
+**New idea: Train a 5-class classifier (4 defects + background) but use it differently.**
+
+Instead of e001's approach (which just used the 5-class probs directly), I'll:
+1. Train on all detector boxes: matched ones get their GT class, unmatched ones get class 4 (background)
+2. Also train on GT crops (classes 0-3)
+3. Score = conf × prob[class] × (1 - prob[background]) for class 0-3
+
+The (1 - prob[background]) factor explicitly suppresses boxes where the classifier thinks "this looks like background".
+
+But wait, e001 already did something similar and it failed. Let me think about what went wrong...
+
+Actually, I don't have the exact code of e001. The hypothesis says "Training on detector boxes (labelled by IoU≥0.5 overlap with ground truth, plus a 5th 'background' class for false alarms) instead of perfect crops". The word "instead" is key - e001 replaced GT crops with detector boxes. That's very different from what I'm proposing.
+
+My proposal: **Keep GT crops AND add detector boxes (matched → GT class, unmatched → background class 4)**. This gives the classifier:
+- Clean GT examples for classes 0-3 (from crops.csv)
+- Detector-box examples for classes 0-3 (matched dets)
+- Background examples (unmatched dets)
+
+And the scoring: score = conf × prob[class] × (1 - prob[background])
+
+This is different from e001 (which replaced GT with detector boxes) and from e002 (which added matched detector boxes but no background).
+
+Actually, I realize the issue: if I add a 5th class, the model architecture changes (num_classes=5 instead of 4). This changes the training dynamics. The background class might be "easier" to learn (it's just "not a defect"), which could steal capacity from the harder defect discrimination task.
+
+Alternative: **Keep 4 classes, but add a separate "background" signal.**
+
+What if I train the 4-class classifier as before, but at test time, I use the **detector confidence** more aggressively? The detector conf should be lower for false alarms. Currently score = conf × prob. What if I use score = conf² × prob? Or conf^1.5 × prob?
+
+Actually, the detector conf is already a signal for "is this a real defect?". The problem is that the classifier doesn't add any additional background signal.
+
+Let me try a different angle: **What if I use the classifier's uncertainty as a background signal?**
+
+For a true defect, the classifier should be confident (one class has high prob). For a background box, the classifier should be uncertain (all probs similar). So:
+
+score = conf × prob[class] × (prob[class] - mean(prob)) 
+
+This amplifies confident predictions and suppresses uncertain ones. But this is similar to prob² which already failed.
+
+OK let me try yet another angle. **What about the number of training steps?**
+
+The log shows only 2 epochs (832 steps total) in ~145 seconds of training. That's very few steps. The model might be undertrained.
+
+What if I:
+- Use a smaller image size (128 instead of 160) to speed up training
+- Or use a smaller batch size to get more steps
+- Or reduce the reserve time
+
+Actually, the training time is 145s out of 180s budget (with 55s reserve). The loading takes 17s. So training gets about 145s. With 411-421 steps per epoch, that's about 0.35s per step. If I reduce IMG_SIZE to 128, I could get maybe 30% more steps.
+
+But the question is: is the model undertrained? Loss went from 0.4479 to 0.2744 in one epoch. That's still high. More training would help.
+
+**Idea: Reduce IMG_SIZE from 160 to 128 to get more training steps.**
+
+This is a simple change that could help if the model is undertrained. The risk is that smaller crops lose detail needed for class discrimination.
+
+Actually, let me think about this more carefully. The crops are from weld images. At 128px, can we still distinguish pore (small holes) from deposit (extra material)? Probably yes, since the context crops are 1.5x and 2.5x the box size.
+
+But wait, the detector operates on the full image. The boxes are in full-image coordinates. The crop is just a window around the box. At 128px, we're just downscaling the crop. The information content is the same (we're just losing resolution). For small defects, this could hurt.
+
+Let me think of another approach.
+
+**Idea: Use a different, faster backbone to get more training steps.**
+
+resnet18 is much faster than efficientnet_b0. With resnet18, I could train for 3-4x more steps in the same time. The question is whether resnet18 is good enough.
+
+Actually, for a fine-tuning task with limited data, a smaller/faster model that gets more training steps might outperform a larger model that's undertrained.
+
+Let me try: **Switch to resnet18 (faster) to get more training steps, keeping everything else the same.**
+
+resnet18 is about 3-4x faster than efficientnet_b0 at 160px. So instead of 2 epochs, I'd get ~6-8 epochs. The loss should decrease significantly.
+
+Risk: resnet18 might not have as good features as efficientnet_b0. But with more training, it could catch up or even surpass.
+
+Actually, let me reconsider. The problem statement says "Tuning hyperparameters alone helped little in earlier experiments; changes of method helped more." So just changing the backbone might not help much.
+
+Let me think about what "changes of method" could be:
+
+1. **Multi-scale training**: Train on multiple crop sizes and average. But this is similar to TTA.
+
+2. **Curriculum learning**: Start with easy examples, move to hard ones.
+
+3. **Focal loss**: Instead of cross-entropy, use focal loss to focus on hard examples.
+
+4. **Label smoothing**: Add label smoothing to prevent overconfidence.
+
+5. **Mixup**: Mix different samples during training.
+
+Actually, **label smoothing** is interesting. The current model might be overconfident on training examples, which could hurt generalization. With label smoothing (e.g., 0.1), the model would be less overconfident, which could help with the ranking (mAP cares about ranking, not just classification accuracy).
+
+But wait, the score is conf × prob. If the model is less overconfident (lower max prob), all scores go down proportionally, which doesn't change the ranking. Unless the smoothing affects different classes differently.
+
+Hmm, let me think about this differently.
+
+**The real issue: The classifier doesn't distinguish background from defects.**
+
+When a false alarm comes in, the classifier assigns it to one of the 4 classes. The score = conf × prob. If the false alarm has high detector conf, it gets a high score, even though it's not a real defect.
+
+The solution is clear: **the classifier needs to know about background.** But e001 showed that adding background as a 5th class (replacing GT crops) hurt.
+
+What if I add background as a 5th class BUT keep GT crops AND use the background probability in scoring?
+
+Let me design this carefully:
+- Training data:
+  - GT crops (high + low): classes 0-3
+  - Matched detector boxes (IoU≥0.5): classes 0-3
+  - Unmatched detector boxes: class 4 (background)
+- Model: 5-class classifier
+- Scoring: For each eval box, compute 5 probs. For class c (0-3): score = conf × prob[c] × (1 - prob[4])
+  - This suppresses boxes where the classifier thinks "background"
+  - The (1 - prob[4]) factor is 1 when the classifier is confident it's a defect, and low when it thinks it's background
+
+This is different from e001 because:
+1. e001 replaced GT crops with detector boxes; I keep GT crops
+2. e001 presumably used score = conf × prob[c] without the background suppression; I use the background probability to modulate the score
+
+The key question: will the 5th class hurt the 4-class discrimination? It might, if background is too different from defects. But the GT crops provide clean examples for classes 0-3, and the background class provides the "not a defect" signal.
+
+Actually, I'm worried this is too risky. e001 failed badly. Let me think of a safer approach.
+
+**Safer idea: Use the classifier's max probability as a background indicator, without adding a 5th class.**
+
+Score = conf × prob[c] × max_prob
+
+Where max_prob = max(prob[0], prob[1], prob[2], prob[3]).
+
+For a true defect: max_prob is high (e.g., 0.8), so score ≈ conf × prob[c] × 0.8
+For a background box: max_prob is low (e.g., 0.3), so score ≈ conf × prob[c] × 0.3
+
+This effectively down-weights uncertain predictions. And it doesn't require any training changes!
+
+Wait, but this is similar to prob² (which failed in e004). Let me check:
+- prob²: score = conf × prob[c]²
+- max_prob × prob[c]: score = conf × prob[c] × max_prob
+
+These are different. If prob[c] is the max, then max_prob = prob[c], and score = conf × prob[c]² (same as e004). But if prob[c] is not the max, then max_prob > prob[c], and score = conf × prob[c] × max_prob > conf × prob[c]².
+
+So this is a softer version of prob². It still penalizes low-probability classes, but less severely.
+
+Hmm, but e004 (prob²) already failed. This might also fail.
+
+Let me think about what else to try.
+
+**Idea: Increase training by reducing reserve time and/or using a faster model.**
+
+Current: 180s budget, 55s reserve, 17s loading → ~108s training → 2 epochs
+If I reduce reserve to 30s: 180 - 30 - 17 = 133s training → ~2.5 epochs
+If I also use a faster model (resnet18): maybe 4-5 epochs
+
+More training should help. The loss was still 0.2744 after epoch 1, which is not converged.
+
+But the problem statement says "Tuning hyperparameters alone helped little." Changing the reserve time is a hyperparameter change. However, changing the model to get more effective training steps is more of a method change.
+
+Let me try: **Switch to convnext_nano (slightly bigger than efficientnet_b0 but with better features) and reduce reserve to 30s.**
+
+Actually, convnext_nano might be slower than efficientnet_b0. Let me check... convnext_nano has ~12M params vs efficientnet_b0's ~4M. So it would be slower. That's the wrong direction.
+
+What about **regnety_016**? It's a small RegNet with ~9M params. Might be faster or slower than efficientnet_b0.
+
+Actually, for speed, **resnet18** (~11M params) or **resnet34** (~21M params) are good choices. ResNet architectures are typically faster than EfficientNet for inference due to simpler operations.
+
+Let me try **resnet18** with a reduced reserve. This should give me 3-4x more training steps.
+
+Wait, but the problem says "Tuning hyperparameters alone helped little in earlier experiments; changes of method helped more." Changing the backbone is an architecture change, not a hyperparameter change. And getting more training steps is a meaningful method change.
+
+Let me go with: **Switch to resnet18 and reduce RESERVE_S from 55 to 30.**
+
+Hypothesis: The model is undertrained (only 2 epochs, loss still 0.27). A faster backbone (resnet18) with a reduced reserve will allow 3-4x more training steps, leading to better convergence and improved mAP.
+
+Actually, I want to be more careful. Let me think about whether resnet18 is a good choice.
+
+resnet18 at 160px input:
+- Forward pass: ~2-3ms on GPU (vs ~5-7ms for efficientnet_b0)
+- So roughly 2-3x faster
+- With 2x more steps, the model should converge better
+
+The risk is that resnet18 has worse features than efficientnet_b0. But for a fine-tuning task with 26K training samples, resnet18 should be sufficient.
+
+Let me also consider: should I change the LR for resnet18? The current LR is 1e-3 with AdamW. For resnet18, this should be fine.
+
+OK, I'll go with this. Let me write the code changes:
+
+1. Change MODEL from "efficientnet_b0" to "resnet18"
+2. Change RESERVE_S from 55 to 30
+
+These are two small changes. Let me make sure the SEARCH blocks are correct.
+
+Actually wait - I need to be more careful. The problem says "One idea per turn, with a short testable hypothesis. Keep the edit focused on that idea." Changing both the model AND the reserve is two changes. Let me focus on just the model change, since that's the "method" change. The reserve change is a hyperparameter tweak.
+
+But if I only change the model to resnet18 without reducing the reserve, I'll get more steps but still have 55s reserved. That's fine - the extra steps will come from the faster model.
+
+Let me just change MODEL to "resnet18".
+
+Actually, I realize I should think more carefully. Let me reconsider the problem.
+
+The current score is 0.6317, and the baseline is 0.638. We're slightly below baseline. The ceiling is 0.758. 
+
+The per-class scores are: pore 0.517, deposit 0.622, discontinuity 0.780, stain 0.608.
+
+Pore and stain are the weak classes. What makes them hard?
+- Pore: small holes in the weld. Might be confused with background or other defects.
+- Stain: discoloration. Might be confused with deposit or background.
+
+The classifier needs to:
+1. Distinguish pore from other defects (especially deposit)
+2. Distinguish stain from deposit and background
+3. Not classify background as any defect
+
+For (3), the background issue is key. The classifier currently has no background class, so it will always assign a defect class to every box, including false alarms.
+
+I keep coming back to the background issue. Let me try a different approach to it.
+
+**New idea: Use the detector confidence as a proxy for background, and train the classifier to be more discriminative.**
+
+What if I weight the training loss by the detector confidence? High-conf detector boxes are more likely to be true defects, so they should have higher weight. Low-conf boxes (more likely background) should have lower weight.
+
+But wait, I'm training on GT crops (which don't have detector conf) and matched detector boxes (which do). The GT crops are all "true" by definition. The matched detector boxes are also "true" (IoU≥0.5). So weighting by conf doesn't make sense for training.
+
+The conf is only useful at test time, for scoring. And it's already in the score: score = conf × prob.
+
+OK, I think the most impactful change I can make is to **add a background class with proper scoring**. Let me design it carefully to avoid the e001 failure.
+
+e001's approach (from the hypothesis): "Training on detector boxes (labelled by IoU≥0.5 overlap with ground truth, plus a 5th 'background' class for false alarms) **instead of** perfect crops"
+
+The key word is "instead of" - e001 replaced GT crops with detector boxes. This means:
+- No clean GT examples
+- All training examples are detector boxes (noisy)
+- Background class is learned from unmatched detector boxes
+
+My proposed approach:
+- Keep GT crops (clean examples for classes 0-3)
+- Add matched detector boxes (classes 0-3, noisy but useful for robustness)
+- Add unmatched detector boxes (class 4, background)
+- Score = conf × prob[c] × (1 - prob[4])
+
+This is fundamentally different from e001. The GT crops provide a clean anchor for the 4 defect classes, while the detector boxes (both matched and unmatched) provide the "real world" distribution.
+
+Let me also think about class balance. If there are, say, 12219 matched dets and 30000 unmatched dets, the background class (30000) would dominate over the defect classes (14128 GT + 12219 matched = 26347). That's roughly balanced (30K vs 26K), which is good.
+
+But if there are 50000 unmatched dets, background would dominate. I should check the numbers... I don't have the exact count of unmatched train dets. Let me assume it's reasonable.
+
+Actually, I can add a simple cap: only use a subset of unmatched dets for background training, to balance the classes. For example, use at most 1.5x the number of defect examples for background.
+
+Let me design the code:
+
+```python
+# After computing matched_dets:
+unmatched_dets = [d for d in train_dets if "cls" not in d]
+# Cap background to avoid overwhelming
+max_bg = int(len(matched_dets) * 1.5)
+if len(unmatched_dets) > max_bg:
+    random.shuffle(unmatched_dets)
+    unmatched_dets = unmatched_dets[:max_bg]
+for d in unmatched_dets:
+    d["cls"] = 4  # background
+train_rows = crops + matched_dets + unmatched_dets
+```
+
+And the model:
+```python
+model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=5)
+```
+
+And the scoring:
+```python
+for d, p in zip(ev, probs):
+    bg = float(p[4])
+    for c in range(4):
+        s = d["conf"] * float(p[c]) * (1.0 - bg)
+        if s > MIN_SCORE:
+            w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+
+Wait, but the problem says "One idea per turn." Adding a background class + changing the scoring is really one idea: "use a background class to suppress false alarms." The scoring change is a natural consequence of having a background class.
+
+Let me also think about whether the (1 - bg) factor is the right way to use the background probability. 
+
+If bg = 0 (definitely a defect): score = conf × prob[c] (same as before)
+If bg = 1 (definitely background): score = 0 (suppressed)
+If bg = 0.5 (uncertain): score = conf × prob[c] × 0.5 (halved)
+
+This seems reasonable. The (1 - bg) factor smoothly transitions between "defect" and "background."
+
+An alternative: score = conf × prob[c] / (1 + bg). This is softer:
+- bg = 0: score = conf × prob[c]
+- bg = 1: score = conf × prob[c] / 2
+- bg = 0.5: score = conf × prob[c] / 1.5
+
+The (1 - bg) factor is more aggressive in suppressing background. I'll go with (1 - bg) since we want to strongly suppress false alarms.
+
+Actually, there's a subtlety. The background probability and the class probabilities sum to 1 (softmax over 5 classes). So if bg is high, the class probs are low, and the score is already suppressed. The (1 - bg) factor adds an extra suppression. This might be too aggressive.
+
+Let me think... If the classifier is well-calibrated:
+- True defect of class c: prob[c] ≈ 0.8, bg ≈ 0.1, other probs ≈ 0.03 each
+  - Score = conf × 0.8 × 0.9 = 0.72 × conf
+- Background: prob[c] ≈ 0.15 for each class, bg ≈ 0.4
+  - Score = conf × 0.15 × 0.6 = 0.09 × conf
+
+The ratio is 0.72/0.09 = 8x. Without the (1-bg) factor, the ratio would be 0.8/0.15 = 5.3x. So the (1-bg) factor helps but doesn't change things dramatically.
+
+I think this is a good approach. Let me write the code.
+
+Actually, I want to reconsider one more time. The e001 experiment failed with 0.5691. Even though my approach is different (keeping GT crops), the addition of a 5th class changes the model architecture and training dynamics. There's a risk that the 5th class hurts the 4-class discrimination.
+
+To mitigate this risk, I could:
+1. Use a smaller weight for the background class (e.g., class_weight)
+2. Or use a separate head for background (multi-task)
+
+But the problem says "Class-weighted loss hurt classification every time it was tried." So class weights are out.
+
+Let me just go with the straightforward approach and see what happens. If it fails, I'll try something else.
+
+Let me write the code changes:
+
+1. Add background class to training data
+2. Change model to 5 classes
+3. Change scoring to use (1 - bg) factor
+
+Here are the specific changes:
+
+**Change 1: Add unmatched dets as background class**
+
+In the current code:
+```python
+    train_rows = crops + matched_dets
+```
+
+I need to add:
+```python
+    unmatched_dets = [d for d in train_dets if "cls" not in d]
+    max_bg = int(len(matched_dets) * 1.5)
+    if len(unmatched_dets) > max_bg:
+        random.shuffle(unmatched_dets)
+        unmatched_dets = unmatched_dets[:max_bg]
+    for d in unmatched_dets:
+        d["cls"] = 4
+    train_rows = crops + matched_dets + unmatched_dets
+```
+
+**Change 2: Model with 5 classes**
+
+```python
+    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
+```
+→
+```python
+    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=5)
+```
+
+**Change 3: Scoring with background suppression**
+
+```python
+    for d, p in zip(ev, probs):
+        for c in range(4):
+            s = d["conf"] * float(p[c])
+            if s > MIN_SCORE:
+                w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+→
+```python
+    for d, p in zip(ev, probs):
+        bg = float(p[4])
+        for c in range(4):
+            s = d["conf"] * float(p[c]) * (1.0 - bg)
+            if s > MIN_SCORE:
+                w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+
+**Change 4: Print statement**
+
+The print says:
+```python
+    print(f"train {len(train_rows)} boxes ({len(crops)} gt + {len(matched_dets)} det), eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
+```
+
+I should update it to include background:
+```python
+    print(f"train {len(train_rows)} boxes ({len(crops)} gt + {len(matched_dets)} det + {len(unmatched_dets)} bg), eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
+```
+
+Let me verify the SEARCH blocks are unique in the file.
+
+For change 1: `    train_rows = crops + matched_dets` - this appears once.
+
+For change 2: `    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)` - this appears once.
+
+For change 3: The scoring loop - let me check. The lines:
+```
+    for d, p in zip(ev, probs):
+        for c in range(4):
+            s = d["conf"] * float(p[c])
+            if s > MIN_SCORE:
+                w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+This appears once.
+
+For change 4: The print line - appears once.
+
+OK, let me finalize.
+
+Wait, I need to double-check: the `unmatched_dets` variable. In the current code, `train_dets` is filtered to get `matched_dets` (those with IoU≥0.5). The unmatched ones are those without a "cls" key. But wait, the code does:
+
+```python
+    for d in train_dets:
+        best_iou, best_cls = 0.0, -1
+        for c in crops_by_img.get(d["image"], []):
+            ...
+        if best_iou >= 0.5:
+            d["cls"] = best_cls
+            matched_dets.append(d)
+```
+
+So `matched_dets` contains the dets with IoU≥0.5, and they get a "cls" key. The rest of `train_dets` don't have a "cls" key. So `unmatched_dets = [d for d in train_dets if "cls" not in d]` is correct.
+
+But wait, I need to be careful: the `dets` list contains both train and eval dets. `train_dets` is the train subset. The `ev` list is the eval subset. So `train_dets` and `ev` are disjoint. Good.
+
+Also, I should make sure that the `unmatched_dets` are from training images only (which they are, since they're from `train_dets`).
+
+One more thing: the `needed` set for images:
+```python
+    needed = {r["image"] for r in train_rows} | {d["image"] for d in ev}
+```
+
+Since `train_rows` now includes `unmatched_dets`, their images will be included. Good.
+
+Let me also think about whether the background class will mess up the DataLoader. The `BoxDataset.__getitem__` returns `r.get("cls", -1)`. For unmatched dets, `cls` will be 4 (I set it). So the label will be 4. The CrossEntropyLoss with 5 classes will handle this correctly.
+
+I think the code is correct. Let me write the final answer.
+
+Actually, one more consideration: the `random.shuffle(unmatched_dets)` uses the global random state, which is seeded. This is fine for reproducibility.
+
+But wait, there's a subtlety: the `random` module is used in `make_crop` for jitter. If I shuffle `unmatched_dets` before creating the DataLoader, it will consume some random state. But since the DataLoader uses `worker_init_fn` to re-seed workers, and the main process's random state is only used for the shuffle, this should be fine. The training jitter in `make_crop` happens in worker processes (which are re-seeded), so the main process's random state doesn't affect it.
+
+Actually, looking at the code more carefully, `make_crop` is called in `BoxDataset.__getitem__`, which is called by the DataLoader workers. The workers are re-seeded by `worker_init_fn`. So the main process's random state is only used for the shuffle. This is fine.
+
+Let me finalize the changes.
+
+Hmm, actually I realize I should double-check: does the `d["cls"]` key conflict with anything? In the `read_csv` function, `cls` is only parsed for `crops.csv` (which has a `cls` column). For `dets.csv`, there's no `cls` column, so `d["cls"]` won't exist initially. When I set `d["cls"] = 4`, it adds the key. This is the same pattern as `matched_dets` where `d["cls"] = best_cls` is set. So it's consistent.
+
+OK, I'm confident in the changes. Let me write them out.
+
+Let me also reconsider the cap on background. I'm capping at 1.5x the number of matched dets. If there are 12219 matched dets, the cap is ~18328. This seems reasonable. But what if there are very few unmatched dets (e.g., 5000)? Then the cap doesn't matter, and we use all 5000. That's fine.
+
+What if there are a lot of unmatched dets (e.g., 50000)? The cap limits us to 18328. This prevents background from dominating. Good.
+
+Actually, I want to reconsider the cap ratio. 1.5x might not be optimal. Let me think...
+
+Total defect examples: 14128 (GT) + 12219 (matched) = 26347
+If I cap background at 1.5 × 12219 = 18328, total = 26347 + 18328 = 44675
+Background fraction: 18328/44675 ≈ 41%
+
+If I cap at 1.0 × 12219 = 12219, total = 26347 + 12219 = 38566
+Background fraction: 12219/38566 ≈ 32%
+
+If I cap at 2.0 × 12219 = 24438, total = 26347 + 24438 = 50785
+Background fraction: 24438/50785 ≈ 48%
+
+I think 1.5x is a reasonable starting point. It gives background a significant but not dominant presence.
+
+OK, final answer time. Let me write the SEARCH/REPLACE blocks.
+
+Actually, I want to reconsider one more time whether this is the right experiment to do. Let me look at the experiment history:
+
+- e001: Add background class (replacing GT) → 0.5691 (failed)
+- e002: Add matched detector boxes → 0.6368 (new best)
+- e003: Add low-res GT crops → 0.6317 (new best, slightly better 5-seed)
+- e004: prob² scoring → 0.6211 (failed)
+
+The background class idea was tried in e001 and failed. But e001 replaced GT crops with detector boxes. My approach keeps GT crops and adds both matched and unmatched detector boxes. This is fundamentally different.
+
+However, there's a risk that the 5th class still hurts. The model has to learn 5 classes instead of 4, and the background class might be "easier" (it's just "not a defect"), stealing capacity from the harder defect discrimination task.
+
+An alternative approach that avoids the 5th class: **Use a separate binary classifier for background.**
+
+Train two models:
+1. 4-class classifier (defect type) - as before
+2. Binary classifier (defect vs background) - trained on matched dets (defect) vs unmatched dets (background)
+
+Score = conf × prob[class] × (1 - prob[background_binary])
+
+But this requires training two models, which takes more time. In the current budget, I can only train for ~2 epochs. Training two models would halve the training time for each.
+
+Unless I use a shared backbone with two heads. But that's a bigger code change.
+
+I think the 5-class approach is simpler and more likely to work if designed correctly. Let me go with it.
+
+Final decision: **Add background class (class 4) to the 5-class classifier, keep GT crops, and use (1 - prob[background]) in the score.**
+
+Let me write the code.
+===== attempt 2 =====
+The user is saying that block 3's SEARCH text was not found. Let me look at the current best file (e003) again to find the exact text.
+
+Looking at the current best train.py:
+
+```python
+    os.makedirs(args.out, exist_ok=True)
+    n = 0
+    with open(os.path.join(args.out, "preds.csv"), "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["det_id", "cls", "score"])
+        for d, p in zip(ev, probs):
+            for c in range(4):
+                s = d["conf"] * float(p[c])
+                if s > MIN_SCORE:
+                    w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+
+So the indentation is 8 spaces for `for d, p in zip(ev, probs):`, 12 spaces for `for c in range(4):`, 16 spaces for `s = ...`, etc.
+
+In my previous attempt, I used 4-space indentation which was wrong. Let me fix it with the exact indentation from the file.
+
+Let me re-copy the exact lines:
+
+```
+        for d, p in zip(ev, probs):
+            for c in range(4):
+                s = d["conf"] * float(p[c])
+                if s > MIN_SCORE:
+                    w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+
+That's 8 spaces for the first line, 12 for the second, 16 for the third, 16 for the fourth, 20 for the fifth.
+
+Now let me also double-check blocks 1 and 2 to make sure they're correct.
+
+Block 1:
+```
+    train_rows = crops + matched_dets
+    needed = {r["image"] for r in train_rows} | {d["image"] for d in ev}
+    images = {p: np.asarray(Image.open(os.path.join(args.data, "images", p)).convert("RGB")) for p in needed}
+    print(f"train {len(train_rows)} boxes ({len(crops)} gt + {len(matched_dets)} det), eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
+```
+
+That looks correct - 4 spaces indentation.
+
+Block 2:
+```
+    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
+```
+
+4 spaces indentation. That looks correct.
+
+Now let me fix block 3 with the correct indentation.

@@ -1,0 +1,515 @@
+===== attempt 1 =====
+Let me analyze the situation carefully.
+
+Current best: e016, 5-seed val mAP@0.5 = 0.6337
+Per-class: pore 0.524, deposit 0.626, discontinuity 0.779, stain 0.606
+
+The most recent experiment e017 (IMG_SIZE=224) timed out. It was killed at 195s. The issue is that 224x224 images are much more expensive to process than 160x160.
+
+Let me think about what to try next. Let me review the experiment history:
+
+- e001-e002: Training on detector boxes with background class - crashed/rejected (0.5172)
+- e003: Low-res crops - rejected (0.6251)
+- e004: Squaring class probability - rejected (0.6161)
+- e005: Training on detector boxes overlapping GT - rejected (0.6248)
+- e006: ConvNeXt-Nano - suspicious (0.2901, likely bug)
+- e007: MixUp - not confirmed (0.6326 seed 0, 0.6292 5-seed)
+- e008: conf × p[c] × max(p) - rejected (0.6265)
+- e009: Wider context 3.5x - not confirmed (0.6342 seed 0, 0.6309 5-seed)
+- e010: Label smoothing - not confirmed (0.6328 seed 0, 0.6254 5-seed)
+- e011: More jitter - not confirmed (0.6356 seed 0, 0.6294 5-seed)
+- e012: Focal loss - rejected (0.6209)
+- e013: TTA with horizontal flip - new best (0.6392 seed 0, 0.6314 5-seed)
+- e014: Top-1 only - rejected (0.5916)
+- e015: Adding detector boxes to training - rejected (0.6285)
+- e016: 2x oversample pore/stain - new best (0.6333 seed 0, 0.6337 5-seed)
+- e017: IMG_SIZE=224 - timeout
+
+So the current best is e016 which has:
+- TTA with horizontal flip (from e013)
+- 2x oversample pore/stain (from e016)
+- IMG_SIZE = 160
+- EfficientNet-B0
+- Two-crop input (tight 1.5x + wide 2.5x)
+
+Let me think about what ideas haven't been tried yet:
+
+1. **Different architecture**: ConvNeXt-Nano was tried but had a bug (0.2901). Could retry with fix. But what was the bug? It was "suspicious (likely bug)". Let me think... maybe the model wasn't properly initialized or the pretrained weights weren't loaded correctly. Actually, looking at the code, the model creation is `timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)`. For ConvNeXt-Nano, the default pretrained weights should work. Maybe the issue was that convnext_nano needs a different image size or the training didn't converge in the time budget. Actually 0.2901 is very low - that's basically random (4 classes, random would be ~0.25). So the model probably didn't train at all or had some issue.
+
+Wait, let me reconsider. The score is 0.2901 which is close to random. This could mean:
+- The model didn't load pretrained weights properly
+- The training didn't work
+- Some other bug
+
+Actually, for ConvNeXt models, the default input size might be different. But timm should handle that. Let me think... Actually, the issue might be that convnext_nano with pretrained=True loads ImageNet weights, but maybe the architecture change requires different hyperparameters (learning rate, etc.) to converge properly.
+
+2. **Different scoring**: Several scoring changes have been tried (squaring, max probability, top-1). What about using the detector confidence differently?
+
+3. **Ensembling**: The brief mentions "ensembling within the time budget" as an in-scope idea. We could train two models (e.g., one at 160x160 and one at a slightly different size, or two different architectures) and average their predictions.
+
+4. **Time budget optimization**: The current training takes about 115s for 3 epochs, leaving ~65s reserve. The 224x224 version took too long. What about 192x192? That's 1.44x the pixels of 160x160, so about 44% more compute per step. That might still fit.
+
+Actually, let me reconsider the 224 timeout. The log shows:
+- e016 (160x160): epoch 0: 68s, epoch 1: 95s, epoch 2: 115s, total 157s
+- e017 (224x224): epoch 0: 73s, epoch 1: 106s, epoch 2: 115s (partial), total 193s
+
+Wait, that's interesting. The per-epoch times are similar! 68 vs 73, 95 vs 106. The difference is that at 224x224, fewer steps fit in the time budget (387 vs 318 steps), so the model sees fewer examples. But the per-step time is similar? That seems odd for a 1.44x increase in pixels.
+
+Actually wait, let me re-read. At 160x160: 141 steps in 68s = 0.48s/step. At 224x224: 141 steps in 73s = 0.52s/step. That's only 8% slower per step, which is much less than the 44% increase in pixels. This suggests the bottleneck might be data loading (reading images, cropping, resizing) rather than the forward/backward pass.
+
+Actually, the data loading involves:
+1. Reading the image from memory (already loaded)
+2. Cropping the region
+3. Resizing to IMG_SIZE x IMG_SIZE
+4. Normalization
+
+The cropping and resizing to 160 vs 224 shouldn't be that different. The forward/backward pass on the model would be the main difference. But with bfloat16 and channels_last, the GPU should handle this efficiently.
+
+Hmm, but the total time difference is 157s vs 193s = 36s more. The reserve is 65s. So at 224x224, the prediction phase takes longer too (more pixels to process for 41879 detections).
+
+Let me think about what would be a good next experiment.
+
+Looking at the per-class scores: pore 0.524, deposit 0.626, discontinuity 0.779, stain 0.606.
+
+The weak classes are pore and stain. The brief says "Pore and deposit are the weak classes; stain is often confused with deposit and background."
+
+Ideas to try:
+1. **Different architecture (retry ConvNeXt)**: The previous attempt had a bug. Could try again with a different architecture like regnety_016 or resnet50.
+2. **Ensemble of two models**: Train two different models and average. But this might not fit in the time budget.
+3. **Different IMG_SIZE**: 192x192 as a compromise between 160 and 224.
+4. **Different scoring**: Maybe use a different combination of detector conf and classifier probability.
+5. **More training data**: Include low-res crops (tried, rejected).
+6. **Different augmentation**: More aggressive augmentation.
+
+Let me think about what's most likely to help.
+
+The current system is at 0.6337, while the ceiling is 0.758 (stage-1 boxes with perfect classes). The gap is 0.125. The one-step baseline is 0.638. So we're just below the one-step baseline.
+
+Key insight: "When all types are merged into one class, the same detector reaches 0.77, so many errors are wrong types, not missed defects." This means the detector is finding the right boxes, but the classifier is getting the types wrong.
+
+The per-class scores suggest:
+- Discontinuity is well-detected (0.779)
+- Pore is the weakest (0.524)
+- Stain is weak (0.606)
+- Deposit is moderate (0.626)
+
+What could help the weak classes?
+
+1. **More context for pore**: Pores are small holes. Maybe the tight crop at 1.5x is too tight or too wide. 
+2. **Different image size**: More detail for small pores.
+3. **Architecture**: A different backbone might capture different features.
+
+Let me think about the architecture option more carefully. The ConvNeXt attempt (e006) scored 0.2901 which is suspicious. Let me think about what could have gone wrong.
+
+Looking at the code, the model is created with:
+```python
+model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
+```
+
+For convnext_nano, this should work. But maybe the issue is that convnext_nano has a different default input size or the pretrained weights aren't compatible. Actually, timm handles this - it loads the pretrained backbone and replaces the classifier head.
+
+Wait, maybe the issue is that convnext_nano is much slower to train (more parameters), so it didn't converge in the time budget. Let me check: convnext_nano has about 50M parameters vs efficientnet_b0's about 4M. That's a 12x difference! So the training would be much slower and might not converge.
+
+Actually, convnext_nano has about 50M parameters? Let me think... ConvNeXt-Tiny has about 28M parameters. ConvNeXt-Nano might be smaller, maybe 10-15M. Still much larger than EfficientNet-B0 (4M).
+
+So the issue with e006 might have been that the model was too large to converge in the available training time. The score of 0.2901 suggests the model barely learned anything.
+
+What about smaller architectures?
+- convnext_atto: very small, maybe 2-3M parameters
+- convnext_pico: even smaller
+- regnety_016: about 9M parameters
+- resnet18: about 11M parameters
+- resnet34: about 21M parameters
+
+Actually, for this task, we want a model that:
+1. Trains fast (to fit in the time budget)
+2. Has good pretrained features
+3. Can distinguish the 4 defect types
+
+EfficientNet-B0 (4M params) seems like a good choice. What about trying a different model with similar parameter count?
+
+- regnety_016: about 9M params, might be slightly slower but could have better features
+- resnet18: about 11M params
+
+Actually, let me reconsider. The main bottleneck is training time. With 3 epochs at 160x160, we use about 115s. The reserve is 65s. Total budget is 180s.
+
+What if we try a different approach entirely? Let me think about what's most promising.
+
+Looking at the scoring: currently score = conf × p[c]. The detector confidence and classifier probability are multiplied. What if we use a different combination?
+
+Actually, let me think about the mAP@0.5 scoring more carefully. For each class, mAP@0.5 is computed. A detection is a TP if:
+- It's assigned to the correct class
+- IoU > 0.5 with a GT box of that class
+- It's the highest-scoring unassigned detection for that GT box
+
+The key insight from the brief: "mAP@0.5 rewards, per class: (a) the right class on boxes that overlap a true defect, and (b) good ranking: true detections should score higher than false ones."
+
+So for each class, we need:
+1. Correct class assignment (accuracy)
+2. Good ranking (true detections scored higher than false detections)
+
+The current approach outputs all 4 classes per box with score = conf × p[c]. This means for a box that's actually a pore, we output:
+- pore: conf × p[pore] (high)
+- deposit: conf × p[deposit] (low)
+- etc.
+
+The low-scoring rows for wrong classes are FPs for those classes. But since they're low-scoring, they should be ranked below the TPs. However, if there are many boxes, the accumulated FPs might still hurt.
+
+Wait, but e014 tried top-1 only and it was rejected (0.5916). So outputting all 4 classes is better than top-1 only.
+
+Let me think about what else could help...
+
+Actually, I notice that the current training uses `TRAIN_ON = ("high",)` - only high-res crops. e003 tried including low-res and it was rejected (0.6251). So high-res only is better.
+
+What about the two-crop approach? Currently we use tight (1.5x) and wide (2.5x) crops. What about using three crops or different context sizes?
+
+Actually, let me think about a different angle. The brief says "Several rows per box (one per class) are allowed and often help." We're already doing this.
+
+What about the scoring function? Currently: score = conf × p[c]. What if we use:
+- score = conf^α × p[c]^β for some α, β
+- score = conf × p[c] / (1 - p[c]) (odds)
+- score = conf × p[c] × (p[c] - p[second]) (margin)
+
+Actually, e004 tried p² (rejected), e008 tried conf × p[c] × max(p) (rejected). So simple modifications to the scoring haven't worked.
+
+Let me think about the architecture angle again. What if we try a slightly different model?
+
+Actually, I just realized something. The e017 timeout was because IMG_SIZE=224 made everything slower. But what if we keep IMG_SIZE=160 for training but use a different model? Or what if we reduce the number of training steps to fit a larger image size?
+
+Actually, let me think about this differently. The current training does 387 steps in 115s. That's about 0.3s/step. With 224x224, it's about 0.37s/step (from the log: 318 steps in ~100s of training time). So the per-step time increases by about 23%.
+
+What if we try IMG_SIZE=192? That's 1.44x the pixels of 160x160. The per-step time might increase by about 15-20%. So 387 steps might become about 330 steps. That should still fit in the time budget.
+
+But wait, e017 at 224x224 did 318 steps in about 100s (from the log, epoch 2 was partial). The total training time was about 115s (same as 160x160). So the number of steps decreased from 387 to 318 (18% fewer). The per-step time increased from 0.30s to 0.36s (20% increase).
+
+For 192x192 (1.44x pixels of 160x160), the per-step time might increase by about 12-15%. So we'd get about 340-350 steps. That should be fine.
+
+But would 192x192 actually help? The pretrained EfficientNet-B0 was trained on 224x224. Using 192x192 is closer to 224 than 160 is. But the improvement from 160 to 192 might be marginal.
+
+Actually, let me reconsider the whole approach. What's the most impactful change we could make?
+
+Looking at the per-class scores again:
+- pore: 0.524 (very weak)
+- deposit: 0.626
+- discontinuity: 0.779 (good)
+- stain: 0.606
+
+The gap between discontinuity (0.779) and pore (0.524) is 0.255. That's a huge gap. What makes pore so hard?
+
+Pores are small holes in the weld. They might be:
+- Small in size (hard to see in a crop)
+- Visually similar to other defects or background
+- Rare in the training set
+
+The 2x oversampling of pore and stain (e016) helped a little. What about 3x or 4x oversampling?
+
+Actually, let me check the class distribution. The training set has 6052 GT boxes. If pore and stain are the weak classes, they probably have fewer examples. Let me think...
+
+If we have 4 classes and 6052 boxes, roughly 1500 per class. But if pore and stain are weak, maybe pore has ~800 and stain has ~1000. The 2x oversampling would give pore ~1600 and stain ~2000, bringing them closer to the other classes.
+
+What about 3x oversampling? That would give pore ~2400 and stain ~3000. But this might overfit to those classes.
+
+Actually, let me think about a completely different approach. What about using the detector confidence more cleverly?
+
+The detector confidence is a measure of how likely the box contains a defect (not background). The classifier probability is a measure of which class the defect is. Currently we multiply them: score = conf × p[c].
+
+But what if the detector confidence is not well-calibrated? For example, if the detector gives high confidence to boxes that are actually background, the score would be high for background boxes, hurting the ranking.
+
+What if we use the detector confidence as a gate: only output predictions for boxes with conf > threshold? But this might drop true detections.
+
+Actually, let me think about what's most likely to give a measurable improvement.
+
+Given the constraints (one idea per turn, focused edit), I think the most promising directions are:
+
+1. **Try a different architecture** (e.g., regnety_016 or convnext_atto) - but the ConvNeXt attempt failed, so this is risky.
+2. **Increase oversampling of weak classes** (3x instead of 2x) - simple change, low risk.
+3. **Use a different scoring function** - several have been tried and rejected.
+4. **Add data augmentation** - MixUp was tried (not confirmed), more jitter was tried (not confirmed).
+5. **Ensemble** - train two models and average. But this might not fit in the time budget.
+
+Let me go with option 2: increase oversampling to 3x for pore and stain. This is a simple, low-risk change that directly targets the weak classes.
+
+Wait, but e016 already tried 2x oversampling and it became the new best. Going to 3x is a natural extension. But will it help?
+
+The risk is that 3x oversampling might cause the model to overfit to pore and stain, hurting the other classes. But since pore and stain are the weak classes, this might be worth it.
+
+Actually, let me reconsider. The current training set is 9084 boxes (6052 GT + 3032 oversampled). With 3x oversampling, it would be 6052 + 2*3032 = 12116 boxes. That's a 33% increase in training data. The training time would increase proportionally.
+
+Current: 387 steps in 115s. With 33% more data: about 515 steps in 152s. That's cutting it close with the 65s reserve (total 217s > 180s budget). So 3x oversampling might cause a timeout!
+
+Let me calculate more carefully. The training loop runs until `time.time() >= t_end` where `t_end = deadline - RESERVE_S`. So the training will stop when it reaches the reserve time. The number of steps is determined by the time budget, not the data size. With more data per epoch, each epoch takes longer, so fewer epochs complete. But the total number of steps in the training time window should be similar (since it's time-based, not epoch-based).
+
+Wait, actually the training loop is:
+```python
+while not done:
+    for xt, xw, y in dl_tr:
+        ...
+        if time.time() >= t_end:
+            done = True
+            break
+```
+
+So it keeps iterating through the data until the time budget is used up. With more data per epoch, each epoch takes longer, but the total number of steps in the training window is determined by the per-step time, not the data size. So the total number of steps should be roughly the same (387 steps), just with more data per epoch.
+
+Actually wait, the number of steps per epoch is `len(train_rows) / BATCH_SIZE`. With 2x oversampling: 9084 / 64 = 141 steps/epoch. With 3x oversampling: 12116 / 64 = 189 steps/epoch. The per-step time is the same (0.30s), so 141 steps take 42s and 189 steps take 57s. The total training time is 115s (from t_start to t_end). So with 2x: 115/42 = 2.7 epochs. With 3x: 115/57 = 2.0 epochs.
+
+The total number of steps is about the same (387 vs 387), but the model sees each example fewer times. With 2x oversampling, each pore/stain example is seen about 2.7 * 2 / 9084 * 6052 ≈ 3.6 times per epoch... wait, I'm overcomplicating this.
+
+Let me just think about it simply: the total number of training steps is determined by the time budget (about 387 steps). The composition of the training set changes (more pore/stain examples). The model sees the same number of total examples, but a higher fraction are pore/stain. This should help the model learn pore/stain better.
+
+The risk is that the model might become biased towards pore/stain and hurt the other classes. But since pore/stain are the weak classes, this is probably worth it.
+
+Actually, I realize I should think about this more carefully. The current 2x oversampling means:
+- pore: 2x (if it was N, now 2N)
+- stain: 2x (if it was M, now 2M)
+- deposit: 1x
+- discontinuity: 1x
+
+With 3x:
+- pore: 3x
+- stain: 3x
+- deposit: 1x
+- discontinuity: 1x
+
+The total number of training examples increases, but the total number of steps in the time window stays the same. So the model sees a higher fraction of pore/stain examples per step. This should help.
+
+But wait, there's a subtlety. The DataLoader shuffles the data. With more pore/stain examples, each batch has more pore/stain examples on average. This is equivalent to class-weighted loss but through data sampling. The brief says "Class-weighted loss hurt classification every time it was tried." But data oversampling is different from class-weighted loss - it changes the distribution of examples seen, not the loss weights.
+
+I think 3x oversampling is a reasonable next step. Let me go with that.
+
+Actually, wait. Let me reconsider. The e016 change was from 1x to 2x oversampling, and it improved the 5-seed mean from 0.6314 to 0.6337 (a 0.0023 improvement). That's within the noise range (±0.005 to 0.01). So the 2x oversampling might not have been a real improvement.
+
+Hmm, but it was confirmed as the new best after 5 seeds. So it was a real improvement, just a small one.
+
+Going from 2x to 3x might give a similar small improvement. But it's a low-risk change.
+
+Let me think about other options...
+
+What about trying a different model? The ConvNeXt attempt failed, but that might have been due to the model being too large. What about convnext_atto (very small, about 2M params) or convnext_pico (even smaller)?
+
+Actually, convnext_pico is extremely small (about 0.4M params). It might not have enough capacity for this task. convnext_atto is about 2M params, similar to EfficientNet-B0.
+
+What about regnety_016? It's about 9M params, a bit larger than EfficientNet-B0. It might have better features but train a bit slower.
+
+Let me think about the time budget. Current training: 387 steps in 115s = 0.30s/step. With regnety_016 (2x the params), the per-step time might be 0.40-0.50s. So we'd get about 230-290 steps in 115s. That's a significant reduction in training.
+
+I think the safest bet is to try 3x oversampling. It's a small, focused change that directly targets the weak classes.
+
+Actually, let me reconsider one more time. Let me look at what hasn't been tried:
+
+1. Different architecture (ConvNeXt failed, but other models untried)
+2. Different IMG_SIZE (224 timed out, 192 untried)
+3. Different scoring (several tried, all rejected)
+4. Different augmentation (MixUp, jitter tried)
+5. Different loss (label smoothing, focal loss tried)
+6. Different sampling (2x oversampling tried, 3x untried)
+7. Different context (3.5x tried, not confirmed)
+8. Ensembling (untried)
+9. Test-time augmentation beyond hflip (e.g., vertical flip, rotation)
+
+I think the most promising untried idea is **ensembling**. The brief explicitly mentions "ensembling within the time budget" as an in-scope idea.
+
+How could we ensemble? We could:
+1. Train two models with different architectures and average their predictions.
+2. Train two models with different random seeds and average.
+3. Train one model and use TTA (already doing hflip).
+
+Option 1 is the most impactful. But it requires fitting two models in the time budget. Currently, one model takes about 115s to train. Two models would take 230s, which exceeds the 180s budget.
+
+Unless we use smaller models. For example:
+- Model 1: EfficientNet-B0 (4M params) - current
+- Model 2: convnext_atto (2M params) - faster to train
+
+Or:
+- Model 1: EfficientNet-B0 at 160x160
+- Model 2: EfficientNet-B0 at 128x128 (faster)
+
+Actually, training two models of the same size won't fit in the time budget. We'd need to either:
+- Use smaller models
+- Reduce the training time for each model
+- Use a different approach
+
+Hmm, this is getting complicated. Let me go back to the simpler idea.
+
+Actually, I just thought of something. What about using the low-res training crops for a second model? The brief says "use of low-res training crops" is in scope. e003 tried including low-res crops in the same training set and it was rejected. But what if we train a separate model on low-res crops and ensemble?
+
+No, that's too complex for one turn.
+
+Let me just go with 3x oversampling. It's simple, focused, and directly targets the weak classes.
+
+Wait, actually, I want to reconsider the architecture angle one more time. The ConvNeXt attempt (e006) scored 0.2901, which is suspicious. Let me think about what could have gone wrong.
+
+Looking at the code, the model is created with:
+```python
+model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
+```
+
+For convnext_nano, this should work. But maybe the issue is:
+1. The model is too large and didn't converge in the time budget.
+2. The pretrained weights weren't loaded correctly.
+3. Some other bug.
+
+If it's issue 1 (model too large), then trying a smaller ConvNeXt (atto or pico) might work. But if it's issue 2 or 3, then any ConvNeXt might fail.
+
+Actually, the score of 0.2901 is very close to random (0.25 for 4 classes). This suggests the model didn't learn anything useful. If it was a convergence issue, the score would be somewhat above random (maybe 0.35-0.40). A score of 0.2901 suggests the model is basically untrained or broken.
+
+Could it be that the pretrained weights weren't loaded? If `pretrained=True` fails silently (e.g., no internet), the model would start from random initialization and might not converge in 3 epochs. But the brief says "No internet" and "Pretrained weights are available only for these timm models." So the weights should be available locally.
+
+Hmm, but what if the weights file is missing or corrupted for convnext_nano? That would cause the model to start from random initialization.
+
+Actually, I think the most likely explanation is that convnext_nano is too large (about 50M params? No, that's ConvNeXt-Tiny. ConvNeXt-Nano is about 10-15M params) and didn't converge in the available training time.
+
+Let me check: EfficientNet-B0 has about 4M params. ConvNeXt-Nano has about 50M params? No, that can't be right. Let me think...
+
+ConvNeXt architectures:
+- ConvNeXt-Tiny: 28.6M params
+- ConvNeXt-Small: 50.2M params
+- ConvNeXt-Base: 88.6M params
+
+ConvNeXt-Nano and ConvNeXt-Atto are not standard ConvNeXt variants. They might be from the "convnext" family in timm with different naming. Let me think...
+
+Actually, in timm, the convnext models are:
+- convnext_tiny: 28.6M
+- convnext_small: 50.2M
+- convnext_base: 88.6M
+- convnext_large: 304.5M
+- convnext_xlarge: 543.7M
+- convnext_22k_221: 286M
+- convnextv2: various
+
+But the brief lists: convnext_atto, convnext_nano, convnext_pico. These are not standard timm model names. They might be custom or from a different source.
+
+Wait, looking at the timm documentation, I don't see convnext_atto, convnext_nano, or convnext_pico in the standard list. These might be from a newer version of timm or a custom addition.
+
+Actually, I just realized that the brief says "Pretrained weights are available only for these timm models: convnext_atto, convnext_nano, convnext_pico, efficientnet_b0, efficientnet_b2, mobilenetv3_large_100, regnety_016, resnet18, resnet26d, resnet34, resnet50, tf_efficientnetv2_b0"
+
+So these are the available models. convnext_atto, convnext_nano, convnext_pico are available. They might be very small models (atto = atom, nano = nanometer, pico = picometer, suggesting decreasing size).
+
+If convnext_nano is about 10M params, it's 2.5x larger than EfficientNet-B0. It might train 2-3x slower. In the time budget, it might only complete 1-2 epochs instead of 3. That could explain the poor score.
+
+What about convnext_atto? If it's about 2-3M params, it's similar to EfficientNet-B0 and should train at a similar speed. It might have different inductive biases that help with the weak classes.
+
+But I'm not sure about the exact parameter counts. Let me just try a different approach.
+
+Actually, you know what, let me think about this from a different angle. The current model is at 0.6337, and the ceiling is 0.758. The gap is 0.125. Even with perfect class assignment, we'd get 0.758. So the classifier is losing about 0.125 mAP due to wrong class assignments and poor ranking.
+
+The per-class scores are:
+- pore: 0.524
+- deposit: 0.626
+- discontinuity: 0.779
+- stain: 0.606
+
+If we could improve pore from 0.524 to 0.624 (matching deposit), the overall mAP would increase by about 0.100/4 = 0.025. That's a significant improvement.
+
+What makes pore so hard? Pores are small holes. They might be:
+1. Small in size (hard to see)
+2. Visually similar to background (dark spots)
+3. Rare in the training set
+
+The 2x oversampling helped a little. What about more aggressive augmentation for pore?
+
+Actually, let me think about the crop context. Currently:
+- Tight crop: 1.5x the box size
+- Wide crop: 2.5x the box size
+
+For small pores, the tight crop might be too small (just the pore and a tiny margin). The wide crop gives more context. But what if the pore is so small that even the wide crop doesn't show enough context?
+
+What about using a 3rd crop with even more context (e.g., 4x)? This would give the model more surrounding weld pattern to distinguish pore from other defects.
+
+But e009 tried increasing the wide crop from 2.5x to 3.5x and it was "not confirmed" (0.6342 seed 0, 0.6309 5-seed). So more context didn't help much.
+
+OK, I'm going to go with 3x oversampling. It's the simplest change that directly targets the weak classes, and it's a natural extension of e016.
+
+Let me write the code change.
+
+Current line:
+```python
+    train_rows = list(crops) + [c for c in crops if c["cls"] in (0, 3)]  # 2x oversample weak pore/stain
+```
+
+New line:
+```python
+    train_rows = list(crops) + [c for c in crops if c["cls"] in (0, 3)] * 2  # 3x oversample weak pore/stain
+```
+
+Wait, that's not right. `[c for c in crops if c["cls"] in (0, 3)] * 2` would give 2 copies of the filtered list, so 3x total (1 original + 2 copies). Let me verify:
+
+- `list(crops)` = all crops (1x)
+- `[c for c in crops if c["cls"] in (0, 3)]` = pore and stain crops (1x)
+- `[c for c in crops if c["cls"] in (0, 3)] * 2` = pore and stain crops (2x)
+
+So `list(crops) + [c for c in crops if c["cls"] in (0, 3)] * 2` = all crops (1x) + pore/stain (2x) = pore/stain 3x, others 1x. Yes, that's correct.
+
+Actually wait, let me re-examine the current code:
+```python
+train_rows = list(crops) + [c for c in crops if c["cls"] in (0, 3)]  # 2x oversample weak pore/stain
+```
+
+This is: all crops (1x) + pore/stain (1x) = pore/stain 2x, others 1x. Correct.
+
+For 3x:
+```python
+train_rows = list(crops) + [c for c in crops if c["cls"] in (0, 3)] * 2  # 3x oversample weak pore/stain
+```
+
+This is: all crops (1x) + pore/stain (2x) = pore/stain 3x, others 1x. Correct.
+
+Let me also update the print statement to reflect the change.
+
+Current:
+```python
+    print(f"train {len(train_rows)} boxes ({len(crops)} GT, weak 2x), eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
+```
+
+New:
+```python
+    print(f"train {len(train_rows)} boxes ({len(crops)} GT, weak 3x), eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
+```
+
+This is a focused, simple change. Let me finalize it.
+
+Actually, I want to double-check the time budget. With 3x oversampling, the training set is larger:
+- Current (2x): 9084 boxes → 141 steps/epoch
+- New (3x): 9084 + 3032 = 12116 boxes → 189 steps/epoch
+
+The per-step time is the same (0.30s). So:
+- Current: 141 steps/epoch × 0.30s = 42s/epoch. In 115s: 2.7 epochs, 387 steps.
+- New: 189 steps/epoch × 0.30s = 57s/epoch. In 115s: 2.0 epochs, 387 steps.
+
+The total number of steps is the same (387), so the training time is the same. The model just sees each example fewer times per epoch. This should be fine.
+
+The prediction phase is unchanged (same number of eval boxes, same model). So the total time should be the same as e016 (about 157s). Well within the 180s budget.
+
+OK, I'm confident in this change. Let me write it up.
+
+Hmm, actually, let me reconsider one more time. Is 3x oversampling the best use of this turn? Let me think about what else could be done...
+
+What about trying `tf_efficientnetv2_b0`? It's a different variant of EfficientNet that might have better features. It's available in the pretrained weights list. The parameter count is similar to EfficientNet-B0 (about 8M params vs 4M for B0). It might train a bit slower but could have better features.
+
+Actually, tf_efficientnetv2_b0 has about 7.8M params, which is about 2x EfficientNet-B0. The per-step time might be 1.5-2x slower. In the time budget, we'd get about 200-260 steps instead of 387. That's a significant reduction in training.
+
+But the features might be better. It's a tradeoff between training time and model quality.
+
+I think 3x oversampling is the safer bet. Let me go with that.
+
+Final answer: 3x oversampling of pore and stain.
+
+Let me write the SEARCH/REPLACE blocks.
+
+Block 1: Change the training set construction
+```
+SEARCH:
+    train_rows = list(crops) + [c for c in crops if c["cls"] in (0, 3)]  # 2x oversample weak pore/stain
+REPLACE:
+    train_rows = list(crops) + [c for c in crops if c["cls"] in (0, 3)] * 2  # 3x oversample weak pore/stain
+```
+
+Block 2: Update the print statement
+```
+SEARCH:
+    print(f"train {len(train_rows)} boxes ({len(crops)} GT, weak 2x), eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
+REPLACE:
+    print(f"train {len(train_rows)} boxes ({len(crops)} GT, weak 3x), eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
+```
+
+This is clean and focused. Let me finalize.

@@ -1,0 +1,263 @@
+===== attempt 1 =====
+Let me think carefully about this.
+
+Current state:
+- Best is e012: 5-seed mean 0.6363, 3-view logit averaging (1.5x, 2.5x, 4x crops), EfficientNet-B0, 160px, trained on true boxes only.
+- Per-class: pore 0.546, deposit 0.615, discontinuity 0.778, stain 0.606.
+- Diagnostics: class accuracy on overlapping boxes: pore 67%, deposit 75%, discontinuity 94%, stain 89%. Stain→deposit confusion (45), deposit→stain (63), pore→stain (18).
+- mAP if all boxes had correct class but kept my scores: 0.7400. So the wrong-class cost is 0.7400 - 0.6363 = 0.1037. That's huge.
+- Perfect class ceiling: 0.758. So score cost is 0.758 - 0.7400 = 0.018.
+
+So the dominant error is class decision on detector boxes that overlap true defects. The main confusion: stain/deposit (63+45=108), pore→stain (18), pore is weak (67%).
+
+Now let me review the history.
+
+Families tried:
+- Data: detector boxes as training data — exhausted, no gain (e001 crashed, e002 rejected, e020 rejected). Actually the earlier runs accepted it twice but tonight it's been rejected. Marked EXHAUSTED.
+- Augmentation: box jitter simulating detector error — e003 rejected, e005 rejected. 2 attempts, no gain.
+- Architecture: shared backbone concat (e004 not confirmed, e007 crashed, e021/e022/e023 crashed), size/aspect input (e008 not confirmed), 9-channel single pass (e024 not confirmed), 3rd view (e012 = best). Architecture has 1 new best (e012).
+- Inference: reserve tuning (e006 rejected), precompute crops (e010 timeout, e011 rejected, e016 timeout, e017 timeout, e018 crashed, e019 rejected, e025 crashed). EXHAUSTED, 5 crashed/timeout.
+- Optimisation: split LR (e009 rejected).
+- Other: 1 crashed.
+
+So the guide says:
+1. Consolidate: detector boxes as training data. But tonight it's been tried (e002, e020) and rejected. The guide said "if it fails twice, drop it." It failed twice tonight (e002 rejected, e020 rejected). So drop it.
+
+2. Close the box-quality gap: simulate detector errors (e003, e005 both rejected — 2 attempts, no gain). Weight/sample by box quality (not tried). Combine views better than averaging (e004, e007, e021-023, e024 — many attempts, mostly crashed or not confirmed).
+
+3. Buy training steps: precompute crops (many crashes/timeouts). The e025 crash was a persistent_workers bug.
+
+4. Fine-grained classes: confusion matrix.
+
+5. Last 1.5 hours: no big swings.
+
+Now, the most recent experiment e025 crashed due to a trivial bug: `persistent_workers=True` with `num_workers=0`. The fix is simple: set `persistent_workers=False` (or remove) when num_workers=0.
+
+But wait — the guide says "A bug: fix it once; a second failure: drop it." e025 was the first attempt at this particular precompute-with-multiprocessing approach. Actually let me look more carefully. The precompute-crops family has been tried many times: e010 (timeout), e011 (rejected), e016 (timeout), e017 (timeout), e025 (crashed). These are all "inference" category and marked EXHAUSTED with 5 crashed/timeout.
+
+Hmm, but e025 is a specific new approach: precompute K=4 variants per box with multiprocessing Pool, store in memory, serve from dataset with num_workers=0. This is different from e010/e011 which precomputed at exact box position. e025 precomputes K=4 jittered variants.
+
+Actually, the precompute approach keeps crashing/timing out. Let me think about whether it's worth fixing.
+
+The e025 precompute took 86s for 6052 boxes × 4 variants = 24208 crops. That's ~3.5ms/crop with multiprocessing. But it ate 86s of the 180s budget! That leaves only ~94s for training + prediction. Prediction alone is ~60s. So training would get only ~34s. That's way too little. The precompute is too expensive.
+
+Wait, but the point of precompute is to speed up training steps by removing per-step crop work. Let me reconsider.
+
+Actually the problem: precomputing 4 variants × 6052 boxes takes 86s. That's a lot. The original per-step crop work was ~0.39s/step. With 285 steps that's ~111s of crop work spread across training. If I precompute once (86s) and then each step is fast (just flip/brightness on precomputed arrays), I could do more steps.
+
+But 86s precompute + training + 60s prediction = already 146s before training. That leaves only 34s for training. That's worse than the current 111s training. So the precompute approach with K=4 is too expensive.
+
+Hmm. Let me reconsider. The real issue is that precomputing is slow because make_crop does PIL resize. 
+
+Actually, let me step back and think about what would actually help.
+
+The dominant error is class decision on detector boxes. The confusion is stain/deposit and pore. The guide's plan:
+- Direction 2 (box quality gap): simulate detector errors — tried twice (e003, e005), no gain. Weight/sample by box quality — NOT tried. Combine views better — tried many times, mostly crashed/not confirmed.
+
+Let me think about "weight or sample training boxes by box quality." The idea: the model is trained on true (perfect) boxes but tested on detector (imperfect) boxes. If I weight the training so the model sees more imperfect boxes... but I don't have imperfect boxes in the training set unless I add detector boxes (which failed). 
+
+Alternatively, the guide's direction 2 first item is "simulate detector errors on the true boxes during training: random shifts and scale changes so that the IoU between the jittered box and the true box covers the range the detector produces (about 0.5 to 1.0), instead of the current small crop jitter." This was tried in e003 and e005, both rejected. So that direction is exhausted (2 attempts, no gain).
+
+Wait, the guide says "Two failed variants of a direction: move to the next direction." So simulate-detector-error is done (e003, e005).
+
+Next: "weight or sample training boxes by box quality, so the model sees enough poorly placed boxes." This requires having poorly-placed boxes. If I add detector boxes to training (which failed in e002, e020), then weight them. But adding detector boxes failed. Hmm.
+
+Actually wait. Let me reconsider. The detector-boxes-as-training-data failed tonight (e002, e020 rejected). But in the EARLIER runs (the 5 previous 5-hour runs), it was accepted twice (5-seed 0.6337, 0.6342, +0.004). So it's a marginal improvement that doesn't pass today's stricter rule. So it's not a reliable gain.
+
+Let me think about what's fundamentally different and could give a broad gain across classes.
+
+The biggest lever: the class decision. The confusion matrix shows:
+- pore: 67% right. pore→stain (18), pore→deposit (5).
+- deposit: 75% right. deposit→stain (63), deposit→pore (2).
+- stain: 89% right. stain→deposit (45), stain→pore (9).
+- discontinuity: 94% right.
+
+So the main confusions: deposit↔stain (63+45=108), pore→stain (18).
+
+Pore is the weakest class (0.546 AP). Stain and deposit are confused.
+
+What could help all of these? Fine-grained texture. The guide says "Use the confusion matrix in the diagnostics. Look for one change that helps the whole pore / deposit / stain confusion, not one class."
+
+Ideas for fine-grained:
+1. Higher resolution input — tried (e014 timeout, and earlier "resolution and small-box handling" no gain).
+2. More context views — tried (3rd view = best, 4th view timeout).
+3. A better backbone for texture — ConvNeXt (e015 timeout).
+4. Test-time augmentation — no gain.
+5. Mixup/CutMix — no gain.
+
+Hmm. Let me think about what hasn't been tried.
+
+Actually, let me reconsider the whole approach. The score cost (0.758 - 0.7400 = 0.018) is small. The class cost (0.7400 - 0.6363 = 0.1037) is the big lever. So I should focus on class decision.
+
+Wait, but actually let me re-read: "mAP@0.5 if every box had its correct class but kept your scores: 0.7400 (yours: 0.6363). The difference is what wrong classes cost; the remaining gap to the perfect-classes ceiling in the brief is what your scores cost compared with the detector's conf."
+
+So:
+- 0.6363 (current)
+- 0.7400 (correct class, my scores) → class decision cost = 0.1037
+- 0.758 (perfect class, detector conf scores) → score cost = 0.018
+
+So class decision is the big lever (0.1037). I need to improve the class decision on detector boxes.
+
+Now, the key insight from the guide: "Stage 2 is a classifier that is very good on clean, hand-drawn boxes but is scored on stage-1 detector boxes: slightly misplaced, differently sized, many of them false alarms. Most of the remaining error is the class decision on detector boxes that do overlap a real defect (see the diagnostics: the gap between your mAP and 'mAP if every box had its correct class'). Treat this as a train/test mismatch problem first, a model-capacity problem second."
+
+So it's a train/test mismatch. The model sees perfect boxes in training, detector boxes in test.
+
+Directions to fix mismatch:
+1. Train on detector boxes (failed tonight, marginal in earlier runs).
+2. Simulate detector errors via jitter (e003, e005 failed).
+3. Weight/sample by box quality (not tried, but needs imperfect boxes).
+
+Hmm, all the mismatch directions have been tried and failed, except "weight/sample by box quality" which is hard without imperfect boxes.
+
+Wait, let me reconsider. Maybe the issue is that the jitter in e003/e005 was too aggressive or the wrong kind. Let me look at what e003 did: "with probability 0.5 each box's center is shifted by up to ~0.45x its long side in a random direction and its size scaled by..." — that's a big shift. And e005: "Precompute the detector's real box-error distribution from the train split (center offset and side scale of each det box vs the true box it overlaps, IoU>0.5) and, during training, jitter true boxes to match that measure."
+
+Both failed. So the mismatch-via-jitter direction is exhausted (2 attempts).
+
+Let me think differently. What about the model itself? The confusion is fine-grained (stain vs deposit, pore). 
+
+Actually, here's a thought: the current model uses 3 views (1.5x, 2.5x, 4x) all at 160px, logits averaged. The 4x view was the one that helped (e012, gain from pore). What if the issue is that at 160px, the fine texture is lost? The guide mentions "input resolution and how much of the object fills both matter."
+
+But higher resolution caused timeouts (e014 320px timeout) and no gain in earlier runs.
+
+Let me reconsider the budget. The log shows:
+- 14s loading
+- 111s training (285 steps)
+- ~60s prediction
+- 185s total
+
+The kill point is 180s but the run shows 185s total — wait, that's over 180. Let me re-read. "done: 4 epochs, 285 steps, 55313 prediction rows, 185s total". And RESERVE_S=55, so t_end = deadline - 55 = 180 - 55 = 125s. Training stops at 125s. Then prediction runs. Total 185s. But the budget is 180s! So the run actually exceeds 180s?
+
+Wait, that's confusing. Let me re-read the log:
+```
+train 6052 boxes, eval 41879 detections, 1022 images (14s)
+epoch 0: loss 0.6973, 94 steps, 69s
+epoch 1: loss 0.3390, 188 steps, 96s
+epoch 2: loss 0.2684, 282 steps, 123s
+epoch 3: loss 0.2421, 285 steps, 125s
+done: 4 epochs, 285 steps, 55313 prediction rows, 185s total
+```
+
+So training ends at 125s (4 epochs, 285 steps). Then prediction takes 185-125 = 60s. Total 185s. But the budget is 180s!
+
+Hmm, but this is the "current best" which scored 0.6363 on 5 seeds. So it must have completed successfully. Wait, maybe the "185s total" includes some overhead, or the deadline is actually a bit more than 180. Or maybe the harness allows a small overrun. Actually the brief says "At the limit the run is killed and counts as failed." So 185s would be killed at 180s.
+
+Wait, let me reconsider. Maybe the --seconds is not exactly 180. The brief says "T is the total wall-clock budget." The log shows 185s total. If the budget were 180, it would be killed. But it's the current best, so it must have succeeded. 
+
+Hmm, this is a discrepancy. Let me look again. Actually maybe the seed-0 run that's shown here had --seconds slightly higher, or the 185s is a miscount. Actually, the "done" line prints time.time() - T0 which is 185s. If the budget is 180s, this run would be killed. But it's listed as the current best with 5-seed mean 0.6363.
+
+Wait — maybe the harness runs with a longer budget for the "best" confirmation, or the 185s is just barely over and the harness has some slack. Actually, re-reading: "The harness scores the eval boxes on validation images and shows you the score." And "If it beats the current best mean, it is re-run with more seeds." So e012 was confirmed with 5 seeds, meaning all 5 runs completed. So the budget must be at least 185s, or the runs were under 180s on average.
+
+Actually, I bet the --seconds for the confirmed runs might be different, or there's measurement variance. The seed-0 run shown is 185s. This is a concern: the current best is running right at the edge. If I add any work, I'll time out. If I remove work (faster prediction, more training), I might be safer.
+
+Actually, this is a critical observation. The current best is at 185s total with a 180s budget (nominally). That's dangerously close. Actually wait, let me reconsider — maybe the budget is higher. Let me look at e017's hypothesis: "The log shows the 3-view prediction phase costs ~60 s against a 55 s reserve (run ends at ...)". And e016: "The current run spends 14 s loading + ~111 s training + ~60 s prediction (185 s total, only ~5 s under the kill point)". 
+
+"only ~5 s under the kill point" — so the kill point is ~190s? That means --seconds is ~190, not 180. Hmm, but the brief says 180. Let me re-read the brief: "T is the total wall-clock budget (loading, training, prediction)." And the command is `python train.py ... --seconds T`. The brief's example says the budget. Actually the brief doesn't explicitly say T=180; it says the guide mentions "The binding constraint is 180 s." So T=180.
+
+But e016 says "185 s total, only ~5 s under the kill point" — that implies kill point ~190s. Contradiction. Unless the kill point is 180 and "5s under" is a miscalculation by the previous agent.
+
+This is getting confusing. Let me just be conservative: the current best is at ~185s with the nominal 180s budget. That means it's RIGHT AT THE EDGE or the budget is actually a bit higher. Either way, I have almost no room to add work. I should either:
+(a) keep the same compute (no added work), or
+(b) reduce work to be safe.
+
+Given that, experiments that add views, increase resolution, or add test-time augmentation are risky (timeouts). The safe bets are:
+- Changes that reduce per-step or per-prediction cost (to buy training steps).
+- Changes that are compute-neutral but improve the model.
+
+Let me think about compute-neutral changes that target the class decision.
+
+Idea: The confusion is fine-grained. What if I improve the training to better separate stain/deposit/pore? 
+
+Actually, here's a thought I haven't seen tried: **the model is trained with a plain CrossEntropyLoss. What about label smoothing?** No, the brief says "Label smoothing improves calibration in some settings but can reduce the information in class probabilities that ranking metrics use." And it's not clearly helpful. Probably not.
+
+What about **the number of training steps / learning rate schedule**? The loss is still falling at the cut (0.242). More training would help. But I can't add time without risking timeout. Unless I make training faster.
+
+Wait — here's a key opportunity. The prediction phase takes ~60s. The reserve is 55s. If I can make prediction faster, I can either (a) be safer, or (b) reduce the reserve and train longer. 
+
+How to make prediction faster? The prediction phase crops and resizes all 41,879 eval boxes × 3 views. That's 125,637 crops. At ~0.48ms/crop that's ~60s. 
+
+Idea: **Precompute the eval crops once.** But that's what e016/e017/e025 tried and they timed out/crashed. The problem is precomputing 41,879 eval boxes is expensive (~55s just for eval crops). Actually e025 precomputed only training crops (6052 × 4 = 24208, 86s) — wait that's more expensive per crop than I thought.
+
+Hmm, actually the precompute approaches keep failing. Let me not go down that path.
+
+Let me reconsider. What's the safest high-value experiment?
+
+Actually, let me reconsider the mismatch problem from a different angle. The guide says "weight or sample training boxes by box quality, so the model sees enough poorly placed boxes." The key realization: I can create imperfect boxes by JITTERING the true boxes, and I can CONTROL the IoU. Instead of adding detector boxes (which failed), I generate synthetic imperfect boxes by jittering true boxes to a target IoU, and train on a MIX of perfect and imperfect boxes. This is different from e003/e005 which replaced the jitter with detector-error simulation.
+
+Wait, but e003/e005 did exactly "jitter true boxes to simulate detector error." And they failed. So that's the same idea.
+
+Hmm. Let me think about what's fundamentally different.
+
+Actually, maybe the issue with e003/e005 is that they made ALL training boxes imperfect (or half of them), which degraded the clean-box performance. The better approach: keep the clean boxes AND add imperfect versions (data augmentation), so the model sees both. But that's basically more augmentation, which is "no gain" family.
+
+Let me step back and think about the architecture direction, which produced the best (e012) and has 3 "close but not confirmed."
+
+e024: 9-channel single forward pass (stack 3 crops) — 0.6355, not confirmed. This is compute-cheaper (1 forward pass instead of 3) but not confirmed (slightly below e012's 0.6363).
+
+Actually, e024 being compute-cheaper is interesting: if I do 1 forward pass per box instead of 3, I could train much faster and get more steps. But it scored slightly lower (0.6355 vs 0.6363). The difference is within noise. But if I combine it with more training steps (because it's 3x faster per step), it might win.
+
+Wait, that's a good idea! e024 (9-channel, 1 pass) is ~3x faster per step than e012 (3 passes). If I use e024's architecture but train longer (more steps) because each step is cheaper, the model might be better trained and beat 0.6363. The "not confirmed" was because it was trained for the same wall time, so fewer steps... no wait, if it's faster per step, it'd have MORE steps in the same wall time. Let me reconsider.
+
+Actually e024: "Stack the three crops into a single 9-channel input and run ONE EfficientNet-B0 forward pass per box (stem re-initialised by repeating the pretrained 3-channel kernel), instead of three separate passes with shared weights." 
+
+Hmm, "instead of three separate passes with shared weights" — wait, the current e012 runs model(xt) + model(xw) + model(xw2), which is 3 forward passes through the SAME model (shared weights). So e012 already shares weights, just does 3 passes. e024 does 1 pass with 9 channels. So e024 is ~3x faster per step (1 pass vs 3 passes).
+
+But e024 scored 0.6355, slightly below e012's 0.6363. Why? Possibly because the 9-channel stem (repeating the 3-channel kernel) is a weaker initialization, or because 1 pass doesn't capture the multi-scale as well. But it's within noise.
+
+Now, if e024 is 3x faster per step, then in the same training budget it does ~3x more steps. More steps = better trained. So e024-with-more-steps might beat e012. But e024 was already run for the full budget (it's a complete experiment), so it already had ~3x the steps of e012... no wait. Let me think.
+
+Actually no. Both e012 and e024 run for the same wall-clock training budget (until t_end). e012 does 3 passes/step, e024 does 1 pass/step. So e024 does ~3x more steps in the same time. So e024 already benefits from more steps. And it scored 0.6355, slightly below e012's 0.6363. So the 1-pass architecture is slightly worse per-step, and even with 3x more steps it's about the same.
+
+Hmm, so that direction (single pass) is roughly neutral. Not a clear win.
+
+Let me reconsider. What's the actual bottleneck and what's the best use of a run?
+
+Let me reconsider the time budget issue. The current best runs at 185s. If the budget is 180s, it's over. But it's the confirmed best, so it must be completing. I think the safest interpretation: the budget is ~180-190s and the current best is right at the edge. I should NOT add any per-box work. I should either keep compute the same or reduce it.
+
+Given that, let me think about a compute-neutral or compute-reducing change that targets the class decision.
+
+Option A: **Reduce prediction cost to buy training time.** If I can cut prediction from 60s to ~40s, I can reduce RESERVE_S from 55 to ~35 and train ~20s longer (more steps). More steps → better class decision. This is the "buy training steps" direction. But the precompute approaches keep failing.
+
+How to cut prediction cost without precompute? 
+- The prediction does 3 forward passes per box (model(xt), model(xw), model(xw2)). If I use the 9-channel single-pass architecture (e024), prediction is 3x faster (~20s instead of 60s). Then I have more reserve margin AND can train longer.
+
+Wait, this is a combination: use e024's 9-channel architecture (which is 3x faster per step), which:
+1. Makes training steps 3x faster → more steps in the same budget.
+2. Makes prediction 3x faster → 20s instead of 60s.
+3. So I can reduce RESERVE_S to ~30 and train for ~135s instead of ~111s.
+
+Net effect: much more training (more steps) AND safe on time. The architecture is slightly weaker per-step (0.6355 vs 0.6363 at equal wall time) but with 3x more steps it should be better trained.
+
+But wait, e024 was ALREADY run for the full budget and scored 0.6355. If I now run e024 with a smaller reserve (more training time), would it do better? e024's training was already for the full budget minus 55s reserve. If I reduce the reserve, e024 trains longer. Since e024 is faster per step, reducing the reserve gives it proportionally more steps.
+
+Hmm, but actually e024 already trained until t_end = deadline - 55. If I reduce reserve to 30, t_end = deadline - 30, so 25s more training. For e024 (fast per step), that's ~25s × (steps/sec). If e024 does ~3x steps of e012, and e012 did 285 steps in 111s (~2.6 steps/s), e024 does ~7.8 steps/s. So 25s more = ~195 more steps. That's a lot more training. Could help.
+
+But this is getting complicated and e024 was "not confirmed" (0.6355). The risk is that the 9-channel stem is genuinely weaker and more steps don't fully compensate.
+
+Let me think of something cleaner.
+
+Option B: **Focus on the class decision via a training change that's compute-neutral.**
+
+The confusion is stain/deposit/pore. What if the issue is that the model needs to see the object at higher effective resolution for fine texture, but I can't increase input size (timeout)? 
+
+Alternative: **Use a different, texture-focused backbone that's faster.** ConvNeXt (e015) timed out. But maybe a smaller/faster backbone with texture focus? The available pretrained models: convnext_atto, convnext_nano, convnext_pico, efficientnet_b0, efficientnet_b2, mobilenetv3_large_100, regnety_016, resnet18, resnet26d, resnet34, resnet50, tf_efficientnetv2_b0.
+
+convnext_atto and convnext_pico are smaller than nano. They might be faster and fit in budget. But "bigger or other backbone" family is "no gain" (8 attempts). So changing backbone is exhausted.
+
+Hmm.
+
+Option C: **Re-examine the score.** The score cost is only 0.018 (0.758 - 0.7400). The class cost is 0.1037. So focus on class. But the class decision is the hard part.
+
+Wait, let me reconsider. Actually, maybe I'm overthinking the time budget. Let me re-read the log once more:
+
+```
+done: 4 epochs, 285 steps, 55313 prediction rows, 185s total
+```
+
+And the reserve is 55s. t_end = deadline - 55. Training stops at t_end. If deadline = 180, t_end = 125. Training ends at 125s (matches "epoch 3 ... 125s"). Then prediction: 185 - 125 = 60s. So prediction takes 60s, but the reserve was only 55s! So the run OVERSHOOTS by 5s (185 > 180). 
+
+But it's the confirmed best. So either:
+1. The budget is actually >185s (maybe 190 or 200), OR
+2. The harness has slack, OR
+3. The seed-0 run shown is an outlier and the 5-seed runs were under budget.
+
+Given e016 says "185Thinking budget reached. Stop thinking now and write the reply in the required format.

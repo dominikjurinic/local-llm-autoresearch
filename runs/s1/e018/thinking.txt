@@ -1,0 +1,322 @@
+===== attempt 1 =====
+Let me analyze the situation carefully.
+
+## Current state
+- Current best: e000 (5-seed val mAP@0.5 0.6288)
+- The two-stage system: stage-1 detector boxes + stage-2 classifier
+- Reference numbers on validation:
+  - one-step 4-class baseline: 0.638
+  - stage-1 boxes with perfect classes (ceiling): 0.758
+  - stage-1 boxes scored as single class 'defect': 0.755
+- Current score: 0.6288
+- If every box had correct class but kept your scores: 0.7461
+
+## Error analysis
+The diagnostics show:
+- True defect boxes with right class chosen: pore 63%, deposit 78%, discontinuity 96%, stain 88%
+- The gap from 0.6288 to 0.7461 is due to wrong classes
+- The "perfect classes ceiling" is 0.758, so even with correct classes your scores cost ~0.012 relative to the ceiling
+
+Key insights:
+1. The classification error is substantial - especially pore (63% right) and deposit (78% right)
+2. Pore is the weakest class - 63% correct
+3. Stain is often confused with deposit (46 deposit vs 540 stain correct)
+4. The dominant loss is wrong-class assignment, not ranking
+
+## What's been tried (from history):
+- Scoring: product rule conf × p(c), different rules - no gain
+- Architecture: bigger models, resolution changes, backbones, logit averaging variants - mostly no gain or crashed/timeout
+- Data: training on detector boxes, third view (4×) - small gains only
+- Optimization: SWA, class balancing - no gain
+- Augmentation: rotations, mixup - no gain
+- Focal loss - no gain
+- Box size as input - never properly tested
+
+## Analysis of the current setup
+The current best e000 uses:
+- EfficientNet-B0 at 160px
+- Two crops: tight (1.5×) + wide (2.5×), logits averaged
+- Cross-entropy loss, AdamW, cosine decay
+- Score = detector conf × class probability
+
+The reference numbers tell us:
+- Perfect classes ceiling: 0.758
+- Current with correct classes: 0.7461
+- So even if we fix classification to perfect, we're still ~0.012 below the perfect-classes score (due to score ranking differences)
+
+Actually wait - the reference says "stage-1 boxes scored as a single class 'defect': 0.755 mAP@0.5" and "d2_class_agnostic_val_map50: the detector alone, if defect types did not matter." So the detector alone gets 0.755 when classes don't matter. The perfect-classes-with-your-scores gives 0.7461. Interesting - so your scores are slightly worse than the detector conf for ranking within a class? No wait...
+
+Actually let me re-read: "mAP@0.5 if every box had its correct class but kept your scores: 0.7461 (yours: 0.6288)". And the ceiling with perfect classes + detector conf as score is 0.758. So the gap from 0.7461 to 0.758 is about 0.012, which is the ranking/score cost.
+
+The key question: what's the largest fixable error? The classification errors (especially pore and deposit) are the biggest issue. Getting pore from 63% to near-perfect could gain significant mAP.
+
+## What hasn't been tried or needs more thought:
+1. **Class-specific handling**: The classes have very different accuracy (63% for pore vs 96% for discontinuity). Discontinuity is basically solved. Pore and deposit are the problems. Why? Pores are small, stain/deposit confusions need fine texture.
+
+2. **Pore specifically**: 63% correct, often confused with deposit (6 deposit chosen) and stain (20 stain chosen!). Stain is the biggest confusion for pore: true pore → 20 stain. And true stain → 46 deposit, 15 pore. So there's a lot of cross-talk between pore/stain/deposit.
+
+3. **What could help**:
+   - Better feature resolution for small defects (pores)
+   - Better handling of the pore-stain-deposit triangle
+   - Maybe the "two-crop" averaging isn't optimal - maybe per-class weighting of tight vs wide crop
+
+Let me think about what's feasible given the budget:
+- The current run at 160px takes ~162s (including loading) with 5 epochs/433 steps
+- The e017 attempt (224px + CONTEXT 2.0) timed out at 192s
+
+The reference number for "third, very wide view (4× next to 1.5× and 2.5×)" was accepted twice but gain only ~0.005 on pore, and it pushed close to the time limit.
+
+## Ideas for improvement:
+1. **Increase resolution more carefully**: The e017 attempt with 224px timed out. But we could reduce other costs (e.g., fewer epochs, smaller batch). Actually, the gain from resolution changes hasn't been clearly established - multiple architecture attempts failed or showed no gain.
+
+2. **Per-class crop weighting**: The hypothesis "Different defect classes rely on different mixtures of fine texture and context" was tried in e014/e015/e016 (crashed/edit-failed, never properly tested). This is interesting - a learned MLP over concatenated features instead of logit averaging.
+
+3. **Pore-specific handling**: Pores are small defects. Maybe use a separate model or special crop strategy for small boxes? Or the "larger MIN_CROP" idea from history (never confirmed gain).
+
+4. **Better training data / labels**: Train on detector boxes with background label (e010/e011) - crashed. But e009 trained on detector boxes gave +0.0017, and the class imbalance issue with background=0 was identified.
+
+5. **The score ranking**: Maybe use a different combination than conf × p(c). The history says no gain there though (e004 rejected).
+
+6. **Ensemble/averaging models**: The history mentions "2-3 model ensembles" tried with no gain.
+
+7. **What about the fact that pore is small?** Let me think about this more carefully. Pores are small defects, and they get 63% accuracy. The diagnostic says "small boxes: 80% right". So even for small boxes, we're at 80%. But wait - the share of true defects with right class by size shows small 80%, medium 91%, large 93%. So actually the small boxes are harder but not catastrophically so. The pore confusion is more about the type: pores confused with stain (20/65 = 31%) and deposit (6/65 = 9%).
+
+Let me reconsider. Total true pore boxes overlapping by IoU>0.5: 48+6+1+20+1 = 76. Pore right: 48, so 63%. Stain chosen for 20 of them. True stain boxes: 15+46+9+540+4 = 614. So a big fraction of pores are being called stain.
+
+Why would a pore look like a stain? Both are relatively low-texture defects. A pore is a small dark spot; a stain is a larger discolouration. With the tight crop at 1.5×, maybe the small pore gets blurred/upsampled and loses its defining characteristic - the sharp dark centre. At 224px it might help but that timed out.
+
+Actually wait - let me reconsider the time budget issue. e017 took 192s at 224px because of 4 epochs with fewer steps (372 vs 433). The training time per step at higher resolution is what increased. Let me think about how to make 224px work within 180s.
+
+Actually, a smarter approach: the model trains on crops at IMG_SIZE. The crop size doesn't change per-image - it's always resized to (IMG_SIZE, IMG_SIZE). So at 224px, each forward pass is more expensive. But we could reduce batch size or epochs.
+
+Let me think about what fundamentally matters here:
+- Pore accuracy is only 63%. That's the single biggest weakness.
+- Discontinuity is essentially solved (96%).
+- The gap from current 0.6288 to the perfect-class ceiling 0.7461 is huge (0.117).
+
+What could plausibly gain 0.01+ on mAP? Getting pore accuracy from 63% to, say, 85% would be massive. That means identifying what distinguishes pores from stains/deposits.
+
+Actually, let me think about this differently. What do the classes look like visually?
+- Pore: small dark spot (like a pinhole)
+- Deposit: excess material around a pore
+- Discontinuity: gap/crack in the weld bead
+- Stain: discolouration (burnt area)
+
+The key confusion is pore→stain. Why? Perhaps because at the current resolution, the fine details of small pores are lost, and pores look like small stains. Or perhaps the model needs context: a pore is often surrounded by deposit (excess weld material), so seeing more context might help.
+
+Actually, here's an important insight from the history: "a third 4× view helped +0.005 mostly on pore". So wider context helps pores. But that pushed to the time limit.
+
+Let me think about a fundamentally different approach: **separate models per class group** or **specialized handling for small boxes**.
+
+Actually, let me reconsider the most promising direction that wasn't properly tested: **per-class weighting of the tight and wide crops (the MLP hypothesis from e014-e016)**. This was marked as "crashed" or "edit failed" so it wasn't actually tested. The idea is that different classes need different amounts of fine texture vs context. A learned combination could help, especially for pore (which might need more tight crop texture) vs stain (which might need more wide crop context).
+
+Alternatively: **a two-branch approach where the model explicitly handles different scales**. 
+
+Let me think about what's most likely to work given the constraints:
+1. Time budget is 180s
+2. Loading takes ~13s, prediction ~30s (roughly)
+3. Training at 160px: ~150s for 433 steps
+
+What about a cleaner idea that targets pore specifically and could be time-efficient? 
+
+**Idea: Train a dedicated model for small boxes / use multi-scale crops where the tight crop is larger.**
+
+Wait, actually, let me think about what makes sense given the "two-crop" design. The tight crop at 1.5× the box's long side... if a pore is small and the box is already small, then 1.5× may be too tight to capture context, but it's also too low-res for fine texture.
+
+Actually, let me reconsider: what about **increasing the number of crops per box** (e.g., three crops at different scales) or **using a multi-scale input**? The history shows "third, very wide view (4×)" helped slightly. 
+
+Hmm, let me think about the most promising untested idea.
+
+Actually, I want to revisit something. Let me look at the confusion pattern again:
+- True pore → 20 stain, 6 deposit, 1 discontinuity, 1 no-row = 28 wrong out of 75
+- The most confusing is pore→stain (33% of errors)
+
+The hypothesis "pore looks like a small stain at low resolution" seems strong. But increasing resolution timed out (e017).
+
+**What about training on smaller crops but with a different backbone or approach?** 
+
+Wait - actually, let me think about the **two-crop averaging** more carefully. The current model averages logits from tight and wide crops. But what if we instead use a learned combination? That's the e014-e016 idea that was never properly tested (crashed/edit failed).
+
+Actually, I realize there's a cleaner version of this idea that should work: **per-class soft weighting of tight vs wide crop logits**. Instead of averaging logit vectors (which is equivalent to equal weighting), learn per-class weights. But actually the simplest thing that captures "different classes need different mixtures" is a small MLP at the end that takes [tight_feat, wide_feat] and produces class logits. That's what e015/e016 tried.
+
+Let me think about whether that's likely to help:
+- Pore might need more fine texture (tight crop)
+- Stain might need more context (wide crop)
+- The current equal-weighting forces the same trade-off for all classes
+- A learned combination could adapt per class
+
+Actually wait, there's an important subtlety: both crops are run through the SAME backbone and then the mean-pooled features are averaged. Actually no - the model averages logits from two separate forward passes of the same backbone. The "tight" and "wide" features come from different crops but the same model weights.
+
+Hmm, let me think about a more direct approach: **use a single multi-scale input**. Instead of two crops that are both resized to 160px, we could concatenate crops or use a feature pyramid. But that changes the architecture substantially.
+
+Actually, let me think about what's simplest and most likely to help given the budget:
+
+**Idea: A per-class learned combination of tight and wide crops.** Replace `(model(xt) + model(xw)) / 2` with a small MLP that combines the mean-pooled features from both crops. This is basically e015/e016's idea but implemented properly this time.
+
+Actually, wait. Let me reconsider something more fundamental. The bottleneck for improving pore classification might be **the resolution of the tight crop**. A 1.5× crop resized to 160px means a small defect occupies relatively few pixels. If we increase IMG_SIZE to 224px, a small defect occupies (224/160)² = 1.96× more pixels. The e017 attempt timed out but that's fixable by adjusting the training loop.
+
+Let me estimate the time for 224px with adjusted budget:
+- At 160px: ~162s total, 433 steps in training (about 149s of training)
+- At 224px, forward pass is roughly (224/160)² ≈ 2× more expensive per pixel... actually for a CNN, the compute scales with output feature size which scales linearly with input size. So each forward pass might be ~1.5-1.8× more expensive.
+- To fit in 180s, we'd need to cut training time significantly
+
+Alternatively: **increase IMG_SIZE but reduce batch size** and keep steps similar? No, that would make per-step slower.
+
+Hmm, let me think about this differently. What about a **two-model ensemble**: one at 160px (for the general classification) and... no, that doubles compute.
+
+OK here's another thought: what if I use a **different input strategy for small boxes**? The idea: for boxes classified as pore (small defects), use larger crops. But this requires the model to handle variable crop sizes at inference, which complicates things.
+
+Actually, let me reconsider the simplest thing that fixes e017's timeout: **increase IMG_SIZE to 224 but reduce epochs/steps appropriately**. The current run does 433 steps in ~150s. At 224px, if each step is ~1.6× more expensive, we'd need about 270 steps in 150s. But fewer steps means less training...
+
+Alternatively, what about a **staged approach**: train at 160px first, then fine-tune at 224px? No, that would take even longer.
+
+OK, let me step back and think about what's fundamentally promising here.
+
+The diagnostic shows the classification error is the main loss. The largest single issue is pore (63% correct). Pore is confused primarily with stain (20/75 errors) and deposit (6/75).
+
+What distinguishes a pore from a stain? A pore is a small, sharp dark spot (a lack of material - a hole). A stain is a discoloration. In weld imagery, pores are tiny circular defects; stains are larger irregular discolourations. The model at 160px with 1.5× crops may be losing the "small and sharp" signature of pores.
+
+But actually, let me reconsider: the tight crop is 1.5× the box's long side. If the box already tightly encloses the pore, then the 1.5× crop adds context around it. The wide crop at 2.5× adds more context. 
+
+Here's a thought: **what if the model needs to see that a pore is small relative to context?** That's an explicit size cue. Actually, maybe the classifier should use box size as a feature? History says "Box size and aspect ratio as an extra model input" was "never properly tested".
+
+Let me reconsider the whole problem from the "what matters most" angle:
+- The gap from 0.6288 to 0.7461 (perfect classes, your scores): 0.117 - this is classification error
+- The gap from 0.7461 to 0.758 (perfect classes, detector conf): 0.012 - this is score ranking
+
+So fixing classification entirely could get us to ~0.746. That's a massive gain. Even getting pore from 63% to ~90% correct would help significantly.
+
+Now, what has NOT been tried properly:
+1. **Per-class learned combination of crops** (e014-e016 idea - crashed/edit failed)
+2. **Box size as a feature** (never properly tested)
+3. **Higher resolution with fixed time budget** (e017 timed out, but could be adjusted)
+
+Let me think about which is most promising:
+
+For the "learned per-class combination" idea - this was tried 3 times and all crashed or failed to edit. It's a somewhat complex change. But it targets the exact issue (different classes need different texture/context trade-offs).
+
+For "higher resolution" - e017 timed out at 224px. The gain from resolution changes hasn't been clear: history shows multiple architecture attempts with no gain or timeouts. The reference numbers suggest the two-crop system is already doing well.
+
+Actually, wait. Let me re-read the history more carefully. "Bigger or other backbone (EfficientNet-B2, ResNet-50, 2-3 model ensembles): no gain: best 5-seed 0.636 (not confirmed)". And "Resolution and small-box handling (224 px, larger MIN_CROP, enlarged tight crops for small boxes): no gain: best 5-seed 0.634".
+
+So resolution changes have been tried multiple times without a clean win. The architecture category is marked "EXHAUSTED?" with 9 ideas and only 3 actually run (2 crashed). 
+
+Hmm wait, let me re-read the categories more carefully:
+- architecture | 9 ideas | 3 ran | 0 new best | 7 crashed/timeout/bug/edit failed
+
+So 9 ideas proposed, only 3 actually ran, and none got a confirmed win. Most architecture changes crashed or failed. That's mostly about feasibility rather than the idea being bad.
+
+OK so here's what I want to consider:
+
+**The most promising untested direction: per-class combination of tight/wide crop features.** This was proposed as e014 (crashed), e015 (edit failed), e016 (crashed). All three were the same idea at different levels of implementation. The hypothesis remains plausible but hasn't been properly tested due to crashes.
+
+Alternatively, **the "box size as feature" idea** - this is a fundamentally different angle that targets the pore problem directly (pores are small; if the model knows the box is small, it can weigh the tight crop more heavily or apply special handling).
+
+Hmm, actually let me think about yet another angle: **the training labels**. What if we train the classifier to be robust differently? For instance, what if the issue is that the model is being trained on perfectly-centred, well-aligned crops but the detector boxes are noisy (shifted)? The history shows "training on detector boxes themselves" gave small gains but crashed.
+
+Let me think about **what's most likely to get a confirmed win**:
+1. A change that improves pore classification significantly (pore is 63% correct, the weakest class)
+2. Must work across classes and images (not just one image)
+3. Must be time-efficient
+
+I'm now thinking about a cleaner version of the per-class weighting idea: **use a learned soft-attention or gating mechanism between tight and wide features, applied per class**. Or more simply: learn a per-class weight for each crop and combine.
+
+Actually, here's an even simpler formulation that captures "per-class different mixtures": instead of averaging the two logit vectors element-wise (i.e., `(logit_t + logit_w) / 2`), we could compute `w_t(c) * logit_t(c) + w_w(c) * logit_w(c)` where w is learned. But that's just a per-class scaling of each crop's logits, which doesn't change the relative ranking within a class... wait, it does: it changes how much each crop contributes per class, which can reorder boxes for a given class if the two crops give different confidence levels for different boxes.
+
+Hmm actually no - within a single class, all boxes get the same w_t(c) and w_w(c), so the relative ranking within that class is preserved... wait no. Let me think again. If box A has logit_t(A) > logit_w(A) for class c and box B has logit_w(B) > logit_t(B), then different weights change the ranking. So yes, per-class weighting of the two crops CAN reorder boxes within a class.
+
+But actually the simplest version - equal weighting of logits from both crops - is already doing this implicitly by averaging. The learned version just makes it per-class adaptive.
+
+OK, let me think about what's most concrete and testable:
+
+**Experiment idea: Replace the fixed logit averaging with a learned per-class gating of tight vs wide crop.** 
+
+Implementation: extract mean-pooled features from each crop separately (f_t, f_w), concatenate [f_t; f_w], pass through a small MLP to get logits. This allows the model to learn class-specific combinations of fine texture and context.
+
+Actually, this is getting complex. Let me simplify: the current code does `(model(xt) + model(xw)) / 2` - averaging final logits. If I switch to taking mean-pooled features from each forward pass and combining them with a learned layer before the class head, that's more flexible.
+
+But wait - is there a simpler way? What about **learning a per-class weight for the two crops directly at inference**? No, we need it trained.
+
+Hmm, let me think about an alternative that targets the same issue but might be easier to implement and faster: **a per-class soft switch between tight and wide crop**. 
+
+Actually, you know what? Let me reconsider the problem from scratch with a cleaner head.
+
+The real question is: why is pore so hard (63%) and what's different about it?
+
+Pores are small dark spots. The confusion is mainly with stain (which is discoloration). At 160px resolution, a small pore might occupy only ~20-30 pixels in the tight crop. Fine texture details of the pore edge are lost in upsampling. 
+
+What if we make the model **multi-scale per box**: instead of two fixed crops, use three crops: tight (1.5×), medium (2.0×), wide (2.5×)? The history says a third 4× view helped slightly (+0.005 on pore). But what about a third view at an intermediate scale?
+
+Actually, the key issue might be that **pores need MORE resolution, not more context**. So:
+- Stain needs context (wide crop helps)
+- Pore needs fine texture (tight crop at higher resolution)
+- Deposit needs both
+
+The current setup uses one resolution (160px) for all. What if we could give pores a higher-resolution tight crop? But the model processes fixed-size inputs...
+
+Hmm, what about **training two models**: one specialized at high res for small boxes, one at regular res? That doubles the compute.
+
+OK let me think about a fundamentally different and simpler idea:
+
+**Idea: Use per-class crop scales.** Since we know the ground truth box sizes during training, and we could estimate box sizes at inference... no, too complex.
+
+**Idea: Multi-view with learned attention.** Still complex.
+
+Let me reconsider - what's the most promising, simple, time-efficient change?
+
+Actually, here's a thought experiment: the e017 attempt used IMG_SIZE=224 and CONTEXT=2.0 (reducing the wide crop to fit in budget). It timed out at 192s. The training took 4 epochs. If I could make it run within 180s, we'd know if higher resolution helps pore.
+
+But the history shows resolution changes have NOT reliably helped: "Resolution and small-box handling (224 px, larger MIN_CROP, enlarged tight crops for small boxes): no gain: best 5-seed 0.634". That's a different set of resolution changes though - it seems to have included "enlarged tight crops for small boxes" which is the multi-scale box idea.
+
+Hmm wait, that line in the history covers: IMG_SIZE=224 (e002/e003 timeout), larger MIN_CROP, enlarged tight crops for small boxes. The best was 0.634 (not confirmed). So resolution did help a bit but not enough to confirm.
+
+OK let me think about this more carefully. What's the "fundamentally different" idea that could break through?
+
+Let me reconsider the **per-class crop weighting / learned combination** idea seriously, since it was never properly tested due to crashes:
+
+The hypothesis: different classes need different mixtures of fine texture and context. Currently all 4 classes use identical weights (1:1 averaging of tight:wild). If pore needs more tight crop weight and stain needs more wide crop weight, a learned per-class combination should help. This is the e014-e016 family which crashed multiple times but was never properly tested.
+
+Implementation plan that avoids the crash issues:
+- Take mean-pooled features from each crop separately (don't use the final logits)
+- Concatenate [f_t; f_w] (or a weighted combination)
+- Pass through a learned layer to get logits
+
+Wait, actually the current code already uses `model(xt)` and `model(xw)` where model has num_classes=4. To combine at the feature level, I'd need to modify the model. Since timm gives us a feature extraction interface (e.g., `model.forward_features`), this is straightforward:
+
+```python
+f_t = model.forward_features(xt)  # mean-pooled features
+f_w = model.forward_features(xw)
+x = torch.cat([f_t, f_w], dim=1)  # [batch, 2*features]
+logits = model.head(x)  # needs adaptation
+```
+
+Actually, `timm` models have a specific structure: `model.forward_features` gives the pooled features, and `model.head` is the classifier. But `head` expects the input to match what the original forward produced. Let me think about this...
+
+For timm EfficientNet-B0, `model.forward_features(x)` returns the global pooled features [batch, 1280]. `model.head.fc` is the classifier from 1280 → num_classes.
+
+So I could do:
+```python
+f_t = model.forward_features(xt)
+f_w = model.forward_features(xw)
+f = torch.cat([f_t, f_w], dim=1)  # [batch, 2560]
+logits = model.head.fc(f)
+```
+This requires modifying the head. That's a clean implementation but it changes the architecture meaningfully (the classifier now takes concatenated features).
+
+Alternatively, keep using `model(xt)` and `model(xw)` for the logits, but combine them with a per-class learned weight... that's just linear weighting of the same dimension.
+
+Hmm, actually let me think about what's simplest: **learned per-class soft switch between crops**. The key insight is we want the model to learn "for class c, rely more on tight crop" vs "rely more on wide crop". 
+
+A clean implementation: for each crop, get the mean-pooled feature; then compute a per-class gating: `g = sigmoid(MLP([f_t, f_w]))` per class (4 values), and combine logits as `logits = g * logit_t + (1-g) * logit_w`. But wait, if we use the original model's logits (which are already transformed by the classifier head), we can't recombine them with a learned weight without retraining.
+
+Hmm actually - let me think about this differently. The current system averages logits: `(logit_t + logit_w)/2`. A natural generalization is to learn a per-class combination: `w_t[c] * logit_t[c] + w_w[c] * logit_w[c]`. But we need to learn w. This can be done by replacing the final layer with one that takes [logit_t, logit_w] and produces the final logits via a learned 2×4 matrix per class... but then we're not using the features anymore, just the raw logits from each crop's classifier.
+
+Actually wait - this is interesting! The current system averages logits from two separate forward passes of the SAME backbone. What if instead we just take the two classifiers' outputs and learn how to combine them? That's actually equivalent to a per-class linear combination of the logits, which is what I described.
+
+But hold on - is there something even better? What about **feature-level fusion before classification**? The tight crop features (1280-d) and wide crop features (1280-d) concatenated (2560-d) passed through a learned layer. This preserves the information from both crops and lets the model learn class-specific weighting at the feature level, not just at the logit level.
+
+The feature-level fusion is more flexible than the logit-level fusion. Let me go with that.
+
+Actually wait - I just realized something important. The current approach already does logit averaging, which is a form of feature fusion (in the logits space). The feature-level fusion with a 2560-d input is strictly more powerful IF the model learns it well. But there's a risk: concatenating features means the classifier now sees 2560 dimensions where the original saw 1280. The pretrained backbone's head was designed for 1280-d inputs. We'd need to modify the head, which means retraining from scratch (or fine-tuning with a new head).
+
+Hmm, actually - one concern: if IThinking budget reached. Stop thinking now and write the reply in the required format.

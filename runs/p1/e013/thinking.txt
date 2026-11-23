@@ -1,0 +1,239 @@
+===== attempt 1 =====
+Let me carefully analyze the current state and what needs to be done.
+
+The lead wants me to implement: training on detector boxes from the train split (labeled by IoU overlap with GT crops), concatenated with the existing crop rows.
+
+Let me look at the current train.py structure:
+
+1. `read_csv` reads crops.csv and dets.csv
+2. `crops` = high-res crops
+3. `dets` = all detections
+4. `ev` = eval detections
+5. `images` = loaded images for crops + eval
+6. `BoxDataset(crops, images, True)` for training
+7. `BoxDataset(ev, images, False)` for eval
+
+The plan:
+1. Read dets.csv, take boxes with split == "train"
+2. Find those overlapping a GT box (from crops.csv on high-res images) by IoU > 0.5
+3. Keep GT class label, drop boxes overlapping no GT
+4. Concatenate to crop rows for training
+5. BoxDataset already handles rows with "image", "x1", "y1", "x2", "y2", "cls" — so detector boxes need the same fields.
+
+Let me check the fields:
+- crops.csv: id, res, image, x1, y1, x2, y2, img_w, img_h, cls
+- dets.csv: det_id, split, image, x1, y1, x2, y2, img_w, img_h, conf
+
+So a detector box row has: det_id, split, image, x1, y1, x2, y2, img_w, img_h, conf. It does NOT have "cls". BoxDataset uses `r.get("cls", -1)` for the label. So I need to add "cls" to the matched detector boxes.
+
+Also, BoxDataset uses `r["image"]` — both have "image". Good.
+
+`make_crop` uses r["x1"], r["y1"], r["x2"], r["y2"] — both have these. Good.
+
+So the plan is straightforward:
+1. Load train dets
+2. For each train det, compute IoU with all GT crops on the same image (high-res). Find the best overlap. If IoU > 0.5, assign that GT crop's class.
+3. Add these to the training rows.
+
+Now, one concern: the images loaded. Currently `needed = {r["image"] for r in crops} | {d["image"] for d in ev}`. The train dets are on training images, which should already be in `needed` because crops are on training images. Let me verify — crops are labeled training boxes, so crops' images are training images. Train dets are "on training images". So the same images. So `needed` already covers them. Good, no extra image loading needed.
+
+Wait, but is it guaranteed that every train det image is in the crops images? The train dets are on training images, and crops are labeled training boxes on training images. But a training image might have detector boxes but no labeled crops? Possibly. To be safe, I should add train det images to `needed`. But that could add images. Let me think — actually it's safer to include them. But adding images means more loading time. Let me check: the log says 1022 images loaded in 13s. If train dets reference images already in crops, no change. If they reference new images, we'd load more. To be safe and correct, I'll add train det images to `needed`. Actually, let me reconsider — the plan says "the extra rows need no image lookups beyond what is already loaded." This implies the images are already loaded. But to be robust, I'll add them to `needed` set. Actually, if a train det image isn't in crops, then it has no GT crops, so it can't be matched (IoU with GT requires GT crops on that image). So such dets get dropped anyway. So we only need images for train dets that DO match a GT crop, and those images are necessarily in crops' image set. So `needed` already covers them. 
+
+Let me be careful: I match a train det against GT crops on the same image. If it matches, that image has GT crops, so it's in `needed`. So no new images needed. Good. I don't need to change `needed`.
+
+Now the time budget. The plan says: "Estimate time: detector-box count roughly doubles the training set; keep steps similar by dropping the earliest batches or reducing epoch loops, and verify total runtime stays under ~160s with RESERVE_S=85 before submitting."
+
+Wait, the current code trains until the budget minus reserve is used up:
+```
+t_end = deadline - RESERVE_S
+budget = max(1.0, t_end - t_start)
+```
+And it loops through the dataloader until time runs out. So the number of steps is determined by time, not by dataset size per se. If I double the dataset, each epoch takes twice as long, but the total number of steps within the time budget stays roughly the same (since it's time-driven). Actually, the number of steps is time-driven: it does steps until t_end. So doubling the dataset means each epoch is longer, so fewer epochs, but the same number of total steps within the budget. So the step count stays ~157. Good — that's exactly what the plan wants ("keep steps similar"). So I don't need to change the training loop at all! The time-driven loop naturally keeps the number of steps similar.
+
+Wait, but there's a subtlety. The DataLoader is created with shuffle=True and drop_last=True. If the dataset is larger, each epoch has more batches, but the loop breaks when time runs out. So total steps ~ same. Good.
+
+Actually wait, let me reconsider. The plan says "keep steps similar by dropping the earliest batches or reducing epoch loops". But since the loop is time-driven, I don't need to do anything — the steps will naturally stay similar. So the smallest change is: just add the detector boxes to the training rows. The time-driven loop handles the rest.
+
+But wait — there's a concern about the reserve. RESERVE_S = 85 is for prediction. The prediction time is fixed (eval boxes, 4 crops). Doubling the training set doesn't change prediction time. So RESERVE_S = 85 is fine. Good.
+
+Let me double check the total time. Currently: 168s total with RESERVE_S=85, deadline=180. So training ends at 180-85=95s, and prediction+writing takes 168-95=73s. Wait, that's within the 85 reserve. Good. Actually let me recompute: t_end = deadline - RESERVE_S = T0 + 180 - 85 = T0 + 95. Training runs until T0+95. Then prediction. Total 168s. So prediction took 168-95 = 73s. Reserve is 85, so 73 < 85, margin of 12s. Good.
+
+If I double the training set, training still ends at T0+95 (time-driven). Prediction still ~73s. Total still ~168s. So no change in total time. 
+
+So the smallest change: add matched train detector boxes to `crops` list. Let me write that.
+
+Actually, wait. Let me reconsider whether doubling the dataset changes the number of steps. The loop:
+```
+while not done:
+    for views, y in dl_tr:
+        ...
+        steps += 1
+        if time.time() >= t_end:
+            done = True
+            break
+```
+So it iterates through batches, doing one step each, until t_end. The number of steps is purely time-driven. So doubling the dataset → each epoch longer → fewer epochs → but same total steps. 
+
+But there's a subtle issue: the DataLoader with num_workers and persistent_workers. The first epoch might have some overhead for spawning workers. But that's already accounted for.
+
+Actually, there's one more consideration. With drop_last=True, if the dataset size is not a multiple of batch size, the last partial batch is dropped. That's fine.
+
+So my change is minimal: just compute the matched detector boxes and extend `crops`.
+
+Let me now think about the IoU matching. I need, for each train det, find GT crops on the same image with IoU > 0.5, and assign the class. If multiple, pick the one with max IoU. Let me write a function.
+
+```python
+def iou(a, b):
+    # a, b are (x1, y1, x2, y2)
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw = max(0.0, ix2 - ix1)
+    ih = max(0.0, iy2 - iy1)
+    inter = iw * ih
+    ua = (ax2 - ax1) * (ay2 - ay1) + (bx2 - bx1) * (by2 - by1) - inter
+    return inter / ua if ua > 0 else 0.0
+```
+
+Now, to make it efficient, I'll group GT crops by image.
+
+```python
+from collections import defaultdict
+gt_by_image = defaultdict(list)
+for r in crops:
+    gt_by_image[r["image"]].append(r)
+
+train_dets = [d for d in dets if d["split"] == "train"]
+extra = []
+for d in train_dets:
+    best_iou = 0.0
+    best_cls = -1
+    for g in gt_by_image.get(d["image"], []):
+        v = iou((d["x1"], d["y1"], d["x2"], d["y2"]),
+                (g["x1"], g["y1"], g["x2"], g["y2"]))
+        if v > best_iou:
+            best_iou = v
+            best_cls = g["cls"]
+    if best_iou > 0.5:
+        row = dict(d)
+        row["cls"] = best_cls
+        extra.append(row)
+```
+
+Wait, but `crops` is filtered to high-res: `crops = [r for r in read_csv(...) if r["res"] in TRAIN_ON]`. So gt_by_image should be built from the filtered `crops` (high-res). The plan says "find those overlapping a GT box (from crops.csv on high-res images)". So yes, use the filtered crops. Good.
+
+But there's a subtlety: the train dets are on training images. Are the training images high-res or low-res? The crops have a "res" field ("high"/"low"). The dets don't have a res field. Hmm. The detector boxes are presumably on the same images as the crops. The plan says to match train dets against high-res GT crops. So I match against the filtered (high-res) crops. If a train det is on a low-res image, it won't match any high-res crop and gets dropped. That's consistent with the plan.
+
+Actually, wait — I should double check: are the detector boxes on high-res images? The brief says "0.69 mAP@0.5 on high-res images" for the one-step detector. And the two-stage system: stage 1 finds candidate boxes. The dets.csv has both train and eval splits. The eval boxes are what we score. The reference numbers mention "high-res images". I think the detector boxes are on high-res images. So matching against high-res crops is correct.
+
+Let me also make sure the extra rows have all fields BoxDataset needs. BoxDataset.__getitem__ uses:
+- `r["image"]` — dets have "image". Good.
+- `make_crop(img, r, ctx, self.train)` — uses r["x1"], r["y1"], r["x2"], r["y2"]. dets have these. Good.
+- `r.get("cls", -1)` — I set row["cls"]. Good.
+
+So the extra rows work with BoxDataset directly. 
+
+Now, `dict(d)` copies all fields of d (det_id, split, image, x1, y1, x2, y2, img_w, img_h, conf) plus cls. That's fine.
+
+Now let me think about whether I need to import defaultdict. I can use a plain dict with setdefault to avoid import. Let me use a plain dict:
+
+```python
+gt_by_image = {}
+for r in crops:
+    gt_by_image.setdefault(r["image"], []).append(r)
+```
+
+That avoids a new import. Good.
+
+Now, where to place this code? After `crops` is defined and after `dets` is read, before the images are loaded (or after — doesn't matter since images are loaded from `needed` which already covers the matching images). Actually, I need `crops` and `dets` both. `crops` is defined, then `dets` is read, then `ev` is filtered, then `needed` is computed, then images loaded. I'll insert the extra-box computation after `ev` is defined (or after `needed`). Let me insert it right before or after the images loading. Actually the order: I'll insert after `ev = [...]` line and before `needed = ...`. But I want to make sure `needed` includes the extra rows' images. As argued, they're already covered. But to be safe, let me add them to `needed` too. Actually, adding them is harmless and safer. Let me do:
+
+```python
+needed = {r["image"] for r in crops} | {d["image"] for d in ev} | {r["image"] for r in extra}
+```
+
+This is safe. Even if extra images aren't needed, it's a no-op.
+
+Then extend crops: `crops = crops + extra`.
+
+Wait, but the print statement says "train {len(crops)} boxes". If I extend crops before the print, it'll show the new count. Let me place the code so that `crops` is extended before the print. The print is:
+```
+print(f"train {len(crops)} boxes, eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
+```
+This is after images loading. So if I extend crops before that, the count reflects the extra boxes. Good.
+
+Let me now write the actual edits.
+
+Current code:
+```python
+    crops = [r for r in read_csv(os.path.join(args.data, "crops.csv")) if r["res"] in TRAIN_ON]
+    dets = read_csv(os.path.join(args.data, "dets.csv"))
+    ev = [d for d in dets if d["split"] == "eval"]
+    needed = {r["image"] for r in crops} | {d["image"] for d in ev}
+    images = {p: np.asarray(Image.open(os.path.join(args.data, "images", p)).convert("RGB")) for p in needed}
+    print(f"train {len(crops)} boxes, eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
+```
+
+I'll change to:
+```python
+    crops = [r for r in read_csv(os.path.join(args.data, "crops.csv")) if r["res"] in TRAIN_ON]
+    dets = read_csv(os.path.join(args.data, "dets.csv"))
+    ev = [d for d in dets if d["split"] == "eval"]
+
+    # Stage-1 detector boxes on the train split, labelled by IoU > 0.5 overlap with GT crops.
+    gt_by_image = {}
+    for r in crops:
+        gt_by_image.setdefault(r["image"], []).append(r)
+
+    def box_iou(a, b):
+        ax1, ay1, ax2, ay2 = a
+        bx1, by1, bx2, by2 = b
+        iw = max(0.0, min(ax2, bx2) - max(ax1, bx1))
+        ih = max(0.0, min(ay2, by2) - max(ay1, by1))
+        inter = iw * ih
+        union = (ax2 - ax1) * (ay2 - ay1) + (bx2 - bx1) * (by2 - by1) - inter
+        return inter / union if union > 0 else 0.0
+
+    extra = []
+    for d in dets:
+        if d["split"] != "train":
+            continue
+        best_iou, best_cls = 0.0, -1
+        for g in gt_by_image.get(d["image"], ()):
+            v = box_iou((d["x1"], d["y1"], d["x2"], d["y2"]), (g["x1"], g["y1"], g["x2"], g["y2"]))
+            if v > best_iou:
+                best_iou, best_cls = v, g["cls"]
+        if best_iou > 0.5:
+            row = dict(d)
+            row["cls"] = best_cls
+            extra.append(row)
+    crops = crops + extra
+
+    needed = {r["image"] for r in crops} | {d["image"] for d in ev}
+    images = {p: np.asarray(Image.open(os.path.join(args.data, "images", p)).convert("RGB")) for p in needed}
+    print(f"train {len(crops)} boxes ({len(extra)} det boxes), eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
+```
+
+Wait, there's a subtlety with `needed` now including `crops` which includes `extra`. That's fine.
+
+Now, the time budget concern. Let me reconsider. The training loop is time-driven, so doubling the dataset keeps the same number of steps. But wait — is there a risk that the larger dataset causes the first epoch to not complete and the loop to behave differently? No, the loop just does steps until t_end. The number of steps is time-driven. So ~157 steps. Good.
+
+But actually, let me reconsider the reserve. The prediction time is fixed. But wait — is there any chance that loading more images (if extra boxes reference new images) adds to load time? As argued, extra boxes only match if their image has GT crops, so their images are already in `needed`. So no new images. Load time unchanged.
+
+Hmm, but actually, let me reconsider. What if a train det is on an image that has GT crops but those crops are low-res (filtered out)? Then gt_by_image (built from high-res crops) won't have that image, so the det won't match, gets dropped. So no new images. Good.
+
+What if a train det is on an image with high-res crops? Then it's in gt_by_image and possibly matches. Its image is in `needed` (from crops). Good.
+
+So no new images. Load time unchanged.
+
+Now, let me reconsider: does doubling the training set actually help? The previous runs showed "Detector boxes from the train split as extra training data (IoU > 0.5 with a true box, labelled with its class)" was "accepted twice (5-seed 0.6337 and 0.6342, about +0.004)". So it's a confirmed small gain. But that was on the two-crop baseline. Now we're combining it with the 4-scale pyramid (e009). The lead's hypothesis says this "combines the winning 4-scale pyramid with the only previously confirmed data-side gain". That's the plan.
+
+Now, is there a risk that adding detector boxes (which are offset/misplaced) as training data with GT labels might hurt? The previous result showed a small gain (+0.004), so it's net positive. But it was on the two-crop model. With the 4-scale pyramid, it might be different. But the lead wants this experiment, so I'll implement it.
+
+Let me also consider: the detector boxes include false alarms (boxes not overlapping any GT). The plan says "dropping any box that overlaps no GT box." So we only keep true-positive detector boxes. Good — that avoids teaching the model that false alarms are defects. This matches the previous confirmed result.
+
+Now, one more consideration: the number of extra boxes. Let me estimate. 6052 GT crops (high-res). The detector has 41879 eval dets. How many train dets? The dets.csv has both train and eval. Let me estimate: if eval is 41879, train might be similar or proportional to the number of training images. Actually, I don't know the exact count. But the plan says "roughly doubles the training set". So ~6000 extra boxes. That's fine.
+
+Actually, wait. Let me reconsider whether the number of extra boxes could be much larger than GT crops. The detector produces many boxes per image (including false alarms). But we only keep those with IoU > 0.5 with a GT box. Each GT box might match 1 detector box (the best). So the number of extra boxes is at most the number of GT boxes that have a matching detector box, roughly ≤ number of GT crops (6052), possibly a bit more if one GT matches multiple dets. Actually, one GT box could match multiple detector boxes (if the detector produces overlapping boxes). But typically the detector's NMS keeps them separated. So extra ≈ number of GT crops with a matching det ≈ up to 6052. So roughly doubles. Consistent with the plan.
+
+OK here's a concern about efficiency: the nested loop over dets and gt_by_image. For each train det, we iterate over GT crops on the same image. If an image has ~10 GT crops and ~100 train dets, that's 1000 IoU computations per image. Total: 41879-ish train dets × ~10 = ~400k IoU computations. Each IoU is a few float ops. That's fast in Python? 400k × ~10 ops =Thinking budget reached. Stop thinking now and write the reply in the required format.

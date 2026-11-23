@@ -1,0 +1,197 @@
+===== attempt 1 =====
+Let me carefully analyze the situation.
+
+Current best: e012, 5-seed mean 0.6342. Per-class AP: pore 0.536, deposit 0.616, discontinuity 0.778, stain 0.606.
+
+Reference numbers:
+- One-step 4-class detector: 0.638 (the baseline to beat — we're at 0.6342, just below)
+- Perfect-class ceiling for stage-1 boxes: 0.758
+- Class-agnostic: 0.755
+
+So the gap to the ceiling is about 0.124. The problem is class assignment. Weak classes: pore (0.536), stain (0.606), deposit (0.616). Discontinuity is good (0.778).
+
+Let me think about what has been tried so far:
+- e001: train on detector boxes rather than GT boxes — rejected
+- e002: include low-resolution crops — not confirmed
+- e003: background class — rejected
+- e004: temperature 0.5 (sharpening) — rejected (hurt by 0.017). Interesting: sharpening hurt, so the model's argmax is often wrong, or the ranking matters.
+- e005: resolution 224 — not confirmed
+- e006: rotation augmentation — rejected
+- e007: some architecture change (details unclear) — rejected
+- e008: TTA horizontal flip — not confirmed (0.6306)
+- e009: efficientnet_b2 — not confirmed
+- e010: class-balanced sampling — not confirmed
+- e011: TTA with 8 views — timeout
+- e012: third view (4x wide context) — new best 0.6342
+- e013: replace the third view with flip TTA — rejected
+- e014: argmax only — rejected (0.5786)
+- e015: focal loss — rejected
+
+Key insight from e004: sharpening the softmax hurt. This suggests that the scores of non-argmax classes matter for ranking — that is, when the model is uncertain, emitting all four rows at conf×p allows the correct class to be ranked appropriately… no wait, actually mAP is per class. For a given class, all predictions of that class are sorted by score. If a box's true class is pore but the model says stain with higher probability, then the pore row has a low score and ranks low among pore predictions, and the stain row becomes a false positive for stain.
+
+Hmm, e014 (argmax only) hurt a lot (0.5786). So emitting all four rows helps. Why? Because for a box whose true class is pore, even if the model's top is stain, the pore row at conf×p_pore is still emitted, and if p_pore is reasonably high it might still rank well among pore predictions. If we emit argmax only, that box contributes nothing to pore.
+
+Now, what could plausibly gain more than 0.01?
+
+Ideas:
+
+1. **Score calibration / per-class score adjustment**: The metric only cares about the per-class ordering of predictions. The score for class c of a box is conf × p_c. The detector's conf is the same for all four classes of that box. So within class c, boxes are ordered by p_c (conf is a shared multiplier… no wait, conf varies per box, so the ordering is by conf×p_c).
+
+Hmm, one thing to think about: should we use a different function of p_c? E.g., p_c^alpha? e004 tried sharpening (dividing logits by 0.5 before softmax = effectively p^k with k>1… actually dividing logits by T<1 sharpens). That hurt. What about softening? That's the reverse direction of the same idea — probably not useful.
+
+2. **Ensemble of two models / two seeds**: Train two models with different seeds and average probabilities. But we only have one seed per run, and the budget is fixed. Training takes about 125 seconds out of 180. We can't fit two trainings. Split the budget: train model A for 60 seconds, model B for 60 seconds, average predictions. Each model would be undertrained. Probably not good.
+
+3. **Better use of the time budget**: Currently 291 steps in about 111 seconds of training (14s load, 125s at end of epoch 3… let me recompute: t_start after load about 14s, t_end = 180-55 = 125s. Training runs from 14s to 125s = 111s, 291 steps → about 0.38s/step. Then prediction: 41879 boxes × 3 views = 125637 forward passes, batch 256 → about 491 batches, 125s to 183s = 58s → about 0.12s/batch.
+
+Wait, 183s total, t_end=125s, prediction 58s. RESERVE_S=55 was too conservative — prediction only took 58s but the reserve was 55s… cutting it close (125+58=183 < 180? No, 183 > 180? The log says 183s total, and the run completed, so --seconds must have been larger than 183. Probably 240 or 300. Hmm, "done: ... 183s total" and the run wasn't killed, so T > 183. e011 timed out with 8 views.
+
+Actually, I don't know T. e012 completed at 183s. e011 (8 TTA views) timed out. If T=240, then 8 views ≈ 2.67× the prediction time of 3 views: prediction would be 58×(8/3)=155s, total 14+111+155=280 > 240. Plausible.
+
+So T is probably 240 or 300. If T=300, we have room: currently using 183s, 117s of slack. If T=240, 57s of slack.
+
+4. **More training time**: Reduce RESERVE_S from 55 to, say, 65? No wait, that reduces training. Increase training by reducing reserve? Prediction took 58s, reserve was 55s — prediction slightly exceeded the reserve but the run completed, so T > 183. If T=240, we can set RESERVE_S to about 70 and gain about 15s of training (about 40 steps). More training might help — loss was still decreasing (0.2593 at epoch 3). But is more training steps the largest lever? The model reaches about 87% macro-F1 with the original recipe on perfect boxes… actually that was the "initial recipe (two-crop input)." Our current recipe is three views.
+
+Hmm, but wait — the per-class AP gap: pore 0.536 vs stain 0.606 vs deposit 0.616. The known confusions: pore↔stain, stain↔deposit.
+
+5. **Use detector conf more cleverly**: The score is conf × p_c. For ranking within class c, we want true positives to rank above false positives. The detector's conf is class-agnostic; false alarms tend to have lower conf. Multiplying by p_c is fine.
+
+6. **Two models with different crops, ensemble at inference**: E.g., train one model on tight+wide, another on wide2… that's what we're doing in a single model with three views.
+
+7. **Train on both high and low resolution** — e002 was not confirmed (0.6261). Skip.
+
+8. **Better backbone**: e009 tried efficientnet_b2 — not confirmed. convnext/regnety/resnet untried. But "architecture" has 4 ideas, 1 new best (e012 was categorized as architecture). e005 (resolution) not confirmed, e007 rejected, e009 not confirmed. Trying yet another backbone is a 5th architecture attempt; probably diminishing returns.
+
+9. **Larger input resolution** — e005 not confirmed.
+
+10. **Data: more augmentation** — e006 rotation rejected. Color jitter? Probably small effect.
+
+11. **Optimization**: LR schedule, batch size, longer training. The schedule is 5% warmup + cosine over the budget. If we can train longer (if T is larger), that's free improvement. Let me think about what T is. Actually, we can probe: reduce reserve to give more training. If T=240: current 183s, reserve 55 → t_end=125. If prediction needs 58s, then setting RESERVE_S=65 gives t_end=115, total = 115+58+about 2 (writing) = 175s, about 65s of slack. That loses 10s of training. If T=300: t_end = 300-65=235, training 221s ≈ 580 steps, total 235+58+2=295 < 300. That's a lot more training!
+
+Hmm, but we don't know T. Risky. If T=240 and I set reserve to 65, that's fine. If I set reserve to 40 (more training) and T=240: t_end=200, prediction 58s → total 260 > 240 → timeout. Dangerous.
+
+Actually wait — can I make the reserve adaptive? The code can't know T… no, it can: args.seconds! deadline = T0 + args.seconds. I can set RESERVE_S relative to args.seconds, but prediction time depends on the number of eval boxes, which I only know after loading dets.csv. I can estimate: after loading, I know len(ev). Prediction time ≈ (len(ev)/256) × time_per_batch. I can measure time_per_batch with a quick dummy forward pass after model creation! That's a robust approach:
+
+- After model creation, run a few dummy batches through the model in eval mode with the eval dataset, time it, and estimate total prediction time P.
+- Then set t_end = deadline - P - margin (say 10s).
+
+This maximizes training time safely. If T=300, we gain about 115s of training. If T=240, we gain about 55s.
+
+But does more training help? Loss was 0.2593 at step 291 and still decreasing. With a cosine schedule over a longer budget, the LR decays more slowly, so we get more effective training. More training of a small model on 6052 boxes… the model might plateau. EfficientNet-B0 on 6k crops: 291 steps ≈ 4.7 epochs. 580 steps ≈ 9.4 epochs. Probably still useful, but the gain might be modest (0.005-0.01?). Hmm.
+
+Actually, let me reconsider. The known fact: "crop classifier given perfect boxes reaches about 87% macro-F1 with the initial recipe (two-crop input)." 87% F1 → the ceiling with perfect boxes is 0.758 mAP. Our mAP is 0.6342. The gap to ceiling 0.124 comes from misclassifications. If macro-F1 is 87%, then about 13% of boxes are misclassified. To close the gap, we need better classification.
+
+What are the fundamental levers for classification accuracy?
+- More/better data: train on detector boxes (e001 rejected), low-res (e002 no), background class (e003 rejected).
+- Better model: b2 (e009 no), resolution (e005 no).
+- Better training: focal (e015 no), class weighting (known to hurt), sampling (e010 no).
+- More training time: untried!
+- Better views: 3 views (e012 yes).
+
+Hmm wait, one more important idea: **use both high and low resolution at inference?** No, eval images are what they are.
+
+**Idea: train longer with adaptive reserve** — this is the "optimization" category, untried (0 experiments). It could plausibly gain 0.01 if the model is undertrained. Evidence: loss still decreasing, only about 4.7 epochs. Pretrained EfficientNet-B0 fine-tuned on 6k images: usually needs 10-30 epochs to converge, but with a 1e-3 LR cosine… 291 steps is a bit low.
+
+But wait, is there a risk that more training overfits? 6052 boxes, batch 64 → 94 steps/epoch. 291 steps = 3.1 epochs (drop_last). Hmm, 94 steps/epoch × 3.1 = 291. So about 3.1 epochs. More epochs → risk of overfitting, but with a cosine LR decay ending at 1e-3×1e-3… the final LR is tiny. With weight decay 0.05. Probably safe.
+
+Alternatively, **increase batch size** to get more steps per second? No, batch 64 is fine.
+
+Let me think about other fundamentally different ideas:
+
+**Idea: per-class score scaling to fix ranking.** The per-class AP depends on ordering. Currently score = conf × p_c. Consider: for stain (diffuse, often confused with deposit), the model's p_stain might be systematically miscalibrated. But we can't use eval labels. We could calibrate on train-split detector boxes (they have labels via overlap with crops.csv). E.g., learn a per-class score transform on train: score_c = f_c(p_c, conf). But e004 (temperature) is in the "scoring" category and hurt; e014 argmax hurt. Scoring has 2 ideas, 0 best, not marked exhausted. But the gain from score manipulation is limited — the ordering is what matters, and monotone transforms per class don't change the within-class ordering… no wait, per-class monotone transforms don't change the within-class ordering at all! So per-class score scaling is useless for AP. Only cross-class interactions matter (which class a box gets assigned to), and that's determined by the model's probabilities, not the score transform. So the scoring category is fundamentally limited: the only thing that matters is which rows we emit (e014 showed emitting all rows is better) and the relative ordering of conf×p_c across boxes of the same class.
+
+Hmm, one scoring idea: drop rows where p_c is very low relative to p_top? E.g., only emit class c if p_c > 0.5×p_top or p_c > threshold. e014 (argmax only) hurt, so emitting all is better than top-1. But a middle ground: emit top-2? Probably small effect.
+
+**Idea: better boxes?** Stage 1 is fixed. No.
+
+**Idea: use the detector's conf in training** — weight training samples by the conf of the overlapping detector box? That's a data/sampling change. Hmm.
+
+**Idea: ensemble of three views with separate models?** Too expensive.
+
+**Idea: use more of the image context at training** — e.g., add a 4th view at 8x (whole bead)? The 4x view helped (e012). A wider view might help stain further. But prediction cost: 4 views vs 3 views → 33% more prediction time. If T=300, fine; if T=240, 14+111+77=202 < 240, fine. Training cost: 33% more compute per step → about 0.5s/step → 111s ≈ 220 steps. Hmm, fewer steps. Tradeoff.
+
+Actually wait. Let me reconsider the biggest error source. Per-class AP: pore 0.536, stain 0.606, deposit 0.616, discontinuity 0.778. The paper says stain is often confused with deposit, and pore and deposit are weak classes.
+
+What's the class distribution? Probably discontinuity is most frequent, pore/stain/deposit less so. e010 (class-balanced sampling) was not confirmed.
+
+**Idea: train on train-split detector boxes with pseudo-labels from the model itself (self-training / pseudo-labeling)?** e001 tried training on detector boxes with GT overlap labels — rejected. Pseudo-labeling is different but risky.
+
+**Idea: two-stage scoring using a second model for the hard confusions?** E.g., a "stain vs deposit" binary head? Complicated.
+
+**Idea: train longer** — let me quantify. If T is unknown but the run completed at 183s, T ≥ about 185. e011 (8 TTA views) timed out: prediction time would be 58×8/3 ≈ 155s, total ≈ 14+111+155 = 280s. So T < 280. So T ∈ (185, 280). Probably T=240 (a common choice) or T=270.
+
+If T=240: current slack = 240-183 = 57s. With adaptive reserve, we can safely take about 45s of that for training (keeping 12s margin). That's about 120 more steps (about 2 more epochs).
+
+If T=270: slack 87s → about 70s more training → about 185 more steps.
+
+Adaptive reserve approach: measure prediction time per batch with a quick timing loop, set t_end = deadline - est_pred - 15s margin. This is safe for any T.
+
+But is the expected gain ≥0.01? Honestly, going from 3.1 epochs to about 5-6 epochs of fine-tuning a pretrained B0 on 6k crops… the loss curve: 0.72 → 0.37 → 0.275 → 0.259. Diminishing returns. 2 more epochs might get loss to about 0.24. mAP gain probably 0.003-0.008. Borderline.
+
+Hmm. Let me think about something with a bigger potential.
+
+**Idea: input resolution 160 → but with more views?** No.
+
+**Idea: use efficientnet_b2 with 3 views?** e009 tried b2 with 2 views — not confirmed (0.6231, actually worse than b0's 0.6288… wait, e009's 5-seed mean 0.6231 vs e000's… e000 is probably about 0.6288? Actually e010's seed-0 is 0.6288 with base e000. So b2 was worse). Larger models don't help → the bottleneck isn't model capacity, it's the information in the crops / the confusions are inherently hard.
+
+**Idea: the crops themselves.** make_crop uses the box center and side = context × long side. For a stain (diffuse, large), the 1.5x tight crop is almost entirely stain — fine. For a pore (small), the tight crop is mostly background with a small hole — the model has to find the hole. Hmm.
+
+What about **aspect-ratio-preserving crops**? Currently the crop is square (s×s), then resized to IMG_SIZE×IMG_SIZE. If the box is elongated (a weld bead defect can be elongated along the bead), the square crop at 1.5× the long side includes a lot of perpendicular context, and the resize to a square… the crop is already square, so no distortion. OK.
+
+**Idea: multi-scale input per view** — already 3 contexts.
+
+**Idea: use the whole image (downsampled) as a 4th view?** The 4x view is "whole-bead context." An 8x view might be the whole image. For stain vs deposit, knowing where on the bead the mark is might help. But stain is often on the bead face…
+
+Let me reconsider: what has actually worked? e012: adding a 4x context view. So context helps. e008 flip TTA was "close but unconfirmed" (0.6306 vs e000's about 0.6288? seed-0 0.6367). Hmm, e008 seed-0 0.6367, 5-seed 0.6306 — "close but unconfirmed" means it didn't beat the best mean at the time.
+
+**Idea: combine e012's 3 views with flip TTA at inference, but only for two views to fit the budget?** e013 tried replacing the 4x view with flip TTA — rejected (0.6273). So the 4x view is worth more than flip TTA.
+
+What about **4 views at inference: tight, wide, wide2, + tight-flipped or wide-flipped**? That's 4/3 = 33% more prediction time. If T=240: prediction 58×4/3=77s, total 14+111+77=202 < 240. OK. Expected gain from one flip view: e008 added 2 flip views (tight+wide flips) for +0.0018 (unconfirmed). So one flip view ≈ +0.001. Not worth the cost.
+
+**Idea: train with flips in the 3-view recipe** — e006 tried rotation (rejected). Flips are already in training (fh, fv random < 0.5). Yes, flips are already in training.
+
+**Idea: color/photometric augmentation** — brightness is there. Contrast/saturation? Weld images can vary in lighting. Small effect, probably <0.003.
+
+**Idea: the real lever might be training time.** Let me look at the loss again: epoch 0: 0.7209 (94 steps), epoch 1: 0.3703, epoch 2: 0.2753, epoch 3: 0.2593 (only 9 steps into epoch 3, then budget ran out). So at the point of stopping, the loss is still dropping about 0.02/epoch. With a longer budget and the cosine schedule, we'd get a meaningful amount of extra training.
+
+Actually, hmm, wait. Let me reconsider the schedule. The cosine is over the entire budget: f = 0.5(1+cos(π(frac-0.05)/0.95)). At frac=1, LR→0. So the last steps have nearly zero LR. If we double the budget, the LR decays more slowly → each epoch has higher effective LR → more learning.
+
+I think "train longer with adaptive reserve" is a solid, safe experiment in the untried "optimization" category. Expected gain: probably 0.005-0.015. Risk: if T is close to 185 (unlikely since e012 completed at 183s and the harness gives some margin… actually the harness kills exactly at the limit; 183 < T). Since e012 completed at 183s, T > 183. e011 timed out at about 280s estimated → T < 280.
+
+With adaptive reserve + 15s margin: if T=185, t_end = 185 - 58 - 15 = 112 → training 98s (less than current 111s!) → slightly worse. Hmm, that's a risk: if T is just barely above 183, we lose training time. But T=185 would be a weird choice; the harness probably uses a round number like 240 or 300. And e011's timeout at about 280 suggests T<280. Hmm, if T=240: t_end = 240-58-15 = 167 → training 153s vs current 111s → +42s ≈ +110 steps. Good.
+
+To be extra safe, I could cap the added training: t_end = min(deadline - est_pred - 15, t_start + 111 + 60)? That caps the gain at 60s. Meh, let's keep it simple: t_end = deadline - est_pred - 20 (margin 20s). If T=240: t_end=162, training 148s, +37s. If T=270: t_end=192, training 178s, +67s.
+
+Actually, I realize I should double-check the prediction time estimate. Prediction: 41879 boxes, batch 256 → 164 batches… wait, 41879/256 = 163.6 → 164 batches. 58s/164 = 0.35s/batch. Hmm, I said 491 batches earlier — that was wrong (I divided by 256 per view, but the batch contains 256 boxes × 3 views = 768 forward passes per batch iteration). OK, 164 batches × 0.35s = 58s.
+
+To estimate: after creating the model, run the eval dataloader for a few batches in eval mode with no_grad, time it, extrapolate. E.g., time 10 batches → per_batch → total = per_batch × 164 + 5s (writing overhead). Then t_end = deadline - total_est - 20.
+
+Edge case: the first batch includes lazy initialization; use 10 batches to amortize.
+
+Also, the dataloader with persistent_workers is already warmed up from training (the eval dl is created but not iterated… actually dl_ev is created but not iterated before prediction; its workers start on first use. The first eval batch includes worker startup + image loading… images are already in memory (the `images` dict), so workers just do crop computation. The first batch might be slower. Extrapolation from 10 timed batches is decent; the margin covers it.
+
+Now, is there something better than just training longer? Let me think about what else is fundamentally different and untried:
+
+- **Data**: exhausted (3 ideas).
+- **Augmentation**: 1 idea (rotation). Could try photometric (contrast, hue, saturation) — but small.
+- **Architecture**: 4 ideas. Backbones: b0, b2 tried. convnext/regnety/resnet untried, but b2 (more capacity) didn't help → capacity isn't the limit. Skip.
+- **Loss**: 1 idea (focal). Class weighting known to hurt. Skip.
+- **Sampling**: 1 idea (class balance). Skip.
+- **Optimization**: 0 ideas! LR, schedule, batch size, training duration all untried.
+- **Inference**: 3 ideas, TTA explored. Skip.
+- **Scoring**: 2 ideas. As analyzed, per-class monotone transforms are useless; row filtering is limited. Skip.
+
+So optimization is the cleanest untried category, and "train longer" is the most promising idea there. But let me also consider: **LR increase** (1e-3 → 3e-3)? With a pretrained model and only about 3 epochs, a higher LR might learn faster. But risky (instability). Training longer is safer and directly addresses the evidence (loss still dropping).
+
+Actually, let me combine: the main change is maximizing training time with a safe adaptive reserve. That's one idea: "use the full budget safely for training."
+
+Wait, but I should double-check the expected gain more carefully. The model is fine-tuned from ImageNet pretrained. 6052 crops. 3.1 epochs at 1e-3 cosine. Typical fine-tuning: the first epoch drops the loss a lot (0.72→0.37), then slower. 2 more epochs might improve F1 by 1-2%. mAP gain: our gap to ceiling is 0.124, mostly misclassification. 1-2% F1 improvement → about 0.01-0.02 mAP? Plausible. Also, the per-class AP gap: pore 0.536… if pore classification improves, pore AP rises.
+
+Alternatively, **batch size 64 → 128** for more stable gradients + same steps? Fewer steps per epoch (47), same step time… no, larger batch = more time per step (about 2x), so fewer steps in the same time. No.
+
+**Reduce IMG_SIZE at training?** No, hurts quality.
+
+OK, another thought — **use both resolutions at inference**? No, each eval image has its own resolution.
+
+**Idea: train on high+low but with separate…?** e002 tried including low — not confirmed. Skip.
+
+Let me also reconsider **adding a 4th view at 8x** (whole image). The 4x view helped (e012 was +0.0054 over e000's 0.6288? e012 5-seed 0.6342 vs e000… e010's seed-0 with base e000 is 0.6288, and e000's 5-seed is probably about 0.6288). So e012 gained about +0.005-0.006. A whole-image view might add a bit more for stain (stain location on the bead). But cost: +33% training step time and +33% prediction time. If T=240: training 111×(3/4)=83s → about 220 steps… wait, step time 0.38s → 0.51s, so 111/0.51 ≈ 218 steps (vs 291). That's a big loss in steps. Net effectThinking budget reached. Stop thinking now and write the reply in the required format.

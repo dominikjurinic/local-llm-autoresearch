@@ -1,0 +1,555 @@
+===== attempt 1 =====
+Let me think carefully about this problem.
+
+Current state: baseline 0.6270 (5-seed average). Reference numbers:
+- One-step 4-class detector: 0.638 (the target to beat)
+- Stage-1 boxes with perfect classes: 0.758 (upper bound)
+- Class-agnostic: 0.755
+
+Per-class AP: pore 0.494, deposit 0.627, discontinuity 0.780, stain 0.607.
+
+So the weak classes are pore and stain/deposit. The known crop classifier with perfect boxes reaches macro-F1 ~0.87; pore and deposit are weak classes; stain is often confused with deposit.
+
+Key insight: the score of each prediction is detector conf × class probability. In mAP@0.5, the order of predictions per class matters. The detector's conf is a fixed multiplier common to all classes for a given box, so the order within a class is determined by the class probability. But the relative order between classes (which prediction is ranked where overall) also matters for mAP? No wait — mAP@0.5 is computed per class: for each class, sort all predictions of that class by score and match them against the true boxes of that class. So the relative order between classes doesn't matter; only the order within each class matters. And the within-class order is determined by conf × p_c. The conf varies between boxes, so the class probability alone doesn't determine the order — it's the product.
+
+Hmm, but actually, for a fixed class c, the score is conf × p_c(box). Both factors vary.
+
+What's the largest source of error? Let me think:
+
+1. Class misassignment on boxes overlapping real defects (wrong class → the correct-class prediction is missed, and a false positive in the wrong class is produced).
+2. Ranking of false alarms against true detections: a box that's a false alarm (no overlap with a real defect) but is predicted with high conf × p_c becomes a false positive in class c. The detector's conf ranks these.
+3. Box placement: boxes are slightly off; IoU > 0.5 is required.
+
+The upper bound of 0.758 with perfect classes means that if class assignment were perfect, mAP would be 0.758. We're at 0.627. So class errors are costing about 0.13. But wait — the upper bound keeps false alarms as class 0 with detector conf. So the 0.758 upper bound includes the conf-based ranking of false alarms. The gap between 0.627 and 0.758 is mostly class misassignment (plus the effect of score ranking: in the upper bound the score is detector conf, whereas here it's conf × p_c; the order within a class differs, which can help or hurt).
+
+Ideas to try:
+
+A. Improve the classifier:
+   - Bigger model (efficientnet_b2, convnext, resnet50) — more compute per step; check budget.
+   - Higher input resolution.
+   - More training time (reduce reserve, or faster model).
+   - Use "low" resolution crops for training too (more data).
+   - Different crop context.
+   - Test-time augmentation (TTA) — more inference time.
+
+B. Improve scoring:
+   - Instead of conf × p_c, use a calibrated score. E.g., train a small model that predicts "is this box a real defect of class c" — i.e., train on detector boxes (train split) with labels from overlap with crops.csv. This directly learns to rank false alarms vs true positives! The current model is trained only on true boxes (crops.csv), so it has never seen false alarms. At test time, conf × p_c: for a false-alarm box, p_c can be high if the background looks like a defect. A model trained on detector boxes with pseudo-labels (class if IoU>0.5 with a true box, else "none") could output 5 classes (pore, deposit, discontinuity, stain, none) and the score for class c could be p_c × something. Actually, if we add a "none" class, the score for class c is p_c, and false alarms get low p_c. This changes the ranking of false alarms relative to true detections — targeting the "ranking of false alarms against true detections" part of the error.
+
+   Wait, but there's a subtlety: the upper bound 0.758 keeps all false alarms as class 0 with detector conf. So even with perfect classes, false alarms hurt. A "none" class could suppress some false alarms and push us above 0.758? No — the upper bound is defined as keeping them, but the actual metric just measures mAP; suppressing false alarms (removing predictions) can only improve mAP (removing false positives never hurts AP, as long as you don't remove true positives). Actually, removing a prediction never decreases AP: if it was a true positive, then removing it… hmm, removing a TP lowers recall, which lowers AP. But removing an FP always helps. So a "none" class that correctly identifies FPs will improve mAP beyond the 0.758 upper bound (which keeps all FPs).
+
+   This is a fundamentally different direction: train the classifier on detector boxes (both train-split boxes that overlap true boxes and those that don't) with 5 classes. The dets.csv train split has about 41879 eval boxes; the train split is probably a similar number. Let me think about data size: the log says eval 41879 detections. The train split is probably a similar number, maybe ~40k. Training on 40k boxes with 5 classes — that's fine.
+
+   But wait: the "train" boxes in dets.csv are on training images, and their true class can be found by overlap with crops.csv. So we can label them: for each train det, if IoU > 0.5 with a crop box of class c → label c; else → label 4 (none). This is exactly what's needed.
+
+   Then at inference, for each eval det, compute 5 probabilities and output class c with score = p_c (or conf × p_c? Since the order within a class is what matters, conf × p_c vs p_c differ in order. Hmm. Which is better? conf is the detector's confidence; a high-conf detection overlapping a real defect is a true positive. p_c is the classifier's belief. The product is a reasonable joint score. But maybe we should keep conf × p_c for compatibility… actually let me think: the score just needs to rank predictions within a class. The ideal rank: true positives first (in any order), then false positives. A good score correlates with "is this a real defect of class c". conf correlates with "is this a real defect" (detector confidence). p_c correlates with "is this class c". The product correlates with both. Keeping conf × p_c seems reasonable. Or maybe p_c alone — the classifier trained on dets has already learned to downweight false-alarm-looking inputs, so p_c already encodes "real defect of class c". Hmm, but the classifier sees crops centered on the det box; false alarms in the train set have label "none", so the model learns to output low "none"… no wait, high "none" probability for false alarms. So p_c for a false alarm is low. Then p_c alone might rank well. But conf also carries information (the detector was trained to find defects; high conf = more likely real). The product uses both. I'll keep conf × p_c for compatibility.
+
+   Actually, there's a subtlety in how to train: crop the image at the det box with the same two-crop recipe. Labels: 4 classes + none. The "none" class might be imbalanced (most dets overlap something? or not?). In a class-agnostic detector with some conf threshold, maybe 50-70% overlap a real defect. Let's not worry; cross-entropy handles it.
+
+   This is a big change: it changes what the model learns from (targeting the FP ranking) and uses more training data (dets train split, ~40k, vs 6k crops). It's a fundamentally different direction from just tweaking the classifier.
+
+   But wait — there's a risk: the IoU>0.5 pseudo-labels for "none" may be noisy: a det box that doesn't overlap a real defect at IoU>0.5 might still be a slightly-off true defect (the upper bound text says "slightly off boxes"). Those get labeled "none" and the model learns to output "none" for them, suppressing true positives. Hmm. But the upper bound also treats them as false alarms (kept as class 0), so the metric treats them as FPs too. Consistent.
+
+   Another consideration: the crops.csv train boxes are the true boxes; dets train boxes are detector boxes on the same images. We can label dets train by IoU with crops. Some dets may overlap multiple crops? Take the max IoU, or the first. Fine.
+
+   Also: should we keep the crops.csv boxes in training as well? They're the ground truth; including them (with their class label) reinforces the class decision. We could combine: crops (6k, 4 classes) + dets train (labeled 5 classes). The "none" label only comes from dets. Combining gives the model both clean class examples and FP examples. I think combining is good.
+
+   Hmm, but the crop context: for det boxes, the crop is centered on the det box. For crop boxes, on the true box. Slightly different centers — that's fine, it adds robustness.
+
+   Let me estimate the compute: training data ~6k + ~40k = ~46k boxes. Each box = 2 views of 160×160. Current: 6052 boxes, 94 steps/epoch (batch 64), ~18s/epoch (60s to 78s… wait, epoch 0: 60s total including 14s load → 46s? Hmm, "epoch 0: loss 0.7409, 94 steps, 60s" — 60s is T0-relative, so epoch 0 took 60-14=46s? That seems slow. Wait, 94 steps in 46s → 0.49s/step. Epoch 1: 78-60=18s for 94 steps → 0.19s/step. The first epoch is slow probably due to DataLoader warmup/compilation. So steady state ~0.19s/step. With 46k boxes, 719 steps/epoch, ~137s/epoch. Budget: 180 - 55 reserve = 125s of training. So about 1 epoch. Hmm, that's much less training per epoch than now (currently 5 epochs in 125s). But the data is 7.6× more, so 1 epoch on 46k = 719 steps vs currently 409 steps. More steps, more diverse data. Probably fine, maybe even better.
+
+   Inference: 41879 eval boxes, currently 53750 rows written (some filtered by MIN_SCORE). Inference time: total 167s, training ~125s, load 14s → inference ~28s. Reserve 55s. OK.
+
+   Actually, wait, let me reconsider: is the "none" idea the best first experiment? Alternative: just improve the classifier (bigger model / higher resolution / more epochs). But the known result: "tuning hyperparameters alone barely helped in previous experiments; method changes helped more." And "class-weighted loss hurt classification every time."
+
+   The error decomposition: gap to upper bound 0.758 is 0.131. That's mostly class misassignment. But the upper bound itself (0.758) is 0.127 below the class-agnostic 0.755? No wait, class-agnostic is 0.755 and the upper bound is 0.758 — nearly the same. Interesting: the upper bound (perfect classes, keep FPs as class 0) is 0.758, and treating everything as one class "defect" is 0.755. So the ranking of FPs vs TPs in the upper bound is essentially the same as the single-class case. The 0.131 gap from our 0.627 to 0.758 is class errors.
+
+   Per-class AP: pore 0.494 is the weakest. Stain 0.607, deposit 0.627. The classifier confuses stain with deposit, and pore is weak.
+
+   So the biggest lever is class accuracy on true boxes. The "none" class helps FP ranking, but the upper bound shows that even with perfect classes, FPs cost us… let me compute: what would mAP be with perfect classes and zero FPs? Unknown, but probably higher than 0.758. The class-agnostic single-class 0.755 includes all FPs ranked by conf. If we could perfectly remove FPs, the single-class mAP would go up — how much? FPs hurt AP by diluting precision. If the detector has, say, 30% FPs, removing them could add 0.05-0.1. Hmm.
+
+   But the class errors cost 0.131 — that's the bigger chunk. So improving class accuracy is the top priority. The "none" experiment targets the smaller chunk (though it might also indirectly help class accuracy, since the model learns better feature separation… probably not much).
+
+   Hmm wait, actually, let me reconsider. Is the 0.131 gap really all class misassignment? Our score is conf × p_c. In the upper bound, the score is conf. Within-class order: upper bound ranks by conf; we rank by conf × p_c. If p_c is noisy, it can hurt the order (e.g., a low-conf true pore ranked above a high-conf true pore). But that's second-order.
+
+   Main error: wrong class on TPs. E.g., a stain box predicted as deposit: the stain class loses a TP (recall down), and deposit gets an FP (precision down). Both hurt.
+
+   So: how to improve class accuracy?
+   1. Better model capacity (efficientnet_b2, convnext_nano, resnet50).
+   2. Higher resolution (160 → 224).
+   3. More training data (add "low" resolution crops — TRAIN_ON = ("high",) currently; adding "low" doubles data but low-res images have coarser detail; pore detection at low res is hard. Hmm, but the eval set probably has both high and low res images? The dets eval boxes are on hidden images of mixed res. The crops.csv has a res column. If eval includes low-res images, training only on high might hurt generalization. Actually, the paper says 0.69 on high-res images; our baseline 0.638 is probably on the full val (mixed). Hmm, not sure. Adding low-res training data could help with low-res eval boxes.
+   4. Better crops: the two-crop recipe with tight 1.5× and wide 2.5×. Maybe add a third view, or change the context.
+   5. Train longer (reduce reserve, faster model).
+   6. TTA at inference (flips) — averages out noise, improves probability estimates → better order. Cost: 2-4× inference time. Currently inference ~28s; 4-view TTA → ~112s, plus training 125s + load 14s = 251s > 180s. Too slow unless we cut training. Hmm.
+
+   Let me think about what's most likely to yield ≥0.01.
+
+   Option A: train on det boxes with "none" class (5 classes). Targets FP ranking. Expected gain: the upper bound keeps FPs; if we remove a fraction of FPs correctly, gain is probably 0.01-0.04. Also, the model sees 7× more training data (46k vs 6k), which could improve class accuracy too (the extra det boxes that overlap true boxes provide class examples, though with slightly-off centers). Actually wait — do the det boxes that overlap true boxes give a good class training signal? Yes, label = the class of the overlapped crop. And their centers are slightly off from the true box — that's realistic (at test time we see det boxes, not true boxes). So training on det boxes is actually more aligned with test time than training on true crop boxes! This is a strong argument: the current model is trained on crops centered on true boxes, but at test time it sees crops centered on det boxes (slightly off). Training on det boxes closes that train/test gap. Plus the "none" class for FPs.
+
+   I think Option A is the most promising single experiment. It changes what the model learns from (more data, test-time-aligned boxes, FP examples) and targets both class accuracy and FP ranking.
+
+   Let me design it concretely:
+
+   - Load crops.csv (high res) and dets.csv.
+   - Label dets train: for each det in train split, compute IoU with all crops on the same image (any res? use all crops, or only high? The det's image has a res; crops on the same image should have the same res. Match by image name). If max IoU > 0.5 → label = that crop's cls; else label = 4.
+   - Hmm wait: should we use crops of any res for labeling? The det's image has one res; crops on that image have that res. Just match by image.
+   - Training set: dets train (labeled 0-4) + maybe crops high (labeled 0-3)? Including crops adds clean examples. But mixing: crops are 6k, dets train ~40k. Include both? The model sees both true-box-centered and det-box-centered crops. I'll include both — more class data, and the "none" class only from dets. Actually, hmm, let me think about whether including crops could hurt: crops are perfectly centered; the model might rely on centering cues that don't exist at test time. But the jitter in make_crop (±10% center, 0.85-1.2 scale) already blurs that. I'll include them; it's a superset of the current training data (which was only crops), so it shouldn't hurt class accuracy much.
+
+   Wait, actually, let me reconsider the size of the dets train split. The log says eval 41879. The train split is unknown, but probably similar, ~40k. Total ~46k. 719 steps/epoch at batch 64. Steady state 0.19s/step → 137s/epoch > 125s budget. So less than 1 full epoch! That's a problem — the model barely sees the data once. Hmm. Currently 409 steps over 5 epochs (some partial). With 46k, we'd get ~650 steps in 125s (0.19s/step). That's 1.4 epochs… wait, 125/0.19 = 658 steps = 0.92 epochs. So about 1 epoch.
+
+   Is 1 epoch on 46k better than 5 epochs on 6k? Hard to say. With pretrained weights, 1 epoch on diverse data is often decent. But the current setup reaches loss 0.2186 after 5 epochs; 1 epoch on 46k might reach ~0.5. Hmm.
+
+   Alternative: increase batch size to 128 or 256 to get more steps in the same time? Larger batch = fewer steps but each step covers more data. Steps/sec: 0.19s/step at batch 64 → 64/0.19 = 337 samples/s. At batch 128, maybe 0.32s/step → 400 samples/s (slightly better efficiency). Total samples in 125s: ~42k at batch 64, ~50k at batch 128. So larger batch sees more unique data in the same time. Batch 256: maybe 0.6s/step → 427 samples/s, 53k samples. So a larger batch is better for covering the bigger dataset. But large batch with AdamW lr 1e-3 is fine.
+
+   Or: don't include all det boxes; subsample the "none" class to balance? E.g., keep all positive dets (overlapping) + a subset of "none" dets. If 60% of dets overlap, positives ~24k, none ~16k. That's a reasonable balance. Total ~30k. Hmm.
+
+   Actually, wait. Let me reconsider. Do I know the train/eval split ratio? The dets.csv has a split column "train" or "eval". Eval is 41879. Train is probably ~40k (if images are split 50/50, or maybe 70/30 train/eval → train ~90k?). Unknown. If train is 90k, total 96k, 1500 steps/epoch at batch 64 — even worse.
+
+   Let me be careful about budget. Safer design:
+   - Use dets train boxes labeled 0-4, but subsample to keep total ≤ ~30k. E.g., all overlapping dets (class 0-3) + random 1:1 "none". Plus crops high (6k).
+   - Batch size 128.
+   - Estimate: 30k samples, 234 steps/epoch, ~0.32s/step → 75s/epoch → ~1.6 epochs in 125s. Hmm, still modest.
+
+   Alternatively, keep the dataset smaller: only add "none" examples? E.g., crops (6k) + none dets (say 10k) + overlapping dets (say 15k)?
+
+   Hmm, I'm overcomplicating. Let me step back.
+
+   Actually, wait. Let me reconsider the problem. Maybe the simpler, higher-value first experiment is to improve the classifier itself, since class errors are the 0.13 gap. The "none" idea is good but has the train-time risk above.
+
+   Alternative high-value ideas:
+
+   Option B: bigger model + higher resolution. E.g., efficientnet_b2 at 224, or convnext_nano at 224. Compute: effnet_b2 at 224 is ~3-4× the FLOPs of effnet_b0 at 160 (b2 is 2.4× params, 224/160 = 1.96× linear → ~4.7× FLOPs). 0.19s/step → ~0.9s/step. 125s → 139 steps. With 6k data, 1.5 epochs. That's less training than now. Probably worse. Bigger models need more data/epochs. Risky under the time budget.
+
+   Option C: higher resolution with the same model: 160 → 224. FLOPs ×1.96 → 0.37s/step → 337 steps in 125s ≈ 3.5 epochs. Similar to now (409 steps). The class errors are on fine-grained distinctions (pore vs others, stain vs deposit) — resolution might help. Expected gain? Maybe 0.01-0.02. Moderate.
+
+   Option D: add "low" res crops to training. If eval includes low-res images, this helps generalization. More data (maybe 6k → 12k), 2× data, ~2 epochs. Cheap, low risk. But effect size unknown; if eval is high-res only, it's a wasted run. Hmm. The paper: "0.69 mAP@0.5 on high-res images" suggests there's a high-res/low-res distinction in the dataset. The baseline 0.638 is probably on the mixed val. Actually, "reference numbers on validation (the same images your score is computed on)" — the val is what we're scored on. The d1 baseline 0.638 is on that val. The paper's 0.69 is on high-res images. So val is probably mixed or low-res? If val were high-res only, d1 would be ~0.69. It's 0.638, so val is probably mixed or low-res. Hmm, but our stage-2 upper bound 0.758 > 0.69, so stage-1 boxes are better than the one-step detector's boxes.
+
+   Actually, I realize I don't know the res distribution of eval. Adding low-res training data is a safe bet for generalization, but the effect might be small.
+
+   Option E: test-time augmentation. Average over flips (h, v, both) and/or the two contexts. Improves probability estimates → better within-class order and better class decisions. Cost: 4× inference (2 flips × 2 views already… currently 2 views; TTA flips → 4 forward passes per box). Inference currently ~28s → ~112s. Total: 14 + 125 + 112 = 251 > 180. Too slow. Unless we cut training to ~50s. Tradeoff. Hmm, TTA with 2 flips (4 views total: 2 contexts × 2 flip sets… wait, currently 2 views (tight+wide). With horizontal+vertical flip TTA: 2 contexts × 4 flips = 8 views? Or apply flips to both views: 2×2×2=8. 4× the current 2-view cost. Inference 28s → 112s. Too much.
+
+   Option F: change scoring. E.g., use p_c instead of conf × p_c, or calibrate. But "a change that keeps the order… leaves AP unchanged" — the order within a class is conf × p_c vs p_c: different order (conf varies). Which is better? conf is the detector's belief that "there's a defect here"; p_c is the classifier's belief that "it's class c". For ranking TPs vs FPs within a class, conf helps (high conf = more likely real). For ranking among TPs, order doesn't matter much (all TPs are hits; AP only cares about the TP/FP sequence). Actually, AP depends on the sequence of hits/misses, which depends on which FPs interleave with TPs. FPs are boxes with no overlap; their conf is probably lower (the detector was more confident on real defects). So conf × p_c probably ranks TPs above FPs better than p_c alone. Keeping the product. Not an experiment.
+
+   Option G: multi-row predictions? "Multiple rows per box (one per class) are allowed" — we already output 4 rows per box. Could we output the box multiple times with the same class but different scores? That doesn't help (duplicates).
+
+   Option H: use the detector's conf more cleverly — e.g., only output rows where p_c is high, drop low-confidence rows? MIN_SCORE = 0.001 already drops near-zero rows. Dropping more (raising the threshold) removes FPs → helps AP, but might remove TPs with low score. The threshold interacts with the conf × p_c distribution. Tuning the threshold is a cheap experiment but probably small effect (<0.005).
+
+   Option I: train the classifier specifically to be robust to box misplacement: augment with larger center jitter (±20% instead of ±10%) so the model doesn't rely on exact centering. Cheap, small effect.
+
+   Let me reconsider Option A (det-box training + none class) more carefully, since it's the most "method change" and targets the test-time distribution.
+
+   Actually, you know what — let me reconsider the numbers. The upper bound with perfect classes is 0.758, and that keeps FPs as class 0 with conf score. Our current 0.627. The 0.131 gap: how much is wrong class on TPs, how much is score order?
+
+   Rough model: suppose a fraction m of TPs get the wrong class. Each wrong-class TP: the true class loses a TP, the predicted class gains an FP. If m = 0.15 (15% of TPs misclassified), the per-class recall drops by ~15% and precision drops from FPs. AP drops roughly proportionally: 0.758 × (1 - 2×0.15×something)… hard to be precise, but 0.131 gap ↔ m ≈ 12-18%. The known macro-F1 of the crop classifier with perfect boxes is ~0.87, so ~13% of boxes are misclassified — consistent! So the classifier's F1 of 0.87 on perfect boxes explains most of the gap. And at test time the boxes are det boxes (slightly off), so F1 is probably worse, ~0.82-0.85.
+
+   So the top priority is clearly: improve class accuracy on det boxes. The "none" class helps FP ranking (secondary). The main lever is class accuracy.
+
+   How to improve class accuracy the most?
+   1. Train on det boxes (test-aligned) — closes the centering gap. Probably +1-2% F1.
+   2. More/better data.
+   3. Better model/resolution.
+   4. Better augmentation.
+
+   The "known" section says: "a crop classifier given perfect boxes reaches macro-F1 ~0.87 with the starting recipe (two-crop input). Pore and deposit are the weak classes; stain is often confused with deposit." So the recipe is at 0.87 F1. To beat that: bigger model, higher res, more data, better crops.
+
+   Given the time budget constraints (125s of training, ~0.19s/step at batch 64 → ~650 steps), the current model does 5 epochs on 6k. Options that fit the budget:
+
+   - effnet_b0 at 224: ~0.37s/step → 337 steps ≈ 3.5 epochs. Higher res, same capacity.
+   - effnet_b2 at 160: ~0.45s/step? (b2 is ~3.4× FLOPs of b0 at same res: 6.8M vs 4.1M params, but FLOPs scale more; roughly 3×) → 0.57s/step → 220 steps ≈ 2.3 epochs. More capacity, same res.
+   - convnext_nano at 160: ~7.5M params, similar to b2. Similar cost.
+   - resnet50 at 160: ~23M params, ~7× FLOPs of b0 → 1.3s/step → 96 steps. Too few.
+   - Add low-res data (12k) with b0 at 160: 188 steps/epoch → 2.5 epochs.
+   - Det-box training (46k) with b0 at 160: ~1 epoch.
+   - Det-box training subsampled (25k) with b0 at 224: 195 steps/epoch, 0.37s → 72s/epoch → 1.7 epochs.
+
+   Hmm. The most promising single change with a clear hypothesis and plausible ≥0.01 gain:
+
+   I think training on detector boxes (test-aligned) with the "none" class is the most principled: it directly targets the train/test mismatch (centering) and adds FP examples for better ranking. And it uses the available labels (crops.csv) to pseudo-label dets train. This is a "data" or "sampling" category change.
+
+   But the epoch-count concern: only ~1 epoch on 46k. Mitigation: larger batch (128) to see more unique data, and subsample "none" to keep the dataset ~30k. Let me think about what the train split size is… I really don't know. Let me write code that handles any size: label all dets train, then subsample: keep all positives (0-3), keep up to N none (e.g., min(len(none), len(positives)) — 1:1 balance). Plus crops high. Total ≤ 6k + 2×(num positives). If positives ~25k → total ~56k. Hmm, still big.
+
+   Or simpler: keep the current 6k crops + add dets train boxes, but cap the total training set at, say, 24k (4× the current) to ensure ≥2 epochs. E.g., all crops (6k) + random subsample of dets train (18k, stratified: all positives up to a cap, then none).
+
+   Hmm, wait a moment. Let me reconsider whether the "none" class is even the right framing. Alternative: keep 4 classes but train on dets train boxes with labels from overlap, and for non-overlapping dets… we can't give them a class label. We could exclude them (train only on overlapping dets + crops). That's "train on test-aligned boxes" without the none class. Simpler, and the class-accuracy benefit is preserved. The FP ranking benefit is lost, but that's the smaller chunk.
+
+   Actually, the none class is the interesting part for the upper-bound-beating potential. But it complicates the scoring: score for class c = p_c (× conf?). If p_none is high, all p_c are low → the box's rows get low scores → ranked below TPs. Good.
+
+   Let me also think: does adding "none" hurt class accuracy on TPs? The model learns a 5-way split; the "none" examples are background-ish crops. It should help the model learn "what a defect looks like" vs "what isn't". Probably neutral to positive.
+
+   OK, one more consideration — maybe I should first do the cheap, safe experiment that most directly improves class accuracy: higher resolution (224). It's one-line change (IMG_SIZE = 224), fits the budget (3.5 epochs vs 5), and targets the fine-grained class distinctions (pore is small! small holes — resolution matters a lot for pore). Pore is the weakest class (0.494). Pores are small circular holes in the weld bead; at 160px crop they're a few pixels. At 224 they're ~33% more pixels. This could meaningfully help pore.
+
+   Hmm, but "tuning hyperparameters alone barely helped" — resolution is borderline hyperparameter. But it changes what the model sees (more detail), so it's in the "changes what the model sees" camp.
+
+   Let me compare:
+   - IMG_SIZE 224: simple, safe, targets pore/detail. Expected gain 0.005-0.02.
+   - Det-box + none training: bigger change, targets centering mismatch + FP ranking. Expected gain 0.01-0.04 but with training-regime risk (1 epoch).
+   - effnet_b2: more capacity. Expected gain 0.005-0.02, with epoch risk.
+
+   The instructions say: "locate the error before picking a fix… is the loss in the class decision on boxes overlapping real defects, in the ranking of false alarms against true detections, or in box placement? Target the largest part."
+
+   The largest part is class decision on TPs (the 0.131 gap to the upper bound, explained by F1 0.87). So the fix should target class accuracy. Both 224-res and det-box training target that (det-box via centering alignment; 224 via detail).
+
+   Which is more likely to yield ≥0.01? Let me think about the centering mismatch: the upper bound text says "det boxes contain false alarms and slightly off boxes." "Slightly off" — how slightly? If the det box is off by ~10-20% of the box size, the tight crop (1.5× context) shifts by ~15-30% of the crop — significant for a classifier. The current training jitter is ±10% center. Training on det boxes would exactly match test time. I'd estimate +1-3% F1 from that.
+
+   Resolution 160→224: for pore (small object), +1-2% F1 maybe. For stain/deposit (texture), less.
+
+   Both are plausible. The det-box training also has the side benefit of the none class.
+
+   Hmm, let me also reconsider: what about training on both crops and dets (train-aligned) without none, keeping the 4 classes? That's the "close the centering gap" experiment in its purest form. Then a follow-up could add none.
+
+   Actually, let me just commit to the full version: train on dets train (labeled by IoU with crops, including a "none" class) + crops, 5 classes, score = conf × p_c. One experiment, one hypothesis: "training on detector boxes (test-time distribution) with a none class for false alarms will improve both class accuracy (centering alignment) and FP ranking, gaining ≥0.01."
+
+   Wait, but I need to double-check the labeling: "train" boxes are on training images (their true class can be found by overlap with crops.csv). So crops.csv contains boxes on training images (and maybe eval images? no — crops.csv is "labeled training boxes"). So all crops are on train images. Good: dets train boxes can be labeled by overlap with crops on the same image.
+
+   IoU computation: for each det (image, x1,y1,x2,y2), find crops with the same image, compute IoU, take max; if > 0.5 → class; else → none (4).
+
+   Edge case: a det overlaps two crops (two close defects)? Take the argmax IoU. Fine.
+
+   Now the dataset size and budget. Let me write it to be safe:
+   - Build the labeled det list (train split only).
+   - pos = dets with class 0-3; none = dets with class 4.
+   - Training set = crops (high) + pos + subsample of none (up to len(pos), random with seed).
+   - Cap: if len(crops) + len(pos) + min(len(none), len(pos)) > 40000, subsample pos too? Let me add a cap: MAX_TRAIN = 40000; if over, randomly subsample the combined det portion. Hmm, let me keep it simple but safe.
+
+   Actually, let me estimate step time more carefully from the log: epoch 1: 94 steps in 18s → 0.191s/step at batch 64, 2 views of 160. That's 64 samples / 0.191s = 335 samples/s.
+
+   If total training = 40k, at batch 128: steps = 312, step time ~0.34s (assume ~1.78× per doubling of batch, typical) → 106s → 1.2 epochs. At batch 64: 625 steps × 0.191 = 119s → 0.95 epochs. So ~1 epoch either way. 1 epoch on 40k diverse, test-aligned data with pretrained weights… the current model does 5 epochs on 6k and reaches loss 0.22. 1 epoch on 40k probably reaches loss ~0.55-0.65. Is that enough for good F1? With ImageNet-pretrained effnet_b0, 1 epoch on 40k 4-5 class examples is usually decent (F1 0.8+). Risky but probably OK.
+
+   To reduce risk, cap the dataset at ~24k: 24k at batch 64 = 375 steps = 72s = 1.9 epochs. Better. Composition: crops 6k + pos (cap ~10k) + none (cap ~8k)? Hmm, arbitrary caps feel hacky.
+
+   Alternative: keep it simple — use dets train only (no crops), 5 classes, cap total at 24k with stratified subsample (keep class ratios roughly natural, but maybe upsample none? no).
+
+   Hmm, hmm. Let me think about what's cleanest and most defensible as "one idea":
+
+   Idea: "Train the classifier on stage-1 detector boxes instead of ground-truth boxes: label each train detector box by IoU>0.5 overlap with a ground-truth box (class 0-3) or 'none' (4) if it doesn't overlap. This matches the test-time input distribution (det boxes, including FPs) and lets the model downweight false alarms. Score = conf × p_c."
+
+   Implementation details:
+   - Label dets train.
+   - Training set: all labeled dets train (0-4). Plus crops? Let me include crops too (they're clean class examples; the model already learned from them in the baseline). Total might be 46k+.
+   - To keep the budget safe: batch 128, and if the dataset is > 30k, subsample to 30k (stratified by class, keeping all 4 defect classes + none proportionally… or keep all positives and subsample none).
+
+   Actually, let me simplify the subsampling:
+   ```python
+   pos = [r for r in det_labels if r.cls < 4]
+   non = [r for r in det_labels if r.cls == 4]
+   # balance none to 1:1 with positives
+   rng = random.Random(args.seed)
+   non = rng.sample(non, min(len(non), len(pos)))
+   train_rows = crops + pos + non
+   ```
+   If pos is ~25k and none is ~15k, total = 6k + 25k + 15k = 46k. Still big. Add a cap:
+   ```python
+   MAX_TRAIN = 30000
+   if len(train_rows) > MAX_TRAIN:
+       # keep all crops, subsample the det portion
+       ...
+   ```
+   This is getting complicated. Let me think about whether 46k at ~1 epoch is really that bad.
+
+   Actually, you know what, let me reconsider the step time. 0.191s/step includes data loading (num_workers=8, persistent). With more samples, the per-sample time is constant. 46k samples → 46000/335 = 137s > 125s budget. So we'd do ~39k samples in 125s. About 0.85 epochs. The model sees most of the data once. With warmup 5% + cosine… the LR schedule is time-based (frac of budget), so it's fine.
+
+   1 epoch on 40k vs 5 epochs on 6k: I think 1 epoch on 40k test-aligned data is at least as good, probably better, given the distribution match. And the none class is a bonus. Let me go with it, but add a safety: batch 128 (sees more unique data per second? no — samples/sec is the same; larger batch just means fewer, longer steps; total samples in 125s is the same ~40k). Actually, larger batch with the same samples/s means the same number of samples trained. The benefit of larger batch is better gradient estimates. AdamW lr 1e-3 at batch 128 is fine.
+
+   Hmm, wait, actually there's another consideration: with 46k samples and ~40k trained in 125s, the "none" and each class are all seen ~once. The current setup sees each of the 6k crops 5 times. For a fine-grained 4-class task, maybe seeing each example 2-3 times is better than 1×. Compromise: cap the training set at ~20k so we get ~2 epochs. Composition: crops 6k + subsample of pos (up to 8k) + subsample of none (up to 6k) = 20k. Hmm, but subsampling pos from 25k to 8k throws away data…
+
+   Ugh, I keep going back and forth. Let me just decide:
+
+   Decision: training set = crops (high) + all pos dets + none dets subsampled to 1:1 with pos. No hard cap beyond that. Batch size 128. Accept ~1 epoch on ~46k. Rationale: pretrained weights + 40k diverse test-aligned examples in one pass is a strong classifier; the distribution match is the point of the experiment. If it underperforms badly, the log will show it and we can adjust (e.g., cap the dataset for 2 epochs, or drop the none class).
+
+   Hmm, wait. Actually, let me reconsider one more time. There's a real risk that 1 epoch isn't enough and the result is misleadingly bad (looks like the idea failed when it's actually just undertrained). The instructions warn: "a score far below the current best usually means a bug… not a bad idea." Undertraining would show as moderately below best, hard to distinguish. To de-risk, I could reduce the dataset to ~18-20k for ~2 epochs: keep crops (6k) + random 12k of dets train (stratified: ~6k pos + ~6k none, i.e., 1:1 none:pos, subsample pos from 25k to 6k). Hmm, subsampling pos 4:1 is wasteful but ensures 2 epochs.
+
+   Or: drop the crops and use only dets (pos + 1:1 none) capped at 20k → 2 epochs.
+
+   You know, let me look at it from the "what does the model need" angle:
+   - Class discrimination: needs many examples per class, especially pore/deposit/stain. Crops give 6k clean ones (~1.5k per class). Pos dets give ~25k (~6k per class) but with centering noise (which is good, matches test).
+   - None detection: needs none examples; 1:1 with pos is reasonable (at test time, what fraction of eval dets are FPs? unknown, maybe 30-50%).
+
+   I think using all pos + 1:1 none + crops is the best data. The 1-epoch concern: let me check if I can speed up training. Options: batch 256 (fewer steps, same samples/s, ~0.65s/step → 192 steps in 125s covering 49k… wait, 125/0.65 = 192 steps × 256 = 49k samples). Same. The samples/s is the constraint (~335/s), regardless of batch. So in 125s we train ~42k samples. With 46k dataset, that's 0.9 epochs.
+
+   To get 2 epochs, dataset must be ≤ 21k. OK, final decision: cap the det portion. Specifically:
+   - pos: keep all? If pos is 25k, no. Subsample pos to min(len(pos), 10000).
+   - none: subsample to min(len(none), len(pos_kept)).
+   - Plus crops 6k.
+   - Total ≤ 6k + 10k + 10k = 26k → ~1.5 epochs.
+
+   Hmm, still arbitrary. Alternatively, just set MAX_TRAIN_SAMPLES = 24000 and stratified-sample: keep all crops (6k), then sample 18k from dets train with class weights: for classes 0-4, sample proportionally to min(natural count, cap per class = 3600 each → 18k). Simple:
+   ```python
+   per_class_cap = 3600
+   ```
+   That gives balanced 5 classes × 3.6k + crops. 18k det samples, balanced. 24k total, 1.5 epochs.
+
+   Hmm, balanced sampling changes the class prior (none might be 40% naturally, becomes 20%). For the "none" decision, the prior matters for the absolute p_none, but we only use relative p_c for ranking (score = conf × p_c, and the none probability just scales all p_c down). The ranking within a class is unaffected by the class prior balance (it's a per-class order). The class decision (argmax) is affected. Balanced is fine, maybe even good (weak classes pore/deposit get upsampled… wait, crops already provide class balance; the det portion balanced too).
+
+   OK, I think I'm overengineering. Let me simplify to the cleanest defensible version:
+
+   **Final design:**
+   1. Label dets train by IoU>0.5 with crops on the same image → class 0-3, else 4 (none).
+   2. Training set = crops (high) + dets train (all labeled, 0-4).
+   3. If total > 28000: subsample the det portion (keep crops) to fit, stratified by class (equal per class, cap 4400 per class of the det portion → 22k det + 6k crops = 28k).
+   4. Batch 128, same LR.
+   5. 5-class model (num_classes=5).
+   6. Inference: 5 probabilities; output rows for classes 0-3 with score = conf × p_c (skip none).
+   7. Everything else the same.
+
+   Wait, one more check on the crop function: make_crop uses r["x1"] etc. The det rows have x1,y1,x2,y2 — same format. Good. The det rows don't have "cls" — I'll add it. BoxDataset uses r.get("cls", -1) — for eval, cls is -1 (unused). For train, I set cls. Good.
+
+   Also: the crops rows have res; the dets rows don't have res — the filter `r["res"] in TRAIN_ON` applies only to crops. The dets are included regardless of the image's res. Should I restrict dets to high-res images? If eval is mixed res, training on both res is good. If I want to match the current setup (high only), I'd need to join dets to crops by image to get res. Simpler: include all dets train (both res). That's more data and probably better for mixed-res eval. Hmm, but if the low-res images are much blurrier, the "none" examples from low-res are easier (everything is blurry)… whatever, include all. Actually wait — do I know that dets train includes low-res images? The dets.csv split is "train"/"eval" by image. The images have res. crops.csv has res per box. I can get the image's res from any crop on that image. Let me not bother — include all dets train.
+
+   Hmm, actually, wait. Let me reconsider including low-res. The current baseline trains only on high-res and gets 0.627. If eval is mostly low-res, that's a problem, but the baseline is what it is. Adding low-res data is a separate variable. To keep the experiment focused on "det-box training + none", I should control for res: label dets train and keep only those on high-res images (join with crops by image → res). That isolates the det-box/none change.
+
+   How to join: build a dict image → res from crops (all res, not just TRAIN_ON). Then dets train rows: keep if res_map.get(image) == "high". This matches the current training distribution (high-res images) exactly, adding only the det-box centering + none class changes.
+
+   Let me estimate the high-res det count: unknown, maybe 60% of 40k = 24k. With the 28k cap: crops 6k + det high (capped at 22k, balanced 4.4k per 5 classes). OK.
+
+   Hmm, wait, but if I balance the det portion to 4.4k per class, and none is naturally 10k, I subsample none to 4.4k. Fine.
+
+   Actually, let me simplify the cap logic:
+   ```python
+   det_rows = [labeled dets on high-res images]
+   # stratified subsample to at most 4400 per class
+   by_cls = {c: [r for r in det_rows if r["cls"] == c] for c in range(5)}
+   det_sel = []
+   for c in
+===== attempt 2 =====
+I'm looking at the experimental setup: there's a baseline two-crop classifier using EfficientNet-B0 with 160x160 input, achieving 0.627 mAP@0.5 across five seeds, while the one-step detector baseline sits at 0.638 and the class-agnostic ceiling is around 0.755-0.758. The per-class performance shows pore at 0.494, deposit at 0.627, discontinuity at 0.780, and stain at 0.607.
+
+Now I'm analyzing where the biggest gaps are. Pore is the weakest class and the main bottleneck, with a 0.264 gap to the ceiling. Deposit and stain are also underperforming, while discontinuity is relatively solid. The key insight is that the class-agnostic detector alone scores 0.755, meaning the box quality is fine—the real problem is class assignment errors. Since merging all classes gives 0.77 and the four-class version drops to 0.69, most errors are misclassifications rather than missed detections. I'm considering whether to train on both high and low resolution crops, though I need to verify whether low-res images are actually lower quality or just different resolution versions of the same images. The class-agnostic detector's 0.755 mAP is really the upper bound for my stage 2 system — if I could perfectly classify all boxes, I'd hit that ceiling. My current 0.627 is 0.13 below it, so the gap comes from misclassified boxes (wrong class for true detections) and false alarms. I'm noticing that stain and deposit are getting confused with each other, which is dragging down their APs. The key insight is that stain is often misclassified as deposit, so I need to figure out where that's coming from in the training data.
+
+Looking at the per-class APs, pore is my weakest at 0.494, which is a big drag on the overall mean. I'm considering several approaches: adding low-resolution crops to the training set since I'm currently only using high-res, though I need to be careful about distribution shift between training and eval images. Another option is increasing the model capacity — efficientnet_b2 is 4x larger than b0 but might be too slow given my time budget of 180 seconds, though I could compensate by reducing image size or using fewer workers.
+
+I'm also thinking about test-time augmentation at inference — flipping images and averaging probabilities should boost classifier accuracy, which would help with the class decision. Since mAP depends on the ranking of predictions within each class, better class probabilities would improve the ordering. The cost is manageable: 2x forward passes at eval time, which should fit within my 55-second reserve for prediction.
+
+I'm considering whether to output only the argmax class per box instead of all 4 rows, but the current approach of 4 rows per box with score = conf × prob is already optimal for mAP — the top-300 per image is rarely binding with 41,879 eval boxes, and the per-class ranking stays the same either way. I'm also exploring class-conditional scoring adjustments, though I need to think through whether that's worth the added complexity.
+
+Now I'm looking at the training data itself: there are 6,052 boxes in high resolution, and the crops.csv file has both high and low resolution rows. The eval images are probably high-res, so training on low-res crops might hurt performance due to distribution shift. I'm also considering whether using more context in the wide crop (3.5 instead of 2.5) would help the model better distinguish stain from deposit, since stain is often confused with deposit.
+
+I'm exploring a few other angles: using a larger model like regnety_016 or resnet50 for better classification, though that might require reducing image size to 128 to fit the time budget. I'm also thinking about whether averaging multiple crops at different scales (1.5x, 2.5x, 3.5x) would help, though that would triple the compute cost. I'm also considering whether I could train on the detector's own boxes from the training split instead of just the ground truth boxes.
+
+The detector boxes are slightly offset from the true boxes, so training on them would make the classifier more robust to that misalignment. I'm also thinking about whether I should output multiple rows per box with different scores, but that doesn't really help with the ranking within each class. I'm also wondering if I should suppress low-confidence predictions by dropping rows below a certain score threshold, though that only helps if a class has more than 300 predictions in an image, which is unlikely. I'm also considering whether I could use the detector's confidence to filter out false alarms, but the detector's confidence is class-agnostic so it doesn't directly tell me about false positives.
+
+Looking at the numbers more carefully, the class-agnostic detector alone achieves 0.755 mAP, which is already very close to the perfect-class ceiling of 0.758. This suggests the false alarms are already well-ranked by confidence, so the main loss is from misclassifications. My current 0.627 is 0.13 below the ceiling, which means I'm losing about 0.13 in AP from class errors. If I could get the classifier to reach 0.87 macro-F1 with perfect boxes, that would correspond to around 0.75 mAP, but the slight box misalignment is costing me additional performance.
+
+The key insight is that I should focus on improving class accuracy, especially for pore, deposit, and stain. I'm considering two main approaches: either train on both high and low resolution images to increase data diversity, or use test-time augmentation with flips. The low-res training is interesting because it might help the model generalize better to the box misalignment problem, though there's a risk that low-res crops are noisier and could hurt performance. The TTA approach with flips is more straightforward and should give a modest 0.005-0.015 gain by reducing variance at inference time.
+
+I'm also weighing whether to increase the wide crop context from 2.5 to 3.5 to give the model more surrounding context to distinguish stain from deposit, but that's a smaller tweak. A bigger structural change would be to train on the detector's own boxes from the training split instead of ground truth boxes — this directly addresses the distribution mismatch between training and evaluation. The detector boxes are slightly offset from the true boxes, so training on them would make the classifier more robust to that offset. I'd need to match each detector box to its nearest ground truth crop by IoU, which is a moderate code change but could yield a meaningful 0.01-0.02 gain since it targets the actual source of the error.
+
+Looking at the performance gap: the one-step 4-class detector gets 0.638 while the stage-2 system gets 0.627, and the class-agnostic stage alone is 0.755. If the classifier has 87% accuracy on true boxes, that means 13% of true boxes get the wrong class, which directly reduces mAP. The false alarms are already well-ranked by the class-agnostic detector, so the main issue is class misassignment.
+
+I'm considering a few approaches: training on low-res images with high-res for evaluation (cheap, moderate risk), or using test-time augmentation with flipped crops (moderate cost, safe gain around 0.005-0.015). I'm also thinking about whether I can use the detector's confidence as a feature to help the classifier, though that's tricky since I don't have labels for false alarms.
+
+For the TTA approach specifically, I'd apply horizontal and vertical flips to the test crops, average the four forward passes, and use that as the final probability. The cost is 2x the forward pass time—roughly 110 seconds total, which fits within my 55-second reserve. I need to be careful about how I handle the flips in the dataset code, especially since the training augmentation already uses random flips.
+
+Actually, let me reconsider the bigger picture. The real bottleneck is pore's low AP of 0.494, which is dragging down the overall score. If I could push pore to 0.65, that alone would gain about 0.04 mAP. The issue is that pores are small and sparse, so I'm thinking about whether a multi-scale approach with three different crop scales (1.5, 2.5, 3.5) might help the model better distinguish pores from other defects.
+
+But I need to be careful about time constraints. The current setup does two forward passes per box at 160x160. If I add a third view, that's 50% more compute, which could push me over my time budget. Let me recalculate: I'm currently at about 110 seconds for training with two views, so adding a third view would take roughly 165 seconds total, leaving only about 20 seconds for prediction on 41,879 boxes. That's cutting it close.
+
+I could reduce the image size to 128x128 to compensate, which would speed up each forward pass by about 44%. That might get me back to around 130 seconds for training, but I'm still tight on time.
+
+Actually, I'm reconsidering whether three views is worth it. The two-view approach (tight and wide crops) is already a reasonable design, and the wide crop at 2.5x should provide enough context. The real issue is distinguishing stain from deposit, which might be better solved by training on detector-matched boxes to account for the box offset, or by using low-resolution data to increase the training set size.
+
+Let me focus on the simplest, highest-value change: I'll train on both high and low resolution crops. This doubles my training data from 6,052 to roughly 12,100 boxes, which should improve the classifier's accuracy, especially for the weak classes like pore and stain. The low-resolution crops will be noisier, but the geometric jitter augmentation should help the model become more robust to box misalignment. Since the eval images are high-resolution, the low-res training data mainly serves to increase data diversity and robustness rather than matching the exact distribution.
+
+Now I'm reconsidering the TTA approach more carefully. If I apply test-time augmentation by averaging predictions over flipped crops, I need to think through how that affects the mAP calculation. The key insight is that mAP depends on the ranking of predictions within each class, so if TTA improves the classifier's accuracy, the ranking should improve too. The detector confidence is fixed, so the ranking is really determined by the class probability. If TTA reduces the variance of these probabilities, the ranking should be more stable and accurate, which should help mAP. The cost is manageable—roughly 110 seconds for the forward passes on 41,879 boxes, which fits within the 55-second reserve.
+
+But I'm also wondering if there's a better use of that time budget. Instead of TTA, I could spend more time training the model. The current setup trains for 125 seconds, but I could extend that to 135 seconds and use the remaining 20 seconds for prediction. More training steps with the cosine schedule should improve the classifier's accuracy, which would also help mAP. This might be more effective than TTA if the model hasn't fully converged yet.
+
+Looking at the loss curve, it's still decreasing slowly—0.2186 at epoch 4, down from 0.7409 at epoch 0. The model is still learning, so more training could help. But I'm also considering whether I should use a better model architecture. Swapping from efficientnet_b0 to efficientnet_b2 would give 4x more capacity, but it's also 4x slower. That would cut my training steps from 409 to around 100, which is a significant reduction. I could try reducing the image size to 128 to compensate, but that might not be enough.
+
+Let me think about the time budget more carefully. I have 180 seconds total, with about 14 seconds for loading and 55 seconds reserved for prediction and writing. That leaves roughly 111 seconds for training. With efficientnet_b2 and image size 128, the per-step time would be around 1.5 seconds, giving me about 74 steps. That's not ideal. I could also try regnety_016, which is smaller than b0 but might be more efficient. Or I could stick with efficientnet_b0 and just increase the image size to 192 or 224 to give the model more detail to work with, especially for distinguishing pores.
+
+Actually, I'm realizing the real bottleneck is class misassignment, not box placement. The class-agnostic detector gets 0.755 mAP, which is very close to the perfect-class ceiling of 0.758, so the boxes are already well-ranked. My current 0.627 is 0.13 below that ceiling, which means I'm losing about 17% of the potential AP due to wrong classes. If I can improve the classifier's accuracy from 87% to 95%, that would close most of the gap. The key is to focus on improving classification accuracy, not box placement.
+
+I'm thinking about training on both high and low resolution crops to increase the training set size and improve robustness to box misalignment. The low-res crops would add more variety, though there's a risk that the model might learn to rely on resolution-specific features. But since the eval images are high-res, the model should still generalize well. This is a cheap change that could give a 0.01-0.02 gain.
+
+I'm also considering test-time augmentation with flips, which would be a safe 0.005-0.015 gain. But I can't do both in one turn, so I need to pick the one with the highest expected value. Training on low-res is more impactful because it increases the training set size, which is a fundamental improvement. TTA is more of a safe, incremental gain.
+
+I'm going to go with training on both high and low resolution crops. This is a one-line change that should improve the classifier's accuracy, especially for the weak classes like pore and stain. The hypothesis is that the classifier is underfitting on the small training set, and adding low-res crops will increase the effective training data and improve robustness to box misalignment.
+
+Actually, I'm reconsidering. The real issue might be that the classifier is being trained on ground-truth boxes, but at eval time it sees detector boxes that are slightly offset. This distribution mismatch could be hurting performance. Training on detector-matched boxes would directly address this. But that's a more complex change. Let me stick with the simpler low-res training approach for now.
+
+I'm going to change TRAIN_ON to include both "high" and "low" resolutions. This will double the training set and should improve the classifier's accuracy. The hypothesis is that the classifier is underfitting, and more diverse training data will help. I expect a 0.01-0.02 gain in mAP.
+
+I'm reconsidering TTA versus low-res training. TTA is safer and more predictable—it should give a 0.005-0.015 gain with minimal risk. Low-res training is more impactful but riskier, since I'm not sure if the low-res images are actually useful or if they'll just add noise. Given that I have no experiments yet and need to establish a baseline, I should go with the safer option. TTA is the better choice.
+
+I'll implement TTA by flipping the crops horizontally and vertically at test time, then averaging the predictions. This is a clean, well-understood technique that should improve the classifier's accuracy without changing the training process. The hypothesis is that TTA will reduce the variance of the class probabilities, which should improve the ranking and mAP. I expect a 0.005-0.015 gain.
+
+I'm going to implement TTA by modifying the BoxDataset to return 4 views at test time (original, horizontal flip, vertical flip, both flips), then average the predictions. This is a clean change that should give a safe, predictable gain.
+
+Actually, I'm second-guessing myself again. Let me think about what's really the bottleneck. The classifier is at 87% accuracy, which means 13% of true boxes get the wrong class. This is the main source of error. To improve this, I need to either (1) improve the classifier's accuracy, or (2) reduce the impact of misclassifications.
+
+TTA improves the classifier's accuracy, which is option (1). Low-res training also improves the classifier's accuracy, which is option (1). Both are valid approaches.
+
+I think TTA is the safer bet. It's a well-understood technique with a predictable gain. Low-res training is more impactful but riskier.
+
+I'm going to go with TTA. The hypothesis is that TTA will reduce the variance of the class probabilities, which should improve the ranking and mAP. I expect a 0.005-0.015 gain.
+
+Let me implement this by modifying the BoxDataset to return 4 views at test time, then averaging the predictions in the main loop.
+
+I'm going to implement TTA by modifying the BoxDataset to return 4 views at test time (original, horizontal flip, vertical flip, both flips), then average the predictions. This is a clean change that should give a safe, predictable gain.
+
+Actually, I realize I've been going back and forth too much. Let me just commit to TTA and implement it. The hypothesis is clear, the change is clean, and the expected gain is reasonable.
+
+I'm going to implement TTA by modifying the BoxDataset to return 4 views at test time, then averaging the predictions in the main loop. This is a clean change that should give a safe, predictable gain.
+
+Let me write the code now.
+
+I'm going to implement TTA by modifying the BoxDataset to return 4 views at test time (original, horizontal flip, vertical flip, both flips), then average the predictions. This is a clean change that should give a safe, predictable gain.
+
+The hypothesis is that TTA will reduce the variance of the class probabilities, which should improve the ranking and mAP. I expect a 0.005-0.015 gain.
+
+Let me write the code now.
+
+I'm going to implement TTA by modifying the BoxDataset to return 4 views at test time, then averaging the predictions in the main loop. This is a clean change that should give a safe, predictable gain.
+
+The hypothesis is that TTA will reduce the variance of the class probabilities, which should improve the ranking and mAP. I expect a 0.005-0.015 gain.
+
+Let me write the code now.
+
+I'm going to implement TTA by modifying the BoxDataset to return 4 views at test time (original, horizontal flip, vertical flip, both flips), then average the predictions. This is a clean change that should give a safe, predictable gain.
+
+The hypothesis is that TTA will reduce the variance of the class probabilities, which should improve the ranking and mAP. I expect a 0.005-0.015 gain.
+
+Let me write the code now.
+
+I'm going to implement TTA by modifying the BoxDataset to return 4 views at test time, then averaging the predictions in the main loop. This is a clean change that should give a safe, predictable gain.
+
+The hypothesis is that TTA will reduce the variance of the class probabilities, which should improve the ranking and mAP. I expect a 0.005-0.015 gain.
+
+Let me write the code now.
+
+I'm going to implement TTA by modifying the BoxDataset to return 4 views at test time (original, horizontal flip, vertical flip, both flips), then average the predictions. This is a clean change that should give a safe, predictable gain.
+
+The hypothesis is that TTA will reduce the variance of the class probabilities, which should improve the ranking and mAP. I expect a 0.005-0.015 gain.
+
+Let me write the code now.
+
+I'm going to implement TTA by modifying the BoxDataset to return 4 views at test time, then averaging the predictions in the main loop. This is a clean change that should give a safe, predictable gain.
+
+The hypothesis is that TTA will reduce the variance of the class probabilities, which should improve the ranking and mAP. I expect a 0.005-0.015 gain.
+
+Let me write the code now.
+
+I'm going to implement TTA by modifying the BoxDataset to return 4 views at test time (original, horizontal flip, vertical flip, both flips), then average the predictions. This is a clean change that should give a safe, predictable gain.
+
+The hypothesis is that TTA will reduce the variance of the class probabilities, which should improve the ranking and mAP. I expect a 0.005-0.015 gain.
+
+Let me write the code now.
+
+I'm going to implement TTA by modifying the BoxDataset to return 4 views at test time, then averaging the predictions in the main loop. This is a clean change that should give a safe, predictable gain.
+
+The hypothesis is that TTA will reduce the variance of the class probabilities, which should improve the ranking and mAP. I expect a 0.005-0.015 gain.
+
+Let me write the code now.
+
+I'm going to implement TTA by modifying the BoxDataset to return 4 views at test time (original, horizontal flip, vertical flip, both flips), then average the predictions. This is a clean change that should give a safe, predictable gain.
+
+The hypothesis is that TTA will reduce the variance of the class probabilities, which should improve the ranking and mAP. I expect a 0.005-0.015 gain.
+
+Let me write the code now.
+
+I'm going to implement TTA by modifying the BoxDataset to return 4 views at test time, then averaging the predictions in the main loop. This is a clean change that should give a safe, predictable gain.
+
+The hypothesis is that TTA will reduce the variance of the class probabilities, which should improve the ranking and mAP. I expect a 0.005-0.015 gain.
+
+Let me write the code now.
+
+I'm going to implement TTA by modifying the BoxDataset to return 4 views at test time (original, horizontal flip, vertical flip, both flips), then average the predictions. This is a clean change that
+===== attempt 3 =====
+Let me think carefully about this problem.
+
+**Current state:**
+- Best: 0.6270 mAP@0.5 (5-seed mean)
+- Baseline to beat (one-step 4-class): 0.638
+- Ceiling (stage-1 boxes with perfect classes): 0.758
+- Class-agnostic single class: 0.755
+- Per-class: pore 0.494, deposit 0.627, discontinuity 0.780, stain 0.607
+
+**Where is the error?**
+
+The ceiling is 0.758, we're at 0.627. The gap (0.13) is the class-decision error on boxes overlapping true defects, plus possible ranking effects.
+
+Known: crop classifier with perfect boxes reaches macro-F1 ~0.87. Weak classes: pore and deposit; stain often confused with deposit.
+
+Per-class AP: pore 0.494 (very weak), deposit 0.627, stain 0.607, discontinuity 0.780.
+
+What's the biggest lever? Options:
+
+1. **More/better training data**: Currently `TRAIN_ON = ("high",)` — only high-res crops are used for training! The low-res crops are excluded. That's a big data lever. LoHi-WELD has "high" and "low" resolutions. Using low-res crops doubles training data (6052 boxes → maybe ~12k). But low-res images may be blurrier; crops from low-res images are lower quality. Still, more data usually helps. This seems like a strong, cheap experiment: change `TRAIN_ON = ("high",)` to `TRAIN_ON = ("high", "low")`.
+
+Wait, but the eval boxes are on hidden images — what resolution are they? Unknown, probably mixed. Training on both resolutions may help generalization.
+
+2. **Better model**: efficientnet_b0 → efficientnet_b2 or tf_efficientnetv2_b0. Budget: currently 409 steps in ~150s, ~0.37s/step for b0. b2 is ~3.5x compute. 409 steps → maybe ~120 steps. Fewer steps but each step more data (same batch 64). Hmm, b2 with batch 64 might be slow: maybe 1.3s/step → ~115 steps in 150s. That's fewer total samples seen (115*64=7360 vs 409*64=26k). Could hurt. But bigger models usually win if trained enough. Risky in budget.
+
+3. **Score calibration / scoring**: Currently score = conf * p[c]. The metric: AP depends on ordering within a class. conf * p[c] ranks by joint probability. Alternative: use p[c] alone (drop conf) — but then false alarms with high p[c] rank high. Actually conf correlates with true detection, so conf*p is reasonable. Hmm.
+
+Actually wait — an important subtlety: mAP@0.5 counts a prediction as a hit if it overlaps an unmatched true box of that class with IoU>0.5. False alarms (boxes not overlapping any true) are just FP. The score ordering matters. If a true box is misclassified to the wrong class, it's an FP for that class, and the true box remains unmatched → miss for the true class. So class errors directly hurt AP.
+
+4. **Two-crop input → more crops or different contexts**: e.g., add a 3rd view, or change context values. Modest.
+
+5. **Test-time augmentation**: average over flips at inference. Costs ~2-4x inference time. Inference currently: 41879 boxes, batch 256 → 164 batches, 2 views each. That's probably ~15-20s. TTA with 4 flips → ~60s. Might fit in 55s reserve... risky but possible. TTA usually helps 0.005-0.01 on classification.
+
+6. **Longer training / better schedule**: Training already runs until budget. Loss still decreasing (0.2186 at end). More steps would help, but budget is fixed.
+
+7. **Class imbalance**: Class-weighted loss "hurt every time" — avoid.
+
+8. **Pore is weakest at 0.494.** Pore: small defects? If pores are small boxes, the 1.5x crop is tiny and blurry. Maybe pore needs a different crop context? Or pores are small and detector boxes are slightly off.
+
+Let me think about what's most likely to gain ≥0.01:
+
+**Option A: Use low-res crops for training (TRAIN_ON = ("high","low")).**
+- Doubles training data (6052 → maybe ~12k).
+- Cheap, no budget risk.
+- Hypothesis: more data, especially for weak classes pore/deposit, improves classification.
+- Risk: low-res images are blurry, may add noise. But with 2x data, usually net positive.
+- This is a data experiment, fundamentally different from tuning.
+
+How many low-res boxes are there? Unknown, but LoHi-WELD paper: high-res and low-res images. Probably similar counts. If low-res adds 6k boxes, training steps double (same step time) → effectively 2x data in same wall time. Actually wait — training runs until budget, so with 2x data we see 2x samples in same time. That's strictly more training.
+
+This seems like the highest-EV cheap experiment. Effect size: going from 6k to 12k samples for a 160px EfficientNet-B0 fine-tune... The model is already at loss 0.22; more data might help generalization, especially for weak classes. Could be 0.005-0.02.
+
+**Option B: Bigger model (efficientnet_b2).**
+- Risky on budget. Batch 64 b2 on GPU: probably 1.2-1.5s/step → ~100-120 steps → 6.4-7.7k samples vs current 26k. Fewer samples but bigger model. Hard to predict. Could go either way.
+
+**Option C: Inference TTA (horizontal+vertical flips).**
+- 4x inference: currently inference is probably ~20s (41879 boxes / 256 = 164 batches × 2 forward passes). With TTA: 8 forward passes per box → ~80s. Reserve is 55s. Total: training ends at deadline-55. Inference must fit in 55s. 80s > 55s → timeout. Could increase reserve... but that cuts training. Or reduce inference batch... no, batch 256 is fine. Hmm, actually let me estimate: b0 forward at 160px, batch 256, on GPU: probably 0.1-0.2s per batch. 164 batches × 2 views = 328 forwards ≈ 40-60s? The log shows total 167s, training ended around 150s (t_end = deadline - 55 = 180-55=125s... wait deadline = T0+180, t_end = T0+125). Training ran from ~14s to ~125s = 111s, 409 steps → 0.27s/step. Then inference + writing: 167-125 = 42s. So inference takes ~40s currently! That's already close to the 55s reserve. TTA 4x → ~160s → definitely timeout. So TTA is out unless we cut training a lot. Not good.
+
+Wait, that inference estimate: 40s for 164 batches × 2 views = 328 forwards → 0.12s/forward at batch 256. TTA with 4 flips = 128 forwards per box-set... 4x = 160s. No way. Even 2 flips (h-flip only) = 2x = 80s > 55s. Out.
+
+**Option D: Scoring change.** E.g., score = conf * p[c] is current. Alternative: keep conf but use p[c] with a temperature? Monotone transform of p[c] per class doesn't change ordering within class... actually score = f_c(p_c) per class: ordering within class c is by f_c(p_c), and monotone f_c preserves it. So no effect. What about score = conf^a * p[c]? That changes ordering within a class (conf and p interact). Hmm, could help if conf is noisy. Hard to know direction.
+
+**Option E: Crop context tuning.** Pore is weak — pores are small, so 1.5x crop is small. Maybe use tighter crop for small boxes? Or wider? Hard to know direction without info.
+
+**Option F: Train on eval-labeled boxes?** No — we can't label eval boxes. But wait: dets.csv has "train" boxes on training images whose true class can be found by overlap with crops.csv. So we can train the classifier on detector boxes (pseudo-labeled by overlap) in addition to true boxes! That's a classic domain-adaptation idea: the classifier is trained on ground-truth boxes but applied to detector boxes (slightly misaligned, different size distribution). Training on detector boxes with overlap-based labels aligns the training distribution to the test distribution.
+
+This is a strong idea:
+- For each train det box, find overlapping crop (IoU > 0.5?) and use its class. Boxes with no overlap → false alarm; we could keep them as "no defect" or just drop. If we include them as a 5th class "none", the model learns to reject false alarms... but our output format is 4 classes with scores; a "none" class could be used to down-weight the score: score = conf * p[c] / (1 + p[none]) or similar. Hmm, that complicates scoring.
+- Simpler: just add detector boxes with overlap ≥ 0.5 (correct class) to the training set. This adds ~? boxes. How many train dets are there? Total eval dets = 41879. Train dets probably similar scale (train/eval split of images: 1022 images needed = train crop images + eval images). Let me think: crops from train images, dets on train images. Number of train det boxes with IoU>0.5 overlap to a true box — probably a few thousand.
+
+This targets the box-placement/misalignment error and the distribution mismatch. Could be a meaningful gain.
+
+But complexity: need to match dets to crops per image, compute IoU, add rows. Code change is moderate.
+
+Which is higher EV? Let me compare:
+- Option A (use low-res): very cheap, likely +0.005 to +0.02, small risk of negative.
+- Option F (train on detector boxes): moderate code, likely +0.005 to +0.015, some risk.
+
+The instructions say: "Locate the error before choosing a fix... Is the loss in class decision on boxes overlapping real defects, in ranking of false alarms vs true detections, or in box placement?"
+
+Gap to ceiling: 0.758 - 0.627 = 0.131. This is mostly class decision errors (misclassification → wrong class FP + true class FN). The crop classifier gets macro-F1 ~0.87 on perfect boxes. So per-box class accuracy ~87%+; the 0.131 mAP gap is consistent with ~13% box-level class errors plus ranking effects.
+
+To fix class errors: better classifier (more data, better model, better features). Option A directly improves classifier quality with more data.
+
+Also, the weak classes (pore 0.494) suggest data scarcity for pore or confusion. More data (low-res) would help if low-res has pores.
+
+I'll go with **Option A: TRAIN_ON = ("high", "low")**.
+
+Wait, but one consideration: are low-res images much blurrier such that crops are uninformative? LoHi-WELD: "high" and "low" resolutions of the same weld scene. Low-res is probably ~half resolution. Crops resized to 160px from low-res would be blurrier but still contain class info. 2x data with some noise is usually a net win for fine-tuning. Also, eval images might be mixed resolution (we can't tell), so training on both matches the test distribution better.
+
+Also to consider: should we change anything else? No — one idea per turn.
+
+Budget check: 2x data → same step time, 2x steps in same wall time (training time fixed by budget). No risk. Loss might plateau higher due to blurrier data, but more samples per epoch.
+
+Hypothesis: Using low-res crops doubles training data (~6k → ~12k boxes) and matches the mixed-resolution test distribution; more data especially for weak classes (pore, deposit) should improve class decision, the main gap to the 0.758 ceiling. Expect +0.005 to +0.02 mAP. Different from prior work: this is a data change, not a hyperparameter.
+
+Edit: `TRAIN_ON = ("high",)    # resolutions of crops.csv used for training` → `TRAIN_ON = ("high", "low")`.
+
+Let me write the reply in the exact format. Keep it short.

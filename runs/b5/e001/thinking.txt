@@ -1,0 +1,206 @@
+===== attempt 1 =====
+Let me carefully analyze the situation.
+
+Current state:
+- Best: e000, 5-seed mean 0.6288 (this is the starting recipe)
+- Baseline one-step 4-class detector: 0.638 (the number to beat)
+- Stage-1 boxes with perfect classes (ceiling): 0.758
+- Stage-1 boxes as single class: 0.755
+- Per class: pore 0.502, deposit 0.624, discontinuity 0.780, stain 0.609
+
+So stage 2 currently is 0.6288, below the one-step baseline 0.638. The ceiling is 0.758. The gap from 0.6288 to 0.758 is 0.13 — this is the classification error on boxes that overlap true defects (plus ranking of false alarms).
+
+Wait — actually the ceiling keeps false alarms as class 0 with detector conf. Current per-class: pore 0.502 is the weakest. Pore and deposit are weak classes; stain is often confused with deposit.
+
+Key insight: the score is conf × P(class). False alarms (boxes not overlapping any true defect) get some class probability; if the model is uncertain, scores are low-ish, but conf is high for detector false alarms. Hmm.
+
+Let me think about the main error components:
+
+1. Classification error on true defects: misclassified boxes count as wrong-class predictions, which hurt AP of both the true class (missed) and the predicted class (false positive). Since merging all classes gives 0.755 and 4-class gives 0.638 for the one-step, most of the error is wrong types.
+
+2. Ranking of false alarms: false alarms of class c compete with true detections of class c. In the ceiling, false alarms are class 0 (pore) with detector conf. Our system assigns classes to false alarms based on the crop classifier.
+
+The biggest lever: improve classification accuracy. Known: crop classifier with perfect boxes reaches macro-F1 ~0.87 with the starting recipe. Weak: pore and deposit; stain confused with deposit.
+
+What changes of method could help?
+
+Ideas:
+a) Use more training data: TRAIN_ON = ("high",) — also use "low" resolution crops. This doubles training data. Low-res crops may be noisier but more data. This is a data change and could plausibly help, especially for weak classes (pore, deposit) where data is scarce. Risk: low-res labels might be noisier? Actually crops.csv contains labelled training boxes at both resolutions; the low-res images are probably the same weld beads at lower resolution (or different images). Using both gives ~2x data. This is a big, cheap change. Expected effect: macro-F1 improvement, especially on rare classes.
+
+Wait, but is "low" a different set of images, or the same images at lower resolution? The data has res "high"/"low". Probably the same weld images captured at two resolutions. Training on both = 2x data, and low-res adds robustness to scale. Seems like a solid first experiment.
+
+b) Ensembling / more views at test time: e.g., add a third view, or TTA (flip). TTA with horizontal flip is cheap (2x inference cost). But inference: 41879 detections × 2 views; currently prediction takes 162-125=37s for 53606 rows... actually prediction is from ~125s to 162s = 37s. TTA flip doubles that to ~74s, still within 180s with training 125s? No wait, training ends at t_end = deadline - 55 = 125s. Prediction must finish by 180s, so 55s for prediction. Currently prediction takes ~37s. TTA flip: ~74s > 55s. Too tight. Could reduce RESERVE_S to 40 and hope prediction fits... risky.
+
+c) Better model: e.g., efficientnet_b2 or tf_efficientnetv2_b0. B2 is bigger; step time increases. Currently ~0.42s/step (94 steps in 46s of epoch 0... let me compute: epoch 0: 94 steps in 59-13=46s → 0.49s/step). B2 is ~2x compute → ~0.9s/step → ~215 steps in 112s. Fewer steps but bigger model. Hmm, tradeoff. tf_efficientnetv2_b0 is similar size to b0. resnet50 larger.
+
+d) Class weighting: "class-weighted loss hurt classification every time it was tried." So no.
+
+e) Different crop context: try single wide crop, or different context. Tuning hyperparameters alone helped little.
+
+f) Use detector conf as input? Not available for training boxes... Actually "train" boxes in dets.csv are on training images with conf — we could use detector conf as an additional feature. Hmm, but training crops come from crops.csv (true boxes), not detector boxes. We could join: for each true box, find overlapping detector box and use its conf as a feature. This is a method change: incorporate detector confidence into the classifier input (e.g., as an additional channel or as a feature concatenated to logits). But the effect is unclear.
+
+g) Two-stage scoring: instead of score = conf × P(c), also emit multiple rows per box (up to 300 rows per image). Currently we emit 4 rows per box (one per class). That's fine.
+
+h) Key insight about the metric: AP depends only on the ordering of predictions within a class. False alarms hurt AP when ranked above true positives. The class probability of a false alarm: if the model is confident about a wrong class, that false alarm gets a high score in that class and pushes down true detections. If the model is uncertain, scores are lower.
+
+One powerful idea: since we can output multiple rows per box, we could output the top-2 classes with different scores. But that's already done (all 4 classes).
+
+i) Pore is the weakest (0.502). Pores are small, bright spots. Maybe a specialized approach: detect pores within a box? Overkill.
+
+j) Training on both high and low res (idea a) — let me estimate: 6052 boxes at high; low probably similar count → ~12000 boxes. Steps per epoch double: ~188 steps/epoch vs 94. Step time same. So ~2.5 epochs in budget. More data per step, fewer total steps. Net effect: more data seen, less optimization. Usually more data helps, especially for rare classes.
+
+Actually wait — is low res the same images? If crops.csv contains the same boxes at two resolutions of the same images, then training on both is like a resolution augmentation. That's good.
+
+Let me think about what's most likely to give ≥0.01 gain:
+
+1. Add low-res training data (data category): cheap, big, addresses weak classes. Expected: +0.01 to +0.03.
+
+2. Bigger/better backbone (architecture): e.g., efficientnet_b2. Risky on time but doable: 0.9s/step → 112s budget gives ~124 steps (plus 5% warmup). Hmm, 124 steps vs 433 currently. B0 with 433 steps vs B2 with ~124 steps. Not obvious B2 wins. tf_efficientnetv2_b0: similar size, maybe slightly better per step. Marginal.
+
+3. Test-time flip (inference): ~+0.005-0.01 typically, but time budget is tight. Could do: keep RESERVE_S=55, prediction currently 37s → 74s with flip. Over budget. Could cut training reserve: RESERVE_S=45, prediction 74s ends at 125-... wait, training ends at deadline - RESERVE_S. If RESERVE_S=45, training ends at 135s, prediction 74s → 209s > 180. No good. To fit flip TTA, need prediction ≤ 55s → must halve inference cost elsewhere. Not doable right now.
+
+Actually, wait, let me recompute prediction time. Total 162s, training ends at 125s (5 epochs, 433 steps). 162-125 = 37s for prediction + writing. 41879 detections × 2 views = 83758 crops at 160px, batch 256, B0 on GPU (probably). 37s. With flip: 74s. RESERVE_S is 55, so we have 55s for prediction+writing. 74s doesn't fit. If we shrink IMG_SIZE to 128: inference cost scales ~ (128/160)^2 = 0.64 → 48s with flip. Training step time also drops: 0.49 → 0.31s/step → more steps (~360). Hmm, but resolution change might hurt accuracy. Pores are small; 160px for a 1.5x crop of a small box... crop is resized to 160 anyway. Lower resolution might blur pores. Risky.
+
+4. Use low-res data AND keep everything else. Let's go with this.
+
+Actually, let me reconsider. The problem statement says "tuning hyperparameters alone helped little in earlier experiments; changes of method helped more." And "class-weighted loss hurt." These are "already known" facts, probably from the paper's experiments or prior agent runs.
+
+The biggest error is classification (ceiling 0.758 vs 0.6288). Per-class: pore 0.502 is the worst. Pore vs deposit confusion, stain vs deposit.
+
+Another method change: train the classifier on detector boxes (train split of dets.csv) with pseudo-labels from overlap with crops.csv, instead of (or in addition to) true boxes. Detector boxes are what we'll classify at test time — distribution match! Training on true boxes but testing on detector boxes has a domain gap: detector boxes are slightly misplaced (as noted "slightly misplaced boxes"). Training on detector boxes (which are "slightly misplaced") with labels from overlap would align train/test distributions. This is a strong method change: "train on the same distribution you'll be tested on."
+
+How: for each train det box, find overlapping crop (IoU > 0.5) → label. Boxes without overlap → false alarms; could be used as negative examples (class-agnostic "not a defect"?) but we have 4 classes; could skip them or use them for something. Actually we could add a 5th "background" class for false alarms during training and at test time... but the output must be 4 classes. Hmm, we could train with 5 classes and at test time use the 4-class probabilities, or renormalize. This is more complex.
+
+Simpler version: train only on detector boxes that overlap a true box (with that label). This changes the input distribution to match test time. Expected effect: the misplaced-box problem is addressed. Pore AP might improve since pores are small and misplacement hurts most.
+
+But wait: how many train det boxes overlap true boxes? dets.csv train split — unknown count. Probably a good fraction.
+
+Hmm, which to pick first: low-res data or detector-box training?
+
+Let me think about magnitude. Domain gap from misplacement: crops are made from true boxes with jitter (±10% center, 0.85-1.2 side) — jitter already simulates some misplacement. Detector boxes are "slightly misplaced." So the distribution gap may be moderate.
+
+Low-res data: doubles data. For classification with macro-F1 0.87, weak classes pore/deposit probably have fewer samples. More data usually helps rare classes.
+
+Actually, I realize I should check: are "low" res crops the same images? The harness says images/ contains the images; crops.csv has res high/low. Probably the dataset has high-res and low-res versions of weld images (the paper mentions high-res images; the one-step detector gets 0.69 on high-res). The eval images are probably high-res (since the ceiling numbers are computed on them). Training on low-res adds scale diversity.
+
+I think the safest, highest-EV first experiment is: TRAIN_ON = ("high", "low") — use all labelled boxes. One-line change, no time risk (more steps per epoch but same total steps budget... wait, more boxes → more steps per epoch, but the loop runs until time budget, so total steps are about the same, just fewer epochs. Actually total steps in budget is ~same (time-based), each step sees 64 boxes. So total boxes seen is the same, just more diverse (mixed res). Hmm — so the "2x data" doesn't increase total boxes seen, it changes which boxes are seen: instead of 433×64=27712 high-res box samples, we'd see a mix of high and low. The benefit is diversity/robustness, not volume. Still plausible: low-res forces the model to rely on texture/shape rather than fine detail, could improve generalization. But the gain might be small (<0.003).
+
+Hmm. Let me reconsider.
+
+Alternative: increase effective training by training longer per box? No.
+
+Let me think about the classification problem more. Macro-F1 ~0.87 with perfect boxes. Per-class AP: pore 0.502. Even with perfect boxes, pore AP would be limited by F1. The gap between our 0.6288 and ceiling 0.758 includes:
+- Classification error (wrong class assignment)
+- Ranking of false alarms (ceiling keeps false alarms as class 0 with conf; we assign classes with conf×P)
+
+Actually interesting: in the ceiling, false alarms are all class 0 (pore) with detector conf. In our system, false alarms get class probabilities — if the model assigns high P(pore) to false alarms, they're similar to ceiling. If it assigns to other classes, it distributes false alarms across classes, which could be better or worse per class.
+
+What's the biggest lever to get from 0.6288 to 0.758? Classification accuracy on true boxes. The one-step detector's 4-class vs single-class gap (0.69 vs 0.77) suggests ~0.08 of error is type confusion in the one-step. Our stage 2 should do better than one-step's classification since it has a dedicated classifier... but we're at 0.6288 < 0.638. Why? Probably because stage-1 boxes are worse than one-step's boxes (one-step jointly optimizes boxes), plus classification error.
+
+Hmm wait, actually the one-step baseline 0.638 is on the same val images. Stage-1 detector alone (class-agnostic) gets 0.755 as single class. So stage-1 boxes are good. The 0.758→0.6288 gap (0.13) is almost entirely classification + ranking.
+
+So the main target: classification accuracy, especially pore (0.502) and stain (0.609), deposit (0.624).
+
+Method changes to improve classification:
+1. Better backbone (b2, v2_b0, resnet50) — bigger model, fewer steps. tf_efficientnetv2_b0 is about the same size as b0 (actually v2_b0 is slightly bigger: 19M vs 4M params... EfficientNet-B0 is 4.1M, tf_efficientnetv2_b0 is 7.8M). Compute probably 1.5-2x.
+2. Train on detector boxes (distribution match).
+3. More views / context.
+4. Use low-res data.
+5. Larger crop resolution (IMG_SIZE 160→224)? Pores are small; more pixels might help pore classification. Cost: (224/160)^2 = 1.96x step time → 0.49→0.96s/step → ~117 steps. And prediction 37→73s > 55s reserve. Too tight. IMG_SIZE 192: 1.44x → 0.71s/step → ~158 steps; prediction 53s ≈ reserve 55s. Too tight, risky.
+6. Ensemble of two small models? No time.
+7. Test-time: average over multiple random crops (like training jitter) — 4x inference cost, doesn't fit.
+8. Score calibration: score = conf × P(c) — maybe use P(c) alone, or conf^a × P(c). Since AP depends only on ordering within a class, and conf is a constant per box... wait, conf varies per box! Different boxes have different conf. So score = conf × P(c) orders boxes by both detector conf and class probability. The ceiling uses pure conf ordering (all false alarms class 0). Hmm, for a given class c, our ordering is by conf×P_c. The "perfect" ordering would rank true defects of class c above false alarms. Using P_c helps if the model is more confident on true defects. This is already done.
+
+Could we improve ranking by using a "defectness" score? E.g., train a separate binary defect/not-defect classifier and multiply? That's a method change: 2 models. Time: 2 models in same budget → each half the steps. Probably net loss.
+
+9. Idea: train the classifier with labels from detector boxes for train split (distribution match) — let me estimate the data. dets.csv train split count unknown. If stage-1 detector produces ~42000 eval boxes over 1022 images... eval is 41879 detections. Train split probably similar scale (maybe ~40k). Boxes overlapping true crops: maybe 30-60k? Actually crops.csv has 6052 high-res boxes (12k total with low?). Detector boxes that overlap true boxes: probably a few thousand. Plus false alarms.
+
+Training on detector boxes with overlap labels: input distribution = detector boxes (matches test), labels = true class. This directly addresses "slightly misplaced boxes" and the fact that test boxes are detector boxes. I think this is a strong method change. We could also keep true boxes in training (mix).
+
+Hmm, but there's a subtlety: a detector box might overlap multiple true boxes (e.g., two defects close together). Take the one with max IoU if IoU>0.5, else skip.
+
+Also false alarm boxes (no overlap): we could use them as an extra "background" class during training to teach the model "this looks like nothing" — at test time, we could use the background probability to down-weight scores: score = conf × P(c) × (1 - P_bg) or similar. This helps ranking of false alarms! This is a real method change that targets the ranking error component.
+
+But complexity: 5-class training, at test emit 4 classes with scores scaled by (1-P_bg) or by P(c)/(1-P_bg). Since scaling by (1-P_bg) varies per box, it changes ordering within a class — could help if background probability correlates with false alarms.
+
+This is getting complex. Let me keep it simpler for the first experiment.
+
+Given "one idea per turn," I should pick the single highest-EV change. Let me rank:
+
+A. Train on detector boxes (distribution match) — method change, directly targets train/test gap. Medium complexity. Expected gain: uncertain, maybe +0.01 to +0.02.
+
+B. Add low-res crops to training — one-line change, diversity. Expected: small (+0.00 to +0.01).
+
+C. Bigger backbone (tf_efficientnetv2_b0 or b2) — architecture. Expected: +0.005 to +0.015, but fewer steps.
+
+D. 5-class with background for false alarm suppression — method change targeting ranking. Higher complexity, higher risk.
+
+E. TTA flip — doesn't fit in time budget.
+
+Hmm, actually let me reconsider the problem. What does the ceiling tell us? Ceiling = 0.758 with perfect classes but false alarms kept as class 0 with conf. Our score 0.6288. If classification were perfect, we'd be at ~0.758 (assuming our false alarm class assignment is similar to ceiling's). So classification error costs ~0.13. That's the dominant error. Ranking of false alarms is a smaller component (ceiling also suffers from it: 0.758 vs 0.755 single-class... wait, single-class is 0.755 and ceiling is 0.758 — very close, both limited by false alarms and box placement).
+
+So: focus on classification accuracy. What limits classification? Macro-F1 0.87 with perfect boxes and starting recipe. Weak: pore, deposit; stain↔deposit confusion.
+
+To improve classification:
+- More/better data
+- Better model
+- Better input representation (crops)
+- Better training (but class weighting hurt)
+
+The input representation is a big lever: currently 2 crops (1.5x tight, 2.5x wide), 160px. Pores are small bright spots — at 1.5x context, the pore is a large fraction of the crop; at 2.5x, smaller. Maybe a 3rd view at 1.0x (just the box) would help pore? Or higher resolution?
+
+Actually, "a crop classifier with perfect boxes reaches macro-F1 ~0.87 with the starting recipe (two-crop input)" — this is a known fact, probably from the paper or prior experiments. So the recipe is decent.
+
+Let me think about data: 6052 high-res boxes. Class distribution? Unknown, but pore is probably common (pores are common in welding). Actually in weld defects, pores are often the most numerous. If pore is common but AP is lowest (0.502), that's not a data scarcity issue — it's a confusion issue (pore vs stain? pore vs deposit?). Pores are small bright dots; stain is a dark patch; deposit is extra material. Pore vs stain confusion is plausible (both small).
+
+Hmm, I don't have per-class confusion data.
+
+Let me think about the detector-box training idea more concretely, since it's a genuine method change (train on the test distribution):
+
+For train split dets, compute overlap with crops (high-res, same image). If IoU > 0.5, label = crop's class. Build a new training set from these boxes. Train the same 2-crop classifier on them. At test, same.
+
+Expected: the classifier sees boxes with the same size/placement statistics as test boxes. The current training uses true boxes with jitter; detector boxes are "slightly misplaced" — the jitter (±10% center, ±15% size) may not fully cover detector misplacement. Also detector box sizes may differ systematically from true boxes.
+
+Risk: if detector boxes are badly misplaced for small defects (pores), the crops might often not contain the defect, making labels noisy → hurts. But IoU>0.5 filter ensures decent overlap.
+
+I think this is a good first experiment: it's a clear method change, cheap to implement, and directly targets the train/test distribution gap. And it's different from everything in the history (no history yet).
+
+Actually wait — should I first do the cheap one-liner (low-res data) to get a data point? No — low-res data has a weak expected effect (same total boxes seen, just mixed). The detector-box change is more likely to matter.
+
+Hmm, but let me reconsider: is there a simpler, higher-EV change? Let me reconsider the backbone. tf_efficientnetv2_b0: 7.8M params vs 4.1M. Compute ~1.6x. Steps: 433 → ~270. Prediction: 37s → ~59s > 55s reserve. Too tight! Prediction would exceed reserve. Let me compute more carefully: prediction time scales with model FLOPs. B0→v2_b0: ~1.5-1.8x. 37s × 1.6 = 59s. Reserve is 55s. Over. Could reduce RESERVE_S to 45 and hope... 125s training end is deadline-55; if I set RESERVE_S=45, training ends at 135s, prediction 59s → 194s > 180. No good. So v2_b0 doesn't fit unless I shrink IMG_SIZE. Not the first experiment.
+
+efficientnet_b2: even bigger. No.
+
+resnet50: 25.6M, ~4x compute of B0? B0 is 0.4 GFLOP at 224... at 160px, ~0.2 GFLOP. ResNet50 at 160: ~0.8 GFLOP? ~4x. No.
+
+mobilenetv3_large_100: 5.4M, similar compute to B0, maybe slightly less. Could be a free lunch? Probably marginal.
+
+regnety_016: 9M params, ~1.5x compute of B0. Similar issue to v2_b0.
+
+So bigger models are mostly time-blocked. OK.
+
+What about training efficiency: use both crops in one forward? Already done (2 forwards per batch). Could concatenate crops along channel dim (6-channel input) with one forward through a modified model? Requires retraining stem. timm supports in_chans=6. One forward instead of two → 2x step speed → 2x steps! And the model can learn cross-view features (attention between tight and wide views). This is a real method change: "fuse two views at input level, double steps." Expected: more steps + feature interaction. Risk: pretrained stem is for 3 channels; with in_chans=6 the stem is reinitialized (timm repeats/averages weights — actually timm initializes extra channels by copying/averaging, so it's a mild perturbation of pretrained weights). Hmm, timm's in_chans handling: for resnet/efficientnet, the conv stem weight is repeated to cover extra channels (I think it copies the first channel's weights... actually `torch.nn.init` or `copy_` — I think timm does `w = w.repeat(1, in_chans//3, 1, 1)` scaled? Not sure exactly; there's `get_pretrained_cfg_and_url` and in `create_model` with in_chans, the stem is reinitialized by repeating). This slightly breaks pretraining but with 2x steps it's probably fine.
+
+This is an interesting experiment but the "2x steps" benefit is the main driver; the input fusion is secondary. Expected gain: +0.005 to +0.015.
+
+Comparing candidates:
+1. Detector-box training (distribution match): targets the actual gap, medium risk.
+2. 6-channel fused input (2x steps): targets optimization amount, medium risk.
+3. Low-res data: small expected.
+4. 5-class background: complex.
+
+I'll go with #1: train on detector boxes that overlap true boxes. Actually, let me combine: train on detector boxes (labeled by overlap) — replacing true boxes. Or mixing both? "One idea per turn" — the idea is "train on the test-time box distribution." I'll use detector boxes as the training set (with overlap labels). Keep everything else identical.
+
+Wait, one concern: how many train detector boxes overlap true boxes? If few (e.g., 2000), training set is small. If many (20k+), great. I don't know. Let me make the code robust: if overlap boxes are too few (< 2000?), fall back to... hmm, fallback complicates. Or mix: use detector boxes + true boxes. But then the "distribution match" is diluted.
+
+Alternative safer design: train on union of (a) true boxes and (b) detector boxes with overlap labels. This strictly adds data in the test distribution. Total boxes seen in budget is fixed by time, so mixing just changes composition. If detector boxes are a large fraction, composition shifts a lot.
+
+Hmm. Let me think about what's most likely to give ≥0.01 gain...
+
+Actually, you know what? Let me reconsider. There's another big lever I haven't considered: the score. Currently score = conf × P(c). The ceiling (0.758) uses score = conf for all boxes (false alarms as class 0). Our per-class AP is limited by ordering. For class c, predictions are ordered by conf × P_c. If P_c is noisy (classification error), the ordering is worse than pure conf ordering on true boxes. But P_c also suppresses false alarms of other classes...
+
+Actually here's a thought: what if we emit each box only for its top class (argmax) with score = conf × P_top? Currently we emit all 4 classes (53606 rows = 41879 × ~1.28? wait 41879×4 = 167516, but only 53606 rows written because MIN_SCORE=0.001 cuts many). So many rows are cut already. Emitting only top-1 per box: ~41879 rows. Would that help? For a box whose true class is c but model says c' (wrong), we'd emit c' with high score → false positive of c' and miss of c. Same as now (the c' row exists now too). No change in ordering of true-class predictions... actually there is a change: currently for class c, the box's row has score conf×P_c (low if model is unsure). With top-1 only, the box doesn't appear in class c at all. The set of predictions per class changes! Hmm, but mAP is computed over all rows; a box with low P_c in class c is a low-ranked prediction — it only matters if it's a true positive (then it's a low-ranked TP, slightly hurting precision at that rank) or a false positive (low-ranked FP, barely matters). Removing low-score rows barely changes AP. So no.
+
+OK, another angle: the per-image 300-row cap. 41879 eval boxes / 1022 images ≈ 41 boxes/image average. 4 classes each → 164 rows/image max, usually fewer after MIN_SCORE. Cap of 300 rarely binds. Fine.
+
+Let me also reconsider: is the weak pore AP (0.502) due to classification (pore confused with others) or due to box placement (pores are tiny; IoU>0.5 is hard)? Stage-1 boxes are "slightly misplaced" — for tiny pores, a slightly misplaced box might have IoU < 0.5 with the true pore box → even perfect class gives a miss. The ceiling is 0.758 overall; if pore's ceiling were much lower than others, that would indicate placement. I don't haveThinking budget reached. Stop thinking now and write the reply in the required format.

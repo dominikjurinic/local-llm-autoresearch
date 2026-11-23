@@ -1,0 +1,234 @@
+===== attempt 1 =====
+Let me think carefully about the situation.
+
+Current best: 0.6288 (5-seed average), seed standard deviation 0.0051.
+Reference values: one-step baseline 0.638, ceiling 0.758 (stage-1 boxes with perfect classes), class-agnostic 0.755.
+
+Per-class AP: pore 0.496, deposit 0.629, discontinuity 0.780, stain 0.609.
+
+So the error is concentrated in pore (0.496) and stain (0.609). Deposit is 0.629. Discontinuity is fine at 0.780.
+
+Past experiments:
+- e001 (data): adding low-resolution training boxes → 0.6246, rejected. So doubling the data didn't help.
+- e002 (architecture): larger backbone → 0.6234, rejected.
+- e003 (data): IMG_SIZE 224 → 0.6197, rejected.
+
+All three were rejected, all based on e000. So nothing has improved since the starting point.
+
+Now, what to try next? Let me think about where the error is.
+
+The score of each prediction is detector conf × class probability. The per-class AP depends on the ordering of predictions within a class. The score is conf × p_c. For a given class c, the order is determined by conf × p_c.
+
+Key insight: the ceiling (0.758) uses detector conf as the score for boxes with perfect classes. Our class-agnostic value is 0.755. So the ranking by conf is already nearly optimal — the ranking of true detections vs false alarms is already good. The remaining gap (0.758 - 0.629 ≈ 0.13) is almost entirely due to class misassignment.
+
+Therefore, the main lever is improving classification accuracy, especially for pore and stain.
+
+The classifier's macro-F1 is about 0.87 with the starting recipe. Pore and deposit are weak classes; stain is often confused with deposit.
+
+Ideas that change what the model sees or learns:
+
+1. **Score calibration / ranking**: instead of conf × p_c, use a different score. But the metric says that monotonic transformations of the per-class score don't change AP. However, changing the score from conf × p_c to, say, just p_c, or p_c^α, or p_c / (1 - p_c), changes the ordering within a class (since conf varies per box). The ordering within class c is currently determined by conf × p_c. If p_c is the dominant factor and conf is noisy, then a different combination might rank better. Hmm, but the ceiling uses pure conf ranking with perfect classes, and that gets 0.758. Our class-agnostic (all boxes as class "defect") gets 0.755 — that's also conf ranking. So conf ranking is nearly the best ranking of true vs false. But within a class, the ranking that matters is: for class c, predictions are sorted by score; a prediction is a hit if it overlaps an unmatched true box of class c.
+
+Actually, let me think about what determines per-class AP. For class c, we have predictions (boxes with class c and score). Sorted by score descending. Each prediction is a TP if it matches an unmatched GT box of class c with IoU>0.5. AP = average precision over this ordering.
+
+The ordering matters in two ways: (a) true detections of class c should come before false alarms of class c (boxes that don't overlap any GT of class c), and (b) among true detections, the order doesn't matter for precision at that point (they all get counted as TP). Actually, the order among TPs doesn't matter, only where FPs are interleaved.
+
+So for class c, we want the score to rank boxes that overlap a true c-defect above boxes that don't. The current score is conf × p_c. conf is the detector's confidence (class-agnostic, so it's a measure of "is there a defect here"), and p_c is the classifier's probability of class c.
+
+The problem: a box that is a true defect of class d≠c but the classifier wrongly gives it high p_c will be ranked high and become a false positive for class c. Conversely, a true c-defect with low p_c (misclassified) will be ranked low.
+
+So the classification accuracy directly determines the FP rate per class.
+
+Now, the key question: is the loss in (a) class decision on boxes that overlap real defects (i.e., misclassification), or (b) ranking of false alarms against true detections?
+
+The ceiling 0.758 (perfect classes, conf score) vs class-agnostic 0.755: these are nearly the same. The class-agnostic treats all boxes as one class "defect" and gets 0.755. Wait, but that's a single class. The ceiling is 4 classes with perfect labels. Hmm, the class-agnostic 0.755 is for a single merged class. The ceiling 0.758 is for 4 classes with perfect labels. So the detector boxes themselves, when given perfect 4-class labels, get 0.758. That means the boxes are good; the labels are the issue.
+
+So the gap from 0.629 to 0.758 is purely the class assignment quality. We need better class assignment.
+
+The classifier is already at macro-F1 0.87. To push AP from 0.629 toward 0.758, we need to improve the class assignment, especially for pore and stain.
+
+Let me think about what could help:
+
+Option A: **Better crop / what the model sees.** The model sees two crops (tight 1.5x and wide 2.5x). Maybe the tight crop is too tight and cuts off context, or the wide crop is too wide. But e003 tried higher resolution and it hurt (0.6197). That's interesting — higher resolution hurt. Why? Maybe because at 224 the model sees more of the low-res noise, or the training didn't converge as well (fewer steps? No, they raised RESERVE_S to 95 so training time was similar... actually let me check: budget = deadline - RESERVE_S. With RESERVE_S 55, budget larger. With 95, budget smaller → fewer steps. So e003 had fewer training steps AND higher res. That's confounded. The higher res means each step is slower too. So e003 likely undertrained. That's why it hurt. So resolution isn't necessarily bad, but the confound makes it inconclusive. I won't retry resolution.)
+
+Option B: **Change the scoring / ranking.** The score is conf × p_c. What if we use a different function? The metric says monotonic transformations per class don't change AP. But conf × p_c vs p_c alone: these are different orderings. Let me think.
+
+Actually, here's a subtle point. The per-class AP depends on the ordering. Currently score = conf × p_c. Consider two boxes both predicted as class c. Box A: conf=0.9, p_c=0.5 → 0.45. Box B: conf=0.5, p_c=0.9 → 0.45. Tie. If we used p_c alone, B would rank higher. Which is better? Box B has higher class confidence (more likely to actually be class c), Box A has higher detector confidence (more likely to be a real defect). For class c AP, we want boxes that are actually class c defects to rank high. p_c measures "is it class c" and conf measures "is it a defect at all". A box with high p_c but low conf is likely a false alarm (not a real defect) that the classifier thinks is class c — that's a false positive for class c. A box with high conf but medium p_c is a real defect that's likely class c.
+
+Hmm, this is getting complicated. The product conf × p_c is a reasonable joint probability P(defect) × P(c|defect) ≈ P(defect and c). That's actually a good estimate of "this box is a class c defect". So the product is principled.
+
+But maybe we can do better. What about using the classifier's probability more aggressively, or calibrating?
+
+Actually, let me reconsider. The main error is misclassification. Let me focus on improving the classifier for pore and stain.
+
+Option C: **Class-specific handling / focal loss / class weights.** The brief says "Class-weighted loss hurt classification every time it was tried." So avoid class weights.
+
+Option D: **Better training data / sampling.** e001 tried adding low-res boxes and it hurt. So more data (low-res) isn't helping. 
+
+Option E: **Test-time / inference changes.** TTA (test-time augmentation) — average over flips at inference. This could improve classification robustness. But it doubles (or 4x) inference time. Let me check budget. Currently prediction takes... total 163s, training ~125s (5 epochs to 125s), so prediction + writing ~38s. With RESERVE_S 55, that fits. If I do TTA with 4 flips, prediction time ~4x = ~150s, which would blow the budget. So TTA is risky. Maybe 2 flips (horizontal only) — 2x prediction ~76s, still might fit within 55s reserve? No, 76 > 55. Hmm. Actually the reserve is 55s but prediction currently takes ~38s. 2x = 76s > 55. So I'd need to reduce reserve or training. Risky. Let me not do full TTA.
+
+Actually wait, let me reconsider the budget. Total T is given by --seconds. In the seed-0 run it finished at 163s total. What's T? The log shows "done ... 163s total" and it wasn't killed, so T >= 163 + something. Actually the harness runs with --seconds T. The default in the code is 180. But the actual T might be different. The run finished at 163s. If T were 180, there's 17s margin. If T is larger, more margin. I don't know T exactly. The RESERVE_S=55 means training stops at deadline - 55, leaving 55s for prediction. Prediction took ~38s (163 - 125). So with 55s reserve, prediction (38s) fits with 17s to spare. 
+
+For TTA, I'd want to be careful. Let me think of a lower-cost approach.
+
+Option F: **The two-crop averaging.** Currently logits from tight and wide crops are averaged: (model(xt) + model(xw))/2. Maybe the tight crop is hurting for some classes. What if I weight them differently, or drop the tight crop, or use a different context? Let me think. The tight crop (1.5x) shows the defect more zoomed in; the wide crop (2.5x) shows more context. For pore (small holes), the tight crop might be better. For stain (which needs context to distinguish from deposit), the wide crop might be better. Averaging is a compromise. 
+
+Hmm, but changing this is a method change. Let me think about what's most likely to give 0.01+.
+
+Option G: **Ensemble of two models** — too expensive for budget.
+
+Option H: **Better use of the detector conf in scoring.** Actually, let me reconsider the scoring more carefully because this is where I might get a clean win without retraining.
+
+The per-class AP depends on ordering within each class. Currently score_c = conf × p_c. 
+
+Let me think about the ideal. For class c, I want to rank boxes by P(box is a true c-defect). That's P(c | box) which is what p_c estimates (the classifier outputs P(c|crop)). But the classifier is trained on true boxes, so it sees mostly real defects. It doesn't see false alarms. So p_c is really P(c | crop, crop is a defect). For a false alarm (not a real defect), the classifier still outputs some p_c (it has to classify the crop). So p_c for a false alarm is "which class does this non-defect look most like".
+
+The conf is P(defect | crop) from the detector. So the joint P(c-defect | crop) ≈ conf × p_c (assuming p_c is conditional on defect). That's the product. Good.
+
+But the ordering within class c: we rank by conf × p_c. Consider a true c-defect with conf=0.6, p_c=0.8 → 0.48. And a false alarm with conf=0.7, p_c=0.7 → 0.49. The false alarm ranks higher — bad. But this is inherent.
+
+Could a different scoring help? What if I use p_c^k × conf^m with different exponents? That changes the ordering. Hard to know a priori.
+
+Actually, here's a cleaner idea. The problem statement says the ceiling (perfect classes, conf score) is 0.758 and class-agnostic is 0.755. The difference between "perfect classes scored by conf" and "our classes scored by conf×p_c" is 0.758 - 0.629 = 0.129. That's the misclassification cost.
+
+Now, if I could get the classifier to be perfect, I'd be at 0.758. The classifier is at 0.87 macro-F1. To close the gap, I need better classification.
+
+Let me think about the biggest lever. Pore is 0.496 AP — the weakest. Stain 0.609. Deposit 0.629. Discontinuity 0.780.
+
+The brief says "Pore and deposit are the weak classes; stain is often confused with deposit." So the confusion matrix has pore↔? and stain↔deposit.
+
+Idea: **The model might benefit from seeing the defect at a scale that preserves pore detail.** e003 tried higher resolution but it was confounded with fewer steps. Let me not retry that.
+
+Idea: **Add a third crop view at an intermediate scale, or change the contexts.** This changes what the model sees. But it changes the model input (3 views instead of 2) — need to change the model to combine 3 views. That's a bigger change.
+
+Idea: **Train longer / better optimization.** The LR schedule is 5% warmup + cosine. Training for ~5 epochs (435 steps). Maybe the model is undertrained? Loss at epoch 4 is 0.2204, still decreasing. Maybe more training would help. But the budget limits it. I could reduce the reserve to train longer, but prediction needs ~38s. If I set reserve to 40, I train a bit longer. But that's a small change and risky.
+
+Actually, let me reconsider. The loss is still decreasing (0.22 at epoch 4). More training could help. But the gain might be small and within noise.
+
+Let me think about a method change that targets pore specifically.
+
+**Pore-specific idea:** Pores are small holes. The tight crop at 1.5x and resize to 160 might blur them. But higher res (e003) hurt (confounded). 
+
+Alternative: **Use a tighter crop for pore detection** — but we don't know the class in advance.
+
+Let me think differently. What about **the scoring using a threshold or a different combination**? 
+
+Actually, here's a thought. The current score writes 4 rows per box (one per class), each with score conf × p_c. So every box gets 4 predictions. The per-image 300-row limit: with 41879 eval boxes × 4 = 167516 rows, but per image at most 300 count. So for images with many boxes, only the top 300 by score count. This means low-confidence boxes on crowded images get dropped. That's fine.
+
+But here's a subtle issue: by writing all 4 classes for every box, we're adding many false positives. For class c, a box that's really class d but has p_c = 0.3 gets a prediction of class c with score conf×0.3. If conf is high, this could rank above a true c-defect with conf×p_c = conf×0.7. Hmm.
+
+What if I only write the top-1 class per box (argmax)? That would reduce false positives for the non-top classes. But it might hurt if the top-1 is wrong. Actually, writing all 4 classes with proportional scores is a standard soft approach. The question is whether writing all 4 or just top-1 is better for mAP.
+
+Let me think. For class c, the predictions are all boxes with their p_c. If I only write top-1, then for class c, only boxes where c is the argmax get a prediction. That removes boxes where c is not the argmax (i.e., p_c < p_d for some d). Those boxes, if they're true c-defects misclassified as d, would be lost (no prediction for c). That hurts recall for c. But it also removes false positives for c from boxes that are confidently class d.
+
+It's a tradeoff. Hard to say a priori. But writing all 4 classes is more standard and probably better for recall. Let me not change that.
+
+Let me reconsider. What's the single most impactful change?
+
+Given that:
+- More data (low-res) hurt.
+- Bigger backbone hurt.
+- Higher res hurt (confounded).
+- Class weights hurt (per brief).
+
+What's left? Method changes that change what the model sees or learns.
+
+Let me think about **the crop context**. The two crops are 1.5x (tight) and 2.5x (wide). What if the issue is that the wide crop at 2.5x includes too much non-defect area, diluting the signal? Or the tight crop at 1.5x is not tight enough?
+
+Actually, a cleaner idea: **the model sees the same box at two scales and averages logits. But maybe a weighted average or a learned combination would help.** But that's complex.
+
+Let me think about **inference-time TTA with just horizontal flip** (2 views instead of 4). At inference, the box is symmetric under horizontal flip in terms of class (a defect is a defect regardless of flip). So averaging over horizontal flip should be safe and could improve robustness. Cost: 2x inference for the flip. Currently inference ~38s → 76s. Reserve is 55s. That doesn't fit. Unless I reduce training.
+
+Hmm, but actually the two crops already give 2 forward passes. With horizontal flip TTA, it'd be 4 forward passes (2 crops × 2 flips). That's 2x the current inference (which is already 2 crops). So 38s → 76s. Doesn't fit in 55s reserve.
+
+What if I do TTA only on the tight crop, or only reduce to 1 crop for inference? No, that changes the model.
+
+Let me reconsider the budget. Actually, I realize I don't know T. Let me assume T is such that the current run (163s) fits with some margin. If T=180, margin is 17s. If T is larger (say 200 or 240), more margin. The harness shows "Log of its seed-0 run" ending at 163s. I'll assume T is at least ~180-200.
+
+For a safe experiment, I should keep total under ~165s or so.
+
+Let me think about a change that doesn't increase inference time much.
+
+**Idea: Change the scoring to better rank, without retraining (or with minimal retraining).**
+
+Actually, retraining is always happening (the whole script trains). So any change to the model or data retrains. A change to only the scoring (the final prediction loop) doesn't change training, so I can use the reserve more for training.
+
+Wait, but the scoring uses the trained model's probabilities. If I change how I combine conf and p_c, I don't need to change training. So I could:
+1. Keep training as is (or even train longer by reducing reserve).
+2. Change the scoring function.
+
+Let me think about a better scoring function. The current: score_c = conf × p_c.
+
+Alternative: score_c = conf^a × p_c^b. Or use the log-odds. Or normalize.
+
+Actually, here's a principled improvement. The classifier p_c is P(c | crop). But we also have conf = P(defect | crop). The probability that the box is a true c-defect is P(c-defect | crop) = P(defect|crop) × P(c|defect, crop). If p_c = P(c|defect, crop) (classifier trained on defects), then P(c-defect) = conf × p_c. That's the current score. Good, it's principled.
+
+But the ranking within class c for mAP: we want to order by P(c-defect | crop) = conf × p_c. That's exactly what we do. So the scoring is already optimal in expectation. The only way to improve is to make p_c a better estimate, i.e., better classifier.
+
+So scoring tweaks won't help much unless the classifier's p_c is miscalibrated in a way that a monotonic-ish transform fixes. But the metric says monotonic transforms per class don't change AP. And conf×p_c vs p_c are not monotonic transforms of each other (they involve conf). So there's some freedom. But it's a small lever.
+
+Let me focus on the classifier. The classifier is a two-crop EfficientNet-B0. 
+
+**Key idea: What if the tight crop is the problem for pore?** Pores are small. At 1.5x context and 160px, a small pore might be a few pixels. The resize to 160 might not preserve it well. But the wide crop at 2.5x shows the pore even smaller. So for pore, neither crop is ideal — both might be too zoomed out or the detail is lost in resize.
+
+Wait, actually for a small defect, the tight crop (1.5x the box) is closer to the defect size, so the pore occupies more of the 160px image. The wide crop (2.5x) makes the pore smaller in the 160px image. So the tight crop is better for pore detail, wide crop better for context (stain vs deposit).
+
+The averaging (model(xt)+model(xw))/2 might dilute the pore signal from the tight crop with the (worse for pore) wide crop. 
+
+Idea: **Weight the tight crop more, or make the combination class-aware.** But class-aware requires knowing the class.
+
+Alternatively: **Add a third, even tighter crop (e.g., 1.0x or 1.2x) to preserve pore detail.** This changes the model input to 3 views. Let me think about cost. 3 views = 3 forward passes in training (currently 2). Training time ~1.5x. Currently training ~125s → ~187s. Plus inference ~38s×1.5=57s. Total ~244s + load 13s = ~257s. That might exceed T. Risky.
+
+Hmm. Let me reconsider.
+
+Actually, maybe I'm overcomplicating. Let me reconsider the confounding in e003. e003 raised IMG_SIZE to 224 AND raised RESERVE_S to 95. Raising RESERVE_S reduces training budget (budget = deadline - RESERVE_S). So e003 trained for fewer steps AND at higher res. Both hurt. So e003 is inconclusive about resolution. But it also suggests that reducing training time hurts. So I should NOT reduce training time.
+
+Let me think about what's the highest-value, lowest-risk change.
+
+Given the constraints, let me reconsider **the crop context values**. Currently TIGHT_CONTEXT=1.5, CONTEXT=2.5. What if I make the tight crop tighter (e.g., 1.2) to better show pore detail, and keep wide at 2.5? This is a small change, doesn't affect model architecture, just the crop. It retrains (crop changes). Cost: same as before (2 views). So total time similar (~163s). Safe.
+
+Hypothesis: A tighter crop (1.2x instead of 1.5x) preserves more pore detail (small holes occupy more of the image), improving pore classification, which is the weakest class (0.496). This differs from e003 (which changed resolution, confounded) and e001/e002 (data/architecture).
+
+But is 1.2x too tight? It might cut off the defect or show too little context. The box is the detector's box, which is roughly the defect. 1.2x means the crop is 1.2x the box side. That's close to the box. Might be fine.
+
+Alternatively, the issue might be the opposite — the crops are fine but the model needs to see the defect relative to the weld bead structure.
+
+Let me think about another angle. **The stain↔deposit confusion.** Stain is often confused with deposit. These might look similar (both are surface discolorations). To distinguish them, the model might need to see the shape/extent. The wide crop (2.5x) gives context. Maybe the wide crop is too wide and the stain's extent is diluted. Or maybe we need an even wider crop for stain.
+
+Hmm, this is hard to target without knowing the confusion.
+
+Let me step back and think about the biggest lever with reasonable confidence.
+
+The per-class AP: pore 0.496 is the biggest gap (should be ~0.75 if perfect). Stain 0.609, deposit 0.629. 
+
+If I could fix pore from 0.496 to ~0.70, that's +0.20 on one class / 4 = +0.05 mAP. That's a big win. So targeting pore is high value.
+
+What's specific about pore? Pores are small holes (dark spots). They're fine-grained texture. The brief explicitly says "Pore (AP 0.496) is the weakest class and is a fine-grained texture" (that was e003's hypothesis). So pore detail is the issue.
+
+e003 tried higher resolution (224) but it was confounded with fewer training steps. So the resolution idea is untested cleanly. But retrying it is risky (might be the confound that hurt).
+
+Alternative for pore detail without changing resolution: **a tighter crop** so the pore occupies more pixels in the fixed 160px image. This is a clean way to get "more detail" for the pore without changing IMG_SIZE or training steps. I like this.
+
+Let me refine: change TIGHT_CONTEXT from 1.5 to 1.2 (or even 1.0). Actually, let me think about what the tight crop does. The box is the detector's box for the defect. TIGHT_CONTEXT=1.5 means crop side = 1.5 × (box long side). So the crop is 1.5x the box. The defect (box) occupies 1/1.5 = 67% of the crop. At 1.2x, the defect occupies 83%. At 1.0x, 100% (the crop is exactly the box). 
+
+For pore detail, a tighter crop (defect occupies more of the image) means the pore's pixels are larger after resize to 160. So more detail. Good.
+
+But there's a risk: if the box is slightly off (misplaced), a tighter crop might cut off part of the defect. The brief says "Detector boxes include false alarms and slightly misplaced boxes." So tighter crops are more sensitive to misplacement. That could hurt.
+
+Let me go with 1.2 as a moderate tightening. Actually, let me reconsider — maybe I should make the change more targeted. What if I keep both crops but make the tight one tighter (1.2) and the wide one a bit wider (3.0) to get a better range? That's two changes. Let me keep it to one change: TIGHT_CONTEXT 1.5 → 1.2.
+
+Hmm, but actually, let me reconsider whether tightening helps pore or hurts. If the pore is a small dark spot and the box tightly encloses it, then at 1.5x the spot is 67% of the image — that's already large. At 1.2x it's 83%. The difference in detail is modest. Maybe the issue isn't the crop scale but the resize quality or the model.
+
+Let me think about a different, possibly higher-value idea.
+
+**Idea: Train the classifier on the detector's training boxes (dets.csv train) instead of / in addition to crops.csv.** Wait, the current training uses crops.csv (the true training boxes). The dets.csv train boxes are detector boxes on training images, whose true class can be found by overlap with crops.csv. Training on detector boxes (which include false alarms and misplaced boxes) would make the classifier robust to the actual input distribution (detector boxes), which is what it sees at test time. Currently it's trained on ground-truth crops (crops.csv), which are the true defect boxes, but at test time it sees detector boxes (which are slightly off and include false alarms). This train/test distribution mismatch could hurt!
+
+This is a strong idea. The classifier is trained on perfect ground-truth boxes but tested on detector boxes. If I train it on detector boxes (dets.csv train, with labels from overlap with crops.csv), the classifier sees the same kind of input it'll get at test time (detector boxes, including false alarms). This should improve robustness.
+
+Wait, but the brief says "Starting point: the 'two-crop' classifier ... trained on the true training boxes". And e001 tried "Adding low-resolution training boxes" (from crops.csv low-res) and it hurt. That's different — e001 added more ground-truth crops at low res. Training on detector boxes is different: it's a different distribution (detector boxes vs ground-truth boxes), and it includes false alarms.
+
+Let me check: dets.csv has "train" boxes on training images, "their true class can be found by overlap with crops.csv". So I can label them. Boxes that overlap a crop (IoU>0.5?) get that crop's class. Boxes that don't overlap any crop are false alarms — what class? They're not defects. But the classifier has to output one of 4 classes. For false alarms, there's no correct class. 
+
+Hmm, this is a problem. If I include false alarms in training, what label do I give them? I could either:
+(a) Exclude false alarms (only train on detector boxes that overlap a crop) — then I train on detector boxes that are real defects, just slightly misplaced. This fixes the misplacement mismatch without the false-alarm labeling problem.
+(b) Include false alarms with a "background" class —Thinking budget reached. Stop thinking now and write the reply in the required format.

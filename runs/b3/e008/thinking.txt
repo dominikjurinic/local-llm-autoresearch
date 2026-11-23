@@ -1,0 +1,195 @@
+===== attempt 1 =====
+Let me think carefully about the state of the research.
+
+Current best: e004, 5-seed val mAP@0.5 = 0.6342. Per-class: pore 0.522, deposit 0.624, discontinuity 0.780, stain 0.611.
+
+Reference values:
+- one-step 4-class baseline: 0.638
+- stage-1 boxes with perfect classes (upper bound): 0.758
+- class-agnostic: 0.755
+
+So the gap between our 0.634 and the upper bound 0.758 is about 0.124. This gap is almost entirely class misassignment (the class-agnostic score is 0.755, meaning the boxes are fine).
+
+History:
+- e001 (scoring): argmax-only rows → 0.5749, rejected. So outputting one row per box (argmax class) is worse than outputting 4 rows with conf×p(c). Interesting — outputting all 4 rows is better. Because... hmm, actually outputting 4 rows means each true detection also appears as a false positive in the other 3 classes. But it scored 0.5749 vs 0.630. So the multi-row approach is better. OK.
+- e002 (data): adding low-res crops → 0.6293, not confirmed.
+- e003 (architecture): larger classifier → 0.6313, not confirmed. (Hypothesis was cut off partway; probably tried a bigger model.)
+- e004 (data): pseudo-labeling detector boxes that overlap with true boxes → 0.6342, new best.
+- e005 (scoring): some change to score coupling → 0.1554, suspicious, probably a bug. Don't repeat.
+- e006 (data): further data change on top of e004 → 0.6323, rejected. (Hypothesis cut off: "the classifier fails on exactly the boxes the detector outputs (misplaced, partially overlapping...)" — probably trained on more detector boxes with lower IoU threshold, or used detector boxes for all training? Rejected.)
+- e007 (inference): TTA flips → 0.6277, rejected.
+
+Lessons:
+- scoring: 1 bug, 1 rejected.
+- data: 1 new best, 1 close but not confirmed.
+- architecture: 1 close but not confirmed.
+- inference: 1 rejected.
+
+Now, what's the biggest part of the error? Per-class AP: pore 0.522, stain 0.611, deposit 0.624, discontinuity 0.780. Macro average = (0.522+0.624+0.780+0.611)/4 = 2.537/4 = 0.634. Yes.
+
+The crop classifier with perfect boxes reaches macro-F1 ~0.87. The weak classes are pore and deposit; stain is often confused with deposit.
+
+What can still be done?
+
+Ideas:
+
+1. **Better crop context / multi-scale views**: The classifier sees a tight crop (1.5x) and a wide crop (2.5x). The context scale might be important for distinguishing pore (small holes) from stain (surface discoloration). Try different context values or more views. But budget: each view is one forward pass per box at inference. e007's TTA (4x) was rejected — but TTA averaging can't change the ranking much... actually, it can change the ranking (different probabilities), and it scored 0.6277, slightly worse. So TTA didn't help.
+
+2. **Training on more data / all detector boxes with pseudo-labels** — e006 tried something in this direction and was rejected. What exactly did e006 do? The hypothesis says "the 0.634 vs 0.758 upper-bound gap is dominated by the classifier failing on exactly the boxes the detector outputs (misplaced, partially overlapping...)" — probably extended pseudo-labeling to IoU > 0.25, or included detector boxes that don't overlap with any true box labeled as false alarms? Can't see the diff. Rejected at 0.6323, so don't repeat the same idea. But a fundamentally different data idea might still be worth trying.
+
+3. **Class imbalance / focal loss** — "class-weighted loss hurt classification every time it was tried." So loss weighting is exhausted.
+
+4. **Better model** — e003 tried a bigger architecture, not confirmed (0.6313). Which model? Probably efficientnet_b2 or convnext. Not confirmed.
+
+5. **Ensemble of two different models** — train two different backbones and average probabilities. This changes what the model sees/learns. Budget: 180 seconds total, 18 seconds for loading. Current training: 397 steps in ~140 seconds (2 epochs). Training two models halves the steps per model. Each model is undertrained but the ensemble might help. Hmm, risky.
+
+6. **Resolution**: IMG_SIZE=160. Pore is a small defect; higher resolution might help pore detection. 160→224 increases compute by (224/160)^2 = 1.96x per view. Step time doubles, so steps halve to ~200. Prediction time also doubles: current prediction is 41879 boxes × 2 views... 53462 rows written in about 37 seconds (162-125). With 224px, prediction ~75 seconds. Total: loading 18 + training ~140 (fewer steps) + prediction ~75 = 233 > 180. Too slow unless we cut something. Maybe 192px: (192/160)^2 = 1.44x. Training step time ×1.44 → ~120 steps... hmm, let me compute: 397 steps in 125-18=107 seconds → 0.27 sec/step. At 1.44x, 0.39 sec/step → 107/0.39 ≈ 275 steps. Prediction: 2 views × 41879 boxes; currently ~37 seconds for 83758 forward passes → 0.44ms/pass. At 1.44x → 0.63ms → 83758 × 0.63ms ≈ 53 seconds. Total: 18 + 107 + 53 + overhead ≈ 185. Slightly over. 176px: 1.21x → training ~107 seconds (same wall time, fewer steps ~328), prediction ~45 seconds → total ~180. Too tight. Hmm.
+
+Actually wait — the time budget T is variable ("--seconds T"). The harness runs with some T. The log shows 162 seconds total, probably T=180. We don't know T exactly; the default is 180. Keep a safety margin.
+
+7. **Use detector confidence more cleverly in scoring** — e005 was a bug. The scoring category has 1 bug + 1 rejected (e001). But e001's idea (argmax only) is fundamentally different from e005 (decoupling conf from p(c)). Hmm, "a direction where 3 or more attempts yielded no confirmed improvement is exhausted." Scoring has 2 attempts, 1 bug. Not exhausted yet.
+
+What's the correct scoring? Currently: score = conf × p(c), output all 4 rows. e001 (argmax only) was worse. e005 (some decoupling) crashed/bugged.
+
+Let me think about what scoring would maximize mAP. For each class c, predictions are sorted by score; AP depends on the order. For a true box of class c, its row for class c has score conf×p(c); its rows for other classes c' have score conf×p(c'). For a false alarm (no true box), all 4 rows are false positives.
+
+Key insight: For class c's AP, what matters is the order of class-c rows. A true detection of class c' ≠ c that has high p(c) will rank high in class c and count as a false positive before the true class-c detection → hurts precision.
+
+One idea: **calibrate / threshold p(c)**: only output row for class c when p(c) > some threshold, or use p(c)^k to sharpen. But sharpening is a monotonic transform of the score within a class... wait, is it? If we output p(c)^k × conf for all rows, within class c the order is preserved (monotonic in conf×p(c))... no wait: score = conf × p(c)^k. For two boxes with different conf and p(c), the order can change: box A conf=0.9, p=0.5 → 0.9×0.25=0.225; box B conf=0.6, p=0.8 → 0.6×0.64=0.384. With k=1: A=0.45, B=0.48. So the order changes. Not a pure monotonic transform because conf varies across boxes.
+
+Hmm, but does the order of class-c rows actually matter for AP? Yes — AP depends on the order of that class's predictions.
+
+Actually, let me think about what's hurting. The class-agnostic score is 0.755 and the perfect-class upper bound is 0.758. So the boxes are essentially as good as the upper bound; the entire 0.124 gap is class assignment. If the classifier assigned perfect classes, we'd get 0.758. Our classifier's macro-F1 on perfect boxes is ~0.87.
+
+Per-class AP: pore 0.522. If pore's AP were at the upper bound... what's the per-class upper bound? We don't have per-class upper-bound numbers. But the class-agnostic 0.755 is a single-class number.
+
+Let me think about the error decomposition for pore: pore boxes are probably small. The detector finds them (class-agnostic is high). The classifier mislabels pores as stain/deposit. Known: "stain is often confused with deposit" and "pore and deposit are the weak classes."
+
+Ideas to improve classification:
+
+A. **More/better context views for distinguishing classes**. Pore = small dark hole; stain = discolored region; deposit = extra material. Context scale matters. Currently tight 1.5x + wide 2.5x. Add a very wide crop (e.g., 4x or 5x) to give more scene context? That's another forward pass per box at inference. Budget: +50% inference time → ~55 seconds extra. Total 162+55 = 217 > 180. Too slow unless we cut training. Hmm, but we could reduce training steps... training is already only 2 epochs.
+
+Actually wait — how much time does inference take? 162 total, 125 at end of epoch 1, so inference+writing ≈ 37 seconds. Adding a 3rd view adds ~18 seconds → 180. Too tight. If we reduce RESERVE... no, reserve is for safety.
+
+Alternatively, add the 3rd view only at training time (train with 3 views, use 2 at inference)? That's distribution mismatch — bad.
+
+B. **Train the classifier to also receive the detector box's own conf or aspect ratio as input** — e.g., concatenate a small feature. Unusual.
+
+C. **Two-model ensemble** (e.g., efficientnet_b0 + convnext_nano, or two different training seeds). Average probabilities. Each model gets half the training time → undertrained. But ensembles usually help. Risky given the budget.
+
+D. **Use low-res crops too** — e002 tried it, not confirmed (0.6293 vs 0.6342, within noise, "close but not confirmed"). So adding low-res data didn't clearly help.
+
+E. **Better augmentation** — currently: jitter, flip, brightness. Add color jitter / contrast? Weld images might have varying illumination. Category "augmentation" hasn't been tried yet! Looking at the history: scoring, data, architecture, data, scoring, data, inference. No augmentation experiments. Augmentation is an unexplored category.
+
+F. **Longer training / lower LR** — the model is trained for only 397 steps with LR 1e-3, cosine decay, 5% warmup. Loss at end of epoch 1: 0.2379. Probably still decreasing. With more steps, the classifier would improve. But time is fixed at 180 seconds. We could reduce prediction cost to gain training time: e.g., reduce RESERVE_S from 55 to 30 (inference takes ~37 seconds, so 30 is too tight; 45 would be OK). That buys ~10 seconds of training → ~37 more steps. Marginal.
+
+G. **Reduce inference cost to train longer**: currently 2 views per box at inference. What if we train with 2 views but only use the tight crop at inference (1 view)? That's distribution mismatch (training averaged both views). We could train with a "view dropout": randomly use only one view (tight or wide) during training, and average at inference... actually, a common trick: train with both views but drop one randomly (drop one view with probability 0.5), so the model learns to classify from either view alone. Then at inference we could use both (average) or just one. If we use both at inference, no savings. If we use one at inference, we halve inference time (~18 seconds saved) → more training steps. But using one view at inference when the model was also trained on both might be slightly worse... actually, if we train with view dropout, the model handles single-view input well. Hmm, but averaging two views at inference is usually better than one. So this saves time but might lose quality. Net effect unclear.
+
+H. **The real question: what's the biggest part of the error?** Let me use the numbers.
+
+Our mAP 0.634. Upper bound 0.758. Gap 0.124.
+
+Per-class: pore 0.522, deposit 0.624, discontinuity 0.780, stain 0.611.
+
+If the classifier were perfect on overlapping boxes (upper bound), we'd get 0.758 overall. Per-class upper bound is unknown, but the class-agnostic single-class AP is 0.755.
+
+Roughly, the per-class losses are: pore loses the most (0.522 vs probably ~0.75 upper bound → loss ~0.23), stain ~0.14, deposit ~0.13, discontinuity ~0.0. Macro loss ~0.124. Consistent.
+
+So pore is the biggest target. Pore = small dark circular holes in the weld. Why does the classifier fail on pores? Probably because pores look similar to stain (dark spots) at 160px, and the tight crop contains mostly the hole with little context.
+
+Ideas specific to pore:
+- Higher resolution for small boxes: the crop is resized to 160 regardless of box size. A small pore box (say 10px) gets upscaled 16x — blurry. A larger stain box gets downscaled. Maybe use a size-aware input: e.g., keep small crops at lower upscale... but the model input is fixed at 160. We could use IMG_SIZE=224 to preserve pore detail. Budget issue as computed.
+
+Let me recompute the budget more carefully for IMG_SIZE=224:
+- Loading: 18 seconds (same).
+- Training: step time scales roughly with pixels: (224/160)² = 1.96. Current: 397 steps in 107 seconds (18→125). Actually, let me check: T0=0, loading 18 seconds, epoch 0 ends at 103 seconds (285 steps), epoch 1 ends at 125 seconds (397 steps). So training ran from 18 to 125 = 107 seconds, 397 steps → 0.27 sec/step. At 224: 0.53 sec/step → 107/0.53 ≈ 202 steps.
+- Inference: 83,758 forward passes in ~37 seconds → 0.44 ms/pass. At 1.96x: 0.86 ms → 72 seconds. Plus writing ~53,462 rows (few seconds).
+- Total: 18 + 107 + 72 + 5 ≈ 202 seconds > 180. Over budget.
+
+IMG_SIZE=192: (1.2)² = 1.44. Training: 0.39 sec/step → 275 steps in 107 seconds. Inference: 0.63 ms/pass → 53 seconds. Total: 18+107+53+5 = 183. Still over.
+
+IMG_SIZE=176: 1.21x. Training 107 seconds (~328 steps), inference 45 seconds. Total 18+107+45+5 = 175. Just fits with 5 seconds margin. Too tight for safety.
+
+So resolution increase is budget-blocked unless we cut inference cost elsewhere.
+
+Alternative: **use a smaller model** to free up budget? e003 tried a bigger model (not confirmed). A smaller model (convnext_pico/atto) trains faster → more steps. But quality might drop.
+
+Hmm, what about **training on both views but with a cheaper inference**: actually, inference cost is dominated by number of boxes (41,879 eval boxes). We can't reduce boxes... but wait, "per image, at most the top 300 rows by score count." We output 4 rows per box = 167,516 rows total, top 300 per image count. 1022 images... eval images are probably ~500? 41,879 boxes / 500 images ≈ 84 boxes/image. So the top-300 cap doesn't bind much (84×4=336 > 300, slightly).
+
+Interesting: since only the top 300 rows per image count, and we output 4 rows per box, the 4th row of a low-score box might not count anyway.
+
+**Scoring idea (fundamentally different from e001 and e005):**
+
+The problem with 4 rows per box: a true pore box with p(pore)=0.6, p(stain)=0.3 emits a stain row with score conf×0.3, which is a false positive in the stain class. If that ranks high, it hurts stain's precision.
+
+e001 (argmax only) scored 0.5749 — much worse. Why? Because with argmax only, a true pore box misclassified as stain emits only a stain row; the pore class gets no prediction for it → pore recall drops to the fraction correctly classified. With 4 rows, pore gets a row with score conf×p(pore) even when p(stain)>p(pore), preserving recall at the cost of some precision. Since AP balances precision and recall, the 4-row version wins.
+
+What about **2 rows per box**: argmax class + second class? Or argmax + a row for the true... we don't know the true. Hmm.
+
+What about **sharpening**: score = conf × (p(c)/Σp)^k... that's just p(c)^k × conf (since Σp=1). For k>1, low-probability rows shrink relative to high ones. This changes the inter-class competition: false rows (wrong class) get suppressed more than true rows. Within a class, the order can change (not purely monotonic due to conf). This is a legitimate scoring experiment, different from e001 (argmax) and e005 (whatever that was — decoupling conf from p(c)?).
+
+Hmm wait, what was e005 exactly? "The current score = conf × p(c) lets high-conf detector false alarms (conf≈0.9) outrank lower-conf true positives when the classifier's p(c) is only moderately high, because the multiplicative coupling amplifies conf's n[oise]..." So e005 tried to decouple, e.g., score = p(c) only, or conf^0.5 × p(c), or rank by p(c) and use conf as a tiebreaker. It scored 0.1554 — catastrophically bad, "suspicious (probably bug)." If it was score = p(c) only, that shouldn't be a bug... 0.1554 is a bug-level score. Maybe it accidentally swapped columns or something. We can't see the code. The harness says "probably bug." If I try a milder version (e.g., conf^0.5 × p(c)), it's different from e005's full decoupling. But if e005's idea was actually sound and it had a bug, retrying risks another bug. Let me think about whether decoupling conf is sound.
+
+Actually, let me think about the metric more carefully. For class c, predictions sorted by score. True detections of class c: score conf×p_c. False alarms (boxes with no true defect): score conf×p_c (p_c usually low, since the classifier sees nothing defect-like... but the detector fired, so the crop shows something; p_c might be moderate).
+
+Also, boxes overlapping a true defect of class c' ≠ c: score conf×p_c (p_c is the misclassification probability).
+
+The detector's conf is a decent signal: high-conf boxes are more likely true. The classifier's p_c is the class signal. The product combines both. e005's hypothesis was that conf's noise amplifies... but the result was a bug, so we learned nothing.
+
+Alternatively, **use the detector conf to down-weight false alarms**: e.g., score = conf × p_c but with a p_c floor... hmm.
+
+Let me step back and think about the biggest lever.
+
+The upper-bound gap is 0.124, all class assignment. Classifier macro-F1 ~0.87 on perfect boxes. To close the gap, we need better class decisions on detector boxes.
+
+What haven't we tried?
+- augmentation (0 experiments)
+- sampling (0 experiments)
+- optimisation (0 experiments)
+- loss (tried class weighting, hurt; other loss changes? "class-weighted loss hurt classification every time it was tried" — that's from the known background, not necessarily in this history. Loss category: 0 in history.)
+
+Wait, the "known" section says class-weighted loss hurt. So loss weighting is out. Focal loss? That's a different loss (reweights easy vs hard examples). Might help with hard misclassified boxes. But risky.
+
+- sampling: currently all training boxes are used equally. Pore and stain are the weak classes. Class-balanced sampling (oversample pore/deposit) might help. This is different from class-weighted loss (which was tried and hurt). Sampling changes the distribution of batches. Hmm, but class-weighted loss hurt "every time it was tried" — sampling is the same direction (emphasize weak classes) via a different mechanism. The lesson says loss weighting hurt; sampling might too. But it's not the same mechanism. Risky but unexplored.
+
+- optimisation: LR schedule, batch size. "Tuning hyperparameters alone helped little in past experiments; method changes helped more." So pure hyperparameter tuning is deprioritized.
+
+- architecture: e003 tried (bigger model?), not confirmed.
+
+- inference: e007 TTA, rejected.
+
+- data: e004 (pseudo-labels) best; e002 (low-res) not confirmed; e006 (more detector boxes?) rejected.
+
+- scoring: e001 argmax rejected; e005 bug.
+
+So the unexplored categories are: augmentation, sampling, optimisation, loss (except weighting).
+
+Which is most likely to give ≥0.01?
+
+Let me think about **augmentation** more concretely. Current training augmentation: center jitter ±10% of side, side scale 0.85–1.2, horizontal/vertical flip, brightness 0.8–1.2. Missing: color/contrast jitter, rotation? Rotation might be bad for welds (weld beads have orientation — the bead runs along a direction, pores are along the bead). Actually, rotating a weld crop 90° changes the context structure; the model might learn rotation invariance that's unhelpful or harmful. Color jitter: weld images from a robot camera — illumination varies. Contrast jitter might help stain (low-contrast discoloration) and pore (dark holes) robustness.
+
+Hmm, but is augmentation likely to move mAP by ≥0.01? The classifier already reaches F1 0.87 on perfect boxes with the starting recipe. The remaining error is on detector boxes (misplaced). Augmentation might help generalization. Medium potential.
+
+**What about input context scale?** The tight crop is 1.5x the box, wide is 2.5x. For pore vs stain discrimination, maybe a wider context (4–6x) helps see the weld bead structure (pores are inside the bead; stain is on the base metal around it). But budget: 3rd view at inference is +18 seconds → total ~180, too tight. Unless we make the 3rd view cheap... no.
+
+Alternative: **replace** one view instead of adding: e.g., tight 1.5x + wide 4x instead of 1.5x + 2.5x. Same compute! The question is whether a wider context helps. Pore vs stain: stain is often on the base metal around the bead; a 4x crop shows more base metal. Deposit: extra material on the bead. Discontinuity: gap in the bead. Wider context might help all of them. This is a cheap, testable change: change CONTEXT from 2.5 to 4.0 (or 3.5). Same budget. Category: data (or inference? it's a change to the input crop — I'd call it "data").
+
+Hmm wait, e006 was about "the classifier failing on exactly the boxes the detector outputs (misplaced, partially overlapping)" — that was about training data (which boxes to train on), not context scale. So changing CONTEXT is new.
+
+But would it help? The starting recipe (two-crop 1.5x+2.5x) reaches F1 0.87. Unknown if 1.5x+4x is better. It's a plausible method change. Expected gain: uncertain, maybe 0.005–0.015.
+
+**Another idea: train the classifier to predict on detector-style boxes with a "false alarm" class?** I.e., add a 5th class "no defect" for detector boxes that don't overlap any true box (IoU ≤ 0.5). Then at inference, boxes the classifier says are "no defect" get all class scores down-weighted (or dropped). This directly targets false alarms and the ranking of false alarms vs true detections. But wait — the gap is class assignment, not false alarms (class-agnostic 0.755 ≈ upper bound 0.758). False alarms are already handled fine by the detector conf. Adding a 5th class changes the 4-class probabilities (they no longer sum to 1), complicating scoring. And e006 already tried something about training on detector boxes (rejected). Hmm, what did e006 do exactly? Can't see. The hypothesis mentions "misplaced, partially overlapping" — probably lowered the IoU threshold for pseudo-labels or added near-miss boxes. Rejected.
+
+Actually, let me reconsider: the per-class numbers. Pore 0.522 is the weakest. What's special about pore? Pores are small. In crops.csv, pore boxes are probably small (a few px to tens of px). The tight crop at 1.5x is tiny → resized to 160 with a lot of interpolation. The wide crop at 2.5x is also small. So the pore crop is mostly the hole + a bit of bead. Stain boxes are probably larger regions.
+
+**Size-aware context**: use a larger context multiplier for small boxes, so the input always covers a similar absolute area. E.g., side = max(box_long × ctx, MIN_ABS), MIN_ABS = 64px or so. Currently MIN_CROP=16. If we set the effective minimum crop side to ~48–64px, small pore boxes get more context (the surrounding bead) at the same 160px input. This is a method change to what the model sees, targets the weakest class (pore), and costs zero budget.
+
+Hmm, but is that right? For a 10px pore box, tight crop = 15px → 16x upscale to 160. With MIN_ABS=48, tight crop = 48px → 3.3x upscale. The pore occupies a smaller fraction of the input, with more bead context. The model can use "small dark hole inside a weld bead" vs "large dark region" for pore vs stain. This seems genuinely plausible for pore/stain confusion.
+
+But wait — training and inference consistency: this change applies to both (make_crop is used for both). Good.
+
+Risk: if pores are identified by local texture, more context might dilute the signal. But the wide crop already exists (2.5x). For a 10px box, wide = 25px → still tiny. So both views are currently tiny for pores. Raising the minimum crop side helps both views for small boxes.
+
+Let me estimate: how many boxes are small? Unknown, but pores are likely the smallest class. This change mainly affects small boxes (pores, maybe some deposits).
+
+Alternative formulation: instead of a global minimum, make the context multiplier size-dependent: ctx = 1.5 if box is large, 3.0 if box is small. Equivalent to a minimum side. Simplest: MIN_CROP from 16 to 48? Let me think about the value. Input is 160px. A 48px crop resized to 160 = 3.3x. A 10px pore hole becomes ~33px in the input — visible with context. A 48px stain box becomes 160px... wait, if the stain box is 48px, its tight crop side = max(48×1.5Thinking budget reached. Stop thinking now and write the reply in the required format.

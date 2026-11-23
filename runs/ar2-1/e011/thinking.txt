@@ -1,0 +1,170 @@
+===== attempt 1 =====
+Let me analyze the situation:
+
+1. Current best is e008 with 5-seed mean 0.6314
+2. e010 (IMG_SIZE 224) timed out - it was doing 4 forward passes (TTA with flip) at 224 resolution which was too slow
+3. The timeout happened because at 224 resolution, the model is slower per step, AND the TTA (4 forward passes) at inference time made it exceed the budget
+
+Let me think about what to try next. Looking at the experiment history:
+- e001: background class - rejected (0.5512)
+- e002: low-res crops - rejected (0.6209)
+- e003: ConvNeXt-Nano - suspicious (0.3721)
+- e004: detector boxes training - rejected (0.6234)
+- e005: TTA horizontal flip - new best (0.6286)
+- e006: focal loss - rejected (0.6215)
+- e007: label smoothing - rejected (0.6230)
+- e008: more training time - new best (0.6314)
+- e009: max prob scoring - not confirmed (0.6298)
+- e010: IMG_SIZE 224 - timeout
+
+The timeout in e010 was because:
+- 224 resolution is ~2x the pixels of 160
+- Training was slower (63s per epoch vs 61s, not much different actually)
+- But the inference with TTA (4 forward passes) at 224 would be much slower
+- Actually looking at the log, it was killed during training (epoch 4, step 377 of 376... it was in the middle of epoch 4)
+- Wait, it says "Killed after 195s" and the last log shows epoch 4 at 130s. So it was still training when killed. The issue is that at 224, each step is slower, so fewer steps fit in the budget.
+
+Actually wait - looking more carefully at the log:
+- e008: epoch 4 at 130s, done at 173s (inference took ~43s)
+- e010: epoch 4 at 130s, killed at 195s (inference would have taken much longer at 224)
+
+The issue is that with 224 resolution, the inference (41879 detections × 4 forward passes) takes much longer. The RESERVE_S of 50s wasn't enough.
+
+So the fix would be to either:
+1. Increase RESERVE_S for 224
+2. Remove TTA at 224 (since it's 4x the inference cost)
+3. Use a smaller model at 224
+
+But actually, let me think about what other ideas to try. We've tried:
+- Data: background class, low-res crops, detector boxes
+- Architecture: ConvNeXt-Nano (buggy)
+- Loss: focal loss, label smoothing
+- Inference: TTA, max prob scoring
+- Optimization: more training time
+- Resolution: 224 (timeout)
+
+Ideas not yet tried:
+1. Fix the 224 timeout by increasing reserve and/or removing TTA
+2. Use a different model (resnet50, efficientnet_b2, etc.)
+3. Ensemble two models
+4. Different scoring: use conf^alpha * prob
+5. Train with more aggressive augmentation
+6. Use both tight and wide crops as separate inputs (concatenation instead of averaging)
+7. Use the detector confidence as an additional input feature
+8. Different learning rate / optimizer
+9. Mixup or cutmix augmentation
+10. Use resnet50 which might be better suited
+
+Let me think about what's most promising. The per-class scores are:
+- pore 0.505 (weakest)
+- deposit 0.630
+- discontinuity 0.782 (strongest)
+- stain 0.609
+
+The gap between pore and discontinuity is large. Pore is very small features. Higher resolution should help but timed out.
+
+Let me try fixing the 224 timeout. The issue is:
+- Training at 224 is slightly slower per step
+- Inference at 224 with TTA (4 passes) is much slower
+
+I could:
+- Increase RESERVE_S to 80s (gives more time for inference)
+- Or reduce TTA to just 2 passes (original + flip, not both views flipped)
+- Or use IMG_SIZE=192 as a compromise
+
+Actually, let me reconsider. The timeout was at 195s with budget 180s. The training was at 130s when it printed epoch 4. Then it continued training until t_end = deadline - RESERVE_S = 180 - 50 = 130s. So training ended at 130s. Then inference started and was killed at 195s (15s into inference, which is way more than the 50s reserve... wait that doesn't make sense).
+
+Wait, let me re-read. The budget is 180s. RESERVE_S = 50. So t_end = T0 + 180 - 50 = T0 + 130. Training runs until T0+130. Then inference runs. The kill happens at T0+180. So inference has 50s.
+
+At 160 resolution, inference took 173-130 = 43s. At 224 resolution, inference would take roughly (224/160)^2 = 1.96x longer, so ~84s. That's way more than 50s. That's why it timed out.
+
+So to fix: increase RESERVE_S to ~100s. But that means less training time. Or reduce TTA.
+
+Actually, a better approach: use IMG_SIZE=192 as a compromise. (192/160)^2 = 1.44x inference time, so ~62s. With RESERVE_S=70, that should work. Training would be slightly slower too.
+
+Or: keep 224 but remove TTA (just 2 forward passes instead of 4). That halves inference time to ~42s, fitting in 50s reserve.
+
+Actually, let me think about this differently. The key question is whether 224 actually helps. We never got a score for it. Let me try 192 with the same TTA, and increase RESERVE_S to 70.
+
+(192/160)^2 = 1.44. Inference at 160 was 43s, so at 192 it'd be ~62s. With RESERVE_S=70, that should be fine.
+
+Training at 192: each step is 1.44x slower. At 160, we got 432 steps in 130s. At 192, we'd get ~300 steps in 130s. That's a tradeoff.
+
+Alternatively, I could try a completely different approach. Let me think about what would have the most impact.
+
+Looking at the scoring: score = d["conf"] * float(p[c]). The detector confidence is used multiplicatively. What if we use a different combination?
+
+Actually, let me try something else. The e009 experiment (max prob scoring) was "not confirmed" - it got 0.6355 on seed 0 but 0.6298 on 5 seeds. So it was slightly worse on average.
+
+Let me think about what hasn't been tried:
+1. Different model: resnet50 or efficientnet_b2
+2. Input resolution 192 (compromise)
+3. More aggressive data augmentation (color jitter, random erasing)
+4. Mixup
+5. Using the detector confidence as an additional feature
+6. Different scoring formula (e.g., conf^0.5 * prob, or conf * prob^2)
+
+I think trying a different architecture is promising. We tried ConvNeXt-Nano but it was "suspicious (likely bug)" at 0.3721. Let me try ResNet50 which is a well-tested architecture.
+
+Actually, wait. Let me reconsider the 224 fix. The hypothesis is clear: higher resolution helps pore detection (smallest features). The fix is straightforward: increase RESERVE_S. Let me go with that.
+
+For 224 with TTA (4 passes):
+- Inference time ≈ 43 * (224/160)^2 ≈ 84s
+- Need RESERVE_S = 90s to be safe
+- Training time available: 180 - 90 = 90s (vs 130s before)
+- At 224, each step is ~1.96x slower, so in 90s we get ~90/1.96 * (432/130) ≈ 147 steps (vs 432 before)
+
+That's a big loss in training. Maybe 192 is better:
+- Inference time ≈ 43 * (192/160)^2 ≈ 62s
+- Need RESERVE_S = 70s
+- Training time: 180 - 70 = 110s
+- At 192, each step is ~1.44x slower, so in 110s we get ~110/1.44 * (432/130) ≈ 252 steps
+
+Still a loss but less severe. And 192 gives 20% more resolution than 160.
+
+Actually, let me reconsider. Maybe I should just increase RESERVE_S and keep 224, accepting fewer training steps. The hypothesis is that resolution matters more than number of steps for pore detection.
+
+Let me go with: BASE: last (e010, which has IMG_SIZE=224), increase RESERVE_S to 95.
+
+Wait, but the instructions say "Every change is applied on top of the current best train.py (or the most recent version with BASE: last)." So if I say BASE: last, I'm editing e010 which only differs from e008 by IMG_SIZE=224.
+
+Let me do: BASE: last, change RESERVE_S from 50 to 95.
+
+Actually, I realize I should think more carefully. At 224 resolution:
+- Training: 94 steps per epoch (same batch size 64, same dataset) but each step is slower
+- From the log: epoch 0 took 63s (vs 61s at 160). So ~3% slower per step? That seems too little for 224 vs 160.
+
+Wait, actually the image loading and preprocessing might dominate, not the forward/backward pass. The crops are loaded from full images and resized to IMG_SIZE. So the cost of resizing to 224 vs 160 is small compared to the network computation.
+
+Looking at the logs more carefully:
+- e008 (160): epoch 0: 94 steps, 61s → 0.65s/step
+- e010 (224): epoch 0: 94 steps, 63s → 0.67s/step
+
+That's only 3% slower! That's surprising. Maybe the GPU is fast enough that the 224 vs 160 difference is small relative to data loading overhead.
+
+But then why did it time out? Let me recalculate:
+- e008: training ended at ~130s, inference took 43s, total 173s
+- e010: training would end at ~130s (same t_end), inference at 224...
+
+If training is only 3% slower, then inference should also be only slightly slower. But it timed out at 195s. So inference took >65s (195-130). That's 50% more than the 43s at 160.
+
+Hmm, maybe the GPU computation is more significant at 224. The forward pass cost scales with image area: (224/160)^2 = 1.96x. With 4 TTA passes, that's 4 * 1.96 = 7.84x the compute of a single 160 pass. At 160, 4 passes took 43s, so 224 4 passes would take ~84s. 130 + 84 = 214s > 180s. That explains the timeout.
+
+So RESERVE_S needs to be at least 85s. Let's use 90s for safety.
+
+With RESERVE_S=90:
+- Training budget: 180 - 90 = 90s
+- At 224, steps are ~3% slower: 90/0.67 ≈ 134 steps (vs 432 at 160 with 130s budget)
+
+That's a significant loss in training steps. But the hypothesis is that resolution matters more.
+
+Alternatively, I could reduce TTA to 2 passes (original only, no flip) at 224:
+- Inference: 2 * 1.96 = 3.92x → ~43 * 0.92 ≈ 40s (wait, that's the same as 160 with 2 passes)
+- Actually: 160 with 4 passes = 43s. 160 with 2 passes ≈ 22s. 224 with 2 passes ≈ 22 * 1.96 ≈ 43s.
+- So RESERVE_S = 50 would work!
+
+But we lose the TTA benefit that gave us the e005 improvement.
+
+I think the best approach is: keep 224, keep TTA, increase RESERVE_S to 90. Accept fewer training steps. The hypothesis is that the resolution gain for pore detection outweighs the loss from fewer steps.
+
+Let me go with this.

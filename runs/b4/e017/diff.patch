@@ -1,0 +1,88 @@
+--- e000/train.py
++++ e017/train.py
+@@ -56,4 +56,6 @@
+ MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+ STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
++N_CLASS = 5             # 4 defect classes + 1 background (no-defect) class
++BG_W = 0.5              # down-weight background boxes so defect classes stay sharp
+ 
+ 
+@@ -114,4 +116,18 @@
+ 
+ 
++def iou(a, b):
++    ax1, ay1, ax2, ay2 = a["x1"], a["y1"], a["x2"], a["y2"]
++    bx1, by1, bx2, by2 = b["x1"], b["y1"], b["x2"], b["y2"]
++    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
++    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
++    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
++    inter = iw * ih
++    if inter <= 0:
++        return 0.0
++    aa = (ax2 - ax1) * (ay2 - ay1)
++    ba = (bx2 - bx1) * (by2 - by1)
++    return inter / (aa + ba - inter)
++
++
+ def main():
+     ap = argparse.ArgumentParser()
+@@ -128,7 +144,18 @@
+     dets = read_csv(os.path.join(args.data, "dets.csv"))
+     ev = [d for d in dets if d["split"] == "eval"]
+-    needed = {r["image"] for r in crops} | {d["image"] for d in ev}
++    # Background training boxes: train-split detector boxes that overlap no true defect.
++    by_img = {}
++    for r in crops:
++        by_img.setdefault(r["image"], []).append(r)
++    bg = []
++    for d in dets:
++        if d["split"] != "train":
++            continue
++        best = max((iou(d, g) for g in by_img.get(d["image"], [])), default=0.0)
++        if best < 0.5:
++            bg.append(dict(d, cls=N_CLASS - 1))
++    needed = {r["image"] for r in crops} | {d["image"] for d in ev} | {b["image"] for b in bg}
+     images = {p: np.asarray(Image.open(os.path.join(args.data, "images", p)).convert("RGB")) for p in needed}
+-    print(f"train {len(crops)} boxes, eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
++    print(f"train {len(crops)} defect + {len(bg)} background boxes, eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
+ 
+     workers = min(8, os.cpu_count() or 2)
+@@ -139,5 +166,8 @@
+ 
+     g = torch.Generator().manual_seed(args.seed)
+-    dl_tr = torch.utils.data.DataLoader(BoxDataset(crops, images, True), batch_size=BATCH_SIZE, shuffle=True,
++    # Interleave defect and background boxes so background is present in every batch.
++    train_rows = list(crops) + list(bg)
++    random.shuffle(train_rows)
++    dl_tr = torch.utils.data.DataLoader(BoxDataset(train_rows, images, True), batch_size=BATCH_SIZE, shuffle=True,
+                                         num_workers=workers, pin_memory=True, drop_last=True,
+                                         persistent_workers=True, generator=g, worker_init_fn=worker_init)
+@@ -145,7 +175,8 @@
+                                         num_workers=workers, pin_memory=True)
+ 
+-    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
++    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=N_CLASS)
+     model = model.to(device).to(memory_format=torch.channels_last)
+-    crit = nn.CrossEntropyLoss()
++    w = [1.0] * (N_CLASS - 1) + [BG_W]
++    crit = nn.CrossEntropyLoss(weight=torch.tensor(w, device=device))
+     opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+     amp = dict(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda")
+@@ -179,5 +210,6 @@
+         epoch += 1
+ 
+-    # Classify every eval detection; one prediction per class with score = detector conf x class probability.
++    # Classify every eval detection; one prediction per defect class with
++    # score = detector conf x defect probability x (1 - background probability).
+     model.eval()
+     probs = []
+@@ -194,6 +226,7 @@
+         w.writerow(["det_id", "cls", "score"])
+         for d, p in zip(ev, probs):
+-            for c in range(4):
+-                s = d["conf"] * float(p[c])
++            defect_mass = float(p[:N_CLASS - 1].sum())
++            for c in range(N_CLASS - 1):
++                s = d["conf"] * float(p[c]) * defect_mass
+                 if s > MIN_SCORE:
+                     w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1

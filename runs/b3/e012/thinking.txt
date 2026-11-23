@@ -1,0 +1,303 @@
+===== attempt 1 =====
+Let me analyze the situation carefully.
+
+Current best: e004, 5-seed val mAP@0.5 0.6342
+- Per-class: pore 0.522, deposit 0.624, discontinuity 0.780, stain 0.611
+- Reference numbers: baseline 0.638, ceiling 0.758, class-agnostic 0.755
+
+Let me group the experiments:
+
+**Scoring:**
+- e001: Single-class output (top class only) → 0.5749, rejected. This was bad because it dropped the multi-row approach.
+- e005: score = conf^0.5 × p(c) → 0.1554, suspicious bug. Probably a bug in implementation.
+
+**Data:**
+- e002: Include low-res crops → 0.6383 seed-0, 0.6293 5-seed mean, not confirmed.
+- e004: Pseudo-label train-split detector boxes (IoU>0.5) → 0.6326 seed-0, 0.6342 5-seed mean, NEW BEST.
+- e006: Train on boxes that partially overlap (IoU>0.25?) → 0.6323, rejected.
+- e008: MIN_CROP cap for small pores → 0.6387 seed-0, 0.6338 5-seed, not confirmed.
+- e010: Crashed (some data change for small defects).
+- e011: Cutout/random erasing augmentation → 0.6357 seed-0, 0.6328 5-seed, not confirmed.
+
+**Architecture:**
+- e003: Larger model or something → 0.6389 seed-0, 0.6313 5-seed, not confirmed.
+
+**Inference:**
+- e007: TTA (test-time augmentation) → 0.6277, rejected.
+
+**Optimisation:**
+- e009: Longer training / different LR → 0.6330, rejected.
+
+So the data category has 1 new best (e004) and 3 close-but-not-confirmed. The trend is: most changes are within noise. The one confirmed gain was e004 (pseudo-labeling detector boxes).
+
+Key observations:
+1. The gap from 0.634 to 0.758 (ceiling) is class mis-assignment.
+2. Pore (0.522) is weakest, then stain (0.611) and deposit (0.624).
+3. Class-agnostic is 0.755, so the detector boxes are good; the problem is class assignment.
+4. A crop classifier with perfect boxes reaches macro-F1 ~0.87.
+
+Let me think about what's fundamentally different and could gain ≥0.01.
+
+The scoring metric: mAP@0.5 per class. AP depends only on the ORDER of a class's predictions. So any monotone transformation of scores doesn't change AP.
+
+Wait, this is a crucial insight. For each class, predictions are sorted by score. A prediction is a hit if it overlaps an unmatched true box of that class by IoU>0.5.
+
+Currently each eval box emits up to 4 rows (one per class, score = conf × p(c)). So each box appears in all 4 classes' lists. This means a true pore detection also appears in the deposit, discontinuity, and stain lists as a false positive (if it doesn't overlap a true box of that class).
+
+But wait — the metric says "a prediction is a hit if it overlaps an unmatched true box of that class by IoU > 0.5." So if a box is a true pore, and it's in the stain list, it would be a false positive for stain (unless it overlaps a true stain box too).
+
+Actually, e001 tried outputting only the top class and it was worse (0.5749). So the multi-row approach is better. Why? Because if you emit all 4 rows, a true pore box is ranked in the pore list by its pore score, and it's a hit there. In the other 3 lists it's a false positive but ranked low (low p(c)), so it doesn't hurt much. Whereas if you emit only the top class, you might emit the wrong class for a box that's actually a different class... no wait.
+
+Hmm, let me think. Actually the multi-row approach: for a true pore box with p = [0.8, 0.1, 0.05, 0.05], it emits 4 rows. In the pore list, it's ranked high (score = conf*0.8) and it's a hit. In the deposit list, it's ranked by conf*0.1, low, and it's a false positive but low-ranked so it barely affects precision. This is good.
+
+If you emit only top class: the box emits one row in pore. Same hit. But for a box where the classifier is wrong... Actually the issue is that with multi-row, you get more total predictions which can help recall. Actually no.
+
+Let me reconsider. The reason e001 (single top class) was worse: by only emitting the top class, you lose the ability for a box to be a hit in a class where it's not the top. But more importantly, the number of predictions per class changes. Hmm.
+
+Actually, I think the key realization is: the scoring is per-class AP, and AP only depends on order within a class. The multi-row approach means each class list contains ALL boxes (ranked by their p for that class). This is actually a clean design.
+
+Now, what could help? Let me think about the biggest source of error.
+
+The ceiling is 0.758 (perfect classes on detector boxes). We're at 0.634. The class-agnostic is 0.755. So the detector boxes are essentially at the ceiling level. The gap is purely class assignment.
+
+If classes were perfect, we'd be at 0.758. We're at 0.634. So class assignment costs us 0.124.
+
+The crop classifier with perfect boxes gets macro-F1 ~0.87. With detector boxes (imperfect), it's worse.
+
+So the main lever is improving class assignment accuracy. But we've tried:
+- More data (pseudo-labels) → helped (e004)
+- Low-res → no
+- Larger model → no
+- Longer training → no
+- Cutout → no
+- MIN_CROP → no
+
+What's fundamentally different?
+
+Let me think about the class assignment problem differently. The confusion is:
+- Pore and deposit are weak classes
+- Stain is often confused with deposit
+- Pore is weakest
+
+Ideas that change what the model sees or learns from:
+
+1. **Class-balanced / focal loss** — but "Class-weighted loss hurt classification every time it was tried." So avoid.
+
+2. **Two-stage: first detect, then classify with a better classifier.** The current model is EfficientNet-B0. What about a better architecture? e003 tried architecture change (probably bigger model) and it was not confirmed. But maybe a different kind of architecture change.
+
+3. **Ensemble of models** — average predictions from multiple models. This could help. But budget constraints.
+
+4. **Use the detector confidence more cleverly in scoring.** The score = conf × p(c). But AP only depends on order within a class. So the conf multiplies all 4 classes' scores for a box equally... no wait, conf is the same for all 4 rows of a box, but p(c) differs. So within a single class's list, the score is conf × p(c). The conf varies across boxes. So the ranking within a class is by conf × p(c).
+
+Hmm, here's a thought: since AP depends only on order, and conf is the detector's confidence, maybe we should NOT multiply by conf, or use it differently. But e005 tried changing the score formula and it was a bug (0.1554). Let me think about what a correct scoring change would be.
+
+Actually, wait. Let me reconsider the metric more carefully. The score determines the order. For a class, predictions sorted by score. A high score = more likely to be a true positive (checked first). 
+
+The question is: what ordering maximizes AP? We want true positives ranked above false positives. 
+
+Currently score = conf × p(c). The detector conf is a proxy for "is this box a real defect at all." The p(c) is "given it's a defect, is it class c." 
+
+For a box that's a true pore: conf might be high, p(pore) high → high score in pore list. Good.
+For a false alarm box (no true defect): conf might be high (detector false alarm), p(c) is whatever the classifier says. If the classifier is confident about some class, this box ranks high in that class's list as a false positive. Bad.
+
+So the issue is false alarms from the detector that the classifier is confident about. These pollute the class lists.
+
+Hmm, but the class-agnostic number is 0.755, which means if we treated everything as one class, we'd get 0.755. That's the detector's quality. When we split into 4 classes, we drop to 0.634. The drop is because:
+1. Mis-assignment: a true pore is classified as deposit → it's a false positive for deposit and a missed detection for pore.
+2. The false alarms are distributed across classes.
+
+Actually, let me reconsider. The class-agnostic 0.755 uses score = detector conf for all boxes as class 'defect'. So the detector's false alarms are already in that 0.755. When we split into 4 classes, the false alarms get assigned to classes by the classifier.
+
+Let me think about what a fundamentally different approach would be.
+
+Idea: **The classifier sees a crop of the box. But the box is from a class-agnostic detector, so it might be slightly misplaced or the wrong size. What if we let the model see the box at the detector's exact geometry AND do something to handle the misplacement?**
+
+Actually, e004 already trains on detector boxes. 
+
+Let me think about the confusion matrix problem. Stain confused with deposit. Pore and deposit weak.
+
+Idea: **Train a separate classifier per pair of confused classes, or use a hierarchical approach.** Too complex for budget.
+
+Idea: **Use more training data by augmenting with the wide context more, or use the image-level context.**
+
+Let me reconsider the budget. The run takes 162s out of 180s budget. RESERVE_S = 55. So training ends at deadline - 55 = 180 - 55 = 125s. Training ran 103s to 125s (2 epochs, 397 steps). Then prediction takes ~37s (125 to 162). 
+
+Wait, 125 to 162 is 37s for prediction. That's a lot. 41879 detections, batch 256, so ~164 batches. Two forward passes each (tight + wide). So 328 forward passes of 256 images. That's the eval time.
+
+Actually we have 18s loading + 107s training + 37s prediction = 162s. Reserve is 55s but only 18s left. So we're using the reserve.
+
+Hmm, so if I want to add more training or a bigger model, I need to be careful.
+
+Let me think about the most promising direction.
+
+Given that:
+- The gap is class mis-assignment (0.634 vs 0.758 ceiling)
+- Pore is weakest (0.522)
+- Most hyperparameter tweaks are within noise
+- The one confirmed gain was training on detector boxes (e004)
+
+I think the most promising fundamentally-different idea is about **the classifier's input representation** or **the model itself**.
+
+Let me reconsider e003 (architecture). It was "raise the classification..." and got 0.6389 seed-0, 0.6313 5-seed. So it was not confirmed — within noise. What did it change? Probably a bigger model. Bigger models on 160px crops might not help much.
+
+What about the **two-view averaging**? The model processes tight crop and wide crop separately and averages logits. What if instead we concatenate them, or use a single larger crop? Actually the two-crop design is from the starting point.
+
+Let me think about a different angle: **the score / ranking.**
+
+Actually, here's a key insight I should exploit. Since AP depends only on order within a class, and we emit 4 rows per box, the ranking within class c is by conf × p_c. 
+
+But consider: the detector conf is the SAME regardless of class. So within class c, boxes are ranked by conf × p_c. A box with high conf but low p_c ranks lower than a box with moderate conf and high p_c.
+
+Is conf a good signal? The detector conf correlates with "is this a real defect." For ranking true positives above false positives within a class, we want: true positives (real defects of class c) ranked high, false positives (either real defects of other classes, or detector false alarms) ranked low.
+
+The p_c is a good signal for "is it class c." The conf is a good signal for "is it a real defect."
+
+So conf × p_c seems reasonable. But maybe the relationship is off. E.g., maybe we should use conf^α × p_c, or a different combination.
+
+But e005 tried a scoring change and it was a bug. Let me be careful. Actually, let me look at what e005 did: "score = conf^0.5 × p(c)" — the hypothesis says "multiplicative coupling amplifies conf's noise." And it got 0.1554 which is a bug (way below best). So the implementation had a bug. I should not repeat that exact thing.
+
+Hmm, but a scoring change that's correct could help. However, the risk is high (bugs) and the effect might be small (within noise).
+
+Let me think about what's most likely to give ≥0.01.
+
+Actually, let me reconsider the problem. The ceiling with perfect classes is 0.758. The class-agnostic is 0.755. So the detector boxes are essentially perfect for detection. The ONLY thing that matters is class assignment.
+
+If we could perfectly assign classes, we'd be at 0.758. We're at 0.634. So we need to improve class assignment by a lot.
+
+The crop classifier with perfect boxes gets macro-F1 0.87. That means ~13% of classes are wrong even with perfect boxes. With detector boxes (imperfect), it's worse.
+
+To improve class assignment, we need a better classifier. Options:
+1. Better model (tried, no gain)
+2. More/better data (tried pseudo-labels, helped a bit)
+3. Better training (tried, no gain)
+4. Better input representation
+
+Let me think about the input representation. The crop is the box region at 1.5x and 2.5x context, resized to 160px. For small pores, this is a lot of upscaling (blur). For large defects, it's downsampling.
+
+What if the issue is that the classifier doesn't have enough context to distinguish stain from deposit? Stain is often confused with deposit. Maybe stain needs more surrounding context (wider crop). 
+
+Actually, here's an idea: **stain and deposit confusion might be because they look similar locally but differ in extent/context.** A wider crop might help. But we already have a 2.5x wide crop.
+
+Let me think differently. What about **using the detector's box size/shape as a feature**? Different defect types have different size distributions. Pores are small, deposits/discontinuities/stains are larger. We could feed the box aspect ratio and size to the classifier. But that's a small effect.
+
+Hmm. Let me reconsider. The per-class scores: pore 0.522, deposit 0.624, discontinuity 0.780, stain 0.611. Discontinuity is good (0.780). Pore, deposit, stain are weak.
+
+The confusion: stain↔deposit, pore is weak.
+
+Idea: **The model is a single EfficientNet-B0. What if we train it with a stronger backbone that's still fast enough?** e003 tried architecture and it was within noise. But maybe e003 wasn't a big enough change or had issues.
+
+Actually, let me reconsider the budget. We have 180s. Loading 18s, training ~107s, prediction ~37s. If I use a bigger model, training gets slower and prediction gets slower. EfficientNet-B0 is small. ConvNeXt or a bigger EfficientNet might be 2-3x slower. That might blow the budget.
+
+Let me think about what's cheap and could help.
+
+Actually, here's a thought about **the number of training epochs / steps**. e009 tried optimisation (longer training) and it was rejected (0.6330). So more training didn't help. The model converges fast.
+
+Let me reconsider the data angle. e004 (pseudo-labels) helped. What else in the data could help?
+
+The training data is 18271 boxes (high-res crops + pseudo-labeled detector boxes). The eval has 41879 detections.
+
+Idea: **What if we pseudo-label the EVAL boxes too?** No, we don't have their labels. And rule 3 says don't find eval labels.
+
+Idea: **Use the train-split detector boxes more aggressively.** e004 used IoU>0.5. e006 tried IoU>0.25 (partial overlap) and it was rejected. So lower IoU threshold didn't help.
+
+Hmm, let me think about the confusion matrix more. The classifier confuses stain and deposit. What if we do a **post-hoc correction** based on the box size? Stains are typically larger than deposits? Or vice versa? This is a heuristic that might help. But it's risky and might be within noise.
+
+Actually, let me step back and think about the scoring more carefully, because I think there's a real opportunity there that's been under-explored (only 2 scoring experiments, one buggy).
+
+The metric: per-class AP, depends only on order. We emit 4 rows per box.
+
+Key question: is emitting 4 rows per box optimal? e001 tried 1 row (top class) and it was worse (0.5749). So 4 rows is better than 1 row.
+
+Why is 4 rows better? Let me think. With 4 rows, each class list contains all boxes ranked by conf × p_c. With 1 row (top class), each box appears in exactly one class list.
+
+Consider a true pore box. With 4 rows: it's in the pore list (high rank, hit) and in deposit/discontinuity/stain lists (low rank, false positive). With 1 row: it's in the pore list only (high rank, hit). 
+
+The difference: with 4 rows, the box also appears as a low-ranked false positive in 3 other lists. Does that hurt? A low-ranked false positive barely affects AP (it's at the bottom of the precision-recall curve). So 4 rows shouldn't hurt much.
+
+But why is 1 row worse? Because with 1 row, you might emit the wrong class. E.g., a true pore box where the classifier says p = [0.4, 0.35, 0.2, 0.05] → top class is pore, OK. But a true deposit box where classifier says p = [0.4, 0.3, 0.25, 0.05] → top class is pore (wrong!). With 1 row, this box is emitted as pore (false positive for pore, missed for deposit). With 4 rows, it's in the deposit list at rank conf×0.3 (still a hit if it overlaps the true deposit box), AND in the pore list at rank conf×0.4 (false positive for pore). So 4 rows gives the box a chance to be a hit in its true class even if not the top.
+
+So 4 rows is better because it's more robust to mis-ranking of the top class.
+
+Now, is there a better scoring scheme? What if we emit rows only for classes above a threshold? Or what if we adjust the score to better rank true positives above false positives?
+
+The score within class c is conf × p_c. The issue: false alarms (detector false positives) with high conf and the classifier being somewhat confident → high score → ranked high → false positive.
+
+But actually, we can't distinguish a detector false alarm from a true detection using only the classifier (the classifier sees the crop; a false alarm's crop is background, so the classifier should be uncertain → low p_c for all classes → low score). So the classifier's uncertainty should handle false alarms.
+
+Hmm, wait. If the classifier is well-calibrated, then for a background crop (false alarm), all p_c are low (sum to 1, so each ~0.25), giving score = conf × 0.25. For a true pore, p_pore is high, score = conf × 0.8. So true positives rank above false alarms. Good.
+
+But if the classifier is overconfident on background (says p_pore = 0.6 for a background crop), then false alarms rank high. This is a calibration issue.
+
+So the lever is classifier calibration / confidence. But that's hard to control.
+
+Let me think about a different, more concrete idea.
+
+**Idea: Use a focal loss or label smoothing to improve calibration.** But class-weighted loss hurt. Label smoothing might help calibration. But this is a loss change, and loss changes have been tried (class-weighted hurt). Label smoothing is different from class weighting though.
+
+Actually, let me reconsider. The "Lessons" say class-weighted loss hurt every time. But label smoothing or focal loss are different.
+
+Hmm, but I'm not sure label smoothing helps AP (which depends on order, not absolute values). Label smoothing would make the model less confident, which might help or hurt the ranking.
+
+Let me think about the most impactful change.
+
+Actually, I realize I should think about whether the two-view averaging is optimal. The model processes tight (1.5x) and wide (2.5x) crops separately and averages logits. What if the tight crop is more informative for some classes and the wide for others? Averaging might dilute.
+
+But changing this is an architecture/inference change, and it's within the "what the model sees" category.
+
+Let me reconsider the whole thing. The confirmed gain was e004 (train on detector boxes). The direction of "match training distribution to inference" is promising. What else is a distribution mismatch?
+
+1. Training uses high-res crops; eval might have low-res. e002 tried including low-res, not confirmed.
+2. Training uses GT boxes; inference uses detector boxes. e004 fixed this (helped).
+3. Training crops are centered on the box; detector boxes are slightly off. e004's pseudo-labels use detector boxes, so this is partly fixed.
+
+What about **the crop context**? Training uses 1.5x and 2.5x. Inference uses the same. So that's matched.
+
+Hmm. Let me think about the model capacity. EfficientNet-B0 has 4M params. For a 4-class problem on 160px crops, that's probably enough. But maybe a slightly bigger model with better transfer would help. e003 tried architecture (not confirmed). Let me not repeat.
+
+Let me think about **ensemble**. Train 2 models with different seeds/architectures and average their probabilities. This reduces variance and can improve accuracy. But budget: 2 models = 2x training + 2x prediction. That might blow the budget.
+
+Actually, we have 180s. Current: 18 load + 107 train + 37 pred = 162. If I train 2 models, training would be ~2x but... no, I'd split the budget. Each model gets ~50s training. 2 models × 50s = 100s training + 2× prediction. Prediction per model ~37s, so 2 models ~74s. Total: 18 + 100 + 74 = 192s > 180. Too much. Unless I reduce batch or something. Risky.
+
+Alternatively, an ensemble of the SAME model architecture but with different random seeds/initializations, trained for half the time each. Might help a little but risky on budget.
+
+Let me think about a cleaner idea.
+
+**Idea: The classifier is weakest on pore (0.522). Pores are small. What if I add a dedicated "pore vs not-pore" signal?** Too complex.
+
+**Idea: Increase the effective resolution for small boxes by not upscaling as much.** e008 tried capping MIN_CROP, not confirmed. e010 crashed. So the small-box handling has been tried.
+
+Let me reconsider. I've been going in circles. Let me focus on the scoring, since it's under-explored and a correct change could help, OR find a fundamentally different data/architecture idea.
+
+Actually, wait. Let me reconsider the ceiling numbers. The ceiling is 0.758 with perfect classes. But that's with the SAME detector boxes and score = detector conf. So if we had perfect classes, score = conf, and we'd get 0.758.
+
+Currently score = conf × p_c. The ranking within class c is by conf × p_c. If p_c were perfect (1 for true class, 0 for others), then within class c, true positives have score = conf × 1 = conf, and false positives (other classes) have score = conf × 0 = 0. So true positives rank above false positives, and we'd get the ceiling 0.758.
+
+The gap (0.634 vs 0.758) is because p_c is not perfect: 
+- For a true pore box, p_pore might be 0.6, p_deposit 0.3. So in the deposit list, this box has score conf × 0.3, which might rank above some true deposit boxes with lower conf. This pollutes the deposit list.
+- Also, a true pore box in the pore list has score conf × 0.6, while a true deposit box in the pore list has score conf × 0.1. So the pore list is mostly correct ordering, but the deposit list is polluted by true pores with high p_deposit.
+
+So the main error is cross-class pollution: true boxes of class A appearing in class B's list with non-negligible score.
+
+To reduce this, we want p to be more peaked (one-hot). A more confident classifier would reduce cross-class pollution. But overconfidence can hurt false-alarm ranking.
+
+Hmm, this is a tradeoff. Let me think about whether sharpening the probabilities helps.
+
+If we apply a temperature < 1 (sharpening) to the softmax, we make p more peaked. This reduces cross-class pollution (good for the true class) but might increase false-alarm issues (bad). 
+
+Actually, sharpening: p_c^sharpened = p_c^T / sum(p^T) for T<1. This makes the max class higher and others lower. For a true pore box, p_pore goes up, p_deposit goes down. So the box ranks higher in pore list (good) and lower in deposit list (good, less pollution). For a false alarm, all p are ~0.25, sharpening keeps them ~equal (0.25 each), so no change. So sharpening should help!
+
+Wait, is that right? For a false alarm with uniform p = [0.25, 0.25, 0.25, 0.25], sharpening with T=0.5: p^0.5 = [0.5, 0.5, 0.5, 0.5], normalized = [0.25, 0.25, 0.25, 0.25]. No change. For a true pore with p = [0.6, 0.2, 0.1, 0.1], T=0.5: p^0.5 = [0.775, 0.447, 0.316, 0.316], sum = 1.854, normalized = [0.418, 0.241, 0.170, 0.170]. So p_pore went from 0.6 to 0.418? No wait, that's lower. Hmm, I messed up.
+
+Let me redo. Sharpening with T < 1 means raising to power 1/T > 1, or equivalently dividing logits by T < 1 before softmax. Let me use the logit formulation: logits l, sharpened = softmax(l / T) for T < 1.
+
+For a true pore, logits might be [2, 0, -1, -1] (pore highest). p = softmax = [0.65, 0.15, 0.10, 0.10]. Sharpen with T=0.5: l/0.5 = [4, 0, -2, -2], p = softmax = [0.73, 0.11, 0.08, 0.08]. So p_pore went from 0.65 to 0.73 (higher), others lower. Good, more peaked.
+
+For a false alarm, logits ~ [0,0,0,0], p = [0.25,0.25,0.25,0.25]. Sharpen: still [0.25,...]. No change.
+
+So sharpening makes true-class probabilities higher and reduces cross-class pollution, without affecting uniform (false alarm) predictions. This should help AP!
+
+But wait, does it? The AP depends on order. Sharpening changes the relative scores. For a true pore box, its score in the pore list goes up (conf × 0.73 vs conf × 0.65), and its score in the deposit list goes down (conf × 0.11 vs conf × 0.15). So it ranks higher in pore (good) and lower in deposit (less pollution, good). 
+
+For a true deposit box with p = [0.15, 0.6, 0.15, 0.10], sharpen: p_deposit goes up, p_pore goes down. So it ranks higher in deposit and lower in pore. Good.
+
+So sharpening shouldThinking budget reached. Stop thinking now and write the reply in the required format.

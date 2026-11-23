@@ -1,0 +1,805 @@
+===== attempt 1 =====
+Let me carefully analyze the situation.
+
+## Current state
+- Best: e000, 5-seed mean 0.6297 mAP@0.5
+- Per-class: pore 0.504, deposit 0.626, discontinuity 0.780, stain 0.609
+- Reference numbers:
+  - One-step 4-class baseline: 0.638 (the number to beat)
+  - Stage-1 boxes with perfect classes (ceiling): 0.758
+  - Stage-1 boxes as single class: 0.755
+
+## History analysis
+
+Let me group the experiments:
+
+**Data category (5 ideas, 2 ran, 0 new best, 3 crashed):**
+- e001: crashed (NameError on `n`, prediction writer deleted)
+- e002: fixed e001's crash, got 0.5541 (rejected - much lower)
+- e006: 0.6225 (rejected) - training on low-res crops too
+- e012: crashed
+- e013: crashed (fixed e012's attribute name but then a different crash)
+
+So data category: e006 ran and got 0.6225 (below best). e012/e013 crashed. The "size/aspect channel" idea (e012/e013) crashed twice.
+
+**Scoring category (3 ideas, 3 ran, 0 new best):**
+- e004: 0.5689 (rejected)
+- e007: 0.6192 (rejected)
+- e010: 0.6289 (rejected)
+All scoring changes failed. This is marked EXHAUSTED.
+
+**Inference category (2 ideas, 2 ran, 0 new best, 1 close):**
+- e003: 0.6355 seed-0, 0.6301 5-seed (not confirmed) - averaging 4 views
+- e011: 0.6253 (rejected) - averaging probabilities instead of logits
+
+**Architecture (1 idea):**
+- e005: 0.6240 (rejected) - swap backbone
+
+**Augmentation (1 idea):**
+- e008: 0.6356 seed-0, 0.6327 5-seed (not confirmed) - mixup
+
+**Sampling (1 idea):**
+- e009: 0.6268 (rejected) - train on detector boxes
+
+## Key insights
+
+The gap is 0.630 vs 0.758 ceiling. This is a ranking problem. The per-class probabilities p_c are the only class signal.
+
+The weakest classes are pore (0.504) and stain (0.609).
+
+Let me think about what's fundamentally different and could gain 0.01+.
+
+The key realization from the history: 
+- Scoring changes (re-ordering scores) mostly failed because AP depends only on ORDER within a class, and many scoring tweaks just re-order in ways that don't help or hurt.
+- Wait, but scoring changes that change WHICH boxes are emitted or their relative ordering across the full list DO matter.
+
+Actually, let me reconsider. The metric: "AP depends only on this ORDER. Any change that keeps the order of a class's predictions (for example multiplying all its scores by a constant, or a monotone function of the score) leaves its AP unchanged."
+
+So within a single class, the order is what matters. The current score is `det_conf * p_c`. For a given class c, the order of boxes is by `det_conf * p_c`. 
+
+The 0.755 single-class number means: if we score all boxes as one class 'defect' with score = det_conf, we get 0.755. This is essentially the stage-1 detector's ranking quality.
+
+The 0.758 ceiling means: if we assign perfect classes to boxes that overlap true defects, keep false alarms as class 0, we get 0.758.
+
+So the difference between 0.758 (ceiling) and our 0.630 is entirely due to:
+1. Wrong class assignments (a true pore box assigned to deposit class → it's a false positive in deposit, and we miss it in pore)
+2. The ranking within each class
+
+Wait, but actually the ceiling 0.758 keeps false alarms as class 0 with their detector conf. So the ceiling's per-class AP for class 0 would include all the false alarms ranked by det_conf.
+
+Hmm, let me think about this differently. The ceiling is 0.758. Our score is 0.630. That's a 0.128 gap.
+
+The per-class APs: pore 0.504, deposit 0.626, discontinuity 0.780, stain 0.609. Mean = (0.504+0.626+0.780+0.609)/4 = 2.519/4 = 0.62975. Yes matches 0.6297.
+
+So pore is the weakest at 0.504. If we could get pore to match the ceiling's pore AP, we'd gain a lot.
+
+What is the ceiling's per-class AP? Not given directly. But the single-class is 0.755.
+
+Let me think about what limits pore specifically. Pores are small. The crop normalizes away the box size. So the model can't tell pore (small) from other defects easily. That's the e012/e013 idea — add a size/aspect channel. It crashed twice.
+
+Actually the size/aspect idea is interesting and fundamentally different. But it crashed twice. Let me look at why.
+
+e012 crashed on wrong attribute name (`model.stem.conv` vs `model.conv_stem`).
+e013 fixed that but then crashed on `torch.cat([xt, m], 1)` — sizes mismatch. Expected size 64 but got size 1 for tensor number 1.
+
+The issue: `m` is the size/aspect channel tensor, and it's being concatenated with `xt` (batch of 64, 3 channels, 160, 160). But `m` has shape (1, ...) or something — "Expected size 64 but got size 1 for tensor number 1 in the list." So `m` has batch dim 1, not 64. This means `m` was computed as a single value (maybe a scalar broadcast) rather than per-sample.
+
+Let me think about what the size/aspect channel should be. For each box, we compute the absolute size (long side in pixels) and aspect ratio. These are per-box values. We need to create a tensor of shape (batch, 1, 1, 1) or (batch, 1, H, W) that broadcasts to the image.
+
+The crash: `torch.cat([xt, m], 1)` where xt is (64, 3, 160, 160) and m is (1, 1, 160, 160) or (1, 1, 1, 1)? The error says "Expected size 64 but got size 1 for tensor number 1". Tensor number 1 is `m`. So m's dim 0 is 1, not 64. So m needs to be expanded to batch size.
+
+Actually, let me reconsider whether I should pursue the size/aspect channel. It crashed twice, but the idea is sound and fundamentally different (it gives the model information it currently doesn't have — absolute box size, which is a strong cue for pore vs deposit/stain).
+
+But wait — the rules say "A direction where three or more attempts gave no confirmed gain is exhausted." The data category has 5 ideas, 2 ran (e006 at 0.6225, and... actually e002 at 0.5541 which was a bug fix). Hmm. Let me count data category ran: e001 crashed, e002 ran (0.5541), e006 ran (0.6225), e012 crashed, e013 crashed. So 2 ran, both below best. The size/aspect is a specific sub-idea that crashed twice.
+
+Actually, I think the size/aspect channel is worth retrying because:
+1. It's fundamentally different — it adds information the model currently lacks.
+2. It directly targets pore (small boxes), the weakest class.
+3. It crashed due to bugs, not because the idea is bad.
+
+But I need to fix it properly. Let me think about the cleanest way to add a size/aspect channel.
+
+Actually, let me reconsider. The problem with the size channel approach: the model's input is a fixed 160x160 crop. Adding a channel with the absolute size means I need to:
+1. Compute per-box size (long side in pixels) and aspect ratio.
+2. Normalize them somehow (e.g., log scale, or / some reference).
+3. Create a (batch, 1, 160, 160) tensor filled with the value (or a spatial pattern).
+4. Concatenate to the 3-channel image → 4 or 5 channels.
+5. Modify the stem conv to accept the new number of channels.
+
+The crash was in the concatenation. Let me think about how to make `m` have the right batch dim.
+
+Actually, a cleaner approach: instead of concatenating a spatial channel, I could just pass the size as an additional feature. But the simplest fix is to make m have shape (batch, 1, 1, 1) and let it broadcast... no, torch.cat doesn't broadcast.
+
+Let me reconsider. Maybe a simpler and more robust approach: create m as (batch, 1, 160, 160) where each pixel = normalized size value. Then cat with xt (batch, 3, 160, 160) → (batch, 4, 160, 160). This should work if m is built per-sample.
+
+But building m per-sample requires knowing each box's size. In the Dataset, I have access to `r` (the row with x1,y1,x2,y2). So I can compute the size in `__getitem__` and return it. Then in the training loop, I build m from the batch of sizes.
+
+Let me redesign:
+- In `__getitem__`, compute `size_log = math.log(max(long_side, 1))` and `aspect = (x2-x1)/(y2-y1)` (or log aspect). Return these as part of the tuple.
+- Actually, to keep it simple, return the raw long_side and aspect, then normalize in the collate/loop.
+
+Hmm, but the DataLoader returns (views[0], views[1], cls). I'd need to add the size info. Let me return (view0, view1, size_feat) where size_feat is a tuple or small tensor.
+
+Actually, the cleanest: return the two views and a tensor of shape (2,) or (1,) with [log_size, log_aspect]. Then in the loop, stack them into (batch, 2), normalize, and expand to (batch, 2, 160, 160) or broadcast.
+
+Wait, but I want to add channels to the image. Let me make it (batch, 2, 1, 1) and then expand to (batch, 2, 160, 160), then cat with xt.
+
+Let me write this carefully.
+
+Actually, let me reconsider the whole approach. Is the size channel really the best next experiment? Let me think about alternatives.
+
+The gap is a ranking problem. The per-class probabilities are the signal. The weakest is pore.
+
+Alternative ideas:
+1. **Size/aspect channel** (data/architecture): gives model box size info. Targets pore. Crashed twice but idea sound.
+2. **More training time / different LR schedule**: but "Tuning hyperparameters alone helped little."
+3. **Better crop context**: try different CONTEXT values. But that's a knob.
+4. **Train longer**: currently 432 steps in ~150s. Could we train longer? The budget is 180s with 55s reserve. So training budget is ~125s (t_end - t_start where t_start is after loading ~13s, so t_start ~13s, t_end = 180-55 = 125s, budget = 112s). 432 steps in 112s. Each step ~0.26s. Could train more if we reduce reserve or... no, reserve is for prediction.
+
+Actually wait, prediction takes time too. 41879 detections, batch 256 → 164 batches. With 2 views each. Let me estimate: total 162s, training ended at 125s (5 epochs), so prediction + writing took ~37s. That's fine.
+
+5. **The single-class 0.755 vs ceiling 0.758**: These are nearly identical. This tells us that the stage-1 detector's box ranking is good (0.755), and perfect classes barely help (0.758). So the box placement/ranking is NOT the main issue — the class decision is.
+
+Wait, that's a key insight. 0.755 (single class, score=det_conf) vs 0.758 (perfect classes). The difference is tiny (0.003). This means: if we could perfectly assign classes, we'd only gain 0.003 over the single-class score. But the single-class score of 0.755 is already high.
+
+But our 4-class score is 0.630. So the class decision is costing us 0.755 - 0.630 = 0.125! That's huge.
+
+Wait, let me reconsider. The single-class 0.755 means: score all boxes as one class 'defect' with det_conf, compute mAP. But mAP@0.5 is per-class averaged. If there's only one class 'defect', then mAP = AP for that one class = 0.755.
+
+Our 4-class: we emit 4 rows per box (one per class), score = det_conf * p_c. The per-class APs are pore 0.504, deposit 0.626, discontinuity 0.780, stain 0.609.
+
+So the class decision is the bottleneck. The gap from 0.755 to 0.630 is 0.125, all due to class assignment errors.
+
+Now, the ceiling 0.758 (perfect classes) vs single-class 0.755: only 0.003 difference. This is because in the ceiling, false alarms are kept as class 0 with det_conf, and true boxes get perfect classes. The per-class APs in the ceiling would be... let me think. Actually the ceiling's mAP is 0.758, so the per-class mean is 0.758.
+
+Hmm, but if perfect classes give 0.758 and we get 0.630, the class decision is costing 0.128. That's the target.
+
+So the key is: improve the class decision (per-class probabilities) to be more accurate.
+
+The macro-F1 of the crop classifier is ~0.87. So it's already pretty good. But the ranking within each class matters for mAP.
+
+Let me think about what specifically hurts. Pore is 0.504. Why?
+
+Pores are small. When we crop a box at 1.5x and 2.5x the long side, and resize to 160x160, the absolute size is lost. A pore (small) and a deposit (larger) cropped and resized look similar in texture but the model doesn't know the original scale.
+
+So adding the size info should help pore a lot. This is the e012/e013 idea.
+
+But there's a subtlety: does the size actually correlate with class? Pores are small, deposits/stains are larger, discontinuities are... Let me assume yes based on the hypothesis.
+
+Actually, let me reconsider. Is there a simpler, more robust way to inject size info that won't crash?
+
+Option A: Add size as an input channel (modify stem). Risky (crashed twice).
+Option B: Add size as a feature to the classifier head (concat to logits or to a penultimate feature). Simpler, less risky.
+
+Actually, Option B is cleaner. Let me think:
+- Compute per-box size features (log_size, log_aspect) → (batch, 2).
+- Normalize.
+- After the backbone, before the final FC, concat the size features to the global feature.
+- Modify the final FC to accept (backbone_features + 2) inputs.
+
+But this requires hooking into the model's forward. With timm, the model has a `forward_features` and `head`. I could do:
+```python
+feat = model.forward_features(x)  # (batch, C, H, W)
+feat = model.global_pool(feat)  # (batch, C)
+feat = torch.cat([feat, size_feat], 1)  # (batch, C+2)
+logits = model.head(feat)  # but head expects C, not C+2
+```
+I'd need to modify the head's Linear to accept C+2.
+
+Hmm, this is getting complex. Let me think about the simplest robust approach.
+
+Actually, the input-channel approach (Option A) is conceptually simplest if I get the batch dim right. Let me reconsider the crash.
+
+The crash in e013: `xt = torch.cat([xt, m], 1)` where xt is (64, 3, 160, 160) and m is (1, 1, 160, 160) — "Expected size 64 but got size 1 for tensor number 1". So m had batch dim 1. This means m was created as a single (1, 1, 160, 160) tensor, not per-batch.
+
+The fix: m must be (batch, 1, 160, 160). So I need to compute m per-sample.
+
+Let me redesign the Dataset to return the size feature, and build m in the loop.
+
+Actually, let me reconsider whether to pursue this at all, given it crashed twice and the data category is "EXHAUSTED?" per the harness.
+
+The harness says data: 5 ideas, 2 ran, 0 new best, 3 crashed, status EXHAUSTED? (3+ ideas, no new best). But the 3 crashes are bugs, not failed ideas. And e006 (the one that actually ran a new idea) got 0.6225, below best.
+
+Hmm. The rule says "A direction where three or more attempts gave no confirmed gain is exhausted: do not propose another variant of it unless you can say what is fundamentally different."
+
+The size/aspect channel is fundamentally different from e006 (which was about training on low-res crops) and e001/e002 (which were about... e001's hypothesis was cut off but it was about the ranking problem). So the size channel is a new idea within the data category, not a repeat.
+
+But it crashed twice. The rule also says "If a run crashed or timed out, read the log and fix the cause." So fixing a crash is allowed.
+
+I think the size/aspect channel is a strong candidate because:
+1. It's fundamentally different (adds new information).
+2. It directly targets the weakest class (pore).
+3. The class decision is the clear bottleneck (0.755 vs 0.630).
+4. It crashed due to bugs, not the idea.
+
+But I'm worried about the risk of a third crash. Let me design it very carefully to be robust.
+
+Actually, let me reconsider. Maybe there's an even simpler, lower-risk way to inject size info that's very unlikely to crash: **use the size as a bias in the score, not as a model input.**
+
+Wait, but that's a scoring change, and scoring is EXHAUSTED (3 ideas, all failed).
+
+Hmm, but those scoring changes were about re-ordering within a class using the existing p_c. Adding a size-based term to the score is different — it's using new information (size) to re-rank. But it's still a "scoring" category change. And the metric says AP depends only on order. If I add a size term to the score, I'm changing the order within each class. This could help if size is a good discriminator.
+
+But wait — the problem is that for a given class c, the boxes are ranked by det_conf * p_c. If I add size info, I'd rank by f(det_conf, p_c, size). For pore, small boxes should rank higher. This could help pore's AP.
+
+But actually, the size is already partially captured in det_conf? No, det_conf is the detector's confidence, which is class-agnostic. It doesn't encode size-to-class mapping.
+
+Hmm, but here's the thing: the score det_conf * p_c already uses p_c which is the model's class probability. If the model knew the size, p_c would already reflect it. So injecting size into the model (Option A/B) is more principled than injecting it into the score.
+
+Let me go with the model-input approach but design it robustly.
+
+Actually, wait. Let me reconsider the risk. The stem modification is the risky part. Let me think about a way to avoid modifying the stem.
+
+Alternative: Instead of adding input channels, I can **scale the input** or use a **two-branch** approach. But that's complex.
+
+Actually, the simplest robust approach: modify the stem conv to accept 5 channels (3 RGB + log_size + log_aspect), and build the 5-channel input properly with the right batch dim.
+
+Let me write the Dataset to return the size features, and build the 5-channel input in the loop.
+
+Let me reconsider the data flow:
+1. `__getitem__` returns (view0, view1, size_feat) where size_feat is a torch tensor of shape (2,) = [log_size, log_aspect] (normalized).
+2. DataLoader collates → view0 (batch, 3, 160, 160), view1 (batch, 3, 160, 160), size_feat (batch, 2).
+3. In loop: build m0 = expand size_feat to (batch, 2, 160, 160), cat with view0 → (batch, 5, 160, 160). Same for view1.
+4. Modify stem to accept 5 channels.
+
+Wait, but I need to normalize the size features. Let me compute log_size and log_aspect, then normalize by subtracting a mean and dividing by std (computed from training data, or fixed constants).
+
+Let me think about the normalization. The long side of boxes: pores are small (maybe 5-20 px), deposits/stains larger (20-100 px), discontinuities medium. Log scale would be good. Let me use log1p(long_side) and log(aspect).
+
+Actually, to be safe and simple, let me:
+- long_side = max(x2-x1, y2-y1)
+- aspect = (x2-x1) / max(y2-y1, 1)
+- feat = [log1p(long_side), log(aspect)]
+- Normalize: subtract mean, divide by std. I'll compute these from the training crops at startup (fast, just numpy).
+
+Actually, computing mean/std from training data is robust and avoids hardcoding. Let me do that.
+
+Let me now think about the stem modification. timm's EfficientNet:
+```python
+model = timm.create_model("efficientnet_b0", pretrained=True, num_classes=4)
+stem = model.conv_stem  # Conv2d(3, 32, kernel_size=3, stride=2, padding=1)
+```
+Wait, e013 used `model.conv_stem`. Let me verify. In timm, EfficientNet's stem is `conv_stem`. Yes.
+
+So:
+```python
+stem = model.conv_stem
+new_stem = nn.Conv2d(5, stem.out_channels, stem.kernel_size, stem.stride, stem.padding, bias=stem.bias is not None)
+# initialize: copy the 3-channel weights, zero the 2 new channels
+with torch.no_grad():
+    new_stem.weight[:, :3] = stem.weight
+    new_stem.weight[:, 3:] = 0  # or small random
+    if stem.bias is not None:
+        new_stem.bias = stem.bias
+model.conv_stem = new_stem
+```
+
+Wait, but if I zero the new channels' weights, the size info won't flow initially. That's fine — it'll learn during training. Actually, zeroing means the size channels contribute nothing at init, and the model starts from the pretrained behavior. Then training adjusts. That's a good init.
+
+Hmm, but actually if I zero the weights for the new channels, the gradient for those weights will be zero initially (since the input to those channels... no wait, the gradient is w.r.t. weight = input * dloss/dout. If input (size feature) is non-zero and dloss/dout is non-zero, the gradient is non-zero even if weight is zero. So it'll learn. Good.
+
+Actually, let me use small random init for the new channels instead of zero, to break symmetry. Or just zero — it's fine either way. Let me use zero for safety (starts from pretrained behavior exactly).
+
+Wait, but there's a subtlety: the pretrained conv_stem expects 3 channels. If I add 2 channels with zero weight, the output is exactly the same as before (since new channels contribute 0). So the model starts from the exact pretrained state. 
+
+Now, the batch dim issue. Let me make sure m is (batch, 2, 160, 160).
+
+In the loop:
+```python
+# size_feat is (batch, 2)
+m = size_feat.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, IMG_SIZE, IMG_SIZE)  # (batch, 2, 160, 160)
+xt = torch.cat([xt, m], 1)  # (batch, 5, 160, 160)
+xw = torch.cat([xw, m], 1)  # (batch, 5, 160, 160)
+```
+
+This should work because size_feat has batch dim = batch.
+
+Wait, but I need to make sure the DataLoader returns size_feat with the right shape. If `__getitem__` returns a torch tensor of shape (2,), the default collate stacks them into (batch, 2). Good.
+
+Let me now write the code.
+
+Actually, let me reconsider: do I even need to modify the stem? What if I just add the size as 2 more channels but keep the stem at 3 channels and... no, the stem must accept all input channels.
+
+Alternatively, I could project the size features into 3 channels and add them to the image? No, that's hacky.
+
+Let me just modify the stem. It's the clean way.
+
+Let me also double check: the eval DataLoader also needs to return size_feat. Since I'm changing `__getitem__` to return 3 things (view0, view1, size_feat), both train and eval dataloaders will return 3 things. In the eval loop, I currently do `for xt, xw, _ in dl_ev`. I'll change it to `for xt, xw, sf in dl_ev` and build m there too.
+
+Let me now write the full changes.
+
+### Change 1: Dataset `__getitem__` to return size features
+
+Current:
+```python
+class BoxDataset(torch.utils.data.Dataset):
+    def __init__(self, rows, images, train):
+        self.rows, self.images, self.train = rows, images, train
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __getitem__(self, i):
+        r = self.rows[i]
+        img = self.images[r["image"]]
+        fh = fv = False
+        bright = 1.0
+        if self.train:  # same flips and brightness for both views
+            fh, fv, bright = random.random() < 0.5, random.random() < 0.5, random.uniform(0.8, 1.2)
+        views = []
+        for ctx in (TIGHT_CONTEXT, CONTEXT):
+            x = make_crop(img, r, ctx, self.train)
+            if fh:
+                x = x[:, ::-1]
+            if fv:
+                x = x[::-1, :]
+            if self.train:
+                x = np.clip(x * bright, 0, 1)
+            x = (x - MEAN) / STD
+            views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))
+        return views[0], views[1], r.get("cls", -1)
+```
+
+I need to add size features. But I need the normalization constants (mean, std of log_size and log_aspect). Let me compute them in main() and pass to the Dataset.
+
+Let me add a `size_stats` parameter to BoxDataset.
+
+New:
+```python
+class BoxDataset(torch.utils.data.Dataset):
+    def __init__(self, rows, images, train, size_stats):
+        self.rows, self.images, self.train, self.size_stats = rows, images, train, size_stats
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __getitem__(self, i):
+        r = self.rows[i]
+        img = self.images[r["image"]]
+        fh = fv = False
+        bright = 1.0
+        if self.train:  # same flips and brightness for both views
+            fh, fv, bright = random.random() < 0.5, random.random() < 0.5, random.uniform(0.8, 1.2)
+        views = []
+        for ctx in (TIGHT_CONTEXT, CONTEXT):
+            x = make_crop(img, r, ctx, self.train)
+            if fh:
+                x = x[:, ::-1]
+            if fv:
+                x = x[::-1, :]
+            if self.train:
+                x = np.clip(x * bright, 0, 1)
+            x = (x - MEAN) / STD
+            views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))
+        # size/aspect features (per box, normalized)Thinking budget reached. Stop thinking now and write the reply in the required format.
+===== attempt 2 =====
+The file has changed since my previous edit. Let me look at the current state. The harness said block 2's SEARCH text was not found. This means block 1 (the N_IN constant) was applied successfully, but block 2 failed. Wait, actually if block 2 failed, does that mean block 1 was applied? Let me re-read.
+
+"Block 2: the SEARCH text was not found in the file (its first line: 'class BoxDataset(torch.utils.data.Dataset):'). Copy the lines exactly from the current file, including indentation. Reply again in the reply format, with corrected edits."
+
+Hmm. So the issue is that the current file doesn't match what I think. Wait — the current best is e000, and I set BASE: last, which is e013. So the file I'm editing is e013's train.py, not e000's.
+
+Wait, let me reconsider. The most recent experiment is e013 (crashed). Its train.py differs from the best (e000) only by the change shown in the diff. So e013's train.py has the stem modification code already in it.
+
+So when I set BASE: last, the file I'm editing is e013's version, which ALREADY contains:
+```python
+    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
+    stem = model.conv_stem
+    new_stem = nn.Conv2d(5, stem.out_channels, stem.kernel_size, stem.stride, stem.padding,
+                         bias=False if stem.bias is None else True)
+    ...
+    model.conv_stem = new_stem
+```
+
+And in the dataset, e013 already modified `make_crop` or the dataset to add size features? Let me look at the e013 diff again.
+
+The e012→e013 diff shows:
+```
+     model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
+-    stem = model.stem.conv
++    stem = model.conv_stem
+     new_stem = nn.Conv2d(5, stem.out_channels, stem.kernel_size, stem.stride, stem.padding,
+                          bias=False if stem.bias is None else True)
+@@ -164,5 +164,5 @@
+         if stem.bias is not None:
+             new_stem.bias.copy_(stem.bias)
+-    model.stem.conv = new_stem
++    model.conv_stem = new_stem
+```
+
+So e013's file already has the stem modification with `nn.Conv2d(5, ...)`. And the crash was in the training loop where it did `torch.cat([xt, m], 1)` but m was a (1,…) tensor.
+
+Wait, but I don't have the full e013 file. I only have the e000 file and the e012→e013 diff. Let me reconstruct e013's file.
+
+Actually, the problem is I don't know exactly what e013's full file looks like. The e012→e013 diff only shows the stem part. But e012 itself introduced the size feature idea. I don't have e012's full file either.
+
+Hmm, this is tricky. The instructions say "If you want to build on (or fix) this most recent version instead of the best, write BASE: last. Its full train.py differs from the best only by the change above."
+
+So e013's full train.py = e000's train.py + the diff shown. The diff shown is only:
+```
+     model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
+-    stem = model.stem.conv
++    stem = model.conv_stem
+     new_stem = nn.Conv2d(5, stem.out_channels, stem.kernel_size, stem.stride, stem.padding,
+                          bias=False if stem.bias is None else True)
+@@ -164,5 +164,5 @@
+         if stem.bias is not None:
+             new_stem.bias.copy_(stem.bias)
+-    model.stem.conv = new_stem
++    model.conv_stem = new_stem
+```
+
+Wait, but that diff references lines that don't exist in e000! In e000, the model creation is:
+```python
+    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
+    model = model.to(device).to(memory_format=torch.channels_last)
+```
+
+There's no `stem = model.stem.conv` in e000. So the diff is showing e012→e013, meaning e012 already had `stem = model.stem.conv` and the `new_stem` code. So e012 introduced the whole stem modification AND the size feature in the dataset AND the training loop changes.
+
+So e013's file = e000 + (all of e012's changes) + (the conv_stem fix).
+
+But I don't have e012's full changes. I only have the e012→e013 diff which is tiny.
+
+Hmm wait. Let me re-read: "Its full train.py differs from the best only by the change above." So e013 differs from e000 (the best) only by "the change above" — which is the diff shown. But the diff shown is the e012→e013 diff, which is just the conv_stem rename. That contradicts...
+
+Actually, I think "the change above" refers to the cumulative change from the best (e000) to e013. But the diff shown is labeled `--- e012/train.py +++ e013/train.py`, which is just the last change. 
+
+This is confusing. Let me think about what's most likely. The harness says "Its full train.py differs from the best only by the change above." Given the diff shown is e012→e013 and is small, but e012 was a crash too... 
+
+Actually, I think the key realization is: I need to see the ACTUAL current file (e013) to make correct SEARCH blocks. But I don't have it fully. I have e000's full file, and I know e013 = e000 + e012's changes + e013's conv_stem fix.
+
+The safest approach: since I'm unsure of the exact content of e013's file (particularly the dataset and training loop that e012 modified), I should NOT base on last. Instead, I should base on the BEST (e000), which I have the full content of, and re-introduce the size feature idea cleanly and correctly.
+
+Wait, but the rule says "Do not repeat an experiment that is already in the history, even reworded, unless it crashed or had a bug that you are now fixing." The size feature idea (e012, e013) crashed both times. So I'm fixing a bug. The idea is sound (per e013's hypothesis: "e012's size/aspect-channel idea was sound but crashed"). So I can re-attempt it.
+
+The cleanest way to fix it: base on e000 (best, full file known) and implement the size feature correctly from scratch, avoiding the bugs that caused e012/e013 to crash.
+
+Actually, wait. Let me reconsider. The issue with my previous attempt (BASE: last) was that my SEARCH blocks were based on e000's content, but the actual file is e013's content, which e012 modified. So block 2 (the BoxDataset) failed because e013's BoxDataset is different from e000's (e012 already modified it to add size features).
+
+So the right move: BASE: best (e000), and implement the size feature idea fresh and correctly. This avoids the unknown e013 content.
+
+Let me reconsider whether basing on best is allowed. The rules say "Every change is applied on top of the current best train.py (or the most recent version with BASE: last)." So BASE: best applies on top of e000. Good. And since e012/e013 crashed, re-attempting the size idea with a bug fix is allowed.
+
+But wait — is re-implementing the size feature on e000 "repeating an experiment"? The experiment (size/aspect channel) crashed both times due to bugs. The rule explicitly allows re-attempting if "it crashed or had a bug that you are now fixing." So yes, this is allowed, and I'm fixing the bug (the tensor shape issue in the cat, and the stem attribute name which I'll handle correctly).
+
+Let me now carefully design the size feature implementation on e000's base.
+
+e000's relevant parts:
+1. Settings: `MEAN`, `STD` defined. I'll add `N_IN = 5`.
+2. `BoxDataset.__init__(self, rows, images, train)` and `__getitem__` returns `views[0], views[1], r.get("cls", -1)`.
+3. DataLoader creation:
+```python
+    g = torch.Generator().manual_seed(args.seed)
+    dl_tr = torch.utils.data.DataLoader(BoxDataset(crops, images, True), batch_size=BATCH_SIZE, shuffle=True,
+                                        num_workers=workers, pin_memory=True, drop_last=True,
+                                        persistent_workers=True, generator=g, worker_init_fn=worker_init)
+    dl_ev = torch.utils.data.DataLoader(BoxDataset(ev, images, False), batch_size=256, shuffle=False,
+                                        num_workers=workers, pin_memory=True)
+```
+4. Model creation:
+```python
+    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
+    model = model.to(device).to(memory_format=torch.channels_last)
+```
+5. Training loop:
+```python
+        for xt, xw, y in dl_tr:
+```
+and
+```python
+            xt = xt.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            xw = xw.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            y = y.to(device, non_blocking=True)
+            with torch.autocast(**amp):
+                loss = crit((model(xt) + model(xw)) / 2, y)
+```
+6. Eval loop:
+```python
+    with torch.no_grad(), torch.autocast(**amp):
+        for xt, xw, _ in dl_ev:
+            xt = xt.to(device).to(memory_format=torch.channels_last)
+            xw = xw.to(device).to(memory_format=torch.channels_last)
+            probs.append(torch.softmax(((model(xt) + model(xw)) / 2).float(), 1).cpu())
+```
+
+Now my plan for the size feature:
+
+Add a helper to compute per-box size features. I'll compute them once for crops (for stats) and store per-box features in the dataset.
+
+Actually, the cleanest: precompute a size feature vector per row and store it in the dataset. In `__getitem__`, return the size feature as a tensor. In the loop, expand it to (B, 2, IMG_SIZE, IMG_SIZE) and cat with the image.
+
+Let me define:
+```python
+def box_size_feats(rows):
+    ls = np.array([math.log1p(max(r["x2"] - r["x1"], r["y2"] - r["y1"], 1.0)) for r in rows])
+    ar = np.array([math.log(max(r["x2"] - r["x1"], 1.0) / max(r["y2"] - r["y1"], 1.0)) for r in rows])
+    m = np.array([ls.mean(), ar.mean()]); s = np.array([ls.std() + 1e-6, ar.std() + 1e-6])
+    feats = np.stack([(ls - m[0]) / s[0], (ar - m[1]) / s[1]], axis=1)
+    return feats
+```
+
+Wait, but the eval boxes' size features should use the SAME normalization (computed from crops). So I compute stats from crops, and apply to both crops and ev. Let me restructure: compute stats from crops, then a function to get feats for any list of rows using those stats.
+
+Let me do:
+```python
+def size_stats(rows):
+    ls = np.array([math.log1p(max(r["x2"] - r["x1"], r["y2"] - r["y1"], 1.0)) for r in rows])
+    ar = np.array([math.log(max(r["x2"] - r["x1"], 1.0) / max(r["y2"] - r["y1"], 1.0)) for r in rows])
+    return np.array([ls.mean(), ar.mean()]), np.array([ls.std() + 1e-6, ar.std() + 1e-6])
+
+def size_feats(rows, m, s):
+    ls = np.array([math.log1p(max(r["x2"] - r["x1"], r["y2"] - r["y1"], 1.0)) for r in rows])
+    ar = np.array([math.log(max(r["x2"] - r["x1"], 1.0) / max(r["y2"] - r["y1"], 1.0)) for r in rows])
+    return torch.from_numpy(((np.stack([ls, ar], axis=1) - m) / s).astype(np.float32))
+```
+
+Then in BoxDataset, I pass the precomputed feats tensor. In `__getitem__`, return `self.feats[i]` as the size feature.
+
+Actually simpler: store feats in the dataset as a tensor, and in `__getitem__` return `self.feats[i]`.
+
+Let me rewrite BoxDataset:
+```python
+class BoxDataset(torch.utils.data.Dataset):
+    def __init__(self, rows, images, train, feats):
+        self.rows, self.images, self.train, self.feats = rows, images, train, feats
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __getitem__(self, i):
+        r = self.rows[i]
+        img = self.images[r["image"]]
+        fh = fv = False
+        bright = 1.0
+        if self.train:
+            fh, fv, bright = random.random() < 0.5, random.random() < 0.5, random.uniform(0.8, 1.2)
+        views = []
+        for ctx in (TIGHT_CONTEXT, CONTEXT):
+            x = make_crop(img, r, ctx, self.train)
+            if fh:
+                x = x[:, ::-1]
+            if fv:
+                x = x[::-1, :]
+            if self.train:
+                x = np.clip(x * bright, 0, 1)
+            x = (x - MEAN) / STD
+            views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))
+        return views[0], views[1], self.feats[i], r.get("cls", -1)
+```
+
+Then in main:
+```python
+    m, s = size_stats(crops)
+    feats_tr = size_feats(crops, m, s)
+    feats_ev = size_feats(ev, m, s)
+    ...
+    dl_tr = torch.utils.data.DataLoader(BoxDataset(crops, images, True, feats_tr), ...)
+    dl_ev = torch.utils.data.DataLoader(BoxDataset(ev, images, False, feats_ev), ...)
+```
+
+Model stem:
+```python
+    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
+    stem = model.conv_stem
+    new_stem = nn.Conv2d(N_IN, stem.out_channels, stem.kernel_size, stem.stride, stem.padding,
+                         bias=stem.bias is not None)
+    with torch.no_grad():
+        new_stem.weight[:, :3] = stem.weight
+        new_stem.weight[:, 3:].zero_()
+        if stem.bias is not None:
+            new_stem.bias.copy_(stem.bias)
+    model.conv_stem = new_stem
+    model = model.to(device).to(memory_format=torch.channels_last)
+```
+
+Wait, I need to confirm timm's EfficientNet uses `conv_stem`. The e013 hypothesis said "timm's EfficientNet exposes the first conv as `model.conv_stem`, not `model.stem.conv`". And e013's crash was NOT about the attribute name (that was fixed in e013); the crash was about the tensor shape in the cat. So `model.conv_stem` is correct.
+
+But wait, let me double check. Actually, for timm efficientnet, the first layer is indeed `conv_stem`. Yes. Good.
+
+Also, I should double check `stem.out_channels`, `stem.kernel_size`, `stem.stride`, `stem.padding` exist for a Conv2d. Yes, nn.Conv2d has these attributes.
+
+Now the training loop. The batch gives `xt, xw, sf, y`. `sf` is a tensor of shape (B, 2). I need to expand to (B, 2, IMG_SIZE, IMG_SIZE):
+```python
+            m = sf.to(device, non_blocking=True).unsqueeze(-1).unsqueeze(-1).expand(-1, -1, IMG_SIZE, IMG_SIZE)
+            xt = torch.cat([xt, m], 1).to(memory_format=torch.channels_last)
+            xw = torch.cat([xw, m], 1).to(memory_format=torch.channels_last)
+```
+
+Wait, `sf` is (B, 2). `sf.unsqueeze(-1)` → (B, 2, 1). `.unsqueeze(-1)` → (B, 2, 1, 1). `.expand(-1, -1, IMG_SIZE, IMG_SIZE)` → (B, 2, IMG_SIZE, IMG_SIZE). Good. That matches xt's (B, 3, IMG_SIZE, IMG_SIZE) for cat on dim 1. 
+
+The previous crash was because m was (1, 2, IMG_SIZE, IMG_SIZE) or (1, ...) — a single tensor, not per-batch. My fix: compute m from the batch's sf, which is (B, 2), so expand gives (B, 2, IMG_SIZE, IMG_SIZE). 
+
+Eval loop:
+```python
+        for xt, xw, sf, _ in dl_ev:
+            xt = xt.to(device).to(memory_format=torch.channels_last)
+            xw = xw.to(device).to(memory_format=torch.channels_last)
+            m = sf.to(device).unsqueeze(-1).unsqueeze(-1).expand(-1, -1, IMG_SIZE, IMG_SIZE)
+            xt = torch.cat([xt, m], 1).to(memory_format=torch.channels_last)
+            xw = torch.cat([xw, m], 1).to(memory_format=torch.channels_last)
+            probs.append(torch.softmax(((model(xt) + model(xw)) / 2).float(), 1).cpu())
+```
+
+Now, one concern: channels_last with bfloat16 autocast. The cat then channels_last should be fine.
+
+Another concern: the expand creates a view; torch.cat will materialize it. Fine.
+
+Let me also double-check: `N_IN = 5`. The new stem has 5 input channels: 3 RGB + 2 size. Good.
+
+Now let me also verify the time budget. Adding 2 channels to the stem conv is negligible. The expand+cat per batch is cheap. So time budget is fine.
+
+Now, let me also reconsider: is the size feature actually going to help? The hypothesis: pores are small, deposits/stains are larger. Actually, let me reconsider the physics. In the LoHi-WELD dataset, pores are small circular holes, deposits are extra material, discontinuities are breaks, stains are discolorations. The box size (long side) might correlate with class. This is a reasonable cue. The e013 hypothesis claimed it was sound. So I'll proceed.
+
+Actually, wait. Let me reconsider whether the size feature is the best use of a run. The lessons say data category is "EXHAUSTED? (3+ ideas, no new best)". But the size feature specifically crashed both times, so it was never actually tested. The rule allows re-attempting crashed experiments with a bug fix. And it's a fundamentally different kind of change (new input information) vs the other data experiments (which were about which crops to train on, resolution, etc.).
+
+Hmm, but let me reconsider. Actually, let me re-examine the data category experiments:
+- e001: crashed (NameError)
+- e006: train on low-res too → 0.6225 rejected
+- e012: size feature → crashed
+- e013: size feature fix → crashed
+- e002: was base e001, restoring writer → 0.5541 rejected
+
+So the data category has: e006 (resolution), e012/e013 (size feature, both crashed). The size feature was NEVER successfully run. So it's not truly exhausted in the sense of "tested and failed" — it crashed. So re-attempting with a fix is legitimate and valuable.
+
+Given the bottleneck is class decision and pore is weakest, and the size is a plausible cue, I'll go with fixing the size feature. This is a good exploitation of a sound-but-crashed idea.
+
+Actually, let me reconsider one more time. Is there a risk the size feature doesn't help and I waste a run? The e013 hypothesis said the idea was sound. The macro-F1 ~0.87 with pore/deposit weak. Size is a physically meaningful cue. I think it's worth a run. And it's different from the scoring/inference re-ranking ideas.
+
+Let me also make sure I'm not making a mistake about the stem. Let me reconsider: what if timm's efficientnet_b0 first conv is `conv_stem`? Let me be careful. In timm, EfficientNetV1 (efficientnet_b0) has `self.conv_stem = nn.Conv2d(...)`. Yes, I'm confident it's `conv_stem`. The e012→e013 diff confirms e013 changed from `model.stem.conv` to `model.conv_stem`, and e013's crash was NOT an AttributeError (it was a cat shape error at line 189). So `model.conv_stem` worked in e013 (the model was created and the stem modified successfully; the crash was later in the training loop). 
+
+So `model.conv_stem` is correct. Good.
+
+Now let me write the SEARCH/REPLACE blocks based on e000's file (BASE: best).
+
+Let me carefully copy e000's lines.
+
+Block 1: Add N_IN constant.
+SEARCH:
+```
+MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+```
+REPLACE:
+```
+MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+N_IN = 5                # 3 RGB + log1p(long_side) + log(aspect)
+```
+
+Block 2: Add size feature helper functions + modify BoxDataset. I'll insert the helper functions before BoxDataset and rewrite BoxDataset.
+
+Actually, let me do it in pieces to keep SEARCH blocks short and unique.
+
+Block 2a: Insert helper functions. I'll insert right before `class BoxDataset`. SEARCH for the line `class BoxDataset(torch.utils.data.Dataset):` — but that might not be unique? Let me check. In e000, `class BoxDataset` appears once. Yes. But I need to insert before it. Let me use:
+SEARCH:
+```
+class BoxDataset(torch.utils.data.Dataset):
+    def __init__(self, rows, images, train):
+        self.rows, self.images, self.train = rows, images, train
+```
+REPLACE:
+```
+def size_stats(rows):
+    ls = np.array([math.log1p(max(r["x2"] - r["x1"], r["y2"] - r["y1"], 1.0)) for r in rows])
+    ar = np.array([math.log(max(r["x2"] - r["x1"], 1.0) / max(r["y2"] - r["y1"], 1.0)) for r in rows])
+    return np.array([ls.mean(), ar.mean()]), np.array([ls.std() + 1e-6, ar.std() + 1e-6])
+
+
+def size_feats(rows, m, s):
+    ls = np.array([math.log1p(max(r["x2"] - r["x1"], r["y2"] - r["y1"], 1.0)) for r in rows])
+    ar = np.array([math.log(max(r["x2"] - r["x1"], 1.0) / max(r["y2"] - r["y1"], 1.0)) for r in rows])
+    return torch.from_numpy(((np.stack([ls, ar], axis=1) - m) / s).astype(np.float32))
+
+
+class BoxDataset(torch.utils.data.Dataset):
+    def __init__(self, rows, images, train, feats):
+        self.rows, self.images, self.train, self.feats = rows, images, train, feats
+```
+
+Block 2b: Modify __getitem__ to return feats.
+SEARCH:
+```
+            x = (x - MEAN) / STD
+            views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))
+        return views[0], views[1], r.get("cls", -1)
+```
+REPLACE:
+```
+            x = (x - MEAN) / STD
+            views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))
+        return views[0], views[1], self.feats[i], r.get("cls", -1)
+```
+
+Block 3: DataLoader creation + size stats.
+SEARCH:
+```
+    g = torch.Generator().manual_seed(args.seed)
+    dl_tr = torch.utils.data.DataLoader(BoxDataset(crops, images, True), batch_size=BATCH_SIZE, shuffle=True,
+                                        num_workers=workers, pin_memory=True, drop_last=True,
+                                        persistent_workers=True, generator=g, worker_init_fn=worker_init)
+    dl_ev = torch.utils.data.DataLoader(BoxDataset(ev, images, False), batch_size=256, shuffle=False,
+                                        num_workers=workers, pin_memory=True)
+```
+REPLACE:
+```
+    m_sz, s_sz = size_stats(crops)
+    feats_tr = size_feats(crops, m_sz, s_sz)
+    feats_ev = size_feats(ev, m_sz, s_sz)
+    g = torch.Generator().manual_seed(args.seed)
+    dl_tr = torch.utils.data.DataLoader(BoxDataset(crops, images, True, feats_tr), batch_size=BATCH_SIZE, shuffle=True,
+                                        num_workers=workers, pin_memory=True, drop_last=True,
+                                        persistent_workers=True, generator=g, worker_init_fn=worker_init)
+    dl_ev = torch.utils.data.DataLoader(BoxDataset(ev, images, False, feats_ev), batch_size=256, shuffle=False,
+                                        num_workers=workers, pin_memory=True)
+```
+
+Block 4: Model stem.
+SEARCH:
+```
+    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
+    model = model.to(device).to(memory_format=torch.channels_last)
+```
+REPLACE:
+```
+    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
+    stem = model.conv_stem
+    new_stem = nn.Conv2d(N_IN, stem.out_channels, stem.kernel_size, stem.stride, stem.padding,
+                         bias=stem.bias is not None)
+    with torch.no_grad():
+        new_stem.weight[:, :3] = stem.weight
+        new_stem.weight[:, 3:].zero_()
+        if stem.bias is not None:
+            new_stem.bias.copy_(stem.bias)
+    model.conv_stem = new_stem
+    model = model.to(device).to(memory_format=torch.channels_last)
+```
+
+Block 5: Training loop unpack + cat.
+SEARCH:
+```
+        for xt, xw, y in dl_tr:
+```
+REPLACE:
+```
+        for xt, xw, sf, y in dl_tr:
+```
+
+Block 6: Training loop cat.
+SEARCH:
+```
+            xt = xt.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            xw = xw.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            y = y.to(device, non_blocking=True)
+            with torch.autocast(**amp):
+                loss = crit((model(xt) + model(xw)) / 2, y)
+```
+REPLACE:
+```
+            xt = xt.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            xw = xw.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            m = sf.to(device, non_blocking=True).unsqueeze(-1).unsqueeze(-1).expand(-1, -1, IMG_SIZE, IMG_SIZE)
+            xt = torch.cat([xt, m], 1).to(memory_format=torch.channels_last)
+            xw = torch.cat([xw, m], 1).to(memory_format=torch.channels_last)
+            y = y.to(device, non_blocking=True)
+            with torch.autocast(**amp):
+                loss = crit((model(xt) + model(xw)) / 2, y)
+```
+
+Block 7: Eval loop.
+SEARCH:
+```
+        for xt, xw, _ in dl_ev:
+            xt = xt.to(device).to(memory_format=torch.channels_last)
+            xw = xw.to(device).to(memory_format=torch.channels_last)
+            probs.append(torch.softmax(((model(xt) + model(xw)) / 2).float(), 1).cpu())
+```
+REPLACE:
+```
+        for xt, xw, sf, _ in dl_ev:
+            xt = xt.to(device).to(memory_format=torch.channels_last)
+            xw = xw.to(device).to(memory_format=torch.channels_last)
+            m = sf.to(device).unsqueeze(-1).unsqueeze(-1).expand(-1, -1, IMG_SIZE, IMG_SIZE)
+            xt = torch.cat([xt, m], 1).to(memory_format=torch.channels_last)
+            xw = torch.cat([xw, m], 1).to(memory_format=torch.channels_last)
+            probs.append(torch.softmax(((model(xt) + model(xw)) / 2).float(), Thinking budget reached. Stop thinking now and write the reply in the required format.

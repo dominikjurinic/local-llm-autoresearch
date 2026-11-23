@@ -1,0 +1,402 @@
+===== attempt 1 =====
+Let me analyze the situation carefully.
+
+Current best: e000 with 5-seed val mAP@0.5 = 0.6311
+- Per-class: pore 0.506, deposit 0.630, discontinuity 0.780, stain 0.608
+- Uses EfficientNet-B0, two-crop (1.5x + 2.5x), trained on true training boxes
+- Score = detector conf × class probability
+
+Key observations:
+1. The one-step 4-class detector baseline is 0.638 mAP@0.5 - we're slightly below this
+2. Stage-1 boxes with perfect classes (ceiling) is 0.758 mAP@0.5
+3. Stage-1 boxes scored as single class 'defect' is 0.755 mAP@0.5
+4. So the classifier needs to get the class right AND rank well
+
+What's been tried:
+- e001: Training on detector boxes with background class - crashed (type bug)
+- e002: Fixed e001 - score 0.5172, rejected (much worse)
+- e003: Including low-res crops - 0.6251, rejected
+- e004: Squaring class probability - 0.6161, rejected
+- e005: Training on detector boxes overlapping true crops - 0.6248, rejected
+- e006: ConvNeXt-Nano - 0.2901, suspicious (likely bug)
+
+The e006 result is suspicious. The loss is stuck around 1.0-1.3 and not decreasing much. With 4 classes, random is ln(4) ≈ 1.386. The loss barely moved from 1.31 to 0.99 over 8 epochs. This suggests the model isn't learning well.
+
+Wait, looking more carefully at the e006 log:
+- 682 steps total (vs 421 for e000)
+- Loss went from 1.31 to 0.99 - barely learning
+- 79219 prediction rows (vs 53543 for e000)
+
+The fact that it has 79219 rows vs 53543 is interesting. With 4 classes and 41879 detections, maximum would be 4*41879 = 167516. The e000 has 53543 rows which means many are below MIN_SCORE=0.001. The e006 has 79219 rows, meaning fewer are below threshold - the model is more uniform (less confident), which is consistent with poor training.
+
+The issue with ConvNeXt-Nano might be:
+1. The learning rate of 1e-3 might be too high or too low for this architecture
+2. The model might need different weight decay
+3. The model might not be compatible with the two-crop approach in the same way
+
+Actually wait - looking at the loss values more carefully:
+- e000 epoch 0: 0.7254 (starting loss already below random)
+- e006 epoch 0: 1.3144 (near random)
+
+This suggests the pretrained weights for ConvNeXt-Nano might not be loading properly, or the model architecture is different enough that the same hyperparameters don't work.
+
+Actually, I think the issue might be simpler. Let me look at the timm model name. "convnext_nano" - is this the correct timm model name? Let me think... In timm, the ConvNeXt models are typically named like "convnext_tiny", "convnext_small", etc. But "convnext_nano" might not exist or might be a different variant.
+
+Wait, the brief says: "Pretrained weights are available only for these timm models: convnext_atto, convnext_nano, convnext_pico, efficientnet_b0, efficientnet_b2, mobilenetv3_large_100, regnety_016, resnet18, resnet26d, resnet34, resnet50, tf_efficientnetv2_b0"
+
+So convnext_nano IS in the list. But the issue is that the model might have a different number of parameters or different training dynamics.
+
+The loss barely decreasing suggests the model isn't training well. With 4 classes, ln(4) = 1.386. Starting at 1.31 and ending at 0.99 after 682 steps is very poor learning.
+
+Possible issues:
+1. Learning rate too high causing instability, or too low
+2. The model might need a different warmup schedule
+3. The weight decay might be too aggressive
+
+But wait - the hypothesis says "suspicious (likely bug)". Let me think about what could be a bug...
+
+Actually, I think the most likely issue is that ConvNeXt models in timm might use a different head or have different default settings. But more importantly, the loss curve suggests the model is barely learning. With AdamW at lr=1e-3 and weight_decay=0.05, this should work for most architectures.
+
+Hmm, but actually looking at the step counts: e000 does 421 steps in the same time budget, while e006 does 682 steps. This makes sense because convnext_nano is smaller/faster than efficientnet_b0. But more steps with barely decreasing loss is a red flag.
+
+Let me think about what to do next. The e006 is marked as "suspicious (likely bug)" so I should probably not build on it. Let me focus on other ideas.
+
+Key insights from the research brief:
+- "A crop classifier given perfect boxes reaches macro-F1 ~0.87 with the starting recipe (two-crop input). Pore and deposit are the weak classes; stain is often confused with deposit and background."
+- "Tuning hyperparameters alone helped little in earlier experiments; changes of method helped more."
+- "Class-weighted loss hurt classification every time it was tried."
+- The score gap: 0.6311 (current) vs 0.758 (ceiling) = 0.127 gap
+- The single-class score is 0.755, meaning the detector boxes are good, it's the classification that's the bottleneck
+
+Ideas that haven't been tried:
+1. Test-time augmentation (TTA) - flip, multiple scales
+2. Ensembling multiple models
+3. Different scoring functions (not just conf × p)
+4. Using the background probability to adjust scores
+5. Training on detector boxes with background (e002 tried this but got 0.5172 - much worse)
+6. Different augmentation strategies
+7. Longer training / different LR schedule
+8. Using both high and low res (e003 tried, was worse)
+
+Wait, e002 (training on detector boxes with background) got 0.5172 which is much worse. e005 (training on detector boxes overlapping true crops, no background) got 0.6248 which is slightly worse than e000. So training on detector boxes seems to hurt.
+
+Let me think about what could help:
+1. **Test-time augmentation**: At inference, use multiple augmented versions (flips, slight scale changes) and average the predictions. This could improve robustness without changing training.
+
+2. **Better scoring**: The current score is conf × p. But maybe we should use a different combination. For example, if the max probability is low (model uncertain), we should suppress more aggressively. Something like conf × p / (1 - max_p + eps) or conf × p^alpha where alpha > 1 (tried in e004, was worse).
+
+Actually wait, e004 tried p² and it was worse (0.6161). So making the score more peaked hurts.
+
+3. **Ensembling**: Train multiple models with different seeds or architectures and average their predictions. But this uses more time.
+
+4. **Different augmentation during training**: The current jitter is ±10% center shift and 0.85-1.2 scale. Maybe more aggressive augmentation would help.
+
+5. **Using the background probability**: If we train with a background class, the model learns to say "this isn't a defect". But e002 showed this hurts. However, maybe we can use it differently - not as a class in the output, but as a confidence adjustment.
+
+Actually, let me reconsider. The key issue is:
+- pore 0.506 (weak)
+- stain 0.608 (weak)
+- deposit 0.630
+- discontinuity 0.780 (strong)
+
+The gap between our score (0.6311) and the ceiling (0.758) is 0.127. This means either:
+1. The classifier is getting classes wrong (wrong class on true detections)
+2. The ranking is bad (false positives scored too high, or true positives scored too low)
+
+Since the single-class score is 0.755 (close to ceiling 0.758), the detector boxes are good. The issue is purely classification quality.
+
+Let me think about test-time augmentation. At inference time, we could:
+- Use horizontal flip
+- Use vertical flip  
+- Use both flips
+- Average the 4 predictions
+
+This is cheap (4x inference time) and doesn't require retraining. With the current budget, we have about 55 seconds reserved for prediction. 4x inference would use about 4x the prediction time. Let me estimate: the current prediction takes about 162-125 = 37 seconds for 41879 detections. 4x would be ~148 seconds, which is too much.
+
+Wait, let me recalculate. The log says:
+- Training ends at ~125s (last epoch)
+- Total is 162s
+- So prediction takes about 37s
+
+With 55s reserved for prediction, 4x TTA would take ~148s which exceeds the 55s reserve. But we could reduce the reserve or train fewer epochs.
+
+Actually, we could do 2x TTA (original + horizontal flip) which would be ~74s. Still too much for 55s reserve.
+
+Hmm, but we could also reduce the number of epochs to free up time. Or we could do TTA only on a subset.
+
+Actually, let me reconsider. The prediction loop processes batches of 256. With 41879 detections, that's about 164 batches. Each batch takes about 37/164 ≈ 0.22s. With 2x TTA, it would be about 74s. We'd need to either:
+- Reduce training time (fewer epochs)
+- Increase the reserve
+- Use a faster model
+
+Actually, we could also do TTA by modifying the dataset to include flipped versions at test time. But the simplest approach is to run inference twice (original + flip) and average.
+
+Wait, but there's another option: we could do TTA during training (which we already do with random flips) AND at test time. The training already uses random horizontal and vertical flips. At test time, we could use all 4 combinations (original, hflip, vflip, both) and average.
+
+Let me think about the time budget more carefully:
+- Total: 180s
+- Loading: ~13s
+- Training: ~112s (13s to 125s)
+- Prediction: ~37s (125s to 162s)
+- Reserve: 55s (but only 18s actually used)
+
+So we have about 18s of slack. With 2x TTA, prediction would take ~74s, total would be ~13+112+74 = 199s. That's over budget.
+
+We could reduce training to ~80s (fewer epochs) and do 2x TTA in ~74s: 13+80+74 = 167s. That works with some margin.
+
+Or we could do a single flip (horizontal only) which is 2x inference: ~74s. Same issue.
+
+Actually, let me reconsider the approach. Instead of full TTA, what about:
+- Training with more aggressive augmentation (already doing flips)
+- At test time, just use the original (no TTA) but with a better scoring function
+
+Or what about a different approach entirely? Let me think about what "changes of method helped more" means.
+
+One idea: **Use the detector confidence differently**. Currently, score = conf × p. But what if we use a different combination? For example:
+- score = conf^a × p^b for some a, b
+- score = conf × p × (1 - p_bg) where p_bg is some background estimate
+
+But we don't have a background class in the current model.
+
+Another idea: **Train with a 5th "background" class but only use it for scoring, not as a prediction class**. During training, include some background crops (random locations) labeled as class 4. At inference, use the background probability to modulate the class scores. But e002 showed that adding background as a class hurts.
+
+Wait, e002 added background as a 5th class AND used it in the output. What if we train with background but only output 4 classes, using the background probability as a confidence multiplier?
+
+Actually, let me re-read e002: "Training the classifier on detector boxes (dets.csv train) labelled by IoU>0.5 overlap with GT crops, with an explicit background class for false alarms". Score was 0.5172. This was much worse. The issue might be that the background class dominated the training (most detector boxes are false alarms), making the model too conservative.
+
+What about a different approach: **Use a two-head model** - one head for 4-class classification, another for binary "defect vs background". The background head could be trained separately with a balanced set.
+
+Actually, this is getting complex. Let me think about simpler changes.
+
+**Idea: Test-time augmentation with horizontal flip only (2x inference)**
+
+This is simple, doesn't change training, and should help with robustness. The time cost is 2x inference.
+
+Current prediction time: ~37s
+With 2x TTA: ~74s
+We'd need to reduce training by ~19s to fit in budget.
+
+We can reduce RESERVE_S from 55 to 80 (to account for 2x prediction) and the training will automatically stop earlier.
+
+Actually wait, the training loop already checks time against `t_end = deadline - RESERVE_S`. If I increase RESERVE_S, training stops earlier, freeing time for prediction.
+
+Current: RESERVE_S = 55, prediction takes 37s, slack = 18s
+With 2x TTA: prediction takes ~74s, need RESERVE_S ≥ 74 + margin
+
+If I set RESERVE_S = 85, training gets 180-13-85 = 82s instead of 180-13-55 = 112s. That's 30s less training. The model might be slightly undertrained but the TTA should compensate.
+
+Let me estimate: with 82s of training, we'd get about 82/112 × 421 ≈ 308 steps (roughly 3.5 epochs). The loss would be around 0.25-0.30 instead of 0.21. This might be a slight loss in classification quality, but TTA should help.
+
+Actually, I realize I should think about this more carefully. The 2x TTA (original + hflip) averages the logits. This is a well-known technique that typically gives 0.5-1% improvement. Given our seed-to-seed noise is ±0.005-0.01, this might be within noise.
+
+Let me think of a more impactful change.
+
+**Idea: Use a larger image size (e.g., 224 instead of 160)**
+
+The current IMG_SIZE is 160. Using 224 would give the model more detail to work with, which could help distinguish pore from deposit (which are both small irregularities). The tradeoff is slower training and inference.
+
+With 224x224 instead of 160x160:
+- Training: ~2x slower (224²/160² ≈ 1.96x)
+- Inference: ~2x slower
+
+Current training: 112s for 421 steps
+With 224: ~57s for 421 steps (about 2x slower per step)
+So we'd get about 210 steps in 112s.
+
+Current inference: 37s
+With 224: ~73s
+
+Total: 13 + 112 + 73 = 198s. Over budget!
+
+We'd need to reduce training. With RESERVE_S = 85:
+Training time: 180-13-85 = 82s
+Steps: ~82/112 × 421 ≈ 308 steps at 160px, or ~82/224 × 421 ≈ 154 steps at 224px
+
+That's quite a reduction. The model might not train well enough.
+
+Hmm, 224 might be too expensive. What about 192?
+192²/160² = 1.44x slower
+Training: 112/1.44 ≈ 78s for same steps, so ~600 steps in 112s
+Inference: 37 × 1.44 ≈ 53s
+Total: 13 + 112 + 53 = 178s. Just fits!
+
+But this is tight. And the improvement from 160 to 192 might be marginal.
+
+Let me think of another approach.
+
+**Idea: Ensemble two models (EfficientNet-B0 + another small model)**
+
+Train two different models and average their predictions. This typically gives 1-2% improvement.
+
+But this doubles training time, which we don't have.
+
+Unless we train them sequentially with less time each. E.g., 50s for model 1, 50s for model 2, 37s for inference on both.
+
+Total: 13 + 50 + 50 + 37×2 = 187s. Over budget.
+
+With RESERVE_S = 80:
+Training: 180-13-80 = 87s → 43s per model
+Inference: 37×2 = 74s
+Total: 13 + 87 + 74 = 174s. Fits!
+
+But 43s per model means about 160 steps each (vs 421 for the current). The models would be undertrained.
+
+This is tricky. Let me think about what's most likely to give a meaningful improvement.
+
+**Idea: Better data augmentation during training**
+
+The current augmentation is:
+- ±10% center shift
+- 0.85-1.2 scale
+- 50% horizontal flip
+- 50% vertical flip
+- 0.8-1.2 brightness
+
+What if we add:
+- Color jitter (hue, saturation)
+- Random erasing
+- More aggressive scale variation
+- CutMix or MixUp
+
+MixUp/CutMix could help regularize the model and improve generalization. These are well-known to improve classification accuracy by 0.5-2%.
+
+Let me think about MixUp:
+- For each pair of samples, create a mixed sample: x = λ*x1 + (1-λ)*x2, y = λ*y1 + (1-λ)*y2
+- This smooths the decision boundary and acts as regularization
+- Typical λ ~ Beta(α, α) with α=0.2-1.0
+
+This is easy to implement and doesn't change the architecture or scoring. It should help with the weak classes (pore, stain) by creating more diverse training examples.
+
+Time cost: minimal (just mixing in the dataloader or in the training loop)
+
+Let me go with MixUp. It's a method change (not just hyperparameter tuning), it's well-established, and it's easy to implement.
+
+Actually, wait. Let me reconsider. The research brief says "Tuning hyperparameters alone helped little in earlier experiments; changes of method helped more." MixUp is a method change, so it should be in scope.
+
+Let me implement MixUp in the training loop:
+
+```python
+def mixup(xt, xw, y, alpha=0.2):
+    lam = torch.distributions.Beta(alpha, alpha).sample().item()
+    idx = torch.randperm(len(y))
+    xt = lam * xt + (1 - lam) * xt[idx]
+    xw = lam * xw + (1 - lam) * xw[idx]
+    y1, y2 = y, y[idx]
+    return xt, xw, y1, y2, lam
+```
+
+And in the training loop:
+```python
+xt, xw, y1, y2, lam = mixup(xt, xw, y)
+loss = lam * crit(logits, y1) + (1 - lam) * crit(logits, y2)
+```
+
+This should be straightforward. Let me write the patch.
+
+Actually, I need to be careful about where to apply MixUp. The current code has:
+```python
+with torch.autocast(**amp):
+    loss = crit((model(xt) + model(xw)) / 2, y)
+```
+
+I need to:
+1. Add a mixup function
+2. Apply it to the batch before forward pass
+3. Compute the mixed loss
+
+Let me write this carefully.
+
+```python
+def mixup_batch(xt, xw, y, alpha=0.2):
+    lam = torch.distributions.Beta(alpha, alpha).sample().item()
+    idx = torch.randperm(len(y), generator=g)  # use the same generator for reproducibility
+    xt = lam * xt + (1 - lam) * xt[idx]
+    xw = lam * xw + (1 - lam) * xw[idx]
+    return xt, xw, y, y[idx], lam
+```
+
+Wait, I need to be careful with the generator. The `g` variable is defined in `main()`. I should either pass it or use `torch.randperm` without a generator (which uses the global seed).
+
+Actually, for reproducibility with the seed, I should use the global torch seed. `torch.randperm(len(y))` should be fine since we've set `torch.manual_seed(args.seed)`.
+
+Let me write the full patch:
+
+In the training loop, replace:
+```python
+            with torch.autocast(**amp):
+                loss = crit((model(xt) + model(xw)) / 2, y)
+```
+
+With:
+```python
+            lam = torch.distributions.Beta(0.2, 0.2).sample().item()
+            idx = torch.randperm(len(y))
+            xt_m = lam * xt + (1 - lam) * xt[idx]
+            xw_m = lam * xw + (1 - lam) * xw[idx]
+            with torch.autocast(**amp):
+                logits = (model(xt_m) + model(xw_m)) / 2
+                loss = lam * crit(logits, y) + (1 - lam) * crit(logits, y[idx])
+```
+
+This is clean and minimal. Let me also consider whether to add MixUp to the eval set - no, we don't do that.
+
+One concern: with MixUp, the effective batch size for gradient computation is different. But since we're just mixing within the batch, the batch size stays the same. The gradients will be a weighted average, which is fine.
+
+Another concern: the `y[idx]` indexing. Since `y` is a 1D tensor of class labels, `y[idx]` gives the permuted labels. This is correct.
+
+Let me also think about whether the alpha value matters. α=0.2 is the standard value from the original MixUp paper. I'll use that.
+
+Let me also consider: should I apply MixUp to both views (tight and wide) independently or jointly? I think jointly is better - the same mix should be applied to both views of the same sample, so the two views remain consistent.
+
+My implementation does this correctly: `xt_m` and `xw_m` are both mixed with the same `lam` and `idx`.
+
+I think this is a good experiment. Let me write the patch.
+
+Wait, I also want to make sure the `torch.distributions.Beta` sampling is reproducible. Since we've set `torch.manual_seed(args.seed)`, the random number generator should be deterministic. The `torch.distributions.Beta.sample()` uses the global generator, so it should be fine.
+
+Actually, let me double-check: `torch.distributions.Beta(0.2, 0.2).sample()` - does this use the global torch random state? Yes, it does. And since we've set `torch.manual_seed(args.seed)`, it's reproducible.
+
+One more thing: the `torch.randperm(len(y))` also uses the global torch random state. So the sequence of random numbers (Beta samples and randperm) will be deterministic given the seed.
+
+I'm confident this is correct. Let me write the patch.
+
+Let me look at the exact lines I need to replace:
+
+```python
+            with torch.autocast(**amp):
+                loss = crit((model(xt) + model(xw)) / 2, y)
+```
+
+I'll replace this with the MixUp version.
+
+Let me also add a comment to explain the change.
+
+Here's my patch:
+
+```
+<<<<<<< SEARCH
+            with torch.autocast(**amp):
+                loss = crit((model(xt) + model(xw)) / 2, y)
+=======
+            lam = torch.distributions.Beta(0.2, 0.2).sample().item()
+            idx = torch.randperm(len(y))
+            xt_m = lam * xt + (1 - lam) * xt[idx]
+            xw_m = lam * xw + (1 - lam) * xw[idx]
+            with torch.autocast(**amp):
+                logits = (model(xt_m) + model(xw_m)) / 2
+                loss = lam * crit(logits, y) + (1 - lam) * crit(logits, y[idx])
+>>>>>>> REPLACE
+```
+
+This is a focused change that tests the hypothesis that MixUp regularization will improve generalization, particularly for the weak pore and stain classes.
+
+Let me verify the SEARCH text appears exactly once in the file. Looking at the code:
+
+```python
+            with torch.autocast(**amp):
+                loss = crit((model(xt) + model(xw)) / 2, y)
+```
+
+Yes, this appears exactly once in the training loop. The eval loop uses a different pattern (softmax, not crit).
+
+This looks good. Let me finalize my response.

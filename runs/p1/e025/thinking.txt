@@ -1,0 +1,160 @@
+===== attempt 1 =====
+Let me carefully think about this.
+
+The research lead's plan: add a center-regression head that predicts per-box offset (dx, dy), supervised by matching GT boxes to stage-1 detector boxes on the training split. At inference, re-crop eval boxes using predicted offset, then feed to the pyramid.
+
+Wait, but there's a fundamental problem with this plan. Let me re-read it.
+
+Step 1: "for training boxes in crops.csv compute (dx, dy) = center(GT_box) - center(detector_box), where the detector box comes from dets.csv matched to the GT box by highest IoU over train-split rows of the same image."
+
+So the training target is: given a crop around the GT box center, predict the offset from the GT box center to the matched detector box center. That way, at test time, given a crop around the detector box center, we can predict the offset back to the GT center, and re-crop.
+
+But wait — the direction is reversed in a subtle way. At training, the crop is made around the GT box (center GT). The target offset is center(GT) - center(det) — i.e., how far the detector box center is from the GT center. Hmm, actually if we're training a model that sees a crop around the GT center and predicts where the detector box is... that doesn't directly help at test time, because at test time we see a crop around the detector center, not the GT center.
+
+Actually, let me think about what we want at test time: we have a detector box (center at det_center). We want to re-crop at the predicted GT center. So we want to predict offset = center(GT) - center(det). At test time, we apply: new_center = det_center + predicted_offset, and crop there.
+
+At training time, we have GT boxes. We can compute the "true" offset = center(GT) - center(matched_det). But the crop we feed the model at training time is centered on the GT box (center GT), not on the detector box. So the model learns: "given a crop centered on GT, predict (center(GT) - center(det))". But at test time, the crop is centered on det, which is different. This is a distribution mismatch: at train the crop is centered on GT, at test the crop is centered on det.
+
+Hmm, so the plan as written has a flaw: the training crop should be centered on the detector box (to match test distribution), and the target should be the offset from det center to GT center. Then at test time, we feed a crop centered on the det box and predict the offset to the GT center.
+
+Actually wait. Let me reconsider. The point of the whole thing is that detector boxes are offset from GT. So:
+- At test: we have det box. We crop around det box center. We want to predict where the real defect is (GT center), i.e., offset = GT_center - det_center. Then re-crop at det_center + offset = GT_center.
+
+So the model at test sees a crop centered at det_center and must output offset to GT_center.
+
+At train: we have GT boxes and matched det boxes. To match the test distribution, the training crop should be centered at det_center, and the target offset = GT_center - det_center.
+
+But the plan says: "for training boxes in crops.csv compute (dx, dy) = center(GT_box) - center(detector_box)" — the target is GT - det, which is correct direction. But "the crop is made around the box center" — currently make_crop uses r["x1"], r["x2"] which are the GT box coordinates (from crops.csv). So the training crop is centered on GT, not on det. That's the mismatch.
+
+Hmm, so to make this work properly, the training crop should be centered on the detector box, and the target offset should be GT_center - det_center. Then at test time, crop centered on det, predict offset, re-crop.
+
+But actually, there's an even simpler consideration. Let me reconsider whether this whole idea is worth it and whether it will work within budget and whether it's likely to help.
+
+Actually, let me step back and think about the research strategy here, because the instructions say I should think about whether this experiment is a good one, but the lead has already chosen it and I'm asked to "Implement exactly this experiment." So my job is to implement it faithfully, fixing any details that can't work as written (time budget, tensor shapes, missing names), and to check every changed function end to end.
+
+But I should be careful: the plan has a real flaw (training crop centered on GT vs test crop centered on det). The instruction says: "If a detail of the plan cannot work as written (time budget, tensor shapes, missing names), make the smallest fix that keeps the idea and say so at the end of the HYPOTHESIS."
+
+So I need to decide: is the GT-centered training crop a "detail that cannot work as written"? It can run, but it won't learn the right thing. Actually, it will learn something but with a train/test mismatch. Let me think about the smallest fix that keeps the idea.
+
+The idea: re-center crops on the detected defect using a predicted offset. For this to work, the training must match the test distribution: training crop centered on the detector box, target = offset from det center to GT center.
+
+Actually, wait. Let me reconsider. There's a subtlety. If I center the training crop on the detector box, then the crop content at training is "defect possibly offset within the crop." The model sees this and predicts how far to shift to center the defect. That's exactly the test scenario. Good.
+
+But here's another subtlety: the classification head and regression head share the pyramid features. If I change the training crop to be centered on the detector box, then the classification is now trained on detector-centered crops, which is actually also a good thing for the classification (matches test distribution — this is the "train on detector boxes" idea which was tried before in e013 and rejected, and e001). Hmm.
+
+Wait, e001 was "training on the actual detector boxes" — rejected (0.6276). e013 was also "Training on the actual detector boxes" — rejected (0.6168). So training the classifier on detector-centered crops was already tried and didn't help. That's a concern.
+
+But this experiment is different: it's not just training on detector boxes; it's adding a regression head that explicitly predicts the re-centering offset, and then re-cropping. The re-crop is the key new thing.
+
+Hmm, but if training on detector-centered crops alone (e001, e013) didn't help, would adding re-centering help? The re-centering would move the crop to the predicted GT center. If the prediction is good, the re-centered crop is like a GT-centered crop but at test time. So effectively the classifier at test time sees a GT-centered crop (if prediction is perfect). That's the same as the current training distribution (GT-centered). So the classifier itself is trained on detector-centered crops but at test sees re-centered (≈GT-centered) crops. That's a mismatch in the other direction!
+
+This is getting complicated. Let me think very carefully about the cleanest formulation.
+
+Option A (plan as written, with the fix that training crop = detector-centered):
+- Training: crop centered on det box. Target offset = GT_center - det_center. Classifier trained on det-centered crops.
+- Test: crop centered on det box → predict offset → re-crop at det_center + offset (≈ GT center). Classifier sees ≈GT-centered crop.
+- Problem: classifier trained on det-centered, tested on GT-centered. Mismatch.
+
+Option B (keep training crop GT-centered as currently, predict offset to det):
+- Training: crop centered on GT. Target offset = det_center - GT_center (how much the det box is off). Classifier trained on GT-centered crops (as now).
+- Test: we have det box. But to use the model, we'd need to crop centered on GT, which we don't have. So this doesn't work at test. Unless... we crop centered on det, but the model was trained on GT-centered crops. Mismatch.
+
+So neither is clean. The fundamental issue: at test we only have the det box, so the first crop must be det-centered. For the model to be used at test, it must be trained on det-centered crops (at least the regression head). And then the re-centered crop is what the classifier sees.
+
+So the cleanest: train everything on det-centered crops, regression predicts offset to GT, classifier trained on det-centered crops, and at test the classifier sees re-centered (≈GT) crops. There's a train/test mismatch for the classifier (trained det-centered, tested GT-centered), but maybe that's okay because the re-centering is small (detector boxes are only slightly offset). Actually if detector boxes are only slightly offset, then det-centered ≈ GT-centered, so the mismatch is small. And the re-centering helps a little.
+
+Hmm, this is a lot of complexity and the prior evidence (e001, e013) says detector-centered training didn't help. And the re-centering gain is uncertain.
+
+Actually, let me reconsider the whole thing. Maybe I'm overthinking the "fix." The instruction says implement exactly this experiment, and make the smallest fix for details that can't work as written. The GT-centered vs det-centered training crop is arguably a design choice, not a "can't work" detail. But it does affect whether the idea works.
+
+Let me reconsider: what's the smallest fix that keeps the idea and makes it coherent?
+
+I think the right interpretation: The regression head should be trained to predict, from a detector-centered crop, the offset from the detector center to the GT center. And the classifier should be trained on detector-centered crops (to match test). At test, predict offset, re-crop, classify.
+
+But wait, there's yet another subtlety about the re-crop and the pyramid. The pyramid makes 4 crops at scales 1.25, 1.75, 2.5, 3.5 around the (possibly re-centered) center. So re-centering shifts all 4 crops. Good, that's consistent.
+
+Actually, hold on. Let me reconsider whether to change the training crop center at all. Let me re-read the plan:
+
+"1. Add to BoxDataset.__getitem__ an optional regression target: for training boxes in crops.csv compute (dx, dy) = center(GT_box) - center(detector_box), where the detector box comes from dets.csv matched to the GT box by highest IoU over train-split rows of the same image. Store it as a 2-vector per row and return it."
+
+So the plan computes the target but doesn't explicitly say to change the crop center. The crop is still made around the GT box (r's coordinates). So the plan as written keeps GT-centered training crops and predicts offset GT - det.
+
+"2. Change MultiScaleClassifier to accept a 'regress' flag: append two extra MLP heads ... predict offsets in normalized box coordinates with a smooth L1 or MSE loss"
+
+"3. Joint loss: total = cross_entropy + alpha * l1_offset ... Train on the training boxes only; eval boxes get zero offset and are classified with the re-centered pyramid features (crop at box center first, then apply offsets computed from a simple fallback that keeps the original crop)."
+
+Hmm, "eval boxes get zero offset" — that's confusing. Let me parse: "eval boxes get zero offset and are classified with the re-centered pyramid features (crop at box center first, then apply offsets computed from a simple fallback that keeps the original crop)."
+
+I think the intent is: at eval, for each eval box, we first crop at the box center, get the pyramid features, predict the offset, then re-crop at the offset-applied center, get new pyramid features, and classify those. The "zero offset / fallback keeps the original crop" is a bit muddled.
+
+OK here's my decision. This is a genuinely complex and somewhat flawed plan. But my job is to implement it faithfully with the smallest fixes. Let me design a clean, correct implementation of the idea:
+
+**Core idea:** A regression head predicts a per-box 2D offset (in normalized box coordinates). At inference, we re-crop each eval box shifted by the predicted offset, then classify the re-centered crops with the pyramid.
+
+**To make it coherent (smallest fix to the plan):**
+- Training crop must be centered on the detector box (to match test distribution where we only have det boxes). Actually, wait. Let me reconsider once more.
+
+Hmm, actually, let me reconsider. There's a simpler and more defensible formulation that keeps the plan's structure but is coherent:
+
+Keep the training crop centered on the GT box (as now — don't change the crop center, minimal change). The regression head predicts the offset from GT center to the matched detector center, i.e., offset = det_center - GT_center. This teaches the model "where the detector box is relative to the defect." But at test, we don't have GT, so we can't use this directly...
+
+No. The whole point is re-centering at test. At test we have det, want GT. So the prediction must be GT - det (from a det-centered crop).
+
+OK let me just go with the coherent version and note the fix:
+
+**Fix:** The training crop is centered on the matched detector box (not the GT box), so that the regression head learns to map a detector-centered crop to the offset toward the GT center — matching the test-time situation where only the detector box is available. The target offset is (GT_center - det_center) normalized by the detector box size. At inference, each eval box is first cropped at its own center, the head predicts the offset, and the crops are re-made shifted by that offset before classification.
+
+Wait, but if I center the training crop on the detector box, then the classification is now trained on detector-centered crops. As noted, e001/e013 tried detector-box training and it didn't help. But here the classifier at test sees re-centered crops. So there's a train/test mismatch for the classifier. 
+
+Ugh. This is a real tension. Let me think about what actually maximizes the chance of a gain, while keeping the idea.
+
+Actually, you know what, let me reconsider the magnitude of the effect and whether this is even a good use of a run. The diagnostics say: "mAP@0.5 if every box had its correct class but kept your scores: 0.7366 (yours: 0.6359). The difference is what wrong classes cost." So wrong classes cost 0.10. The confusion matrix shows pore→stain (19), deposit→stain (55), stain→deposit (43), etc. The hypothesis is that these confusions are because the crop is offset and contains background.
+
+But is that actually true? The detector boxes overlap GT by IoU>0.5 (that's how the diagnostic selects boxes). IoU>0.5 means the boxes are fairly well aligned — the center offset is limited. For two boxes with IoU 0.5, the center can be offset by up to... let's see. IoU 0.5 is a fairly strong overlap. The center offset is probably small relative to box size. So "crop contains no defect at all" might be an overstatement — with IoU>0.5, the crop (which is 1.25x the box) definitely contains the defect. So the "classifier sees background" hypothesis is likely weak for the IoU>0.5 boxes.
+
+Hmm, but the diagnostic only looks at boxes with IoU>0.5 for the confusion matrix. The full mAP includes ranking of false alarms etc. But the 0.10 gap is specifically "wrong classes" on these IoU>0.5 boxes.
+
+So the re-centering idea targets a problem (offset) that may be small for the boxes that actually cause the 0.10 loss. This makes me skeptical of the effect size. But the lead chose it, and I implement it.
+
+Actually, let me reconsider. My instructions: "Implement exactly this experiment in the current train.py, nothing more." and "If a detail of the plan cannot work as written (time budget, tensor shapes, missing names), make the smallest fix that keeps the idea and say so at the end of the HYPOTHESIS. Check every changed function end to end."
+
+So I should implement it, making it correct and coherent. Let me focus on making it run correctly within budget, with correct tensor shapes, and a coherent (if imperfect) realization of the re-centering idea.
+
+Let me now think about the budget. Current run: 168s total, 157 steps, training ends at ~95s (t_end = deadline - 85 = 180-85 = 95s). Load 13s. So training from 13s to 95s = 82s for 157 steps ≈ 0.52s/step. Prediction: from 95s to 168s = 73s. Reserve is 85s, so prediction+write must fit in 85s; it took 73s, leaving 12s margin.
+
+Now, the re-centering at inference requires: for each eval box, (a) crop at box center, run pyramid to get offset prediction, (b) re-crop at offset center, run pyramid again to get classification. That's 2x the forward passes at inference (plus the crop creation). Actually the offset prediction needs the pyramid features, then the regression head. Then re-crop and full forward for classification. So roughly 2x inference compute.
+
+Current inference is 73s for 41879 detections with 4 crops. 2x would be ~146s, which exceeds the 85s reserve. That's a problem. So I need to either increase the reserve (reduce training time) or make inference cheaper.
+
+Wait, let me reconsider. The offset prediction: I need pyramid features (4 crops forward through backbone) + regression head. Then re-crop (4 crops) + full forward (backbone + projs + head + regression head, but I only need classification). So it's essentially 2 full forwards per eval box. That's 2x the current inference.
+
+Current inference 73s → 2x = 146s. Reserve is 85s. Not enough. So I must reduce the reserve and/or training.
+
+Options:
+1. Reduce RESERVE_S to account for 2x inference, and reduce training time accordingly. But training is already only 82s. If I need inference ~146s + write ~10s = 156s, plus load 13s = 169s, that leaves only 11s for training. Not enough — training needs at least ~50s to be useful (current 82s gives loss 0.27).
+
+Hmm. This is a serious budget problem. Let me reconsider.
+
+Actually wait — do I need the full pyramid for the offset prediction? The offset could be predicted from a cheaper feature. But the plan says to use the fused pyramid vector. Let me think.
+
+Alternative: predict the offset from a single crop (the tightest, 1.25x) rather than the full pyramid. That's 1 forward for offset + 4 forwards for classification = 5 forwards vs current 4. That's only 1.25x inference. 73s * 1.25 = 91s. Still over 85s reserve but close. Hmm, still tight.
+
+Alternatively, the offset head could share the backbone forward with... no, the crops are different (offset crop vs re-centered crop), so no sharing.
+
+Let me reconsider the budget more carefully. Actually, let me reconsider: maybe I can reduce the number of crops for the offset prediction to 1, and keep 4 for classification. And reduce the reserve to, say, 130s (inference ~91s + write ~10s + margin). Then training budget = 180 - 130 = 50s. Load 13s, so training from 13s to 50s = 37s ≈ 71 steps. That's fewer than current 157 steps. The model would be less trained. Risky.
+
+Hmm, this is getting really tight. Let me reconsider whether 2x inference is really needed, or whether I can be smarter.
+
+Actually, here's a cleaner idea that reduces inference cost: Do the re-centering in a single pass by predicting the offset from the detector-centered crop, but compute the offset from the SAME backbone features used for... no, the crops differ.
+
+Wait, actually, maybe I'm overcomplicating. Let me reconsider: what if the offset prediction uses the detector-centered crop's features, and then I re-crop. The re-crop features are new. So 2 forwards. Unless I predict the offset from a very cheap model.
+
+Alternatively — and this might be the key realization — maybe I should reconsider whether re-centering is worth the 2x inference cost. Given the budget, 2x inference is hard to fit. 
+
+Let me reconsider the whole budget with concrete numbers. Let me re-derive step time. Actually the inference time is dominated by 41879 detections × 4 crops = 167,516 crop forwards through the backbone. At 73s, that's ~0.43ms per crop-forward. For 2x (offset 4 crops + classify 4 crops = 8 crops), 135,112... no wait, 41879 × 8 = 335,032 crop-forwards ≈ 146s. Yes.
+
+To fit: total = load(13) + train(T) + inference(I) + write(W) ≤ 180 with margin. If I = 146, W = 10, then T ≤ 180 - 13 - 146 - 10 = 11s. Way too small.
+
+If I use 1 crop for offset: I = 41879 × 5 = 209,395 ≈ 91s. Then T ≤ 180 - 13 - 91 - 10 = 66s. Load 13, so train from 13 to 79 = 66s ≈ 127 steps. That's close to current 157. Feasible!
+
+So: offset predicted from a single tight crop (1.25x), classification from the 4-crop pyramid. Inference ≈ 1.25x current. Reserve must be ~105s (Thinking budget reached. Stop thinking now and write the reply in the required format.

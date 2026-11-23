@@ -1,0 +1,132 @@
+===== attempt 1 =====
+Let me think about the current state.
+
+Current best: e012, 5-seed 0.6363. Three views (1.5x, 2.5x, 4x), EfficientNet-B0, logits averaged, trained on true boxes only.
+
+Diagnostics:
+- Confusion: pore→stain 18, pore→deposit 5; deposit→stain 63; stain→deposit 45; discontinuity mostly fine. So the dominant error is deposit↔stain confusion (63+45=108 boxes), plus pore→stain (18).
+- mAP if all boxes had correct class: 0.7400 vs my 0.6363. So wrong class costs 0.1037. Gap to the perfect-class ceiling 0.758 is 0.018 (score).
+- So the biggest lever is classification accuracy on detector boxes, especially deposit/stain.
+
+History: many families exhausted:
+- data (detector-box training): tried 4 times, no new best. Exhausted.
+- augmentation (box-error jitter): 1 attempt, rejected.
+- inference (precompute etc.): 12 attempts, 8 crashed/timeout, no best. Exhausted.
+- architecture: 10 attempts, e012 (third view) is the best; shared-backbone concat crashed 3 times (e021-23); 9-channel single pass (e024) not confirmed (0.6355 vs 0.6363, essentially equal); learned view weights rejected.
+- optimisation: split LR rejected (0.5854 — probably a bug or just bad), SWA crashed.
+- scoring: 16 attempts in past runs, no gain. Exhausted.
+
+What has not been tried (outside the families):
+- The guide's plan: (1) consolidate detector-box training — but that family is marked exhausted here (4 attempts, no new best, though in past runs it was accepted twice at +0.004). Hmm, the guide says to implement it carefully and confirm; but our history shows e001 crashed, e002 rejected, e020 rejected. So 3 attempts in this run, no gain. The lessons table says "EXHAUSTED? (3+ ideas, no new best)". So I should not repeat.
+
+- Box-quality weighting/sampling: "weight or sample training boxes by box quality" — has this been tried? "Class-balanced sampling or class-weighted loss" (4 attempts, no gain) was about class balance, not box quality. Box-quality weighting (sample more from boxes the detector places poorly) — I don't see it in the history. Actually e005 was "precompute the detector's real box-error distribution and jitter true boxes to match it" — that's augmentation, rejected. Box-quality-weighted sampling is a different thing but related. Hmm.
+
+- "Combine the two views better than averaging logits, e.g. one shared backbone that concatenates pooled features from both crops before a small head" — tried: e004 (not confirmed 0.6329), e007 crashed, e021-23 crashed 3 times. So 5 attempts, 1 not confirmed, 4 crashed. That direction has been tried many times. But e024 (9-channel single pass, one forward) got 0.6355, not confirmed — basically on par with 0.6363.
+
+- Buy training steps: inference family is exhausted with 8 crashes/timeouts. But the key observation: the run ends at 185s, prediction takes ~60s, reserve 55s. Wait — actually the log says training stops at 125s (285 steps), prediction 125→185 = 60s. Total 185s < 180? No wait, --seconds T. The log says "done: ... 185s total". The harness kills at T. If T=180, 185s would be a kill... but e012 succeeded at 185s total? Hmm, the brief says "T is the total wall-clock budget... at the limit the run is killed". e012's log says 185s total and it succeeded (5-seed mean). So T must be larger, maybe 200 or 240? Actually past runs: "fewer steps fit in 180 s" suggests budget 180s. But e012 finished at 185s. Maybe T=180 but the kill is at T+something? Or the harness's seconds is 200? The guide says "the binding constraint is 180 s" and "keep the whole run under ~165 s". e012 at 185s total succeeded... confusing, but the guide says to keep under ~165s. Let's trust the guide: total run should be under ~165s.
+
+Wait, actually e012's log: "done: 4 epochs, 285 steps, 55313 prediction rows, 185s total". And it was accepted as new best with 5 seeds. So T must be at least ~190. But e014 (320px 4th view) timed out, e015 (ConvNeXt) timed out, e016, e017, e028 timed out/rejected... e017: drop 4x view at inference — that should save ~20s of prediction, yet it timed out?? The diff says "the dataset still computes all three crops per eval box" — so e017's edit didn't actually remove the crop computation (bug in the edit), so it didn't save time and timed out. e018 crashed, e019 (fixed) got 0.6176 — dropped the 4x view at inference and got worse (0.6176 vs 0.6336 seed 0). Interesting: dropping the 4x view at inference hurt a lot. So the 4x view matters at inference.
+
+e028: "free up ~15s of the 60s prediction phase" — 0.6178, rejected. What did e028 do? Probably precomputed eval crops in the main process (single-threaded) and that ate the time, or dropped something. Rejected.
+
+So the prediction phase cost is ~60s for 41,879 boxes × 3 crops. That's the bottleneck for buying training steps. Precompute attempts (e010, e011, e025, e026, e029, e030) all crashed/timeout/rejected. e030 crashed on a NameError: module-level function `_mk_eval_crop` references `images`, which is a local variable in main — not defined at module level. Fix: make `images` a global, or pass it via a module-level global set in main.
+
+Now, the question: what's the next experiment?
+
+Options:
+
+A) Fix e030 (BASE: last) — precompute eval crops with a process pool so the prediction phase is just normalize+forward, buying ~15-20s of training. The fix is trivial: declare `images` as a global at module level and assign it in main, or set a module-level `_IMAGES` global before spawning the pool. Fork start method: workers inherit globals, so setting a module global works.
+
+But wait — is precompute actually the right move? The inference family is marked EXHAUSTED (12 ideas, 8 crashed/timeout, no new best). But most of those crashed on plumbing. e030's crash was a pure NameError that's now understood. The guide says "bugs: fix once; second failure: drop it". e029 crashed (plumbing: local closure not picklable), e030 crashed (NameError). That's two failures of the same idea (precompute eval crops with a process pool). By the rule "second failure: drop it", I should drop this direction. Hmm, but the rule says "two failed variants of a direction: move to the next direction". e029 and e030 are two failures of eval-crop precompute. So per the guide's rule of thumb, I should drop it.
+
+But wait — the crash cause is now fully understood and the fix is one line. The guide's rule is about not wasting runs. A one-line fix for a fully-diagnosed crash... the rule says "bugs: fix once; second failure: drop it". e029's crash was "the crop function was a local closure, not picklable" — e030 fixed that but introduced/exposed the NameError. Actually the NameError was in e030's own new code (module-level function referencing `images` which is local to main). So e030's crash is a bug in e030 itself, not a repeat of e029's bug. So "fix once" applies: e030 crashed on its own bug; fixing that bug once is allowed. I think BASE: last with the one-line global fix is defensible and cheap. And the payoff is real: prediction ~60s → maybe ~25-30s (forward only), buying ~30s of training ≈ +80-90 steps. Loss still dropping at cutoff (0.242). That's a meaningful amount of training.
+
+But wait — will the precompute itself fit in the budget? e010 (precompute train+eval) took ~129s total for 48k boxes ≈ 1.35 ms/crop... wait, 129s / (41879+6052 boxes × 3 crops) = 129/137,493 ≈ 0.94 ms/crop. For eval only: 41,879 × 3 = 125,637 crops ≈ 118s?? That can't be right — e010's log said ~129s total for both. Hmm, "precompute crops for 41,879 eval boxes and 6,052 training boxes (~129s total, ~1.35 ms/crop)". 1.35 ms/crop × 137,493 crops = 186s. Doesn't add up; maybe 1.35 ms is per box (3 crops)? 47,931 × 1.35 ms = 65s. Hmm. Anyway, e010 timed out. e011: precompute only training crops ≈ 16s — that's 6,052 boxes × 3 crops = 18,156 crops in 16s ≈ 0.88 ms/crop. So eval-only precompute ≈ 125,637 × 0.88 ms ≈ 111s. That's too long! It would eat the entire budget.
+
+Wait, but that's single-process. e030 uses ProcessPoolExecutor with 8 workers. 8× speedup (if CPU-bound): 111/8 ≈ 14s. That's feasible! The on-the-fly eval crop phase takes 60s with a DataLoader with 8 workers... hmm wait, if the DataLoader already uses 8 workers and the prediction phase is 60s, why would precompute with 8 processes be 14s?
+
+Let me think. Prediction phase: 41,879 boxes, batch 256 → 164 batches. Each batch: workers crop 256×3 crops, main process does 3 forward passes on the GPU. If GPU forward is the bottleneck, total time is dominated by GPU. 55,313 rows... 164 batches × 3 views. If each batch takes ~0.36s (60s/164), that's GPU-bound (forward of 256×3 through EfficientNet-B0 at 160px is fast, maybe 0.2-0.3s on a decent GPU). So precomputing crops doesn't save the GPU time! The 60s prediction phase is mostly GPU forward, not crop computation.
+
+Hmm wait, but e016's hypothesis said "the prediction phase re-crops and resizes all 41,8..." and timed out (the edit probably added precompute time without removing anything). e028 "free up ~15s of the 60s prediction phase" got 0.6178 (rejected) — so it did save some time but the score dropped? Why would precomputing crops change the score? It shouldn't — same crops, same model. Unless the saved time was spent differently (e.g., the reserve change altered training length). 0.6178 is well below 0.6336 (e012 seed 0) — that's a big drop, more than noise. Suspicious. Maybe e028 changed something else (like dropping a view, or a bug in the precompute that changed crops). I can't see e028's code.
+
+Actually, wait. Let me reconsider: is the prediction phase GPU-bound or CPU-bound? Training: 285 steps in ~111s (from 14s to 125s) = 0.39 s/step, batch 64, 3 views = 192 forwards per step. Prediction: 164 batches × 3 views = 492 forwards of 256 = 125,952 forwards... let me compute in forward units: training = 285 × 64 × 3 = 54,720 forwards (with backprop). Prediction = 41,879 × 3 = 125,637 forwards (no backprop). If forward is ~2× faster than forward+backward... training 111s for 54,720 fwd+bwd → if fwd is 40% of that cost, fwd cost ≈ 44s for 54,720 → 0.8 ms/forward. Prediction fwd: 125,637 × 0.8 ms ≈ 100s. But prediction is 60s. So the GPU forward is ~0.48 ms/forward → 125,637 × 0.48 ms ≈ 60s. Yes! That matches: the prediction phase is GPU-bound, ~60s of pure forward. Precomputing crops saves maybe 5-10s of CPU overlap, not 15-30s. The GPU time is irreducible (unless we drop a view or use a smaller model).
+
+So eval-crop precompute buys at most ~5-10s. Marginal. And the family is exhausted with 2 recent crashes. Per the guide: drop it.
+
+What else can buy training steps?
+- Drop the 4x view at inference: tried (e019), 0.6176 — hurt a lot. So no.
+- Drop the 4x view entirely (train and inference): e000→e012 diff... e012 added the 4x view and it was the new best (0.6363 vs e000's 0.630). So the 4x view is worth ~+0.006. Keep it.
+- Smaller/faster model: ConvNeXt timed out (e015)?? ConvNeXt-Nano should be faster than EfficientNet-B0... unless the timeout was from something else (maybe the edit changed something else, or convnext was slower on this GPU). Past runs: "bigger or other backbones (EfficientNet-B2, ResNet-50, 2-3 model ensembles): 8 attempts, no gain; 1 timeout". So backbone swaps have been tried a lot.
+- Reduce IMG_SIZE: "resolution and small-box handling (224px...)" — 224 was tried (bigger). Smaller (128)? Not explicitly listed; the family says "224 px, larger MIN_CROP, enlarged tight crops" — so 224 (up) was tried, not 128 (down). Hmm, but resolution changes are in a family with 9 attempts, no gain. And the guide says small one-class gains aren't accepted; a resolution change risks hurting the fine-grained classes.
+
+OK, here's the crux. The diagnostics show the dominant error is class confusion: deposit→stain 63, stain→deposit 45, pore→stain 18, pore→deposit 5. Total wrong ≈ 150 out of ~1120 correct-class boxes... let me count: total boxes overlapping truth: pore 75, deposit 269, discont 458, stain 614 → 1416 boxes. Correct: 51+203+431+548 = 1233. Wrong: 183. So 87% of overlapping boxes get the right class. mAP cost of wrong class: 0.7400 - 0.6363 = 0.1037.
+
+How to fix deposit/stain confusion? Ideas:
+1. Higher resolution for the tight view (e014: 320px tight — timeout). What about 224px for all views? The "resolution" family tried 224 — no gain (best 5-seed 0.634, not confirmed). Hmm, that was in past runs, on the 2-view base. On the 3-view base, 224 would cost 1.97× compute (224/160)² ≈ 2× forward time → training steps halved. Probably net negative given the budget. Risky.
+
+2. Mixup/CutMix: tried (5 attempts, no gain).
+
+3. Label smoothing: not in the list! "Label smoothing improves calibration in some settings but can reduce the information in class probabilities that the ranking metric uses" — probably neutral-to-negative for AP. Skip.
+
+4. The confusion is fine-grained texture. What about color? Weld defects: stain vs deposit — stain is discoloration (brownish), deposit is material buildup. The crops are RGB; maybe the model needs better color handling. Hmm, hard to target.
+
+5. Class-conditional something... "class-weighted loss hurt classification every time" — skip.
+
+6. What about training on detector boxes (data family)? Marked exhausted here (3 attempts in this run: e001 crash, e002 rejected 0.6282, e020 rejected 0.6229). But in past runs it was accepted twice at +0.004/+0.005. In this run, e002 (0.6282) and e020 (0.6229) were both below the base 0.630. So it doesn't help on top of e012. Drop.
+
+7. Box-quality-weighted sampling: not tried. But how much would it help? The classifier is already at 87% on detector boxes; the mismatch is mild. Jitter augmentation (e003, e005) was rejected. Weighting by box quality is a cousin. I'd rate it low probability.
+
+8. Multi-crop input at test time (TTA): tried (8 attempts, no gain).
+
+9. Ensemble of 2 models: tried in past runs (no gain, and budget).
+
+10. Longer training: the loss is still dropping (0.242 at cutoff). Every second of training is free improvement. The only way to get more training time is to cut prediction time or loading time. Loading is 14s. Prediction is 60s (GPU-bound). Training is 111s.
+
+Hmm wait, let me recompute the budget. What is T? e012 finished at 185s total and succeeded. If T were 180, it would have been killed. So T ≥ ~190. Maybe T=200? The guide says "the binding constraint is 180 s" and "keep the whole run under ~165 s". If T=180 and e012 finished at 185... contradiction. Unless the kill is at T+5 or the log's "185s" includes something. Actually, maybe T=180 is the default but the harness passes a different --seconds? The contract says `--seconds T`. e012's log says 185s total and it passed. Past runs: "fewer steps fit in 180 s" — suggests T=180. But then e012 at 185s should have been killed... unless the harness's kill has some slack, or T is actually 200 and "180 s" in the guide is approximate.
+
+Let me look at the timeouts: e014 (320px 4th view) timed out. e017 (drop 4x at inference, but the edit didn't actually save time) timed out. e016 timed out. e028 (freed ~15s of prediction) got 0.6178 — didn't time out, so it finished under T. e028's base e012 is 185s; if e028 saved ~15s it would be ~170s, under 180. And e012 at 185s passed. So T is between 185 and maybe 195? If T=180, e012 couldn't have passed. So T > 185. Maybe T=200? Then the guide's "180 s" is wrong, or the guide means "the effective budget after reserve". Hmm.
+
+Actually, maybe the harness passes --seconds 200 (or 195). e012: 185s, OK. e014: added a 320px 4th view — forward cost +1.97× for that view... total forward cost: 3 views at 160 + 1 view at 320 = (3×1 + 1.97) vs 3 → ×1.66. Training 111s → 184s; prediction 60s → 100s; total 14+184+100 = 298s > T. Timeout consistent with T≈200. e017: no actual savings (bug), but maybe added something? It timed out at 195s per the e018 description ("the run was killed at 195 s"). So T=195? Or the kill happened at 195 because T=195. Hmm, "killed at 195 s" — maybe T=195? But then e012 at 185 has 10s of slack. The guide says to keep under ~165s — with 10s of slack that's odd.
+
+Whatever T exactly is (190-200), the practical fact: e012 uses 185s and has little slack. To buy training time I need to cut ~10-20s from loading/prediction.
+
+Loading: 14s (1022 images). Could I load only the needed images faster? Already loads only needed. 14s for 1022 images ≈ 14ms/image — that's disk decode; a process pool could cut it to ~3-4s. Saves ~10s. That's real! And it's not in the exhausted families (inference family is about prediction precompute; loading parallelization is different). Risk: low (pure plumbing, no score change from parallel decode — same images). Payoff: ~10s more training ≈ +25-30 steps. Worth ~+0.003-0.005? Loss is 0.242 and dropping; 30 more steps might reduce it to ~0.23. Marginal but real. Hmm, "effects below ~0.005 can't be distinguished from noise". 30 steps ≈ 10% more training. Past "longer training" attempts: 6 attempts, best 5-seed 0.6355, not confirmed. So longer training alone didn't confirm a gain. Hmm.
+
+OK, let me step back and think about what could plausibly gain ≥0.01.
+
+The error budget: 0.758 (ceiling) - 0.6363 (me) = 0.122. Of that, 0.1037 is wrong class, 0.018 is score/ranking.
+
+To gain 0.01 in mAP I need to fix ~10% of the wrong-class errors, i.e., ~15-20 of the 183 misclassified boxes... actually mAP is per-class and involves ranking too; rough.
+
+Where are the 183 errors? deposit→stain 63, stain→deposit 45, pore→stain 18, pore→deposit 5, discont→stain 22, discont→deposit 4, discont→pore 1, stain→discont 8, stain→pore 9, deposit→pore 2, pore→discont 1. Total: 63+45+18+5+22+4+1+8+9+2+1 = 178 (plus "no row" 11). So stain is involved in 63+45+22+8+18+9 = 165 of the 178 errors! Stain is the hub of confusion: it's both a big source of errors (63+45+8+9=125 errors where stain is the truth or... let me recount: stain as truth: 9+45+8+4(no row) = 66 wrong. Stain as prediction: 18+63+22+4(no row) = 107 wrong. So stain is over-predicted (107) and under-detected (66). Net: the model predicts stain too often, especially for deposit and pore.
+
+Why? Stain is the largest class (614 overlapping boxes vs pore 75). With plain CrossEntropyLoss and uniform sampling, the model sees stain 614/1416 ≈ 43% of the time. Class-weighted loss hurt (per the brief). Class-balanced sampling was tried (4 attempts, no gain). Hmm.
+
+But wait — the per-class AP: pore 0.546 (worst), deposit 0.615, stain 0.606, discont 0.778. Pore has few boxes (75 overlapping) and its AP is lowest. Pore's errors: 18→stain, 5→deposit.
+
+What fundamentally changes what the model sees or learns?
+
+Idea: stain is discoloration — a color phenomenon. Deposit is material. Maybe the model is using color cues incorrectly, or the color normalization (ImageNet MEAN/STD) is washing out the stain color. What about training with per-image color jitter... tried (stronger color augmentation, no gain).
+
+Idea: input the crop at native resolution without resizing? Tried (resolution family, no gain).
+
+Idea: use the detector's conf in training? No — training labels are class only; the conf is a stage-1 output. We could use it for weighting... but that's the "scoring" family (conf × p rules), exhausted.
+
+Idea: what about the "no row" boxes (11)? Those are boxes where all scores < MIN_SCORE=0.001. conf × p < 0.001 means conf < ~0.00025 — negligible.
+
+Idea: second-stage classifier on detector boxes with box-quality-aware training — the R-CNN approach: train on stage-1's own proposals. That's the "data" family (detector boxes as training data), exhausted in this run (3 attempts, no gain).
+
+Hmm, what about a fundamentally different formulation: instead of classifying each box independently, use the set of boxes in the image? No, too complex and risky.
+
+Let me reconsider the budget. The single most reliable lever per the guide: "every second of training you gain is a free improvement". And "each step gained is worth more than a bigger model".
+
+Current: 14s load + 111s train + 60s predict = 185s.
+
+Ways to buy training time:
+1. Parallel image loading: 14s → ~4s. +10s. Low risk. (New idea — not in any family.)
+2. Speed up prediction: GPU-bound 60s. Options: drop a view (tried, hurt), smaller model (tried, no gain), fewer rows... no. bf16 already on. Batch 256 → bigger batch (512)? Might slightly reduce GPU overhead. Marginal.
+3. Speed up training steps: 0.39 s/step. DataLoader with 8 workers doing crop+resize for 64×3 crops per step. If the loader is the bottleneck, precomputing training crops (e011: 16s precompute, then cheap serving) — e011 got 0.6254, rejected. But e011 precomputed crops without jitter (exact box positions) and applied flip/brightness on the cached arrays — that removed the geometric jitter (position/scale jitter was part of the training signal!). Wait, e011: "precompute all training crops (tight + wide, at exact box positions) once... so per-step work is only cheap flip/brightness/normalize" — that removed the random crop jitter (cx shift, side scale). The jitter is augmentation; removing it could hurt. And it was rejected (0.6254 vs 0.630 base). Hmm, but was it rejected because of the removed jitter, or because the precompute didn't save enough time? e011's score 0.6254 is below base 0.629-0.630. Could be either.
+
+   Alternative: precompute K jittered variants per box once (e025/e026 idea) — e026 got 0.0997 (suspicious bug — probably the dataset served wrong labels or something). That direction has 2 failures (e025 crash, e026 bug). Drop per the rules.
+
+   Actually, is the training loader the bottleneck? 0.39 s/step for batch 64. GPU forward+backward for 192 images at 160px EfficientNet-B0: maybe 0.15-0.25s. Loader: 1Thinking budget reached. Stop thinking now and write the reply in the required format.

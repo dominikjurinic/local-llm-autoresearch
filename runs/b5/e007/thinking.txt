@@ -1,0 +1,210 @@
+===== attempt 1 =====
+Let me carefully analyze the situation.
+
+**Current state:**
+- Best: e000, 5-seed val mAP@0.5 = 0.6288 (std 0.0049)
+- Per-class: pore 0.502, deposit 0.624, discontinuity 0.780, stain 0.609
+- Reference numbers:
+  - one-step 4-class detector (baseline to beat): 0.638
+  - stage-1 boxes with perfect classes (ceiling): 0.758
+  - stage-1 boxes as single class: 0.755
+
+So we're at 0.6288, below the 0.638 baseline. The ceiling is 0.758. There's a big gap: 0.758 - 0.6288 = 0.129. That's huge. So the error is overwhelmingly in class assignment (and possibly the ranking of false alarms).
+
+Wait, let me think about what the ceiling means. The ceiling (0.758) uses stage-1 boxes with perfect classes for boxes that overlap a true defect, and keeps false alarms as class 0 with detector conf. So the ceiling already includes the false alarms! The difference between ceiling (0.758) and our score (0.6288) is purely class assignment errors on the boxes that overlap true defects... plus maybe some ranking effects.
+
+Actually wait. Let me reconsider. The ceiling assigns the CORRECT class to every box that overlaps a true defect (IoU>0.5). Our model assigns classes. So the gap 0.758 - 0.6288 = 0.129 is entirely due to:
+1. Misclassifying boxes that overlap true defects (wrong class → the box doesn't match the true box's class, so it becomes a false positive for the predicted class and a miss for the true class).
+2. Ranking: even with correct classes, the ordering of predictions within a class matters for AP.
+
+But the ceiling uses detector conf as the score. Our model uses detector conf × class probability. So there could be a ranking difference too.
+
+Hmm, but actually the key insight: the per-class macro-F1 of the crop classifier with perfect boxes is ~0.87. So the classifier is decent but not great. Pore and deposit are weak. Stain confused with deposit.
+
+Let me think about what's the biggest lever. The gap to ceiling is 0.129. That's the class assignment. If we could perfectly classify, we'd be at 0.758. We're at 0.6288. So class assignment is costing us ~0.129.
+
+Now, the per-class AP: pore 0.502 is the weakest. Stain 0.609, deposit 0.624, discontinuity 0.780.
+
+Let me think about the macro-F1 ~0.87. If macro-F1 is 0.87, that means on average 87% of boxes get the right class. But the AP impact could be larger because a misclassified box both adds a false positive in the wrong class AND removes a true positive from the right class.
+
+Actually, let me reconsider the whole thing. The key question: what's the best next experiment?
+
+Let me group past experiments:
+- **data** (3 ideas, all failed): 
+  - e001: train on detector boxes instead of GT boxes → rejected (0.6264)
+  - e002: include low-res → not confirmed (0.6261)
+  - e003: add background class → rejected (0.5935, big drop)
+  - Lesson: data changes (what boxes to train on, resolution of crops, background class) haven't helped.
+- **scoring** (1 idea, failed):
+  - e004: temperature sharpening → rejected (0.6119). Interesting: sharpening made it WORSE. That's a hint. Sharpening the softmax makes the top class more confident, which should help ranking if the top class is right. But it hurt. This suggests that the class probability is actually useful for ranking — i.e., the confidence in the class matters, and flattening/sharpening disrupts the useful signal. Or it suggests the top-class prediction is often wrong, so sharpening amplifies wrong confidence.
+- **architecture** (1 idea, close but not confirmed):
+  - e005: resolution 160→224 → not confirmed (0.6251, seed-0 0.6303). Very close.
+- **augmentation** (1 idea, failed):
+  - e006: random rotation → rejected (0.6246).
+
+So far everything is a small tweak. The "Lessons so far" says data is EXHAUSTED? (3+ ideas, no new best). So I should NOT do another data experiment.
+
+Now, what's fundamentally different and could gain ≥0.01?
+
+Let me think about the error structure. The gap to ceiling is 0.129. This is class assignment. The classifier macro-F1 is 0.87. To close the gap, we need better class discrimination, especially for pore (0.502) and stain/deposit confusion.
+
+Ideas that change what the model sees or learns from:
+
+1. **Better model architecture**: Try a stronger backbone. We have pretrained options: convnext_atto, convnext_nano, convnext_pico, efficientnet_b0 (current), efficientnet_b2, mobilenetv3_large_100, regnety_016, resnet18, resnet26d, resnet34, resnet50, tf_efficientnetv2_b0. 
+
+   EfficientNet-B0 is small. EfficientNet-B2 is bigger (more params, better accuracy). Or ConvNeXt. But the concern is training time. Currently 433 steps in ~150s of training. EfficientNet-B2 would be ~2x slower per step maybe. Let me estimate. Actually the model is run twice per batch (two views). EfficientNet-B2 is ~3.4x params of B0 (6.6M vs 2.0M... actually B0 is 4M, B2 is 7.7M). Hmm.
+
+   Actually, a bigger model might help classification. But the "Lessons" say architecture had 1 idea "close but not confirmed" (resolution). The guidance says after two failed follow-ups switch. Architecture only has 1 attempt. So trying a bigger backbone is reasonable.
+
+   But wait — the concern: does a bigger model actually help? The task is fine-grained texture discrimination (pore vs stain vs deposit). A bigger model with more capacity might help. This is a "method" change (what the model is), which the prompt says matters more than knobs.
+
+2. **Ensemble / more views**: Currently two crops (1.5x and 2.5x) averaged. Could add more context scales, or more augmentation at test time (TTA). But TTA costs inference time. We have 41879 eval boxes. Each box = 2 crops. So 83758 forward passes at 160px. That's the current inference. Adding views doubles it.
+
+   Actually, let me reconsider. The inference: 41879 boxes × 2 views = 83758 images. At batch 256, that's ~327 batches. The log shows total 162s, with ~13s load, ~150s training (433 steps). So inference is ~15-20s? Let me compute: 5 epochs, 433 steps, 125s at end of epoch 4, done at 162s. So training took from ~13s to ~145s (132s), and inference + writing took ~17s. So we have RESERVE_S=55 reserved but only used ~17s for inference. So there's slack.
+
+   Wait, t_end = deadline - 55. deadline = T0 + seconds. If seconds=180, deadline = T0+180, t_end = T0+125. So training runs until 125s. Then inference + writing from 125s to 162s = 37s? Hmm, but the log says "done: ... 162s total". And epoch 4 ended at 125s. So inference+writing = 162-125 = 37s. OK.
+
+   So we have a reserve of 55s but inference only took 37s. So we could afford more inference (TTA) or a bigger model.
+
+   Actually, the budget arithmetic: if I make the model bigger, training slows down. Let me estimate. Current: 433 steps in ~132s (from 13s to 145s). That's ~0.30s/step. If EfficientNet-B2 is ~2x compute, that's ~0.6s/step, so ~216 steps in 132s. Fewer steps but each step is on a bigger model. The final model quality depends on both.
+
+   Hmm, this is getting complicated. Let me think about what's most likely to gain ≥0.01.
+
+3. **The temperature experiment (e004) hurt**. This is a strong signal. Sharpening the softmax made it worse. Why? If the class probability were pure noise, sharpening would amplify wrong confidence and hurt. But actually, thinking about it: the score = conf × p(class). For a given box, the 4 rows have scores conf×p0, conf×p1, conf×p2, conf×p3. In mAP, per class, predictions are sorted by score. The relative ordering of a box's rows across classes doesn't directly matter for a single class's AP except through which class the box "belongs to" in the ranking... 
+
+   Wait, no. Let me reconsider how mAP works here. For each class c, we collect all predictions with cls=c, sorted by score. A prediction is a hit if it matches an unmatched GT box of class c. So for class c, the ranking is by score = conf × p_c. 
+
+   Now, the temperature change: score = conf × p_c / T before softmax... no wait, e004 divided logits by TAU=0.5 before softmax, making p_c sharper. So for the true class, p_c goes up (if it was the argmax), and for wrong classes p goes down. This changes the score of each row.
+
+   For a box whose TRUE class is c and where the model correctly predicts c as argmax: after sharpening, p_c increases, so the row (box, c) gets a higher score. Good for ranking within class c — this box moves up. But the sharpening also affects OTHER boxes. For a box whose true class is c but model predicts d≠c: the row (box, c) has low p_c, sharpening makes it even lower, so it's ranked lower in class c. That's bad — a box that IS class c but not confidently predicted as c gets pushed down.
+
+   Hmm, but actually the net effect depends. The fact that it hurt (0.6119 vs 0.6288, a drop of 0.017) suggests that the "confidence" in the class probability is carrying useful ranking signal that sharpening destroys, OR that the model's argmax is often wrong so sharpening amplifies errors.
+
+   Actually, here's a cleaner thought: maybe the issue is that the score should be based on conf primarily, and the class probability is mostly for class assignment, not ranking. But that's not quite it either.
+
+Let me step back and think about the biggest lever.
+
+**The gap to ceiling is 0.129, all class assignment.** The single most impactful thing would be to improve class accuracy. The classifier is at macro-F1 0.87 with the "starting recipe". 
+
+What fundamentally changes what the model sees/learns?
+
+Option A: **Bigger/better backbone.** EfficientNet-B0 → EfficientNet-B2 or ConvNeXt or ResNet50. This is a method change (model capacity). Given the fine-grained texture task, more capacity should help. This is the most promising "method" change I haven't tried. Architecture category only has 1 attempt (resolution), which was "close but not confirmed" — so it's not exhausted.
+
+But I need to be careful about training time. Let me estimate more carefully.
+
+Current: EfficientNet-B0, 160px, batch 64, 2 views. 433 steps in ~132s. Per step ~0.30s. Each step processes 64×2 = 128 images at 160px through B0.
+
+EfficientNet-B2 at 160px: B2 has more params (7.7M vs 4.0M) and is wider. Compute maybe ~1.8x. So ~0.55s/step → ~240 steps in 132s. Fewer steps but bigger model. The quality tradeoff is unclear but generally a bigger model with pretrained weights fine-tuned for similar total compute tends to be at least as good, often better, especially for fine-grained tasks.
+
+Actually, hmm. Let me reconsider. The concern with a bigger model is that we get fewer training steps. But the model is pretrained, so even a few hundred steps of fine-tuning is usually enough. And the ceiling gap is large, so capacity is likely the bottleneck.
+
+Alternatively, Option B: **ConvNeXt.** ConvNeXt models are strong for fine-grained classification. convnext_nano is a reasonable size. But again time.
+
+Let me reconsider the time budget more carefully. Actually, let me reconsider whether I should keep IMG_SIZE=160 or go back. The best is e000 at 160. e005 (224) was "close but not confirmed" at 0.6251 (5-seed), seed-0 0.6303. So 224 didn't clearly help. Keep 160.
+
+Let me think about Option A more. Actually, I realize there might be a subtlety: the two-view averaging. Currently model(xt) + model(xw) averaged then one softmax. With a bigger model, same recipe.
+
+Let me also consider: **Option C — change the loss or add class-specific handling.** But "class-weighted loss hurt every time" (from "What is already known"). And loss category hasn't been tried in the history table but the known info says it hurt. So avoid loss weighting.
+
+**Option D — inference: test-time augmentation (TTA).** Average predictions over flipped/rotated versions at test time. This changes what the model sees at inference. But the guidance says TTA is a knob-ish change, and it costs time. Also, the temperature experiment suggests the ranking signal is delicate. TTA would smooth probabilities, which is opposite of sharpening. Could help or hurt. Medium priority.
+
+**Option E — the "two-crop" recipe: maybe the wide crop (2.5x) is hurting.** The wide crop includes a lot of surrounding context. For fine-grained texture (pore vs stain), maybe the tight crop is more informative and the wide crop adds noise. But that's a "what the model sees" change. Could try removing the wide crop or changing contexts. But this is somewhat exploratory.
+
+Hmm, let me reconsider the strongest candidate. 
+
+The prompt strongly emphasizes: "Ideas that change what the model sees or learns from usually matter more than turning one more knob." And "changes of method helped more" (from known).
+
+The biggest untried method change is **model capacity/architecture**. We're using the smallest reasonable EfficientNet. Going to a bigger backbone (EfficientNet-B2, or ConvNeXt, or ResNet50) is the most likely to move the needle on the class-assignment error, which is the dominant error (0.129 gap to ceiling).
+
+Let me also reconsider: is there a risk that a bigger model doesn't help because the bottleneck is data/labels not capacity? The macro-F1 0.87 with B0... if we had a perfect model we'd be at ceiling 0.758. The classifier at 0.87 macro-F1 gives us 0.6288. If we improve macro-F1 to, say, 0.93, we might close most of the gap. Bigger model is a reasonable bet to improve F1.
+
+Actually, let me reconsider the numbers. macro-F1 0.87 → 0.6288 mAP. Ceiling (perfect class) → 0.758. So there's a lot of headroom. Even a modest F1 improvement could give +0.01 to +0.03.
+
+Let me go with **EfficientNet-B2** as the architecture change. Wait, but I should double check the time. Let me reconsider.
+
+Actually, let me reconsider between B2 and other options. The available pretrained: convnext_atto (0.25M, tiny), convnext_nano (5M), convnext_pico (0.1M), efficientnet_b0 (4M, current), efficientnet_b2 (7.7M), mobilenetv3_large_100 (5.4M), regnety_016 (9M), resnet18 (11M), resnet26d (16M), resnet34 (21M), resnet50 (25M), tf_efficientnetv2_b0 (7.5M).
+
+For a fine-grained texture task at 160px, I'd want a model that's not too big (time) but has good pretrained features. EfficientNet-B2 is a natural step up from B0 (same family, better). tf_efficientnetv2_b0 is similar size to B2. ConvNeXt-nano is 5M.
+
+I'll go with EfficientNet-B2: it's the most direct "bigger version of what we have", keeping the recipe identical, so the only variable is capacity. Clean experiment. If B2 helps, we've confirmed capacity matters and can push further.
+
+Wait, but let me reconsider the time budget more rigorously, because if B2 is too slow and we get fewer steps, it might not help.
+
+Let me estimate step time. The current setup: batch 64, 2 views, so 128 forward passes of B0@160 per step (plus backward). 433 steps in ~132s → 0.305s/step.
+
+EfficientNet-B2@160: B2 is wider (width coefficient 1.1, depth 1.1) than B0. FLOPs: B0 ~390M, B2 ~730M (at 224px). So ~1.9x FLOPs. At 160px it scales similarly. So ~0.58s/step. In 132s → ~228 steps.
+
+228 steps vs 433 steps, but each on a 1.9x bigger model. Total "compute" is similar (228×1.9 ≈ 433×1.0). So it's roughly the same total training compute, just in a bigger model. For fine-tuning a pretrained model, a bigger model at the same total compute usually does at least as well, and for fine-grained tasks often better. Reasonable bet.
+
+Actually, I realize I should double-check: does the harness give us the same --seconds each run? The current run used ~162s total, presumably with --seconds=180 (default). So we have 180s. With B2, training would use the full t_end = 125s budget (it trains until the budget). So it'd do ~228 steps by 125s, then inference. Inference with B2: 41879 boxes × 2 views = 83758 images. B2 inference is ~1.9x slower. Current inference was ~37s (125→162). With B2, ~70s. So 125 + 70 = 195s > 180s! That would TIMEOUT.
+
+Hmm, that's a problem. Let me recompute. Actually wait, let me recompute current inference time. The log: "epoch 4: ... 125s" then "done: ... 162s total". So after the training loop ends (at t_end=125s), inference+writing takes 162-125 = 37s. But wait, is t_end actually 125? deadline = T0 + seconds. If seconds is 180, t_end = T0 + 180 - 55 = T0 + 125. Yes. So training runs until T0+125. Then inference 125→162 = 37s. Total 162s, under 180s. Good, 18s margin.
+
+With B2: inference ~1.9x → ~70s. 125 + 70 = 195s > 180s. TIMEOUT. Bad.
+
+So I need to reduce inference cost or increase reserve handling. Options:
+- Increase RESERVE_S so training stops earlier, leaving more time for inference. But that reduces training.
+- Reduce inference cost: bigger eval batch (already 256), or reduce views at inference, or reduce eval resolution.
+- Use a smaller model.
+
+Hmm. This is the budget arithmetic the prompt warns about. Let me reconsider.
+
+If I set RESERVE_S higher, say 75, then t_end = 180-75 = 105. Training 105-13 = 92s → ~158 steps with B2. Inference 105→175 = 70s. Total 175s < 180. OK but only 5s margin, and fewer training steps.
+
+Alternatively, keep B2 but reduce inference views to 1 (only tight crop) at test time? That halves inference. But then the recipe changes between train and test. Actually the model is trained with 2 views averaged; at test we could still use 2 views. Hmm.
+
+Actually, let me reconsider. Maybe a smaller step up is better: **tf_efficientnetv2_b0** or **convnext_nano** or **mobilenetv3_large_100**, which are ~1.5-1.7x compute, not 1.9x. Or even just accept B2 with adjusted reserve.
+
+Actually, let me reconsider the whole approach. Maybe the cleaner, safer, high-value experiment is different.
+
+Let me reconsider **Option E: the two-crop recipe / what the model sees.** Actually, here's a thought: the wide crop at 2.5x might be diluting the fine texture. But I'm not sure.
+
+Let me reconsider **Option D: TTA at inference.** Actually TTA increases inference time, making the timeout worse. Bad direction given the budget.
+
+Let me reconsider the **temperature finding** (e004 hurt). This is actually a really useful clue. Sharpening the softmax made mAP drop by 0.017. What does that tell us?
+
+The score for row (box, c) = conf × p_c. Consider the effect on a specific class's AP. For class c, predictions sorted by conf × p_c. The "correct" ranking would put true-class-c boxes (that overlap GT) high. 
+
+Sharpening increases p_c for boxes where c is argmax, decreases for others. Net effect was negative. 
+
+One interpretation: the p_c values are already well-calibrated-ish and the conf is the main ranking driver. Sharpening over-weights the class probability and under-weights conf, disrupting the ranking. Actually no, sharpening multiplies all p_c by making the distribution peakier, which for the argmax class raises its score relative to conf... 
+
+Hmm, actually here's a cleaner take. Consider two boxes of true class c, both overlapping GT. Box A: model very confident (p_c=0.9). Box B: model unsure (p_c=0.4, argmax is c). Both have conf ~0.8. Before sharpening: A score 0.72, B score 0.32. A ranked above B. After sharpening (T=0.5): A p_c→~0.99, B p_c→~0.8 (if argmax). A score 0.79, B score 0.64. Both up, A still above B. So within "correct argmax" boxes, order preserved, both get higher absolute scores → they beat false alarms more. That should HELP.
+
+But the overall effect was negative. So the negative must come from boxes where argmax is WRONG. Consider box C: true class c, but model's argmax is d. p_c maybe 0.3, p_d 0.5. Before: row (C,c) score 0.24, row (C,d) score 0.40. After sharpening: p_c→0.1, p_d→0.85. Row (C,c)→0.08, row (C,d)→0.68. So box C's class-c row drops a lot (0.24→0.08), meaning C is ranked much lower in class c. If C is a true detection of class c (overlaps GT c), pushing it down hurts class c's AP. And C's class-d row jumps up, adding a false positive in class d (if C doesn't overlap GT d). So sharpening amplifies misclassifications. Net negative.
+
+So the lesson: **the model's argmax is frequently wrong, and the class probability is doing double duty (class assignment + ranking). Sharpening amplifies the errors.** This suggests we need to REDUCE misclassifications (improve class accuracy), not manipulate the score. Which again points to **better model / better features**.
+
+OK here's another thought. What if we decouple: use the class probability only for class assignment (argmax) and use conf for ranking? I.e., score = conf for the argmax class, and drop the other 3 rows (or give them tiny scores). Wait, but the metric allows multiple rows per box. If we only emit the argmax class with score=conf, then:
+- For a box where argmax is correct: it's a prediction of the right class with score=conf. Good.
+- For a box where argmax is wrong: it's a prediction of the wrong class with score=conf → false positive in wrong class, miss in right class.
+
+Versus current (all 4 rows): the wrong-class rows have low scores (conf×p_wrong), so they're low-ranked false positives; the right-class row has score conf×p_right.
+
+Hmm, which is better? Currently, a box with argmax=d but true=c emits (box,c) at conf×p_c (low-ish) and (box,d) at conf×p_d (high-ish, false positive). If instead we emit only (box,d) at conf... the (box,d) false positive is the same, but we LOSE the (box,c) row entirely (a potential true positive for class c). So emitting only argmax would be worse for the true class. So current multi-row is better. OK.
+
+What about emitting argmax at score=conf (higher than conf×p_d)? That raises the false positive in the wrong class. Bad.
+
+So the current scoring (all rows, conf×p_c) seems reasonable. The temperature experiment confirms that manipulating it is risky. Let me not touch scoring.
+
+So the lever is **class accuracy**. The cleanest high-value method change: **bigger/better backbone**.
+
+Given the timeout risk, let me pick a model that's a moderate step up and fits the budget. Let me reconsider the time more carefully and pick.
+
+Actually, let me reconsider: maybe I'm overestimating inference time. Let me recompute. 41879 boxes × 2 views = 83758 images at 160px. Current (B0) inference took 37s. That's 83758/37 ≈ 2264 img/s. For B2 at ~1.9x, ~1190 img/s → 83758/1190 ≈ 70s. Yes ~70s.
+
+Total with B2: training until t_end, then 70s inference. To fit in 180s with margin, t_end must be ≤ ~105s. So training window = 105 - 13 = 92s. B2 at ~0.58s/step → ~158 steps.
+
+158 steps of fine-tuning on a B2 model. Is that enough? For a pretrained model, yes, usually. But it's fewer steps than current. Risky but probably OK.
+
+Alternatively, pick a lighter model: **tf_efficientnetv2_b0** (7.5M, similar to B2) — same issue. **convnext_nano** (5M) — moderate. **mobilenetv3_large_100** (5.4M) — moderate, and MobileNetV3 is efficient (fewer FLOPs). Actually MobileNetV3-Large has ~219M FLOPs at 224px, less than EfficientNet-B2's 730M! So it'd be faster than B2. And it's a decent classifier. Hmm.
+
+Actually, let me reconsider. The cleanest experiment with the least confounding: change only the model, keep everything else, and adjust RESERVE_S to fit. Let me go with **EfficientNet-B2** and set RESERVE_S to a value that fits.
+
+Wait, but I want to be careful. Let me reconsider: is the timeout risk acceptable? The prompt says "At the limit the run is killed and counts as failed. Keep a safety margin." A timeout is a wasted run. I need to be confident it fits.
+
+Let me be more conservative. Let me estimate B2 step time and inference time with some uncertainty. If I'm off by 30%, inference could be 90s, and I'd need t_end ≤ 85s, training window 72s → ~124 steps. Still probably OK for fine-tuning.
+
+To be safe, let me set RESERVE_S = 80. Then t_end = 100. Training window = 100-13 = 87s. Inference budget = 180 - 100 = 80s. If B2 inference is ~70s, we finish at ~170s. 10s margin. If it's 90s, we finish at 190s → timeout. Hmm, risky.
+
+Alternatively, reduce inference cost: at inference, use a larger batch (e.g., 5Thinking budget reached. Stop thinking now and write the reply in the required format.

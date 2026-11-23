@@ -1,0 +1,429 @@
+===== attempt 1 =====
+Let me carefully analyze the situation.
+
+## Current state
+- Best: e005, 5-seed val mAP@0.5 = 0.6345 (architecture: MLP head on concatenated backbone features from two views)
+- 17 experiments so far
+- e017 crashed (fix for e016, both trying to add train-split detector boxes as extra training data)
+
+## History analysis by idea family:
+
+**Data - detector boxes as training data:**
+- e001: crashed (broadcasting bug)
+- e002: seed 0 0.6330, 5-seed 0.6307 - not confirmed
+- e009: seed 0 0.6325 - rejected
+- e016: crashed
+- e017: crashed (fix for e016)
+
+This has been tried 5 times (e001, e002, e009, e016, e017), with 2 crashes and 2 non-confirmations. The one confirmation from earlier runs was +0.004 (5-seed 0.6337 and 0.6342). But in this run's context, e002 got 0.6307 (not confirmed) and e009 got 0.6325 (rejected). This direction is looking exhausted - 5 attempts, no confirmed gain.
+
+**Data - stage-1 error simulation (jitter):**
+- e003: seed 0 0.6342, 5-seed 0.6294 - not confirmed
+- e010: seed 0 0.6380, 5-seed 0.6335 - not confirmed
+
+Two attempts, both not confirmed. The guide says "Two failed variants of a direction: move to the next direction." This is exhausted.
+
+**Architecture:**
+- e005: NEW BEST (MLP head on concatenated features) - 0.6345
+- e006: wider MLP - rejected (0.6338)
+- e007: box size/aspect ratio as extra input - not confirmed (0.6317)
+
+**Optimisation:**
+- e004: pre-compute crops - bug (0.0531)
+- e012: pre-compute + shrink reserve - crashed
+- e013: num_workers=0 - timeout
+- e014: on-demand image decode - not confirmed (0.6322)
+- e015: return uint8 from workers - rejected (0.6209)
+
+5 attempts, no new best. Exhausted.
+
+**Inference:**
+- e011: TTA flips - timeout
+
+1 attempt, timeout.
+
+**Data - other:**
+- e008: random zoom views - crashed
+
+## What's the guide's plan?
+1. Consolidate: detector boxes as training data - tried 5 times, 2 crashes, 2 not confirmed. The guide says "If it fails twice, drop it and move on." It has failed (not confirmed) twice (e002, e009) plus 2 crashes. I should drop this.
+
+2. Close the box-quality gap:
+   - Simulate detector errors (jitter): tried twice (e003, e010), not confirmed. Exhausted.
+   - Weight/sample by box quality: NOT tried yet!
+   - Combine views better (shared backbone, pooled features joined before head): e005 already did this (concatenated features → MLP head). e006 tried wider MLP (rejected). e007 tried box size/aspect (not confirmed).
+
+3. Buy training steps: tried 5 times, no gain. Exhausted.
+
+4. Fine-grained classes: not tried yet.
+
+## Where is the error?
+
+Diagnostics:
+- mAP if every box had correct class: 0.7464
+- Current: 0.6345
+- Gap: 0.1119 (wrong classes cost this much)
+
+Confusion matrix (on boxes overlapping true defects):
+- Pore: 62% right (47/75). 21→stain, 5→deposit, 1→discontinuity, 1→no row
+- Deposit: 80% right (217/271). 48→stain, 2→pore, 3→discontinuity
+- Discontinuity: 96% right (442/460)
+- Stain: 90% right (555/624). 41→deposit, 9→pore, 6→discontinuity
+
+Per-class AP: pore 0.505, deposit 0.639, discontinuity 0.781, stain 0.613
+
+The biggest problem is **pore** (62% right, AP 0.505). Pore is confused with stain (21 cases) and deposit (5 cases). Stain is confused with deposit (41 cases).
+
+So the main confusion is:
+1. Pore → Stain (21)
+2. Stain → Deposit (41)
+3. Deposit → Stain (48)
+
+These are the "fine-grained" confusions the guide mentions.
+
+## What hasn't been tried?
+
+Looking at the "no gain" families from earlier runs:
+- Score rows manipulation: exhausted
+- Background class: exhausted
+- Detector boxes as training data: tried (accepted in earlier runs but not here)
+- Third wide view: tried
+- Low-res crops: exhausted
+- Bigger backbone/ensembles: exhausted
+- Resolution/small-box: exhausted
+- TTA: exhausted (timed out)
+- Longer training: exhausted
+- Class-balanced sampling/weighted loss: exhausted
+- Training augmentation: exhausted
+- Focal loss: exhausted
+- Box size/aspect as input: tried (e007, not confirmed)
+
+**What has NOT been tried in any run:**
+- Weighting/sampling training boxes by box quality (IoU with detector boxes)
+- The confusion between pore/stain/deposit specifically
+- Using the detector confidence as a training signal
+- Different loss for the confused classes
+- Multi-scale training (training at multiple resolutions)
+- Knowledge distillation from the one-step detector
+- Pseudo-labeling from the detector on eval images (but we can't use eval labels)
+- Training with the detector's own predictions as soft labels
+- Using the detector confidence to weight the loss
+- **Contrastive or metric learning** to separate confused classes
+- **Label smoothing** (not in the "no gain" list explicitly, but focal loss was tried)
+- **Mixup/CutMix** (training augmentation was tried but "no gain" - though mixup specifically might not have been)
+- **Learning rate warmup** (the current schedule has 5% warmup)
+- **Different optimizer** (SGD vs AdamW)
+- **Batch size changes**
+- **Training on both high AND low resolution crops** (currently only "high")
+
+Wait, let me re-read: `TRAIN_ON = ("high",)` - only high resolution crops are used for training! What about low resolution? The earlier runs tried "Low-resolution crops added to training" and got "no gain: best 5-seed 0.629". So that's exhausted.
+
+Let me think about what's fundamentally different and could help.
+
+The key insight from the diagnostics:
+- The gap between current mAP (0.6345) and "perfect classes" (0.7464) is 0.1119
+- This is the cost of wrong class assignments
+- The confusion is mainly pore↔stain and stain↔deposit
+
+What could reduce this confusion?
+
+1. **Better features for fine-grained discrimination**: The model uses EfficientNet-B0 at 160px. The fine texture that distinguishes pore from stain might need higher resolution. But "Resolution and small-box handling" was tried and got no gain.
+
+2. **Training the model to be more discriminative between confused classes**: 
+   - Class-weighted loss: tried, hurt
+   - Focal loss: tried, no gain
+   - What about a **margin-based loss** that specifically pushes apart the confused classes?
+   - What about **contrastive learning** in the feature space?
+
+3. **Using the detector confidence as a signal**: The detector conf might correlate with box quality. Boxes with high conf are more likely to be well-placed. We could weight training by matching the detector conf distribution.
+
+4. **Ensemble of classifiers**: Tried, no gain.
+
+5. **Different backbone**: Tried, no gain.
+
+6. **The head architecture**: e005 (MLP on concat features) was the best. e006 (wider) was rejected. What about a **cross-attention** between the two views' features? Or a **bilinear pooling** approach?
+
+Actually, wait. Let me reconsider the problem. The current model takes two crops (1.5x and 2.5x) through the same backbone, concatenates the features, and passes through a small MLP. The backbone is shared.
+
+What if the issue is that the backbone is being used for a task it's not well-suited for at 160px? The fine texture of pores vs stains might be lost at this resolution.
+
+But resolution changes were tried and didn't help.
+
+Let me think about what's truly untried:
+
+**Idea: Use the detector confidence to reweight training samples.**
+
+The detector boxes have a `conf` value. In training, we use the true boxes from crops.csv. But the detector boxes from the train split have conf values. If we can match true boxes to detector boxes (IoU > 0.5), we get a conf for each true box. We could then weight the training loss by this conf, so the model focuses more on boxes that the detector is confident about (which are more representative of the test distribution).
+
+Wait, but this is similar to "weight or sample training boxes by box quality" which the guide mentions as a direction. And it's somewhat related to "detector boxes as training data" which has been tried.
+
+Actually, the guide says: "weight or sample training boxes by box quality, so the model sees enough poorly placed boxes" - this is about the quality of the box placement (IoU between detector box and true box), not the detector confidence per se.
+
+**Idea: Train with a margin-based loss for the confused class pairs.**
+
+Instead of standard cross-entropy, use a loss that adds a margin between the logit of the true class and the logits of the most-confused classes. This would directly push the model to be more discriminative between pore/stain/deposit.
+
+This is different from:
+- Class-weighted loss (weights the entire class)
+- Focal loss (weights easy vs hard examples)
+- Label smoothing (softens all targets)
+
+A margin loss specifically targets the confusion pairs.
+
+**Idea: Use a deeper/wider head with cross-attention between views.**
+
+The current head is a 2-layer MLP on concatenated features. What if we use a small attention mechanism that lets the tight crop features attend to the wide crop features? This could help the model learn interactions between local and global context.
+
+But this is in the "architecture" category which has 1 new best and 2 non-confirmations. It's not exhausted (only 3 attempts, 1 new best).
+
+**Idea: Train with a mix of crop contexts.**
+
+Currently the two views are fixed at 1.5x and 2.5x. What if we randomly sample the context scale during training (e.g., tight: uniform 1.0-2.0, wide: uniform 2.0-4.0)? This was tried in e008 and crashed. But the crash might have been a bug.
+
+Actually, e008 crashed. Let me not repeat it.
+
+**Idea: Use the second-stage classifier to score, but also incorporate the detector confidence more cleverly.**
+
+Currently: score = conf × p(class). What if we use score = conf^α × p(class)^β for some α, β? But the "score rows" family was exhausted (16 attempts, no gain).
+
+**Idea: Multi-crop training at different scales with a shared backbone.**
+
+Instead of two fixed views, use 3-4 views at different scales. But "Third, very wide view" was tried (3 attempts, accepted twice in earlier runs at +0.005). And TTA at inference was tried (timeout).
+
+**Idea: Use a different loss that accounts for the class imbalance in the confusion matrix.**
+
+The confusion matrix shows that pore has only 75 overlapping boxes (47+5+1+21+1), while stain has 624. The model sees many more stain examples. What if we use a **class-balanced sampling** specifically for the confused classes? But "Class-balanced sampling or class-weighted loss" was tried (4 attempts, no gain).
+
+**Idea: Use a siamese/triplet loss to pull together same-class features and push apart different-class features.**
+
+This is fundamentally different from all the losses tried (cross-entropy, focal, class-weighted). A triplet loss would directly optimize the feature space geometry, which could help with fine-grained discrimination.
+
+But implementing this correctly within the time budget is risky.
+
+**Idea: Use the pretrained backbone's intermediate features (not just the final pooled feature) for the head.**
+
+Currently, the backbone outputs a single pooled feature (1280-dim for EfficientNet-B0). What if we also use the spatial features (before global pooling) and apply a small attention or pooling? This could preserve more spatial information for fine-grained discrimination.
+
+This is an architecture change. The "architecture" category has 3 attempts, 1 new best. Not exhausted.
+
+**Idea: Use a different backbone that's better at fine-grained recognition.**
+
+ConvNeXt models are known to be good at fine-grained recognition. The available models include convnext_atto, convnext_nano, convnext_pico. "Bigger or other backbone" was tried (8 attempts, no gain) but I think those were EfficientNet-B2, ResNet-50, and ensembles. ConvNeXt specifically might not have been tried.
+
+Wait, the earlier runs tried "Bigger or other backbone (EfficientNet-B2, ResNet-50, 2-3 model ensembles)" - 8 attempts. It's possible ConvNeXt was not specifically tried. But the family is marked as "no gain" with 8 attempts. I should be cautious.
+
+Actually, re-reading: "Bigger or other backbone (EfficientNet-B2, ResNet-50, 2-3 model ensembles) | 8 | no gain: best 5-seed 0.636 (not confirmed), others 0.600-0.631; 1 timeout. Fewer steps fit in 180 s"
+
+So they tried bigger backbones and ensembles. ConvNeXt might or might not have been tried. But the family is exhausted.
+
+**Let me think about what's truly untried and could have a big effect.**
+
+The guide says:
+1. Consolidate (detector boxes) - exhausted
+2. Close box-quality gap:
+   - Jitter simulation - exhausted (2 attempts)
+   - Weight/sample by box quality - NOT tried
+   - Combine views better - e005 did concat+MLP, e006 wider (rejected), e007 box size (not confirmed)
+3. Buy training steps - exhausted
+4. Fine-grained classes - NOT tried
+
+The guide says "Fine-grained classes (only after 2 and 3)." Since 2 and 3 are mostly exhausted, we should move to fine-grained classes.
+
+**What's the best fine-grained approach?**
+
+The confusion is:
+- Pore → Stain (21)
+- Stain → Deposit (41)
+- Deposit → Stain (48)
+
+These are all "texture" confusions. Pores are small circular holes, stains are discoloration, deposits are extra material. They can look similar in a small crop.
+
+**Idea: Use a higher-resolution crop specifically for the confused classes.**
+
+Wait, resolution was tried. But what about using a **different crop strategy** for the fine-grained discrimination? Instead of centering on the box, what if we use a **multi-scale feature pyramid** within the model?
+
+Actually, let me think about this differently. The model sees a 160x160 crop. The fine texture that distinguishes pore from stain is at a specific scale. If the crop is too large, the texture is diluted. If too small, there's not enough context.
+
+**Idea: Use a U-Net or FPN-style architecture that processes multiple scales.**
+
+This is a big architecture change and risky within the time budget.
+
+**Idea: Use a simpler, more focused approach - train a separate classifier for the confused class pairs.**
+
+For example, a two-stage classification: first predict "pore-like" vs "non-pore-like", then within "pore-like" predict pore vs stain. This is a hierarchical classification approach.
+
+But this is complex and risky.
+
+**Let me reconsider the "weight by box quality" idea.**
+
+The guide specifically mentions this as a direction under "Close the box-quality gap." The idea is: the detector produces boxes with varying quality (IoU with true boxes). During training, we only see perfect boxes (from crops.csv). At test time, we see detector boxes with IoU 0.5-1.0. If we weight the training samples by how "detector-like" they are, the model will be better calibrated to the test distribution.
+
+But how do we get the box quality for training boxes? We can match training boxes to detector boxes (IoU > 0.5) and use the detector's conf or the IoU as a quality measure.
+
+Wait, this is very similar to "detector boxes as training data" which has been tried 5 times. The difference would be: instead of ADDING detector boxes as new training samples, we WEIGHT the existing true boxes by their match quality to detector boxes.
+
+Actually, I think the key difference is:
+- "Detector boxes as training data": add the detector boxes (which are misplaced) as additional training rows, labeled by the true box they overlap.
+- "Weight by box quality": keep the true boxes but weight them, or augment them with jitter proportional to the detector's error distribution.
+
+The jitter approach was tried (e003, e010) and didn't help. The "add detector boxes" approach was tried 5 times and didn't confirm.
+
+What about **weighting the loss by the detector confidence of the matching detector box**? Boxes that the detector is very confident about (high conf) are more likely to be well-placed and more representative. Weighting by conf would focus training on the "easy" detector boxes and de-emphasize the "hard" ones.
+
+But this is a subtle change and might not have a big effect.
+
+**Let me think about what could plausibly gain 0.01 or more.**
+
+The gap to perfect classes is 0.1119. The per-class APs are:
+- Pore: 0.505 (biggest gap to 1.0)
+- Deposit: 0.639
+- Discontinuity: 0.781
+- Stain: 0.613
+
+If I could improve pore from 0.505 to 0.555 (+0.05), that's +0.0125 mAP (since mAP is the mean of 4 classes). If I could improve stain from 0.613 to 0.663 (+0.05), that's another +0.0125. Together, +0.025 mAP. That's a big gain.
+
+What specifically hurts pore? 38% of pore boxes are misclassified (21→stain, 5→deposit, 1→discontinuity, 1→no row). The main confusion is pore→stain.
+
+What makes pore look like stain? Both can be small, darkish regions. Pore is a hole (darker, more defined edge), stain is discoloration (more diffuse). The distinction is in the texture and edge sharpness.
+
+**Idea: Use a higher-resolution crop for the tight view.**
+
+Currently IMG_SIZE = 160. What if we use 224 for the tight crop? The fine texture would be better preserved. But "Resolution and small-box handling (224 px, ...)" was tried and got no gain.
+
+Hmm.
+
+**Idea: Use a different normalization or preprocessing that preserves texture better.**
+
+Currently: normalize with ImageNet mean/std, resize to 160x160 with bilinear. What if we use a different resize method (e.g., bicubic)? Or what if we don't normalize (use raw pixel values)?
+
+This is a small change and unlikely to have a big effect.
+
+**Idea: Use a data augmentation that specifically preserves and enhances texture.**
+
+Currently: random flip, brightness 0.8-1.2, crop jitter. What about:
+- Random sharpening
+- Random noise
+- Random contrast enhancement
+
+"Training augmentation (rotation, mixup, stronger colour or geometry)" was tried (5 attempts, no gain). So this is exhausted.
+
+**Idea: Use a different backbone that's specifically designed for fine-grained recognition.**
+
+ConvNeXt is known to be good at this. Let me check if it was tried. The earlier runs tried "Bigger or other backbone (EfficientNet-B2, ResNet-50, 2-3 model ensembles)" - 8 attempts. It's possible ConvNeXt was not specifically tried, but the family is marked as exhausted.
+
+Actually, I just realized: the available pretrained models include convnext_atto, convnext_nano, convnext_pico. These are SMALL models (faster than EfficientNet-B0). Using a faster model would allow more training steps within the time budget. And ConvNeXt's architecture (with its specific normalization and depthwise separable convolutions) might be better for fine-grained texture discrimination.
+
+But the "bigger or other backbone" family is exhausted with 8 attempts. I should not repeat it.
+
+**Let me reconsider the problem from scratch.**
+
+The key constraint is 180 seconds. The current run uses:
+- 13s loading
+- ~112s training (436 steps)
+- ~37s prediction
+- Total: 162s
+
+The loss is still falling at the end (0.169). More training steps would help. But "Longer training" was tried (6 attempts, no gain) and "Buy training steps" was tried (5 attempts, no gain). Both exhausted.
+
+Wait, "Longer training (smaller reserve, measured prediction time)" - 6 attempts, no gain. "Buy training steps" in the optimisation category - 5 attempts, no gain. These are different families but both about getting more steps. Both exhausted.
+
+**What about the prediction phase?**
+
+Currently: 41879 detections, batch size 256, 2 views each. That's 41879/256 ≈ 164 batches × 2 forward passes. At ~0.2s per batch, that's ~65s. But the log shows ~37s for prediction. So it's faster than I thought.
+
+What if we use a larger batch size for prediction? Or use torch.compile? These are small optimizations.
+
+**Let me focus on what's truly untried and could have a big effect.**
+
+After all the analysis, I think the most promising untried direction is:
+
+**Use a margin-based or contrastive loss to directly optimize the discrimination between the confused classes (pore, stain, deposit).**
+
+Specifically, I'll add a **triplet loss** term to the cross-entropy loss. For each batch, I'll select triplets where the anchor and positive are the same class, and the negative is from a confused class (pore-stain, stain-deposit, deposit-stain). The triplet loss will push the feature representations of the same class closer and different classes further apart.
+
+Wait, but the current model outputs 4 logits (one per class) from the head. There's no explicit feature space to apply triplet loss to. I'd need to modify the architecture to have a feature embedding before the final classification layer.
+
+Actually, the head is: Linear(2560→128) → ReLU → Dropout → Linear(128→4). I could add a feature embedding layer: Linear(2560→128) → ReLU → [feature space] → Linear(128→4). Then apply triplet loss on the 128-dim feature.
+
+But this is a significant architecture change and adds complexity. Risk of bugs.
+
+**Alternative: Use a "confused class margin" loss.**
+
+For each sample, compute the cross-entropy loss. Additionally, for the confused class pairs, add a margin term: max(0, margin - (logit_true - logit_confused)). This directly penalizes the model if the confused class logit is too close to the true class logit.
+
+This is simpler to implement and doesn't change the architecture. It's a loss function change.
+
+The "loss" category hasn't been tried in this run (it's not in the history). In earlier runs, "Focal loss" (2 attempts, no gain) and "Class-weighted loss" (hurt) were tried. A confused-class margin loss is fundamentally different from both.
+
+Let me think about the expected effect:
+- Pore→stain confusion: 21 cases. If the margin loss reduces this by half (10 cases), pore accuracy goes from 62% to ~75%, AP from 0.505 to ~0.60. That's +0.095 for pore, +0.024 mAP.
+- Stain→deposit: 41 cases. Similar effect.
+- Deposit→stain: 48 cases. Similar effect.
+
+Even a modest reduction in confusion could give +0.01-0.02 mAP.
+
+**But wait**: the "loss" category is not in the "no gain" list from earlier runs. The only loss-related families are "Focal loss" (2 attempts, no gain) and "Class-weighted loss" (part of "Class-balanced sampling or class-weighted loss", 4 attempts, no gain). A confused-class margin loss is different.
+
+However, I need to be careful: the guide says "Class-weighted loss hurt classification every time it was tried." A margin loss is different from class weighting, but it's in the same spirit of modifying the loss.
+
+Let me think about whether this is the right experiment.
+
+Actually, I realize I should look at this from a different angle. The problem is that the model is trained on TRUE boxes but tested on DETECTOR boxes. The detector boxes are slightly misplaced. This means:
+1. The crop content is slightly different (shifted, different size)
+2. The class distribution of what's in the crop is different (more background, less of the defect)
+
+The jitter simulation (e003, e010) tried to address this by adding random shifts/scales during training. It didn't help.
+
+What if the issue is not the box placement but the **class distribution** in the crops? Detector boxes that overlap a true defect by IoU > 0.5 might contain a different proportion of defect vs background than the true boxes. For example, a detector box shifted by 20% might include more surrounding material and less of the defect itself.
+
+This is a distribution shift that jitter might not fully capture. Jitter shifts the center but keeps the same size. A detector box might also be a different size.
+
+**Idea: Train with crops that have a random "inclusion" of the defect, simulating the detector's imprecise localization.**
+
+Instead of centering the crop on the box center, randomly offset the crop so that the box is partially included. This is similar to jitter but more aggressive.
+
+But this is essentially the jitter approach, which was tried twice and didn't help.
+
+**Let me try a completely different angle: the scoring.**
+
+Currently: score = conf × p(class). The "score rows" family was exhausted (16 attempts, no gain). So I can't change the scoring.
+
+**What about the number of rows per box?**
+
+Currently: 4 rows per box (one per class). The "score rows" family included "only the argmax class per box, dropping non-argmax rows" which was tried and didn't help. So I can't change this either.
+
+**I'm running out of ideas. Let me look at the problem from the perspective of what the model is actually learning.**
+
+The model is a crop classifier. It takes two crops (tight 1.5x, wide 2.5x) and predicts the class. The backbone is EfficientNet-B0 (1280-dim features). The head is a 2-layer MLP.
+
+The model achieves:
+- 62% accuracy on pore (overlapping boxes)
+- 80% on deposit
+- 96% on discontinuity
+- 90% on stain
+
+Discontinuity is easy (96%). The hard classes are pore, deposit, stain.
+
+What if I use a **two-stage classification head**? First, a coarse classification (e.g., "hole-like" vs "surface-like"), then a fine classification within each group. This would help with the pore/stain confusion by first separating "hole" from "surface", then distinguishing pore from stain within "hole-like" (if stain is also "hole-like") or separating them in the first stage.
+
+But this is complex and risky.
+
+**Let me go with the confused-class margin loss.** It's:
+1. Untried (different from focal loss and class-weighted loss)
+2. Targets the specific confusion pattern (pore↔stain, stain↔deposit)
+3. Simple to implement (just modify the loss function)
+4. Could plausibly gain 0.01+ mAP
+5. Low crash risk
+
+The implementation:
+- Define confused class pairs: (0,3), (1,3), (3,1) [pore-stain, deposit-stain, stain-deposit]
+- For each sample, compute the standard cross-entropy loss
+- Additionally, for each confused pair where one is the true class, add a margin term: max(0, margin - (logit_true - logit_confused))
+- Total loss = CE + λ × margin_loss
+
+The margin should be small (e.g., 0.5-1.0) and λ should be moderate (e.g., 0.5-1.0).
+
+Wait, actually, I need to think about this more carefully. The margin loss would be:
+- For a pore sample: max(0, margin - (logit_pore - logit_stain)) + max(0, margin - (logit_pore - logit_deposit))
+- For a stain sample: max(0, margin - (logit_stain - logit_pore)) + max(0, margin - (logit_stain - logit_deposit))
+- For a deposit sample: max(0, margin - (logit_deposit - logit_stThinking budget reached. Stop thinking now and write the reply in the required format.

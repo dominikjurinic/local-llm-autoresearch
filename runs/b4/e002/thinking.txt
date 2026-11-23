@@ -1,0 +1,546 @@
+===== attempt 1 =====
+Let me analyze the situation.
+
+Current best: e000, 5-seed mean 0.6297. Per-class: pore 0.504, deposit 0.626, discontinuity 0.780, stain 0.609.
+
+e001 crashed: it was training on stage-1 detector boxes with a background class (5 classes), but the prediction-writing block was accidentally removed, so `n` was undefined → NameError. The idea itself (train on detector boxes with background class) is interesting but the run was wasted.
+
+Key insight from e001's hypothesis: since every eval box is emitted with one row per class, the hit set per class is already fixed by stage 1 (same as the 0.758 ceiling); the 0.63 vs 0.758 gap is a *ranking* problem. Wait, is that right? Let me think.
+
+Actually, mAP@0.5 per class: predictions of class c are sorted by score. A prediction is a hit if it overlaps an unmatched true box of class c with IoU > 0.5. If we emit all 4 classes for every box, then the predictions for class c are all detector boxes (scored by conf * p_c(box)). The hit set for class c = boxes that overlap a true box of class c with IoU>0.5. This is the same as the "perfect class" ceiling setup? In the ceiling, every box that overlaps a true defect (any class) gets the correct class, and false alarms are kept as class 0. So the ceiling emits: for each true-overlapping box, one row (correct class), plus false alarms as class 0.
+
+In our setup, we emit 4 rows per box. For class c, the predictions are all boxes with score conf * p_c. The hits are boxes overlapping true boxes of class c. So the hit set for class c is exactly the boxes that overlap true boxes of class c — same as ceiling for that class. But the ordering differs: in the ceiling, the score for a true box of class c is its detector conf; false alarms are in class 0 with detector conf. In our case, the score is conf * p_c(box), so the ordering within class c is by conf * p_c.
+
+So the gap from 0.758 to 0.63 is a ranking problem: our class scores p_c reorder the predictions within each class, and also the relative ranking of false alarms vs true detections.
+
+Wait, but actually there's a subtlety. In the ceiling, false alarms are all put in class 0. So for classes 1,2,3, the predictions are only the boxes that overlap true boxes of that class (all hits), ordered by conf. That gives high AP. For class 0, it's all boxes (true class-0 overlaps + all false alarms), ordered by conf.
+
+In our 4-row-per-box setup: for class c, predictions are ALL boxes (scored conf*p_c). So false alarms are included in every class. The ranking of false alarms vs true hits within class c is what determines AP. So yes, it's a ranking problem.
+
+The key: to beat 0.638 (one-step) and approach 0.758, we need the class probability p_c to rank true class-c boxes above false alarms and above boxes that are true of other classes.
+
+Now, the issue: our classifier is trained on true training boxes (the ground-truth crops), but at test time it sees detector boxes (which include false alarms and misplaced boxes). There's a train/test distribution mismatch. e001 tried to fix this by training on detector boxes with a background class. That's a good idea but it crashed.
+
+However, e001's approach of adding a background class changes the scoring. Let me think about whether a background class helps. If we have 5 classes (0-3 + background=4), and we emit rows for classes 0-3 only (not background), then... the background class probability would reduce the scores of all defect classes proportionally? No. If we score = conf * p_c for c in 0..3, and p is a 5-way softmax, then adding a background class means p_c for defects are lower (sum to <1 with background). But the ordering within class c is still by conf * p_c. The background class doesn't directly enter the 4-class mAP (we don't emit class 4 rows, or even if we do, mAP is over 4 classes). 
+
+Hmm, actually the background class helps the classifier learn to reject false alarms, which sharpens p_c. A false alarm would get high p_4 (background), low p_c for all c. A true box gets high p_c. So the ranking conf * p_c would put true boxes above false alarms. That's the benefit.
+
+But wait — does emitting a background row help or hurt? We should NOT emit class 4 rows because mAP is over 4 classes (0-3). Emitting class 4 rows would just be ignored (or could it cause issues? The metric says "mAP at IoU 0.5 over the 4 classes" — so only classes 0-3 count). So we emit only 0-3.
+
+Actually, let me reconsider. The real question for ranking: within class c, we want true class-c boxes ranked high. The score conf * p_c. For a true class-c box, p_c is high. For a false alarm, p_c is low (if background class works). For a true box of class d≠c, p_c is low. Good.
+
+So the background-class idea is sound. But e001 crashed because the prediction-writing code was removed. Let me fix that.
+
+But there's a concern: training on 71757 det boxes (37311 background) is a lot. The epoch took 434 steps in 125s (vs 94 steps/59s before). So ~11s per 100 steps... wait, 434 steps in 125-15=110s → ~0.25s/step. The original was 94 steps in 59-13=46s → 0.49s/step. Hmm, actually the new one is faster per step because... no wait. Let me recompute. Original: epoch 0 at 59s, 94 steps. Load was 13s. So 46s for 94 steps = 0.49 s/step. New: epoch 0 at 125s, 434 steps, load 15s, so 110s for 434 steps = 0.25 s/step. That's odd, faster per step? Maybe because background crops are cheaper? No. Actually maybe the batch composition. Hmm, or maybe the GPU was less loaded. Anyway.
+
+The budget: T is presumably 180s (default). RESERVE_S=55. So training budget = 180-55 = 125s. In the new setup, at 0.25s/step, 125s → ~500 steps. But the run crashed at 125s (epoch 0 done) because... wait it printed epoch 0 at 125s then crashed on the final print. Actually the crash was a NameError, not a timeout. So it finished training (or was killed?). Let me look: "epoch 0: loss 0.9156, 434 steps, 125s" then traceback. So it got through epoch 0 and then... actually the while loop: t_end = deadline - RESERVE_S. If seconds=180, T0 at start, deadline = T0+180. t_end = T0+125. Training runs until time >= t_end. At 125s it would stop. But it printed epoch 0 at 125s. So it did exactly one epoch and hit the time limit. Then it went to prediction, but the prediction code was removed, so it went straight to the final print which referenced undefined `n`. 
+
+Wait, but if prediction code was removed, then after training it would just print the final line. But `n` is undefined. So NameError. So the run "finished" training in 125s (one epoch) and then crashed on print. So actually it would have timed out anyway if prediction were there? No — the point is the prediction code was removed by the edit, so it never ran. We need to restore it.
+
+But the bigger issue: with 71757 training boxes, one epoch = 434 steps takes 110s. That leaves almost no time for multiple epochs AND prediction. The reserve is 55s for prediction. Prediction over 41879 eval boxes: originally 53378 rows written, took... the original run: training 432 steps to 125s, then prediction to 162s total. So prediction took 162-125 = 37s. With 55s reserve, that fits (37 < 55). 
+
+But in the new setup, if training uses the full 125s budget (one epoch only), then prediction needs 37s, total 125+37 = 162s < 180. OK that fits. But we only get ONE epoch of training on the huge dataset. That might be enough or not.
+
+Hmm, but actually the concern: is one epoch on 71757 boxes enough to train a good classifier? The original did 5 epochs on 6052 boxes = 30260 box-epochs. The new does 1 epoch on 71757 = 71757 box-epochs. So more total data seen. But the model needs to converge.
+
+Actually, let me reconsider the whole approach. Let me think about what's the highest-value experiment.
+
+The gap is ranking. The weakest class is pore (0.504). Stain 0.609, deposit 0.626, discontinuity 0.780.
+
+Options:
+1. Fix e001 (train on detector boxes with background class). This addresses train/test distribution mismatch. This is a method change (what the model learns from). Potentially high impact. But risky (time budget, one epoch).
+
+2. Improve the scoring/ranking directly. Since it's a ranking problem, maybe we can calibrate or adjust scores. But "changes of method helped more" and "tuning hyperparameters alone helped little."
+
+3. Better classification of pore (weakest class). Pore and deposit are weak; stain confused with deposit.
+
+Let me think about the ranking problem more carefully. The score is conf * p_c. The detector conf is fixed. So the ranking within class c is determined by p_c (times conf). Actually it's conf * p_c, so both matter. A false alarm with high conf but low p_c might still rank above a true box with low conf but high p_c. 
+
+Actually, here's a key insight: the detector conf already ranks boxes reasonably (the class-agnostic detector alone gets 0.755 as single class). The problem is that when we split into 4 classes, the p_c reordering hurts. Specifically, for class c, we want the true class-c boxes to be ranked by something that keeps them above false alarms.
+
+Consider: what if we DON'T multiply by p_c for ranking, but instead use conf for the "is it a defect" ranking and p_c only for class assignment? But the metric uses a single score per row. So for class c, score = f(conf, p_c). 
+
+Hmm. Let me think about the ceiling again. Ceiling: true boxes of class c scored by conf (detector conf), false alarms as class 0 by conf. So within class c (c≠0), ALL predictions are true boxes (hits), ordered by conf → AP = 1 basically (all hits, no false positives in that class). For class 0, predictions = true class-0 boxes + all false alarms, ordered by conf → AP = (precision-recall of the class-agnostic detector restricted to class 0). That's why ceiling is 0.758.
+
+In our setup, for class c, predictions = ALL boxes (true c + true other + false alarms), scored by conf * p_c. The false alarms and true-other-class boxes are false positives for class c. So our AP for class c is lower than ceiling because of these false positives interleaved.
+
+To approach the ceiling, we want p_c to be high for true-c boxes and low for everything else, AND we want the conf * p_c ranking to separate true-c from the rest well.
+
+The background class idea: train the model to distinguish "defect (and which)" from "background (false alarm)". This directly targets the false-alarm ranking. A false alarm gets high background prob, so low p_c for all c → ranks low. Good.
+
+But there's a subtlety: the training labels for detector boxes. e001 labels a det box as the class of the crop it overlaps (IoU>0.5), else background. But what about a det box that overlaps a true crop but is misplaced such that IoU < 0.5? It'd be labeled background even though it's near a defect. That's fine, it's a hard case.
+
+Also, what about det boxes that overlap MULTIPLE crops? e001 takes the first one (break). Could be ambiguous. Minor.
+
+OK here's my concern with e001: it's a big change and it crashed. If I fix it (BASE: last, restore prediction code), I'm betting on the background-class idea. But I also need to make sure it fits the time budget and actually trains enough.
+
+Alternatively, I could do a cleaner, more controlled experiment. Let me think about what's most likely to give ≥0.01 gain.
+
+Actually, let me reconsider. The most direct lever for the ranking problem: the score function. Currently score = conf * p_c. 
+
+Consider the false-alarm problem. The class-agnostic detector (conf only) gets 0.755. When we add p_c, we get 0.63. So p_c is HURTING a lot. Why? Because p_c introduces false positives: a false alarm with moderate p_c (say the model is uncertain and assigns 0.3 to some class) gets score conf * 0.3, which might rank above true boxes of that class with low conf.
+
+Wait, but actually the issue is more subtle. Let me think about class 0 (pore). Pore AP is 0.504, the worst. 
+
+Hmm, let me think differently. What if the problem is that the model's p_c is not well-calibrated as a ranking signal? 
+
+Let me consider a simpler, high-value change: use the background class to reject false alarms, but keep it clean. Actually, I think fixing e001 is reasonable but let me consider the time budget issue more carefully.
+
+Actually, wait. Let me reconsider whether training on detector boxes is even the right move, or whether it's the ranking/scoring.
+
+Let me reconsider the numbers:
+- one-step 4-class: 0.638
+- our two-stage: 0.6297 (slightly below one-step!)
+- ceiling (perfect classes on stage-1 boxes): 0.758
+- class-agnostic single class: 0.755
+
+So our two-stage (0.6297) is BELOW the one-step (0.638). That's bad — the two-stage should be able to do at least as well if stage 1 boxes are good. The ceiling is 0.758, so there's lots of headroom. The fact that we're below one-step means our class assignment + ranking is actively hurting.
+
+The class-agnostic is 0.755. So if we could just get the ranking right (keep conf-based ranking mostly, use p_c only to disambiguate class), we'd be near 0.755-0.758.
+
+Key realization: The ranking within each class should ideally preserve the conf ordering as much as possible, because conf is a good "defect-ness" signal (0.755 class-agnostic). The p_c should only be used to decide WHICH class, not to re-rank defect-ness.
+
+But the metric uses one score per row. So for class c, score must encode both "is this a defect" (conf-like) and "is this class c" (p_c-like). The product conf * p_c does that but the p_c part can dominate and re-rank.
+
+Hmm, what if we use a softer combination? Like score = conf * (p_c)^alpha for alpha < 1, to reduce the re-ranking effect of p_c? Or score = conf * p_c but with p_c "sharpened" only at the class level...
+
+Actually, let me think about what the ideal score is. For class c, we want to rank boxes by P(box is a true class-c defect). That's P(defect) * P(class c | defect) roughly, but really it's P(true class-c | box). The detector conf ≈ P(defect | box). The classifier p_c ≈ P(class c | box is a crop). 
+
+The problem: the classifier is trained on true crops (all defects), so it never sees background. So p_c always sums to 1 over 4 classes (it assumes the box IS a defect). So for a false alarm, the model still assigns some class with prob summing to 1. So p_c for a false alarm is not low — it's just "which defect does this look like." So conf * p_c for a false alarm = conf * (some class prob). If the false alarm has high conf and the model assigns 0.4 to class c, then score = 0.4 * conf, competing with true class-c boxes.
+
+THIS is the core problem. The classifier has no concept of "not a defect." So it can't down-rank false alarms. The background class (e001) fixes exactly this.
+
+So e001's idea is well-motivated. Let me fix it.
+
+But I'm worried about:
+1. Time budget (one epoch only on 71757 boxes).
+2. Whether the background label assignment is good.
+3. Whether 5-class softmax with only 4 emitted rows works.
+
+Let me reconsider the time budget. Actually, maybe I should subsample the background boxes to balance the dataset and speed up. 37311 background vs 34446 defect (71757-37311). That's roughly balanced, actually. Hmm, 37311 bg, 34446 defect. Balanced. But 71757 total is a lot.
+
+Actually, for the ranking to work, we want the model to learn "defect vs background" well. Balanced is fine. But we don't need ALL 37311 background boxes; we could subsample. But let's not over-engineer.
+
+Let me reconsider: the real question is whether one epoch is enough. The original did 5 epochs on 6052 = 30k box-epochs and got loss down to 0.218. The new does 1 epoch on 71757 = 72k box-epochs. More data, one pass. With pretrained init, one pass might give loss ~0.5-0.6. Might be undertrained.
+
+Alternatively, I could reduce the training set to make multiple epochs possible. E.g., subsample background to match defect count and maybe subsample defect too, to get ~15k boxes, allowing ~3-4 epochs.
+
+Hmm, but this is getting complicated. Let me step back.
+
+Actually, maybe the cleanest high-value experiment is NOT the background class (which is a big, risky change), but rather a scoring change that directly addresses the false-alarm ranking using the existing 4-class model.
+
+Wait, but the existing 4-class model can't reject false alarms. So a scoring change alone won't fix false alarms. Unless... we use the detector conf more cleverly.
+
+Actually, here's a thought: the false alarms have a distribution of conf. True defects have higher conf on average (that's why class-agnostic gets 0.755). So conf already down-ranks most false alarms. The remaining problem is class assignment among true defects (wrong type) and the residual false alarms.
+
+Recall: "When all types are merged into one class, the same detector reaches 0.77, so many errors are wrong types, not missed defects." So the main error is wrong types, not missed defects. So false alarms are not the main issue — wrong class assignment is.
+
+So the ranking problem is: for class c, true class-c boxes should be ranked above true class-d boxes (d≠c) and above false alarms. The conf is similar for all true defects (they're all defects), so conf doesn't help separate classes. The p_c does. So we NEED p_c to separate classes. And p_c is what the classifier provides.
+
+So the issue is classifier accuracy, especially for pore (0.504) and stain/deposit confusion.
+
+Hmm wait, but if the main error is wrong types, then improving classifier accuracy directly helps. The background class might help a little (rejecting false alarms) but the main gain would come from better class separation.
+
+Let me reconsider. Per-class AP: pore 0.504 (worst), stain 0.609, deposit 0.626, discontinuity 0.780. 
+
+Pore is worst. Why? Pore might be visually similar to other things, or rare, or the crop context matters.
+
+Let me think about what changes could help pore specifically. 
+
+Actually, let me reconsider the whole thing. We have limited runs. Let me pick the experiment most likely to give ≥0.01.
+
+Given "changes of method helped more" and the analysis that the classifier can't reject false alarms (no background concept), I think the background-class training (fixing e001) is the most principled method change. But it's risky on time.
+
+Alternatively, a safer method change: train the classifier to be better at the weak classes. But "class-weighted loss hurt every time." So not that.
+
+Let me think about the two-crop input. The model sees a tight crop (1.5x) and a wide crop (2.5x), logits averaged. Maybe the wide crop helps for context (stain vs deposit). 
+
+What about using a better model? We have timm options. EfficientNet-B0 is small. Maybe EfficientNet-B2 or ConvNeXt-nano would classify better. But that's a model change — could help if the bottleneck is classification accuracy. But it also slows training/prediction.
+
+Hmm. Let me estimate: the current run does 432 training steps in ~112s (125-13) and prediction in ~37s. If I switch to a bigger model, step time increases. EfficientNet-B2 is ~2x params of B0. Might be 1.5-2x slower. Then training budget 125s → ~250-300 steps instead of 432. And prediction 37s → ~60-75s, which exceeds the 55s reserve! So prediction would blow the budget. Risky.
+
+Actually the reserve is 55s. Prediction currently 37s. A 2x slower model → 74s prediction > 55s reserve. Timeout. So bigger model is risky unless I reduce prediction cost (e.g., fewer views, smaller batch... no).
+
+Let me reconsider. The safest high-value move might be to fix e001 (background class) because it directly addresses a real weakness (no false-alarm rejection) and it's a method change. Let me make it fit the budget.
+
+To fit the budget with the background class:
+- The training set is 71757 boxes. One epoch = 434 steps in ~110s. That's the whole budget. So only one epoch.
+- To get more epochs, subsample. Let me subsample background to, say, 1:1 with defect, and maybe cap total.
+
+Actually, let me reconsider. Do we even want to train on ALL detector boxes? The detector boxes on training images — how many are there? 71757 total train det boxes. That's a lot (vs 6052 true crops). Many are false alarms.
+
+For the model to learn "defect vs background," we want a representative sample. Subsampling background to match defect count (34446) gives 68892 total. Still a lot. 
+
+Alternatively, subsample both to ~20k total for 3-4 epochs. 
+
+Hmm, let me think about the time more carefully. Actually, maybe I'm overcomplicating. Let me just fix e001 minimally: restore the prediction-writing code, and adjust the reserve / training to fit. The main bug is the missing prediction code. Let me restore it and also handle the 5-class → emit only 4 classes.
+
+Wait, in e001, the model is 5-class. The prediction code (which was removed) needs to emit rows for classes 0-3 only, with score = conf * p_c (c in 0..3). It should NOT emit class 4. Let me restore that.
+
+But also, the `probs` would be 5-dim. The original code did `for c in range(4)`. That's fine — it only emits 0-3. Good. So I just need to restore the prediction block and it'll work with 5-class probs (only using first 4).
+
+Let me also reconsider: does adding a 5th (background) class and training on detector boxes actually improve the 4-class ranking? Let me think about the score. score_c = conf * p_c where p is 5-way softmax. For a true class-c box, p_c high, p_bg low. For a false alarm, p_bg high, all p_c low. So score_c for false alarm is low. Good. For a true class-d box (d≠c), p_c low. Good. So the ranking improves. Yes.
+
+But there's a risk: the background class might "absorb" true boxes that are hard (misplaced, partial), reducing p_c for them and hurting recall. But those are borderline anyway.
+
+OK let me also reconsider whether to keep the two-crop. Yes, keep it (it's the starting recipe, macro-F1 0.87).
+
+Now, the time budget concern. Let me make the training fit. Options:
+(a) Keep 71757 boxes, accept ~1 epoch. Risky (undertrained).
+(b) Subsample to allow multiple epochs.
+
+Let me go with (b): subsample background boxes to balance and cap total training size for multiple epochs. Actually, let me think about what's cleanest.
+
+Actually, you know what, let me reconsider the entire approach once more. There's a real risk that the background-class idea, while principled, might not pan out in one run (undertrained, label noise from IoU matching, etc.). And it's a big change.
+
+Let me consider a more surgical, higher-confidence experiment.
+
+Alternative idea: The score is conf * p_c. What if the issue is that p_c is not the right ranking signal and we should blend conf more strongly? But we established the main error is wrong types (conf doesn't separate classes). So p_c is needed.
+
+Another alternative: improve the classifier for the weak classes via better crops. E.g., for pore, maybe a tighter crop helps (pores are small, point-like). For stain vs deposit, the wide context helps. 
+
+Hmm, what about per-class crop context? That's complex.
+
+Let me reconsider. Actually, I think the background-class idea is the best bet, and fixing the crash is justified (the rule says "If a run crashed... fix the cause"). And the idea wasn't tested (crashed before scoring). So re-running the fixed version is not "repeating an experiment" — it's fixing a crash. Good.
+
+But I want to make it robust on time. Let me design it to fit comfortably.
+
+Let me reconsider the time. Load 15s. Training budget = 180 - RESERVE. If I set RESERVE higher (say 70s) to be safe for prediction, training budget = 180-70 = 110s. With 71757 boxes at 0.25s/step... wait, 434 steps took 110s = 0.25s/step. 110s budget → ~440 steps = 1 epoch. So still ~1 epoch.
+
+To get 2-3 epochs, I need to halve/triple the data. Let me subsample.
+
+Actually, let me reconsider the step time. 0.25s/step for batch 64 = 16 images (2 views each = 32 forward passes... no, 2 views per sample, so 64 samples = 128 crops per step, 2 forward passes of 64). Hmm.
+
+Let me just subsample the training set to ~25k boxes so that 3 epochs fit. 25k boxes / 64 = ~390 steps/epoch. At 0.25s/step = ~97s/epoch. That's too slow for 3 epochs (291s). No.
+
+Wait, I'm confusing myself. Let me recompute step time. Original: 94 steps in 46s = 0.49s/step. e001: 434 steps in 110s = 0.25s/step. Why is e001 faster per step? Same batch size 64. Same model. Same views. The only difference is the data (detector boxes vs crops). Detector boxes might be smaller crops (faster)? Or it's noise / GPU contention. Inconsistent. Let me assume ~0.3-0.5s/step.
+
+If 0.4s/step, then 110s budget → ~275 steps. With 71757 boxes, one epoch = 1121 steps. So 275 steps = ~0.25 epoch. Even worse.
+
+Hmm, the step time is uncertain. Let me be conservative: assume 0.4s/step. Then to fit ~110s training budget, I can do ~275 steps. To get a meaningful number of epochs, I need the dataset small enough. If I want 3 epochs, dataset = 275/3 * 64 = ~5866 boxes. That's about the original size! So subsample to ~6000 boxes → 3 epochs.
+
+But subsampling 71757 → 6000 loses a lot of the background signal. Hmm.
+
+Alternatively, accept 1 epoch on a larger set. 1 epoch on 20k boxes = 312 steps, at 0.4s = 125s. Too slow. 1 epoch on 10k boxes = 156 steps, 62s. Leaves room.
+
+This is getting too uncertain. Let me take a different, cleaner approach to the time issue: reduce the cost per sample so more samples fit.
+
+Actually, the cleanest fixThinking budget reached. Stop thinking now and write the reply in the required format.
+===== attempt 2 =====
+The search text was not found. Let me check the current file. The most recent version (e001) deleted the prediction writing block, so the file ends like this:
+
+```
+    probs = torch.cat(probs).numpy()
+
+    print(f"done: {epoch} epochs, {steps} steps, {n} prediction rows, {time.time() - T0:.0f}s total", flush=True)
+```
+
+Wait, according to the diff, the last lines of e001 are:
+
+```
+             xw = xw.to(device).to(memory_format=torch.channels_last)
+             probs.append(torch.softmax(((model(xt) + model(xw)) / 2).float(), 1).cpu())
+-    probs = torch.cat(probs).numpy()
+-    os.makedirs(args.out, exist_ok=True)
+-    n = 0
+-    with open(os.path.join(args.out, "preds.csv"), "w", newline="") as f:
+-        w = csv.writer(f)
+-        w.writerow(["det_id", "cls", "score"])
+-        for d, p in zip(ev, probs):
+-            for c in range(4):
+-                s = d["conf"] * float(p[c])
+-                if s > MIN_SCORE:
+-                    w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
++
+     print(f"done: {epoch} epochs, {steps} steps, {n} prediction rows, {time.time() - T0:.0f}s total", flush=True)
+```
+
+So the file has the following:
+
+```
+    probs = torch.cat(probs).numpy()
+
+    print(f"done: {epoch} epochs, {steps} steps, {n} prediction rows, {time.time() - T0:.0f}s total", flush=True)
+```
+
+Hmm, wait. In the diff, `probs = torch.cat(probs).numpy()` was also deleted (the `-` line), and a blank line was added (`+`). So the file now looks like this:
+
+```
+            probs.append(torch.softmax(((model(xt) + model(xw)) / 2).float(), 1).cpu())
+
+    print(f"done: {epoch} epochs, {steps} steps, {n} prediction rows, {time.time() - T0:.0f}s total", flush=True)
+```
+
+So `probs = torch.cat(probs).numpy()` no longer exists in the file. That's why my search failed.
+
+So I need to insert the following:
+
+```
+    probs = torch.cat(probs).numpy()
+    os.makedirs(args.out, exist_ok=True)
+    n = 0
+    with open(os.path.join(args.out, "preds.csv"), "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["det_id", "cls", "score"])
+        for d, p in zip(ev, probs):
+            for c in range(4):
+                s = d["conf"] * float(p[c])
+                if s > MIN_SCORE:
+                    w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+
+Between `probs.append(...)` and the print.
+
+Also, I noticed there's a typo in the previous reply: `f"{s:.6ff}"` — this is a bug in the format string. I need to be careful to write `f"{s:.6f}"`.
+
+Let me construct the search block:
+
+```
+            probs.append(torch.softmax(((model(xt) + model(xw)) / 2).float(), 1).cpu())
+
+    print(f"done: {epoch} epochs, {steps} steps, {n} prediction rows, {time.time() - T0:.0f}s total", flush=True)
+```
+
+Replace with:
+
+```
+            probs.append(torch.softmax(((model(xt) + model(xw)) / 2).float(), 1).cpu())
+    probs = torch.cat(probs).numpy()
+    os.makedirs(args.out, exist_ok=True)
+    n = 0
+    with open(os.path.join(args.out, "preds.csv"), "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["det_id", "cls", "score"])
+        for d, p in zip(ev, probs):
+            for c in range(4):
+                s = d["conf"] * float(p[c])
+                if s > MIN_SCORE:
+                    w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+    print(f"done: {epoch} epochs, {steps} steps, {n} prediction rows, {time.time() - T0:.0f}s total", flush=True)
+```
+
+Wait — but there's a subtle point. The model is currently 5-class (background is class 4). probs will be 5-dimensional. Writing out rows for c in range(4) uses p[0..3], which is fine.
+
+But wait, there's another issue: the softmax over 5 classes. The score is d["conf"] * p[c]. This is fine as a ranking.
+
+Also, I should double-check that the blank line after probs.append is actually in the file. From the diff:
+
+```
+-                if s > MIN_SCORE:
+-                    w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
++
+     print(f"done: ...
+```
+
+The `+` adds a blank line. So the file is:
+
+```
+            probs.append(torch.softmax(((model(xt) + model(xw)) / 2).float(), 1).cpu())
+
+    print(f"done: {epoch} epochs, {steps} steps, {n} prediction rows, {time.time() - T0:.0f}s total", flush=True)
+```
+
+Yes, there is a blank line.
+
+Also, I need to re-check the time budget. The e001 run: 71757 training boxes (versus the original 6052). Epoch 0: 434 steps in 125 seconds (13 seconds load + 112 seconds training). So about 0.26 seconds/step. Budget is 180 seconds, reserve 55 seconds → training budget of about 112 seconds. So only about 434 steps fit in one epoch, and the run was killed at 180 seconds before prediction. Hmm, wait — the log shows "epoch 0: loss 0.9156, 434 steps, 125s", then a traceback at the final print... Actually, the traceback is a NameError, meaning the run did complete (it reached the final print). Wait, but if it was killed at the limit, it would count as a failure. The NameError occurred because `n` was undefined (the write block was removed). So the run actually completed the training loop and crashed at the final print.
+
+Wait, but how did it complete? t_end = deadline - 55 seconds. Total budget 180 seconds. Load 15 seconds. So t_end is 180-55=125 seconds from T0... Actually deadline = T0 + 180. t_end = deadline - 55 = T0 + 125. The epoch 0 print shows 125 seconds. So after epoch 0, time.time() >= t_end → done=True. So only 434 steps total. That's fine — it's a time-based training loop.
+
+So the fixed run will: 15 seconds load, about 110 seconds training (about 430 steps), then prediction on 41879 eval boxes. Prediction: batch 256, 2 forward passes per batch (tight + wide). 41879/256 ≈ 164 batches × 2 forwards. In the e000 run, prediction on 41879 boxes... e000's total was 162 seconds, training was 125 seconds (432 steps), so prediction + write was about 37 seconds. Here, the model is the same size (5 classes vs 4 classes, negligible difference). So prediction is about 35 seconds. Total ≈ 15 + 110 + 35 = 160 seconds < 180 seconds. OK, but a bit tight. The reserve is 55 seconds, so prediction fits within the reserve. Fine.
+
+One concern: with only 434 steps on 71757 samples, that's less than one epoch (0.06 epochs). The model barely trains. Hmm, that's a concern for the background-class experiment. The original e000 had 6052 samples, 432 steps ≈ 5.7 epochs. Now with 71757 samples, 434 steps ≈ 0.06 epochs. That's very little training.
+
+Hmm, this is a real concern. The model will barely be trained. Options:
+1. Increase the batch size to get more steps? No — increasing batch size reduces steps (fewer steps per epoch, but each step processes more samples). Actually, the number of steps in a fixed time is determined by step time, not batch size. Larger batch → fewer steps but more samples per step. 434 steps × 64 = 27800 samples in 110 seconds. With batch 256: 434... no wait, step time increases with batch size.
+
+Actually, samples/sec ≈ 64/0.26 ≈ 246 samples/sec. In 110 seconds → about 27000 samples seen. With 71757 samples, that's 0.38 epochs. Hmm, my earlier calc was wrong: 434 steps × 64 = 27776 samples, / 71757 = 0.39 epochs.
+
+Still, less than one full pass. The model sees about 38% of the data once. With pretrained weights, maybe that's enough to learn background rejection? Uncertain.
+
+Alternative: subsample the training rows. E.g., cap background to a certain fraction, or cap total rows to about 20k so we get about 1.5 epochs. The e000 baseline trained 5.7 epochs on 6052 rows and reached loss 0.22.
+
+Actually, let me think about what's most likely to work. The key question: does training on detector boxes + background actually improve mAP? The hypothesis is that it helps with false-alarm ranking. But the metric: per-class mAP depends on the ordering of predictions of that class. All eval boxes emit all 4 class rows. So per class, predictions are all 41879 boxes sorted by conf × p_c. A false alarm with high p_c for class c ranks high and counts as an FP for class c, lowering AP.
+
+If the model learns background, then true defects get low p_c (background dominates), pushing them down... wait, no. For a true defect of class c, we want high p_c. For a false alarm, we want low p_c for all c (background high). Then false alarms rank low for all classes → fewer FPs → higher AP. Yes, that's the mechanism.
+
+But wait — there's a subtlety with the ceiling. The ceiling (0.758) keeps false alarms as class 0 with detector conf. So even the ceiling has FPs. The gap between 0.758 and our 0.630 is partly ranking of FPs and partly misclassification of true boxes.
+
+Hmm, but actually, another consideration: with a 5-class model, for a true defect of class c, the probability mass splits between c and background. The relative ordering of true boxes within class c is still determined by p_c. Fine.
+
+But there's a risk: if the model learns background too strongly, true defects (especially weak ones like pores) get suppressed, lowering recall ordering. Class weighting or loss tuning might matter, but "class-weighted loss hurt classification every time" — though that was in the 4-class setup.
+
+Anyway, the immediate task is just to fix the crash and run the experiment. The experiment as designed (e001) was to train on all 71757 det boxes including background. The crash was purely the missing write block. So the minimal fix is to restore the write block.
+
+But should I also consider the training amount issue? The instructions say "one idea per turn, keep edits focused on that idea." The idea is the background-class training data. The crash fix is a bug fix, which is allowed ("unless it crashed or had a bug we're now fixing").
+
+I think the safest thing is to restore the write block exactly as in e000 (but with 4-class output rows from the 5-class probs). That's the minimal fix to test the idea.
+
+But I'm worried about under-training. Let me reconsider: is 0.39 epochs enough? With pretrained EfficientNet-B0 and a simple task (defect vs background, 4 defect types), even a few hundred steps might shift the background class meaningfully. The loss went from 0.9156 (initial, 5-class) — actually epoch 0's loss of 0.9156 is the average over 434 steps. Initial 5-class CE is about ln(5)=1.61. So it went down to about 0.92, decent progress.
+
+Hmm, but to be safe, I could reduce the training set size to get more epochs. But that changes the idea (subsample background). Actually, subsampling background is a natural part of the design: 37311 background out of 71757 is 52%. That's fine for class balance, but the sheer size is the issue.
+
+Actually, let me reconsider the time. The e001 run's epoch 0 was 434 steps in 125 seconds total (15 seconds load). So training was 110 seconds for 434 steps = 0.253 sec/step. With a 180-second budget and 55-second reserve, training budget = 125-15 = 110 seconds. So exactly one "epoch" (434 steps) fits, and then done=True. Prediction is about 35 seconds within the reserve. Total about 160 seconds. OK.
+
+So the run will do 434 steps. That's the reality. To get more effective training, I'd want fewer samples per epoch. I could subsample to about 15k rows → 15000/64 ≈ 234 steps/epoch, so in 110 seconds (434 steps) that's about 1.85 epochs. More passes.
+
+But that's a design choice baked into the idea. The e001 idea as written used all rows. Let me think about whether to keep all rows or subsample.
+
+Given the uncertainty and the fact that this is the first real test of the background idea, I'll keep it simple and faithful: restore the write block only. If it works, great; if under-training is the issue, we'll see low scores and can adjust.
+
+Actually, wait. Let me reconsider. The concern about under-training is real and could make the experiment look bad for the wrong reason. But the instructions also say not to waste runs and to target the largest error. The background idea is promising. I think the cleanest thing is to test it as designed (all rows) first.
+
+Hmm, but actually, let me reconsider the step count more carefully. Is it really only 434 steps? Let me recompute. Actually, the concern: with 71757 samples and batch 64, one epoch = 1121 steps. Each step 0.253 sec → one epoch = 284 seconds. But the training budget is only 110 seconds → 434 steps = 0.39 epochs. Yes.
+
+So the model does less than one pass. That's a lot of under-training compared to e000 (5.7 epochs). This could really hurt.
+
+Let me think about a better design that's still "one idea": train on detector boxes + background, but subsample so we get about 2-3 epochs within the budget. That's a reasonable, focused design. Subsample background to match positives, or cap total.
+
+Actually, the cleanest: keep all defect-labeled det boxes (34446, since 71757-37311=34446) and subsample background to the same count (34446)? That's 68892 total, still a lot. Or subsample background to 1:1 with positives → 34446 bg + 34446 pos = 68892. Still 0.64 epochs. Not enough.
+
+Alternatively, cap total training rows to about 20000: 10000 positives (subsampled from 34446) + 10000 background. 20000/64 = 312 steps/epoch → 434 steps = 1.4 epochs. Better.
+
+Hmm, but subsampling positives loses information.
+
+Let me step back. What's the actual goal? Learn to reject false alarms. The positives teach "what defects look like," the background teaches "what non-defects look like." For the ranking to improve, the model needs to separate them. Even a light training on pretrained features might work because the features are already good.
+
+I think I'm overthinking. Let me just do the minimal fix (restore write block) and test the idea as e001 designed it. That's the honest test. If it's under-trained, the score will tell us, and we can then adjust the data size as a follow-up.
+
+Actually, no. Let me reconsider the risk. If under-training makes it look bad, we waste a run and might wrongly conclude the background idea is bad. But the score is compared to 0.6297. If background helps even a little with 0.39 epochs, we might still see a gain. And the loss did go down to 0.92.
+
+Also, importantly: the e000 baseline is 0.6297 with a 4-class model trained 5.7 epochs on true crops. The new model is 5-class trained 0.39 epochs on det boxes. These are quite different. Hard to predict.
+
+Let me just go with the minimal fix. It's the cleanest "fix the crash" and tests the actual idea. I'll restore the write block.
+
+Let me write the exact search/replace. The current file (e001) around that region:
+
+```
+    model.eval()
+    probs = []
+    with torch.no_grad(), torch.autocast(**amp):
+        for xt, xw, _ in dl_ev:
+            xt = xt.to(device).to(memory_format=torch.channels_last)
+            xw = xw.to(device).to(memory_format=torch.channels_last)
+            probs.append(torch.softmax(((model(xt) + model(xw)) / 2).float(), 1).cpu())
+
+    print(f"done: {epoch} epochs, {steps} steps, {n} prediction rows, {time.time() - T0:.0f}s total", flush=True)
+```
+
+Wait, I need to verify the exact content. From the e000 original:
+
+```
+    model.eval()
+    probs = []
+    with torch.no_grad(), torch.autocast(**amp):
+        for xt, xw, _ in dl_ev:
+            xt = xt.to(device).to(memory_format=torch.channels_last)
+            xw = xw.to(device).to(memory_format=torch.channels_last)
+            probs.append(torch.softmax(((model(xt) + model(xw)) / 2).float(), 1).cpu())
+    probs = torch.cat(probs).numpy()
+    os.makedirs(args.out, exist_ok=True)
+    n = 0
+    with open(os.path.join(args.out, "preds.csv"), "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["det_id", "cls", "score"])
+        for d, p in zip(ev, probs):
+            for c in range(4):
+                s = d["conf"] * float(p[c])
+                if s > MIN_SCORE:
+                    w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+    print(f"done: {epoch} epochs, {steps} steps, {n} prediction rows, {time.time() - T0:.0f}s total", flush=True)
+```
+
+The e001 diff removed from `probs = torch.cat(probs).numpy()` through `w.writerow...` and added a blank line. So e001 is:
+
+```
+            probs.append(torch.softmax(((model(xt) + model(xw)) / 2).float(), 1).cpu())
+
+    print(f"done: {epoch} epochs, {steps} steps, {n} prediction rows, {time.time() - T0:.0f}s total", flush=True)
+```
+
+So my search should be:
+
+```
+            probs.append(torch.softmax(((model(xt) + model(xw)) / 2).float(), 1).cpu())
+
+    print(f"done: {epoch} epochs, {steps} steps, {n} prediction rows, {time.time() - T0:.0f}s total", flush=True)
+```
+
+And replace with:
+
+```
+            probs.append(torch.softmax(((model(xt) + model(xw)) / 2).float(), 1).cpu())
+    probs = torch.cat(probs).numpy()
+    os.makedirs(args.out, exist_ok=True)
+    n = 0
+    with open(os.path.join(args.out, "preds.csv"), "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["det_id", "cls", "score"])
+        for d, p in zip(ev, probs):
+            for c in range(4):
+                s = d["conf"] * float(p[c])
+                if s > MIN_SCORE:
+                    w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+    print(f"done: {epoch} epochs, {steps} steps, {n} prediction rows, {time.time() - T0:.0f}s total", flush=True)
+```
+
+This restores the write block. The model is 5-class, so p has 5 elements; we write out c in range(4) using p[0..3]. Good.
+
+Let me double-check the f-string: `f"{s:.6f}"` — correct, no typo.
+
+Now, is the search text unique? `probs.append(torch.softmax(((model(xt) + model(xw)) / 2).float(), 1).cpu())` appears only once (in the eval loop). The training loop uses `loss = crit((model(xt) + model(xw)) / 2, y)`. So yes, unique. And the print line is unique. Good.
+
+Let me also make sure I'm not missing that the `probs = torch.cat` line was removed. Yes, per the diff it was removed. So it's not in the file. Good, my search doesn't include it.
+
+Now let me also reconsider: should I keep BASE: last? Yes, because I'm fixing the crash of e001 (the most recent). The instructions say "if a run crashed or timed out, read the log and fix the cause" and "unless it crashed or had a bug we're now fixing," you can re-run. So BASE: last is correct.
+
+Let me finalize.
+
+Actually, let me reconsider the under-training concern one more time, because it could make this run uninformative or misleading. But I'll commit to the minimal fix. The hypothesis text should acknowledge this is a crash fix re-running the background-class idea.
+
+Let me write the hypothesis: The e001 run crashed only because the prediction-writing block was accidentally removed (NameError on `n`); the background-class training idea itself never got to produce a score. Restoring the writer (emitting 4 class rows from the 5-class softmax, score = conf × p_c) lets us actually test whether adding a background class (labelled by IoU>0.5 overlap, else background) improves the per-class ranking by teaching the net to down-rank false alarms and misplaced boxes — the main gap between our 0.630 and the 0.755 class-agnostic ceiling. This is a bug fix of the most recent version, not a new idea.
+
+Good. Let me write it out.
+
+Let me verify the exact indentation of the lines I'm copying. In the file, the eval loop body is indented 12 spaces (3 levels: main→with→for). Let me check:
+
+```
+    with torch.no_grad(), torch.autocast(**amp):
+        for xt, xw, _ in dl_ev:
+            xt = xt.to(device).to(memory_format=torch.channels_last)
+            xw = xw.to(device).to(memory_format=torch.channels_last)
+            probs.append(torch.softmax(((model(xt) + model(xw)) / 2).float(), 1).cpu())
+```
+
+`with` is 4 spaces, `for` is 8 spaces, body is 12 spaces. Yes, `probs.append` is 12 spaces.
+
+The print is 4 spaces: `    print(f"done: ...`.
+
+Good. Let me write the search with exact spaces.
+
+Search:
+```
+            probs.append(torch.softmax(((model(xt) + model(xw)) / 2).float(), 1).cpu())
+
+    print(f"done: {epoch} epochs, {steps} steps, {n} prediction rows, {time.time() - T0:.0f}s total", flush=True)
+```
+
+That's 12 spaces before probs.append, blank line, 4 spaces before print.
+
+Replace:
+```
+            probs.append(torch.softmax(((model(xt) + model(xw)) / 2).float(), 1).cpu())
+    probs = torch.cat(probs).numpy()
+    os.makedirs(args.out, exist_ok=True)
+    n = 0
+    with open(os.path.join(args.out, "preds.csv"), "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["det_id", "cls", "score"])
+        for d, p in zip(ev, probs):
+            for c in range(4):
+                s = d["conf"] * float(p[c])
+                if s > MIN_SCORE:
+                    w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+    print(f"done: {epoch} epochs, {steps} steps, {n} prediction rows, {time.time() - T0:.0f}s total", flush=True)
+```
+
+Good. This is the fix. Let me output.

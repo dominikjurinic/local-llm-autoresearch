@@ -1,0 +1,159 @@
+===== attempt 1 =====
+Let me analyze the situation carefully.
+
+Current best: e000 with 5-seed val mAP@0.5 = 0.6288. Per-class: pore 0.502, deposit 0.624, discontinuity 0.780, stain 0.609.
+
+Key diagnostics:
+- The dominant error is wrong class assignment on boxes overlapping true defects (0.117 mAP loss).
+- If every box had its correct class but kept your scores: 0.7461 vs yours 0.6288. So the classification error costs ~0.117 mAP.
+- The gap to the perfect-classes ceiling (0.758) is ~0.012 more, which is what your scores cost compared with the detector's conf (ranking).
+
+Class confusion matrix on overlapping boxes:
+- true pore: 63% right (48/76), confused mostly with stain (20) and deposit (6)
+- true deposit: 78% right (210/269), confused mostly with stain (55)
+- true discontinuity: 96% right
+- true stain: 88% right (540/614), confused mostly with deposit (46) and pore (15)
+
+Pore is the weakest class at 63%. The reference says "pore and deposit are the weak classes; stain is often confused with deposit".
+
+The current system: two-crop classifier (1.5x tight + 2.5x wide crop), EfficientNet-B0, trained on ground truth boxes from crops.csv, score = conf * p(c).
+
+What we know:
+- The "third wide view (4x)" idea helped only +0.005 mostly on pore - exhausted-ish.
+- Changing backbone (efficientnetv2_b0, convnext_nano/pico) crashed or no gain.
+- Training on detector boxes (e009, e010): e009 gave 0.6305 (not confirmed), e010 crashed with a bug.
+- The e010 idea is promising conceptually: train the classifier on detector boxes themselves so it learns to reject false alarms too and matches test-time distribution. The score 0.4972 is way below baseline, which likely means something was broken in e010's implementation.
+
+Wait, let me think about what e010 did wrong. It trained on 71757 detector boxes with cls = best GT class if IoU > 0.5 else 0 (background). That means ~65k negative samples as class 0 and ~6k positives. The problem: class imbalance! Class 0 (background/false alarms) would dominate heavily. Actually, wait - the model outputs 4 classes. If 90% of the data is class 0, the model would predict class 0 for everything to get a high accuracy. But then the mAP on defect classes would be terrible because no positive rows would be written for defects (or very few).
+
+Actually, hold on: with cls=0 meaning background, and there being ~65k of them vs ~7k positives spread over 4 classes... that's ~1.7k per class. Class 0 dominates. The model would predict mostly class 0. But the prediction writes rows with score = conf * p(c) for all c where s > MIN_SCORE. If the model is dominated by background class, then p(defect) would be very low, and scores would be near zero... but wait, e010's score was 0.4972, not a total collapse. Hmm, actually 60854 prediction rows were written - similar count to the baseline (53606). So some rows are being written.
+
+Actually the issue might be that with class 0 as "background", the model learns background at the test-time distribution. But there's a subtlety: at test time, we score each eval box with all 4 classes. If the model is heavily biased toward class 0, then p(c) for defects is low, and the scores are low. But actually if the detector conf is high, scores could still exceed MIN_SCORE.
+
+Hmm, but a bigger issue: e010's data handling. The crops.csv has ~6052 training boxes. e010 replaced them with 71757 detector boxes. Wait - how many detector boxes are on train images? Let me think. dets.csv includes "train" split boxes (on training images) and "eval" boxes. The 71757 number is suspiciously large compared to 6052. Hmm, the detector likely produces many more boxes than ground truth.
+
+Actually wait - there's another potential bug: with class 0 = background, the model now has a huge imbalance. But more importantly, when scoring at test time, the model outputs a probability for "class 0" which is supposed to mean pore in our scheme (cls 0 = pore). Wait no - in the output format, cls 0 means pore, cls 1 deposit, etc. In e010, the training labels use cls=0 for background/false alarms, which is ALSO the class label for "pore" in the final output. That's the bug! The model was trained with class 0 meaning "no defect", but the final prediction writes rows where cls=0 means "pore". So a background prediction at training time (class index 0) becomes a pore prediction at test time!
+
+Yes, that's the fundamental bug in e010: class label collision. Background = class 0 in the training scheme, but class 0 = pore in the output scheme. So all the false-alarm rejection learning became "predict pore" instead of "don't predict", which corrupts the pore class entirely.
+
+That's why the score is 0.4972 - the classifier learned to call background "pore" (class 0), so the pore class gets flooded with false positives, and the true pores get buried. Actually wait, if all rows are scored as pore... hmm, actually it would make the model output high probability for class 0 on everything. That means every box gets a row with cls=0, score = conf * p(0) which is high. Since mAP@0.5 counts per-class precision, flooding class 0 with false positives (since we're scoring all eval boxes as pore even when they're not pores) would hurt the pore class's precision massively. And true defects' scores for their own class would be low.
+
+So e010's idea is valid (train on detector boxes including false alarms, to teach rejection), but the label collision is fatal.
+
+Now, how to fix it? Options:
+1. Use a 5th class for background (class index 4) and map outputs appropriately - but the output format only allows cls in {0,1,2,3}. Actually, we could train with 5 classes (0-4 where 4 = background), and at scoring time just use p(1..4) mapped to the 4 defect classes and ignore class 4. But wait, we'd need to handle the mapping: a false alarm should be rejected, i.e., no rows or low score. If we train with 5 classes, then p(defect) for a false alarm would be low, so scores would be low - that works naturally.
+
+Actually wait - there's a subtlety. At test time, every eval box gets rows for all 4 classes with score = conf * p(c). The mAP computation uses the per-class ranking. If the classifier learns to output low probability for defects on false alarms, then those boxes get low scores for their correct class and won't hurt much (they might still appear as high-confidence false positives if a box is actually a defect but misclassified... no, wait).
+
+Hmm, let's think about the scoring more carefully. The mAP@0.5 is computed per class. For class "pore", we look at all predictions of class pore, sorted by score. A prediction is a hit if it overlaps an unmatched true box of that class by IoU > 0.5. So:
+- True positives: correctly classified pores.
+- False positives: boxes scored as pore (any score) that don't overlap a true pore.
+
+If we score every eval box for all classes, then false alarms get high scores for the class their classifier thinks they are. If the classifier learns background as a separate class, then false alarms would have low p(c) for all defect classes and thus low scores for all classes. But the harness says "leaving a box out drops it". So if we write no rows for a false alarm (score below MIN_SCORE), it just doesn't count. That's good - false alarms shouldn't hurt precision at all!
+
+So the key insight: with the current scheme (score = conf * p(c) for all 4 classes, min score filter), a false alarm gets scored for all 4 classes. If the classifier is accurate, the true defect class gets the highest p(c), so the false alarm's row would be scored as its wrong class - that hurts precision of the wrong class but not recall (recall is only affected by missing true positives).
+
+Wait, actually I need to think about this differently. The mAP@0.5 for a class counts hits at IoU > 0.5 between the prediction and an unmatched true box. If a false alarm overlaps a true defect of a DIFFERENT class, it would count as a false positive for that class (it takes up "uniquely matched" slots? No - a single prediction can only match one ground truth). Actually in mAP computation, each prediction is evaluated against the closest unmatched GT. So if a false alarm overlaps a true pore but was scored as deposit, it would count as a false positive for deposit and potentially block matching to the true pore (if the thresholding is strict per-class).
+
+Hmm wait, actually the standard AP@0.5 with IoU>0.5: for each class, predictions sorted by score; for each prediction in order, find an unmatched GT of that class with IoU > 0.5. If found, it's a TP; else FP. Each GT can only be matched once. So if a false alarm (overlap a true pore) is scored as deposit at high confidence, it counts as FP for deposit, and the true pore might still find another unmatched detection or become FN.
+
+OK so the goal: get the class right on overlapping boxes (that's the 0.117 mAP loss), AND avoid false alarms being scored under the wrong class name (which hurts precision).
+
+The e010 idea (train on detector boxes, with background as a label) would fix both:
+- Positives labeled by GT class → better class assignment.
+- False alarms labeled background → classifier learns to give low p(defect) for them → they get low scores on all classes → they don't appear in the per-class ranking at all (if below MIN_SCORE).
+
+The bug was the class-0 collision: background label 0 == pore label 0.
+
+So the fix: use class 4 (or shift) for background. Since we have 4 defect classes, add a 5th class index for "background/false alarm" and just don't write rows for that. Then map p(1..4) to the 4 output classes.
+
+Wait but there's another subtlety: at test time, the eval boxes include both true defects (overlapping GT) and false alarms. The classifier outputs a probability over 5 classes including background. For a false alarm, p(background) is high → p(defect classes) are low → scores below MIN_SCORE → no rows written. 
+
+But careful: what about boxes that overlap a true defect but the detector box quality is poor (IoU < 0.5)? Those are still in the eval set, and at test time they'd be scored. At training time, e010 labeled them by IoU > 0.5 with GT class, else background. Hmm, that's exactly what e010 did: "Positives keep their GT class; unmatched boxes are background (class 0)". But the IoU threshold at train time was 0.5, while at test time we score all boxes. So a box overlapping a GT with IoU=0.4 would be trained as background but scored as a prediction that overlaps a GT by <0.5 → it doesn't count as a hit. If its p(defect) is high (because the classifier thinks it's a defect), it would be scored under some class and count as FP if it happens to overlap a true box of that class by >0.5... but IoU<0.5 means it can't overlap any GT by >0.5? No, actually IoU < 0.5 for the closest GT doesn't mean it can't overlap another GT by >0.5. But generally if it's a poor match to the true box, it might still partially overlap. Hmm, this is getting complicated.
+
+Actually, let me reconsider. The e010 bug report says "The 0.117 mAP classification loss is driven by a classifier trained on...". It scored 0.4972 which is suspiciously low, consistent with the class-0 collision (all false alarms become "pore" predictions, flooding the pore class).
+
+Now, what's the best next experiment?
+
+Let me consider the options:
+
+**Option A: Fix e010's label collision.** Train on detector boxes with a 5th class for background (index 4), and at test time use probabilities of classes 1-4 for the four defect classes. This is a "fundamentally different" fix from the exhausted data family (which was just "train on detector boxes without fixing the label collision"). The hypothesis: this fixes the bug and unlocks e009's +0.002 gain (and more, since it properly rejects false alarms).
+
+**Option B: Look at the class-agnostic ceiling.** Stage-1 boxes scored as a single class 'defect' reaches 0.755 mAP@0.5. The current best is 0.6288. So there's a big gap. Most of that (0.755 - 0.638 = 0.117) is the wrong-class error. The rest (0.638 - 0.6288 = 0.009) is from detector conf ranking.
+
+Wait, actually let me re-read: "stage-1 boxes scored as a single class 'defect': 0.755 mAP@0.5". That's the ceiling for ranking using the detector's confidence. Our baseline achieves 0.6288. So total possible gain is about 0.127. We've gained nothing so far beyond noise level.
+
+The main error is classification: pore 63%, deposit 78%, stain 88%, discontinuity 96%. The per-class AP: pore 0.502, deposit 0.624, stain 0.609, discontinuity 0.780.
+
+The biggest opportunity is clearly pore (63% right) and deposit (78% right). Pore-confidence error is huge.
+
+**Option C: Use the 5th class + better handling.** This is Option A.
+
+**Option D: Re-examine whether the current best e000's scoring rule (conf * p(c)) is optimal.** The history shows that changing the product rule to "detector conf alone" or other rules didn't help much. And the reference numbers show the detector conf as a ranking for perfect classes gives 0.758.
+
+**Option E: Ensemble.** Multiple seeds/averaging could help, but each run is limited to 180s and we need to finish within budget. An ensemble of 2 models would need ~2x time or half the training per model. The history shows ensembles "no gain" (best 5-seed 0.636 not confirmed). Actually that was a different idea though - 2-3 model ensembles from one run? It says "Bigger or other backbone... others 0.600-0.631; 1 timeout". So ensemble ideas were tried and rejected/no gain.
+
+**Option F: Focus on what the reference numbers suggest.** The perfect-class ceiling is 0.758, but with our scores it's 0.7461 (i.e., our scores cost 0.012 compared to detector conf). And the wrong classes cost 0.117. So improving classification is the priority. The e010 idea targets exactly that.
+
+**Option G: Use a different resolution for training.** The history says "Resolution and small-box handling (224 px...) no gain" and "Bigger or other backbone...". But those were all killed by timeout or edit failures. Hmm, actually the current best e000 uses IMG_SIZE=160. The two-crop approach is fixed. 
+
+**Option H: Change the augmentation to better distinguish pore vs deposit/stain.** The history shows "Training augmentation (rotation, mixup, stronger colour or geometry) no gain" and "Class-balanced sampling or class-weighted loss no gain". So we shouldn't try those again.
+
+**Option I: Better handling of the background/false-alarm problem in scoring.** Currently every eval box is scored for all 4 classes. If a false alarm is classified as a defect (even wrong one), it gets high scores and hurts precision. What if we add a "background" class at test time? We can't - the output format only allows cls 0-3. But we could implement it via a threshold: only write rows where the classifier's max probability exceeds some threshold, or where p(c) > threshold for that specific c. Actually, a smarter approach: since the metric is per-class ranking, false alarms hurt precision by appearing in the class list with high scores. If we can suppress them...
+
+Wait, actually, let me think about this more carefully. The current system writes rows for all 4 classes where conf * p(c) > MIN_SCORE. For a true defect (overlapping GT), the correct class gets conf * p(correct) which is high → TP. For a false alarm, it gets conf * p(wrong_class) → FP on some wrong class. The total number of rows is 53606 for ~41879 eval boxes. So each box gets roughly 1-2 rows on average.
+
+Hmm, the harness's reference number says "stage-1 boxes with perfect classes (ceiling for stage 2): 0.758" where "Every detector box that overlaps a true defect (IoU > 0.5) gets the correct class; every other box (false alarms) is KEPT, as class 0, with its detector conf." So in that reference, false alarms are kept as class 0 (=pore?) with detector conf. Interesting - so false alarms kept as class 0 would hurt the pore class precision. But they still get a score. Hmm, in that reference, "class 0" is used as "background" but in our output format, class 0 means pore! Wait, no - let me re-read: "every other box (false alarms) is KEPT, as class 0, with its detector conf." This means in the reference implementation they treat it as a separate class-agnostic detection task where class 0 represents "no defect". But our scoring maps cls to {0,1,2,3} = pore/deposit/discontinuity/stain. So if we wrote false alarms as class 0 in our output, they'd be scored as pores and hurt the pore class precision badly!
+
+Wait, but actually... hmm. The reference numbers are given by the harness to help us locate errors. "stage-1 boxes with perfect classes (ceiling for stage 2): 0.758 mAP@0.5". If false alarms were kept as class 0 (=pore in our scheme), that would hurt the pore AP. Unless... the reference is computed on a different label mapping where class 0 = background? Hmm, let me re-read: "Every detector box that overlaps a true defect (IoU > 0.5) gets the correct class; every other box (false alarms) is KEPT, as class 0, with its detector conf."
+
+So in the reference's notation, class 0 means... hmm, but in our system, cls 0 = pore. If false alarms are kept as class 0 (pore), then the pore class would be flooded with false positives, hurting precision. But the reported value is 0.758 which is much higher than our 0.6288. That doesn't make sense if we're flooding pores...
+
+Unless... hmm. Wait, maybe the reference means: "kept as class 0" in a 5th-class sense (background), and it's scored with a per-class AP where the background class isn't part of the 4 classes being averaged. So the 0.758 is the average over the 4 defect classes only, and the "class 0" entries don't count toward any of the 4 classes' precision because... hmm, but if they're labeled cls=0 (pore), they would count toward pore's precision.
+
+Hmm, I think there might be a subtle difference: the reference says these are "stage-2 ceiling" numbers, computed by an external script. Perhaps in that script, class 0 is literally a background/background label and is excluded from the per-class averaging. The key point of that number is: if you got all the classes right on overlapping boxes (and kept false alarms somewhere), the AP would be 0.758.
+
+And then "mAP@0.5 if every box had its correct class but kept your scores: 0.7461 (yours: 0.6288)" from the diagnostics. This says: with our scores and correct classes, we'd get 0.7461. The difference 0.7461 vs 0.758 is "what your scores cost compared with the detector's conf".
+
+So actually the reference 0.758 might use class 0 = background for false alarms (excluded from averaging), while our current scoring writes all 4 classes including potentially false alarms as class 0/pore... no wait, currently false alarms get scored for all 4 classes with scores based on p(c). The class that the classifier thinks they are gets a high score.
+
+OK, I think the cleanest interpretation:
+- 0.758 = perfect classification of overlapping boxes + detector conf ranking, with false alarms handled as background (not counted against any class or kept at low rank).
+- 0.7461 = our scoring rule with perfect classes → our scoring costs 0.012.
+- 0.6288 = ours. So classification error costs ~0.117.
+
+So the fix is clearly: improve classification accuracy on overlapping boxes. And ideally also suppress false alarms (score them low on all classes).
+
+The e010 idea (train on detector boxes with background label) targets this directly. Its only problem was the class-0 collision bug. Fixing that by using a 5th class (index 4) for background should unlock it.
+
+Actually, hold on. Let me think about whether we can use 5 classes at all. The model currently has num_classes=4. We'd change to num_classes=5 and map the output probabilities of indices 1-4 to the four defect classes. At test time, for each eval box, write rows for c in {0,1,2,3} with score = conf * p(c+1) where p is the 5-class probability. The background class (index 4) would never be written.
+
+But wait - there's a catch: if we train with 5 classes and at test time use p(1..4), then for false alarms, p(4) = high → p(1..4) all low → no rows written (or below MIN_SCORE). That's exactly what we want!
+
+Also, we should reconsider the label assignment. e010 used: positive if IoU > 0.5 with a GT box, label = that GT's class; else background. But at test time, the eval boxes include some that overlap GT with IoU < 0.5 (poorly overlapping true defects) and some that don't overlap any GT (false alarms). At training, we'd label them by their IoU to a GT box: if IoU > 0.5, use GT class; else background. Hmm, but a box overlapping a true defect with IoU = 0.3 would be trained as background. At test time it might get high p(defect) and be scored as a false positive for the class it overlaps (if IoU to that GT > 0.5 in the mAP calculation... no wait, if the box's IoU with the true GT is < 0.5, then in the per-class ranking, this prediction would NOT match that GT box by IoU > 0.5). So it wouldn't count as a TP regardless of class. But could it overlap another true box (different instance, same class) by > 0.5? Possibly, if boxes are close together. Generally not.
+
+Actually, here's the thing: at test time, we score ALL eval boxes for all classes. If a false alarm has high p(c) for some class c and overlaps a true box of class c by IoU > 0.5 (by coincidence, e.g., adjacent defects), it would count as FP for class c. So suppressing them is valuable.
+
+Hmm wait, but actually - how does the mAP computation work exactly? "a prediction is a hit if it overlaps an unmatched true box of that class by IoU > 0.5." It iterates predictions in score order. If a false alarm overlaps a true pore by IoU > 0.5 (say it's right next to a true pore), and it's scored as pore at high confidence, it takes the slot for that GT, making the true pore a FN. So yes, suppressing false alarms matters.
+
+But actually, in the current system (e000), every eval box is already scored for all 4 classes with some score. If the classifier gives low p(c) for all classes on a false alarm, then the scores are low and maybe below MIN_SCORE → no rows → no harm. So teaching the model to output background probability for false alarms naturally suppresses them.
+
+OK so Option A seems like a solid, targeted fix. Let me now think about how to implement it cleanly.
+
+Actually wait - there's another consideration. The current e000 trains on crops.csv boxes (ground truth boxes) with two-crop inputs. These are "perfect" boxes: tight crops of the actual defect. At test time, we classify detector boxes which are noisier (shifted, scale errors, etc.). e010's idea addresses this domain gap.
+
+But there's a subtlety about what label to give each detector box: IoU > 0.5 with a GT → GT class; else background. What about a detector box that overlaps a GT by IoU = 0.3? Is it really "no defect"? Well, in the mAP metric at test time, if this box doesn't overlap any true box by >0.5, it can't be a TP. So training it as background is fine and it won't hurt (as long as we don't score it too high for a wrong class).
+
+Hmm wait, but there's another consideration: what if a detector box overlaps a GT with IoU < 0.5 but still overlaps the true defect region? At test time, it can't be matched by mAP@0.5 (IoU must be > 0.5), so it doesn't count as TP regardless. But could training it as background hurt? No - it just teaches the model that this box isn't a valid detection. Fine.
+
+OK let me now think about whether there might be other issues with e010 beyond the label collision. The crash score was 0.4972, which is catastrophic. Let me think about what else could have gone wrong:
+
+1. **Class 0 collision** (background = class index 0 = pore): This alone explains the disaster. If the model predicts "background" with high probability for false alarms, and background is index 0... wait, no. The model's output is a 5-class one-hot (or in e010's case, still 4 classes!). Oh wait - e010 kept num_classes=4 and just set the label to 0 for background. So there were only 4 classes: pore(0), deposit(1), discontinuity(2), stain(3). And "background" was labeled as class 0 = pore! So a false alarm would be trained as "pore". That means the model learned: "this box with no defect → predict pore". This floods the pore class at test time with massive FP. That's exactly why e010 scored so poorly (0.4972 vs 0.6288). The pore AP would collapse from 0.502 to near zero, and all other classes would be unaffected... wait no - if the model predicts "pore" for everything, then non-pore rows wouldn't have high scores. Actually with a 4-class model trained with background-as-pore, the model's p(pore) would be high everywhere. The other classes' predictions would be low. So we'd see: pore AP collapses (huge FP), and other classes lose recall because... hmm, no - for true defects of class deposit, if the model assigns p(deposit) low but conf * p > MIN_SCORE? Not likely.
+
+Actually, with a 4-class model where background is label 0 = pore, the model learns to distinguish "defects" from "pore-ish stuff"? No wait. Let me think again. The classes are: 0=pore (trained as "background"), 1=deposit, 2=discontinuity, 3=stain. So the model's class 0 output now means "false alarm/no defect" which is a huge class at test time. At test time, cls=0 means pore in the output. So all the false alarms would be scored as pore with high confidence → pore AP collapses to near zero. And the other classes... their true positives would have decent scores (conf * p(class)), so they'd mostly survive. But the total mAP = mean of 4 class APs, and pore at ~0 would drag the mean down from 0.6288 to ~0.4972. Yes! That's exactly the drop. 
+
+So e010's idea is sound; the bug is clear. The fix: use a 5th class index for background.
+
+Hmm, but wait. There's another important subtlety. In e010, they trained on 71757 detector boxes from the train split. That's a lot of data (vs 6052 in e000). With 180s budget and 71k samples, we got only 1 epoch (445 steps at batch 64... wait, 71757/64 ≈ 1121 steps per epoch, but they did 445 steps = ~35% of an epoch). Actually the log says "done: 1 epochs, 445 steps". So we got about 445 steps which is less than one full pass. That's a lot of data but very little training. With 6052 boxes, we got 433 steps (about the same!). So the batch size and step count are similar because the budget caps it.
+
+Hmm interesting - so in e010 with 71k samples and 445 steps, each step saw a random batch of 64 from 71k. That's fine for SGD-style training. But one epoch isn't enough... but wait, we also did 433 steps on 6052 boxes in e000Thinking budget reached. Stop thinking now and write the reply in the required format.

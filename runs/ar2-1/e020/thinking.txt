@@ -1,0 +1,262 @@
+===== attempt 1 =====
+Let me analyze the crash in e019. The error is:
+```
+RuntimeError: Input type (torch.cuda.DoubleTensor) and weight type (CUDABFloat16Type) should be the same
+```
+
+The issue is that `np.random.normal(0, noise_sigma, x.shape)` produces a float64 (double) array by default. When this is added to `x` (which is float32), the result becomes float64. Then when converted to a torch tensor and moved to CUDA, it's a DoubleTensor, which conflicts with the bfloat16 weights.
+
+The fix is to ensure the noise is generated as float32: `np.random.normal(0, noise_sigma, x.shape).astype(np.float32)`.
+
+But wait - e019 was rejected/crashed, so I should base my next experiment on the current best (e012). Let me think about what to try next.
+
+Looking at the experiment history:
+- Current best: e012 (tf_efficientnetv2_b0, two-crop, TTA with HFlip, 50s reserve) - 0.6373 5-seed mean
+- Per-class: pore 0.517, deposit 0.636, discontinuity 0.781, stain 0.616
+
+Rejected/failed ideas:
+- Background class (e001, e004) - rejected
+- Low-res crops (e002) - rejected
+- ConvNeXt-Nano (e003) - bug
+- Focal loss (e006) - rejected
+- Label smoothing (e007) - rejected
+- 224 resolution (e010, e011) - timeout/not confirmed
+- Mixup (e013) - not confirmed (0.6371 vs 0.6373)
+- Random rotation (e014) - rejected
+- ResNet-50 (e015) - timeout
+- Random erasing (e016) - rejected
+- conf^2 scoring (e017) - rejected
+- SGD optimizer (e018) - not confirmed (0.6337)
+- Contrast + noise (e019) - crashed
+
+What hasn't been tried:
+1. Training on detector boxes (dets.csv train) - e001 and e004 tried this but were rejected. However, e001 used a background class, and e004 used IoU matching. Maybe a different approach?
+2. Different scoring: using max_prob as a multiplier (e009) - not confirmed
+3. Ensemble of two different architectures
+4. Different batch size
+5. Longer training (but time-constrained)
+6. Using both high and low res (e002 rejected)
+7. Different context sizes
+8. Multi-scale inference (different crop sizes at test time)
+9. Temperature scaling on the classifier output
+10. Using the detector confidence differently
+11. Training with a different number of classes or adding a "not defect" class
+12. Using a different backbone that's available: regnety_016, resnet26d, mobilenetv3_large_100, convnext_atto, convnext_pico, efficientnet_b2
+
+Wait, let me think about what could actually help. The per-class scores show pore (0.517) and stain (0.616) are weak. The model is a crop classifier - it sees a tight crop and a wide crop.
+
+Ideas that seem promising and haven't been tried:
+1. **Temperature scaling / score calibration**: Instead of raw softmax probabilities, use a temperature parameter to sharpen or soften the distribution. This could help with ranking.
+2. **Different scoring formula**: Instead of `conf * p[c]`, try `conf * p[c] / sum(p)` (which is just p[c] since softmax sums to 1) or `conf * (p[c] - 0.25)` or `conf * p[c] * max_p` (tried in e009, not confirmed).
+3. **Ensemble**: Train two different models and average their predictions. But this doubles training time.
+4. **Different context ratios**: Maybe the tight crop at 1.5x is too tight and the wide at 2.5x is too wide. Try 1.3x and 3.0x.
+5. **Use efficientnet_b2 instead of tf_efficientnetv2_b0**: b2 is larger (9M params vs 6M), might have more capacity. But e015 (ResNet-50, 25M params) timed out. b2 should be smaller though.
+6. **Increase batch size**: Currently 64. With more data per step, might train more stably.
+7. **Use both high and low res for training but with different weights**: e002 tried adding low-res and was rejected.
+8. **Score = conf * p[c] * (p[c] - min_p)**: Emphasize the relative confidence.
+9. **Drop the wide crop and use two tight crops with different contexts**: e.g., 1.2x and 1.8x instead of 1.5x and 2.5x.
+10. **Use a larger image size (192 instead of 160)**: Middle ground between 160 (current) and 224 (timed out).
+
+Actually, let me think about what's most likely to help given the constraints:
+
+The key insight from the background: "When all types are merged into one class, the same detector reaches 0.77, so many errors are wrong types, not missed defects." This means the classifier is the bottleneck - it's misclassifying types.
+
+The ceiling is 0.758 mAP. We're at 0.637. So there's 0.12 mAP to gain.
+
+Per-class: pore 0.517 (weakest), deposit 0.636, discontinuity 0.781 (best), stain 0.616.
+
+The fact that pore and stain are weak suggests the model struggles to distinguish fine-grained texture patterns. 
+
+Let me think about what practical change could help:
+
+1. **Image size 192**: Between 160 and 224. Should be fast enough (224 timed out, but 192 is 23% smaller area). This gives more pixels for fine features.
+
+2. **Different scoring**: The current score is `conf * p[c]`. What if we use `conf * p[c] * (p[c] - 0.25)`? This would give zero score when the model is completely uncertain (uniform) and positive when it's confident about a class. This is similar to e009 but different.
+
+3. **Training on dets.csv train boxes**: e001 and e004 tried this. e001 added a background class (rejected). e004 used IoU matching (rejected). But maybe the issue was the implementation. Let me think... Actually both were rejected, so this direction seems unproductive.
+
+4. **Two different context sizes for the two crops**: Currently 1.5x and 2.5x. What about 1.2x and 2.0x? Or 1.8x and 3.0x? The 1.5x might be too tight for small pores, and 2.5x might include too much background.
+
+5. **Use efficientnet_b2**: It's in the available list. It's larger than tf_efficientnetv2_b0 (9M vs 6M params). Should be able to train in similar time since it's not much bigger.
+
+Actually, let me reconsider. The 224px model timed out because inference took too long. At 192px, the inference would be (192/224)^2 ≈ 0.73x the time. If 224px inference took ~84s with 50s reserve (timeout), then 192px would take ~61s. With 50s reserve, that's still too tight. But with 90s reserve (like e011), it might work. However, e011 with 224px and 90s reserve got 0.6272 (not confirmed, worse than 0.6373).
+
+So higher resolution doesn't seem to help much. Let me focus on other ideas.
+
+Let me think about **scoring**. The current formula is `score = conf * p[c]`. 
+
+What about:
+- `score = conf * p[c] * max(p)` (e009, not confirmed at 0.6298)
+- `score = conf * (p[c] - 0.25)` (shifted probability, zero at uniform)
+- `score = conf * p[c]^2` (sharpened)
+- `score = conf * p[c] * (p[c] / (1 - p[c]))` (log-odds scaled)
+
+Actually, let me think about this differently. The mAP@0.5 scoring rewards:
+1. Correct class assignment on true detections
+2. Good ranking (true > false)
+
+For (1), we need the correct class to have the highest score among the 4 classes for that box.
+For (2), we need true detections to have higher scores than false alarms.
+
+The current `conf * p[c]` handles (2) partially through conf (detector confidence) and p[c] (classifier confidence). But it doesn't strongly penalize boxes where the classifier is uncertain across all classes.
+
+What if we use: `score = conf * p[c] * (p[c] - mean(p))`? This would be zero when the classifier is uniform and positive when it's confident. But this is similar to e009.
+
+Actually, let me look at this from a different angle. What about **training the model to be more discriminative**? 
+
+One idea: **Use a larger batch size (128 instead of 64)**. This gives more stable gradients and might help with the hard-to-distinguish classes. The tradeoff is fewer steps per epoch, but with the time budget, we might get similar total steps.
+
+Actually wait - let me reconsider the **two-crop architecture**. Currently both crops go through the same model and logits are averaged. What if instead we concatenate the features (not logits) before the classification head? Or use a different combination?
+
+Actually, a simpler idea: **use 3 crops instead of 2** - tight (1.5x), medium (2.0x), wide (2.5x). This gives the model more scale information. The cost is 50% more inference time per image, but we have 50s reserve and currently use ~40s for inference (172s total - 130s training = 42s inference). With 3 crops + TTA (4 passes), that's 6 forward passes instead of 4, so ~63s inference. With 50s reserve, that's tight. Let me increase reserve to 70s.
+
+Hmm, but that reduces training time. Let me think of something else.
+
+**Idea: Use a different scoring formula based on log-odds.**
+
+Instead of `score = conf * softmax(logits)[c]`, use `score = conf * sigmoid(logits[c] - mean(logits))`. This normalizes the logits relative to their mean, making the score more sensitive to the relative ranking of classes.
+
+Actually, let me think about what's most likely to give a clear improvement:
+
+Looking at the per-class APs: pore 0.517, stain 0.616. These are the weak classes. The model confuses them with each other and with deposit/background.
+
+**Key insight**: The model is trained on perfect boxes (crops.csv). But at test time, it sees detector boxes that may be slightly misaligned. The jitter in training (±10% center, 0.85-1.2 size) helps somewhat, but maybe not enough.
+
+**Idea: Increase the jitter during training.** Currently it's ±10% center shift and 0.85-1.2 size. What if we increase to ±20% center and 0.7-1.4 size? This would make the model more robust to box misalignment.
+
+But wait, e004 tried training on detector boxes (which have the actual misalignment) and was rejected. So maybe the misalignment isn't the main issue.
+
+Let me think about **what scoring change could help**. 
+
+Current: `score = conf * p[c]` where p = softmax(logits).
+
+The problem with this: if the model is uncertain (p ≈ [0.25, 0.25, 0.25, 0.25]), all classes get score ≈ conf * 0.25. The ranking between classes is lost. But the absolute score is still conf * 0.25, which might be higher than a true detection where the model is confident but the detector conf is lower.
+
+What if we use: `score = conf * (p[c] - 0.25) / 0.75`? This maps [0, 1] to [0, 1] with 0.25 → 0. Uncertain boxes get near-zero scores. But this might be too aggressive.
+
+Or: `score = conf * p[c] * (4 * p[c] - 1)`? When p[c] = 0.25 (uniform), score = 0. When p[c] = 1 (certain), score = conf. When p[c] = 0.5, score = conf * 0.5.
+
+Actually, I think the simplest and most impactful change I haven't tried is:
+
+**Use a temperature-scaled softmax for scoring.** Instead of `softmax(logits)`, use `softmax(logits / T)` where T < 1 (e.g., T = 0.7). This sharpens the probability distribution, making the model more decisive. Combined with the conf, this should improve ranking.
+
+Wait, but this is essentially what e009 tried (multiplying by max_prob). Let me think differently.
+
+**New idea: Use the logit difference (max_logit - logit[c]) as a penalty.**
+
+`score = conf * exp(-alpha * (max_logit - logit[c]))`
+
+This is like a softmax but with a learnable temperature. With alpha = 1, it's equivalent to softmax. With alpha > 1, it's sharper.
+
+Actually, I think the most promising untried idea is:
+
+**Train with a larger batch size (128) and correspondingly higher learning rate (2e-3).**
+
+Rationale: Larger batches give more stable gradient estimates, which is especially important for the hard-to-distinguish classes (pore vs stain). The higher LR compensates for the fewer steps per epoch. This is a common finding in deep learning: larger batches often generalize better when paired with appropriate LR scaling.
+
+But wait, e018 tried SGD and got 0.6337 (not confirmed). The optimizer change didn't help. Maybe batch size isn't the issue.
+
+Let me think about what else...
+
+**Idea: Use a different image size (192) with the current model.**
+
+At 160px, small pores might not have enough pixels. At 224px, inference was too slow. 192px is a middle ground. The inference time scales roughly as (192/160)^2 = 1.44x. Current inference is ~42s, so 192px would be ~60s. With 50s reserve, that's tight. Let me use 70s reserve.
+
+Actually, looking at the log more carefully:
+- Total time: 172s
+- Training ended at: 130s
+- Inference + writing: 42s
+
+If I use 192px, inference would be ~60s. With 70s reserve, training would end at 180-70=110s. Currently training takes 130s. So I'd lose ~20s of training. That's about 2 fewer epochs. Not ideal.
+
+Hmm, let me think of something that doesn't change the time budget much.
+
+**Idea: Change the scoring to use `conf * p[c] * max(p)** (i.e., multiply by the max probability as a confidence gate).
+
+Wait, that's exactly e009 which got 0.6298 (not confirmed, worse than 0.6373).
+
+**Idea: Use `conf^0.5 * p[c]` instead of `conf * p[c]`.**
+
+This reduces the impact of detector confidence and gives more weight to the classifier. The rationale: if the detector conf is noisy, reducing its exponent helps. The classifier's probability is a more reliable signal for class discrimination.
+
+e017 tried conf^2 (rejected). conf^0.5 is the opposite direction.
+
+Actually, I think a more impactful idea is:
+
+**Idea: Add a "not a defect" (background) class to the training, but DON'T use it for scoring. Instead, use the background probability to scale down all class scores.**
+
+Wait, e001 tried exactly this and was rejected (0.5512). So this direction is unproductive.
+
+Let me look at this from a completely different angle. What about **the order of the two crops**? Currently: tight (1.5x) first, wide (2.5x) second. What if the wide crop is more informative for classification (gives more context about the weld bead pattern)?
+
+**Idea: Weight the two crop logits differently. Instead of `(model(xt) + model(xw)) / 2`, use `0.4 * model(xt) + 0.6 * model(xw)`.**
+
+The rationale: the wide crop (2.5x) provides more context about the overall weld pattern, which might be more discriminative for distinguishing pore from stain (which look similar in a tight crop but different in context). The tight crop is useful for seeing the exact defect shape.
+
+This is a simple change that doesn't affect training time or inference time (well, it slightly changes inference since we're weighting the logits differently, but the computation is the same).
+
+Actually, this is a good hypothesis. Let me go with this.
+
+Wait, but this changes the effective training objective. During training, the loss is computed on the average of the two logits. If I change the weighting, the model will learn to be more confident on the weighted view. This should be fine.
+
+Let me formalize:
+- Training: `loss = crit(0.35 * model(xt) + 0.65 * model(xw), y)`
+- Inference: `logits = 0.35 * model(xt) + 0.65 * model(xw)` (and same for flipped)
+
+Actually, I realize I should be more careful. The current code does:
+```python
+loss = crit((model(xt) + model(xw)) / 2, y)
+```
+
+I'll change this to:
+```python
+loss = crit(0.3 * model(xt) + 0.7 * model(xw), y)
+```
+
+And in inference:
+```python
+logits = (0.3 * model(xt) + 0.7 * model(xw) + 0.3 * model(xt.flip(3)) + 0.7 * model(xw.flip(3))) / 4
+```
+
+Wait, that's not quite right. Let me think about this more carefully.
+
+Current inference:
+```python
+logits = (model(xt) + model(xw) + model(xt.flip(3)) + model(xw.flip(3))) / 4
+```
+
+This averages 4 forward passes: tight, wide, tight-flip, wide-flip.
+
+If I want to weight wide more:
+```python
+logits = (0.3 * model(xt) + 0.7 * model(xw) + 0.3 * model(xt.flip(3)) + 0.7 * model(xw.flip(3))) / 2
+```
+
+The /2 normalizes because the weights sum to 2 (0.3+0.7+0.3+0.7).
+
+For training:
+```python
+loss = crit(0.3 * model(xt) + 0.7 * model(xw), y)
+```
+
+This is a clean change. Let me go with this.
+
+Hypothesis: The wide crop (2.5x context) provides more discriminative information about the weld bead pattern, which helps distinguish visually similar defect types (pore vs stain). Weighting it more heavily (0.7 vs 0.3) should improve classification accuracy for the weak classes.
+
+Let me write the SEARCH/REPLACE blocks.
+
+Looking at the code:
+
+Training loss:
+```python
+            with torch.autocast(**amp):
+                loss = crit((model(xt) + model(xw)) / 2, y)
+```
+
+Inference:
+```python
+            # TTA: average original and horizontal flip of both views
+            logits = (model(xt) + model(xw) + model(xt.flip(3)) + model(xw.flip(3))) / 4
+```
+
+I'll change both to weight the wide crop more.

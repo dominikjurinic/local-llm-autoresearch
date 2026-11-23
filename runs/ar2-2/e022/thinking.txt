@@ -1,0 +1,487 @@
+===== attempt 1 =====
+Let me analyze the situation carefully.
+
+Current best: e016, 5-seed val mAP@0.5 = 0.6411
+- Per-class: pore 0.537, deposit 0.635, discontinuity 0.780, stain 0.612
+- Model: efficientnet_b0, IMG_SIZE=224, single wide crop (2.5x), TTA with horizontal flip
+- Training: 26347 boxes (14128 gt + 12219 det), ~660 steps, ~2 epochs
+
+Key observations:
+1. The ceiling for stage 2 is 0.758 mAP (stage-1 boxes with perfect classes)
+2. The baseline one-step 4-class detector is 0.638 mAP
+3. We're at 0.6411, barely above baseline
+4. The gap between us (0.6411) and ceiling (0.758) is huge - 0.117 mAP
+5. The single-class "defect" score is 0.755, meaning the boxes are good but classification is the bottleneck
+
+What's been tried and failed:
+- Background class (e001, e005) - hurt
+- Focal loss (e006) - hurt
+- Mixup (e007) - hurt
+- Batch size reduction (e010) - hurt
+- Weighted sampling (e011) - hurt
+- Vertical flip TTA (e012) - hurt
+- EfficientNet-B2 (e013) - hurt
+- Max-prob scoring (e014) - hurt
+- ConvNeXt-Nano (e015) - hurt
+- Higher LR (e017) - hurt
+- IMG_SIZE 192 (e018) - hurt
+- Margin scoring (e019) - hurt
+- Higher min LR (e020) - hurt
+- tf_efficientnetv2_b0 (e021) - not confirmed (seed-0 was 0.6447 but 5-seed was 0.6352)
+
+What worked:
+- Adding detector boxes to training (e002) - big improvement
+- Low-res crops (e003) - helped
+- Single wide crop (e008) - helped (more training steps)
+- H-flip TTA (e009) - helped
+- IMG_SIZE 224 (e016) - helped
+
+The key insight: we're severely undertrained. 660 steps is very few. The model is at loss 0.29 after 2 epochs. The ceiling is 0.758 but we're at 0.641.
+
+Let me think about what could help:
+
+1. **More training steps**: The model is clearly undertrained. But we've tried reducing IMG_SIZE (e018) and it didn't help. We've tried reducing batch size (e010) and it didn't help. We've tried higher LR (e017) and it didn't help.
+
+2. **Better model**: tf_efficientnetv2_b0 was promising on seed-0 (0.6447) but failed 5-seed (0.6352). Maybe it needs more training steps to converge?
+
+3. **Scoring**: The scoring function is important. Currently it's `conf * prob[c]`. We've tried prob², max-prob, margin - all hurt. 
+
+4. **Data**: We're using both GT crops and matched detector boxes. The unmatched detector boxes (false alarms) were tried as background and hurt.
+
+5. **Architecture**: We've tried several. Let me think about what else could work.
+
+Wait, let me reconsider. The key problem is that the model is undertrained. 660 steps with 26347 samples means about 2.5 epochs. The loss is still dropping fast (0.52 → 0.29). 
+
+What if we could train more efficiently? The bottleneck is the forward/backward pass per step. With IMG_SIZE=224 and EfficientNet-B0, each step takes about (164-17)/660 ≈ 0.22s. 
+
+Ideas for more training:
+- Use a smaller/faster model (but ConvNeXt-Nano was terrible, ResNet18 might be worth trying)
+- Use AMP (already using bfloat16 on CUDA)
+- Reduce the number of images loaded (but we need them all)
+- Use a more efficient data pipeline
+
+Actually, wait. Let me look at the numbers more carefully:
+- 17s loading
+- 94s for epoch 0 (411 steps)
+- 125s for epoch 1 (660 total steps)
+- Total 164s out of 180s budget
+
+So epoch 0 took 77s (94-17), epoch 1 took 31s (125-94). Wait, that doesn't make sense. Let me re-read.
+
+"epoch 0: loss 0.5211, 411 steps, 94s"
+"epoch 1: loss 0.2859, 660 steps, 125s"
+
+So 411 steps in 94s = 0.228s/step
+Then 249 more steps (660-411) in 31s (125-94) = 0.124s/step
+
+That's a big speedup. Maybe the first epoch has some overhead (data loading, compilation, etc.)
+
+Total training time: 125-17 = 108s for 660 steps
+Reserve: 55s
+Total budget: 180s
+Used: 164s
+Remaining: 16s
+
+So we have 180-164 = 16s left, but reserve is 55s. Wait, the reserve is 55s for prediction. So training stops at 180-55 = 125s. And it did stop at 125s. Then prediction takes 125 to 164s = 39s.
+
+So we're using the full training budget. The question is how to get more effective training in the same time.
+
+Let me think about what hasn't been tried:
+1. **ResNet18 or ResNet34** - simpler, faster architectures. Might allow more training steps.
+2. **MobileNetV3** - efficient architecture
+3. **RegNetY-016** - very small, fast
+4. **ConvNeXt-Pico or ConvNeXt-Atto** - even smaller than Nano
+5. **Two-crop with smaller model** - the original two-crop was rejected in e008 because single wide crop allowed more training. But what if we use a faster model with two-crop?
+
+Actually, wait. Let me reconsider the problem. The per-class APs are:
+- pore 0.537 (weakest)
+- deposit 0.635
+- discontinuity 0.780
+- stain 0.612
+
+The gap to ceiling (0.758) is large for all classes. The issue is that:
+1. The classifier isn't accurate enough
+2. The scoring isn't optimal
+
+For the scoring: we output 4 rows per box (one per class). The score is `conf * prob[c]`. In mAP@0.5, each class is scored independently. So for class c, we have one row per box with score `conf * prob[c]`. The ranking within class c matters.
+
+Actually, I realize something important. When we output 4 rows per box, for each class c, we have N boxes each with a score. The mAP for class c depends on ranking these N boxes by score and checking which ones match GT boxes of class c.
+
+The issue is: for a box that's a true pore, we output:
+- (box, pore, conf * p_pore)
+- (box, deposit, conf * p_deposit)
+- (box, discontinuity, conf * p_disc)
+- (box, stain, conf * p_stain)
+
+For the pore class AP, we care about the pore row. The deposit row for this box doesn't affect pore AP. But the deposit row for this box DOES affect deposit AP (it's a false positive for deposit if the box doesn't match a deposit GT).
+
+So the scoring is per-class, and each class's AP depends on the ranking of all boxes by their score for that class.
+
+Given that, the scoring function `conf * prob[c]` seems reasonable. The issue is that prob[c] needs to be well-calibrated.
+
+Let me think about what could actually help here...
+
+One thing I notice: the model only gets ~2.5 epochs of training. That's very undertrained. The loss is still dropping fast. If we could train for more epochs, we'd likely improve.
+
+The fastest way to get more training: use a faster model. Let's look at the available models:
+- convnext_atto (1.5M params)
+- convnext_nano (5M params) - tried, terrible (0.5833)
+- convnext_pico (2M params)
+- efficientnet_b0 (4M params) - current
+- efficientnet_b2 (7.7M params) - tried, worse
+- mobilenetv3_large_100 (5.4M params)
+- regnety_016 (0.9M params)
+- resnet18 (11.7M params)
+- resnet26d (10M params)
+- resnet34 (21.8M params)
+- resnet50 (25.6M params)
+- tf_efficientnetv2_b0 (7.7M params) - tried, not confirmed
+
+Wait, ConvNeXt-Nano was 0.5833 which is terrible. But that might be because it's undertrained (only ~1 epoch). Let me think...
+
+Actually, the issue with ConvNeXt-Nano might be that it needs more training. With 4M params (EfficientNet-B0), we get 660 steps. With 5M params (ConvNeXt-Nano), we'd get fewer steps. But 0.5833 is really bad - that's worse than the baseline.
+
+Hmm, but what about a much smaller model? RegNetY-016 has only 0.9M params. It would be much faster per step, allowing many more training steps. The question is whether it has enough capacity.
+
+Actually, let me think about this differently. The problem is:
+1. We need a model that's accurate enough (capacity)
+2. We need to train it enough (steps)
+3. We're limited by wall-clock time
+
+The sweet spot might be a model that's slightly smaller than EfficientNet-B0 but still has enough capacity. ConvNeXt-Pico (2M params) or RegNetY-016 (0.9M params) could work.
+
+But wait, ConvNeXt-Nano (5M) was terrible. That suggests the ConvNeXt family might not work well for this task with limited training. Let me not go down that path.
+
+What about ResNet18? It's 11.7M params, which is larger than EfficientNet-B0. So it would be slower per step. Probably not the answer.
+
+Actually, let me reconsider. The issue might not be the model but the training. Let me think about what else could help:
+
+1. **Learning rate schedule**: We've tried higher peak LR (e017, rejected) and higher min LR (e020, rejected). What about a different schedule shape?
+
+2. **Data augmentation**: We have H-flip, V-flip, brightness jitter, and geometric jitter in make_crop. What about:
+   - Color jitter (hue, saturation, contrast)
+   - Random erasing
+   - Cutout
+   - Gaussian blur
+
+3. **Training data**: We're using GT crops + matched detector boxes. What about:
+   - Using ALL detector boxes (including unmatched) with soft labels?
+   - Hard negative mining?
+
+4. **Inference**: 
+   - Multi-scale TTA (already have H-flip)
+   - Ensemble of multiple models
+   - Different scoring functions
+
+5. **The scoring function**: This is crucial. Let me think more carefully.
+
+For mAP@0.5, for each class c:
+- We have a list of (box, score) pairs
+- We sort by score descending
+- We check each box: does it match an unmatched GT box of class c with IoU ≥ 0.5?
+- If yes, it's a TP; if no, it's a FP
+- AP = average precision
+
+The key insight: for a given box, we output 4 rows (one per class). For class c, the score is `conf * prob[c]`. 
+
+Now, consider a box that's a true pore. For the pore class, this box should have a high score. For the deposit class, this box should have a low score (so it doesn't interfere with deposit AP).
+
+The current scoring `conf * prob[c]` does this: if prob[pore] is high, the pore row has high score, and the deposit row has low score (assuming prob[deposit] is low). This seems reasonable.
+
+But what if the model is uncertain? E.g., prob = [0.3, 0.3, 0.2, 0.2]. Then all scores are similar, and the ranking is noisy.
+
+What if we use `conf * prob[c] / sum(prob)` = `conf * prob[c]` (since sum = 1)? Same thing.
+
+What about `conf * (prob[c] - 0.25)`? This would penalize all classes equally when the model is uniform. But we tried margin (e019) and it was terrible (0.5805).
+
+What about `conf * prob[c] * (1 - prob_bg)` where prob_bg is the probability of "not a defect"? We tried this (e005) and it was worse (0.6039).
+
+Hmm, let me think about the data side more.
+
+Actually, I just realized something. The training data includes:
+- 14128 GT crops (perfect boxes)
+- 12219 matched detector boxes (IoU ≥ 0.5 with GT)
+
+Total: 26347 boxes, ~2.5 epochs in 660 steps.
+
+What if we could increase the effective training data? For example:
+- Use the same boxes multiple times (but that's just more epochs, which we're limited by)
+- Generate augmented versions (we already do some augmentation)
+- Use a larger crop context (but we tried 2.5x and it's the current setting)
+
+Actually, wait. Let me re-examine the augmentation. The current augmentation in make_crop:
+- Center jitter: ±10% of side
+- Side scale: 0.85-1.2
+- H-flip: 50%
+- V-flip: 50%
+- Brightness: 0.8-1.2
+
+This is pretty standard. What about adding:
+- Random rotation (small angle, like ±15°)
+- Color jitter
+- Gaussian blur
+- Random erasing
+
+Let me think about which of these would be most impactful...
+
+Actually, I think the most impactful change would be to **increase the number of training steps** by using a faster model or more efficient pipeline. But we've tried several approaches to this.
+
+Let me look at this from a different angle. What's the theoretical maximum we can achieve?
+
+The ceiling is 0.758 (perfect classification on stage-1 boxes). We're at 0.641. The gap is 0.117.
+
+The single-class "defect" score is 0.755. This means that if we just output "defect" for every box with score = conf, we get 0.755. The 4-class version should be able to do at least as well as the single-class version if the classification is perfect. The fact that we're at 0.641 means the classification is significantly hurting us.
+
+Let me think about why. For each box, we output 4 rows. If the classification is wrong, we get:
+- A false positive for the wrong class (hurting that class's AP)
+- A missed true positive for the right class (hurting that class's AP)
+
+So wrong classification hurts twice: once by adding FPs to the wrong class, and once by missing TPs in the right class.
+
+The per-class APs tell us:
+- pore 0.537: many pores are misclassified (probably as stain or deposit)
+- deposit 0.635: moderate misclassification
+- discontinuity 0.780: best class, least confusion
+- stain 0.612: many stains are misclassified (probably as deposit or pore)
+
+This matches the known confusion: "stain is often confused with deposit and background."
+
+So the key challenge is distinguishing stain from deposit, and pore from stain.
+
+What could help with this?
+1. More training (more steps)
+2. Better features (better model)
+3. Better data (more diverse examples)
+4. Better scoring (handle the confusion)
+
+Let me think about a specific idea: **using a two-stage scoring that accounts for the confusion pattern**.
+
+Actually, here's an idea I haven't tried: **temperature scaling on the softmax**. If we apply a temperature < 1 to the logits before softmax, we make the probabilities more peaked. This would increase the score for the correct class and decrease it for others, improving the ranking.
+
+But wait, this is similar to what we tried with prob² (e004, rejected). Temperature scaling is different though: instead of squaring the probability, we scale the logits. For a probability of 0.5, temp=0.5 gives softmax(0.5*logit) which is more peaked than 0.5² = 0.25.
+
+Actually, let me think about this more carefully. If the true distribution is [0.7, 0.1, 0.1, 0.1] and we apply temp=0.5:
+- log(0.7) = -0.357, log(0.1) = -2.303
+- 0.5 * log(0.7) = -0.178, 0.5 * log(0.1) = -1.151
+- exp(-0.178) = 0.837, exp(-1.151) = 0.316
+- sum = 0.837 + 3*0.316 = 1.785
+- normalized: [0.469, 0.177, 0.177, 0.177]
+
+Hmm, that actually makes it less peaked! Temperature < 1 makes it MORE peaked, temperature > 1 makes it less peaked. Wait, I had it backwards.
+
+Temperature T: softmax(x/T). T < 1 makes it more peaked, T > 1 makes it less peaked.
+
+So T = 0.5:
+- log(0.7)/0.5 = -0.714, log(0.1)/0.5 = -4.605
+- exp(-0.714) = 0.490, exp(-4.605) = 0.01
+- sum = 0.490 + 3*0.01 = 0.520
+- normalized: [0.942, 0.019, 0.019, 0.019]
+
+Yes, T < 1 makes it more peaked. This would increase the score for the correct class and decrease it for others.
+
+But we already tried prob² (e004) which is similar to T=0.5 in effect. And it was rejected (0.6211).
+
+Hmm, but prob² is not exactly the same as temperature scaling. prob² = p², while temperature scaling gives a different function. Let me think...
+
+Actually, for the purpose of ranking, what matters is the relative ordering of scores. If we use p² instead of p, the ordering within a box changes (the class with the highest p gets boosted more). But across boxes, the ranking might change differently.
+
+I think temperature scaling is worth trying, but it's similar to what we've already tried. Let me think of something else.
+
+**New idea: Train with a larger effective batch by using gradient accumulation.**
+
+Wait, we already have batch size 64. Reducing it to 32 was tried (e010) and rejected. But that was with proportionally scaled LR. What if we keep the same LR but use a smaller batch?
+
+Actually, e010 was "Reducing batch size from 64 to 32 (with proportionally scaled LR)" and it was rejected. So smaller batch with scaled LR didn't help.
+
+**New idea: Use a learning rate warmup + constant LR (no cosine decay).**
+
+The cosine decay brings LR to near-zero at the end, which wastes time. We tried higher min LR (e020) and it was rejected. But what about a completely different schedule?
+
+Actually, let me think about this differently. The model is undertrained. The loss is still dropping fast. The issue is we don't have enough time. What if we:
+
+1. Pretrain the model on a simpler task (like the single-class "defect" detection) for a few steps, then fine-tune on the 4-class task?
+
+This is a form of curriculum learning. The idea is that the model first learns to distinguish defects from background, then learns the fine-grained classes.
+
+But wait, we don't have a background class in the training data. The training data is all defects (GT crops + matched detector boxes). So this doesn't directly apply.
+
+**New idea: Use a two-head model - one head for defect/non-defect, one for class.**
+
+But again, we don't have non-defect examples in the training data (we tried adding them and it hurt).
+
+Let me go back to basics. What's the simplest thing that could work?
+
+The model is undertrained. We need more training steps. The fastest way to get more steps is to use a faster model.
+
+Let me look at the available models again:
+- convnext_atto (1.5M params) - not tried
+- convnext_pico (2M params) - not tried
+- regnety_016 (0.9M params) - not tried
+- mobilenetv3_large_100 (5.4M params) - not tried
+- resnet18 (11.7M params) - not tried
+
+ConvNeXt-Nano (5M) was terrible (0.5833). But that might be because:
+1. It's undertrained (fewer steps than EfficientNet-B0)
+2. The ConvNeXt architecture doesn't work well for this task
+3. The pretrained weights don't transfer well
+
+Let me try a different family. ResNet18 is a classic, well-understood architecture. It's 11.7M params, which is larger than EfficientNet-B0 (4M), so it would be slower per step. But it might have better pretrained features.
+
+Actually, wait. The per-step time is dominated by the convolution operations, which scale roughly with the number of parameters and the input size. ResNet18 at 224x224 would be slower than EfficientNet-B0 at 224x224.
+
+Hmm, let me think about this differently. What if we use a smaller input size with a larger model? E.g., ResNet18 at 160x160? That would be faster per step than EfficientNet-B0 at 224x224.
+
+But we tried IMG_SIZE=192 with EfficientNet-B0 (e018) and it was rejected (0.6387 vs 0.6411). So smaller input size didn't help.
+
+OK let me think about completely different approaches:
+
+**Idea: Ensemble of two models trained with different seeds/architectures.**
+
+Within the time budget, we could train two smaller models and average their predictions. E.g., two EfficientNet-B0 models with different seeds, or one EfficientNet-B0 + one ConvNeXt-Pico.
+
+But training two models would halve the training steps per model. That might not be worth it.
+
+**Idea: Use the detector confidence more cleverly.**
+
+Currently, score = conf * prob[c]. The detector confidence is a measure of how likely the box is a defect. But we're not using it to distinguish between classes. What if we use it differently?
+
+For example, what if high-confidence boxes are more likely to be correctly classified, so we should trust the classifier more? And low-confidence boxes are more likely to be false alarms, so we should suppress them?
+
+This is similar to what we tried with (1 - prob_bg) in e005, but using the detector conf directly.
+
+Actually, the detector conf already modulates the score. A low-conf box gets a low score regardless of the classifier. So this is already handled.
+
+**Idea: Train the classifier to predict the detector confidence as well.**
+
+No, that doesn't make sense. The detector confidence is given.
+
+**Idea: Use a different loss function that accounts for the class imbalance.**
+
+We tried focal loss (e006) and class-weighted loss (mentioned in the brief as having hurt). What about label smoothing?
+
+Label smoothing: instead of using hard labels (1.0 for the correct class, 0.0 for others), use soft labels (e.g., 0.9 for the correct class, 0.1/3 for others). This regularizes the model and prevents overconfidence.
+
+This is a simple change that hasn't been tried. Let me think about whether it would help...
+
+Label smoothing would make the model less confident, which means the probabilities would be less peaked. This could hurt the ranking (since we want the correct class to have a high probability). But it could also help by preventing the model from overfitting to noisy labels (the matched detector boxes might have some label noise).
+
+Actually, I think label smoothing is worth trying. It's a simple, well-understood technique that's commonly used in image classification.
+
+Let me calculate: with label smoothing α=0.1, the target for the correct class becomes 1-α+α/K = 0.9+0.025 = 0.925, and for each wrong class it becomes α/K = 0.025.
+
+This is a small change. Let me propose it.
+
+Wait, actually, I want to think about whether there's a more impactful change.
+
+Let me re-examine the numbers:
+- 660 steps, ~2.5 epochs
+- Loss: 0.52 → 0.29
+- Per-class AP: pore 0.537, deposit 0.635, disc 0.780, stain 0.612
+
+The loss is still dropping fast. If we could get to 5-10 epochs, the loss would be much lower and the classification would be better.
+
+The key constraint is wall-clock time. 180s total, 55s reserve, so 125s for training. 17s for loading. So 108s for 660 steps = 0.164s/step.
+
+To get 2x more steps (1320), we'd need 0.082s/step. That's a 2x speedup per step.
+
+How to get 2x speedup:
+- Half the input size (112x112): but this would hurt accuracy
+- Half the model size: use a 2M param model instead of 4M
+- Use a faster architecture: e.g., MobileNetV3 vs EfficientNet
+
+Actually, let me look at this from the perspective of FLOPs:
+- EfficientNet-B0 at 224x224: ~390 MFLOPs
+- MobileNetV3-Large at 224x224: ~219 MFLOPs (about 44% less)
+- RegNetY-016 at 224x224: ~100 MFLOPs (about 74% less)
+- ConvNeXt-Pico at 224x224: ~130 MFLOPs (about 67% less)
+
+So MobileNetV3-Large could give us ~1.8x more steps, and RegNetY-016 could give us ~4x more steps.
+
+But will they have enough capacity? RegNetY-016 is only 0.9M params. That's very small. It might not be able to learn the fine-grained distinctions between pore/stain/deposit.
+
+MobileNetV3-Large is 5.4M params, similar to EfficientNet-B2 (7.7M) which was tried and rejected (e013, 0.6340). But EfficientNet-B2 was rejected partly because it was slower (fewer steps), not because it was a bad architecture.
+
+Hmm, let me think about this more carefully.
+
+Actually, I just realized something. The issue with e013 (EfficientNet-B2) might have been that it was slower, so it got fewer training steps. If we use a faster model with similar capacity, we might do better.
+
+MobileNetV3-Large (5.4M params, ~219 MFLOPs) is faster than EfficientNet-B0 (4M params, ~390 MFLOPs) per step. So it would get more training steps AND have similar capacity. This seems like a good candidate.
+
+But wait, MobileNetV3-Large uses depthwise separable convolutions, which are efficient but might not capture the same features as standard convolutions. The pretrained weights are from ImageNet, so they should have good general features.
+
+Let me propose trying MobileNetV3-Large. The hypothesis is that its faster per-step cost allows more training epochs within the same budget, and its similar parameter count provides comparable capacity.
+
+Actually, wait. Let me reconsider. The per-step cost includes both the forward/backward pass AND the data loading/processing. The data processing (cropping, resizing) is the same regardless of the model. So the speedup from a faster model is less than the FLOPs ratio suggests.
+
+Let me estimate: if the data processing takes 30% of the step time and the model takes 70%, then:
+- EfficientNet-B0: 0.164s/step (70% model = 0.115s, 30% data = 0.049s)
+- MobileNetV3-Large: 0.219/0.390 * 0.115 + 0.049 = 0.064 + 0.049 = 0.113s/step
+- Speedup: 0.164/0.113 = 1.45x
+
+So we'd get about 1.45x more steps: ~957 steps instead of 660. That's about 3.6 epochs instead of 2.5.
+
+That's a meaningful improvement. Let me go with MobileNetV3-Large.
+
+Actually, hold on. Let me reconsider whether there's a better option.
+
+What about using a smaller input size with the current model? We tried 192 (e018, rejected at 0.6387). What about 192 with a different schedule?
+
+No, that's too many variables. Let me focus on one change.
+
+Let me go with **MobileNetV3-Large**. The hypothesis is clear: faster per-step cost → more training epochs → better convergence → higher mAP.
+
+Wait, but I should also consider: does MobileNetV3-Large have a different image size requirement? Let me check... MobileNetV3-Large is typically trained at 224x224, same as EfficientNet-B0. So IMG_SIZE=224 should work.
+
+Also, I need to make sure the timm model name is correct. The brief says "mobilenetv3_large_100" is available. Let me use that.
+
+Let me write the change:
+
+```
+MODEL = "efficientnet_b0"
+```
+→
+```
+MODEL = "mobilenetv3_large_100"
+```
+
+That's it. One line change.
+
+Actually, wait. Let me also consider whether the LR should be different. MobileNetV3-Large has 5.4M params vs 4M for EfficientNet-B0. The LR might need to be slightly higher. But the brief says "Tuning hyperparameters alone helped little in earlier experiments; changes of method helped more." So let me keep the same LR and just change the model.
+
+Let me finalize my proposal:
+
+BASE: best (e016)
+CATEGORY: architecture
+HYPOTHESIS: MobileNetV3-Large has ~44% fewer FLOPs than EfficientNet-B0 at the same input size, allowing ~45% more training steps within the same wall-clock budget. With more training epochs (≈3.6 vs 2.5), the model converges better on the weak pore and stain classes, improving mAP.
+
+The change is just the MODEL line.
+
+Let me double-check the SEARCH text matches exactly:
+
+```
+MODEL = "efficientnet_b0"
+```
+
+Yes, that's in the settings section.
+
+Actually, I want to reconsider one more time. Is there a risk that MobileNetV3-Large's pretrained features are worse than EfficientNet-B0's? Both are trained on ImageNet, but they have different architectures. MobileNetV3 uses inverted residuals and depthwise separable convolutions, while EfficientNet uses compound scaling.
+
+For fine-grained classification (pore vs stain vs deposit), the quality of the pretrained features matters. If MobileNetV3's features are worse, we might lose more from the architecture change than we gain from more training steps.
+
+But I think the risk is acceptable. The 45% more training steps is a significant advantage, and MobileNetV3-Large is a well-established architecture with good ImageNet performance (75.2% top-1).
+
+Let me go with this.
+
+Hmm, actually, one more thought. What about **convnext_pico**? It's 2M params, much smaller than EfficientNet-B0. It would be much faster per step, allowing many more training epochs. But ConvNeXt-Nano (5M) was terrible (0.5833). Would ConvNeXt-Pico (2M) be even worse?
+
+I think the ConvNeXt family might have issues with this task (maybe the depthwise convolutions don't work well for the texture-based distinctions). Let me avoid it.
+
+What about **regnety_016**? 0.9M params, very small. It would be extremely fast, allowing 4-5x more training steps. But 0.9M params is very small - it might not have enough capacity for 4-class fine-grained classification.
+
+I'll stick with MobileNetV3-Large as the safest bet for a meaningful improvement.
+
+Final answer:
+- BASE: best
+- CATEGORY: architecture
+- HYPOTHESIS: MobileNetV3-Large has ~44% fewer FLOPs than EfficientNet-B0 at 224×224, enabling ~45% more training steps (≈950 vs 660) within the same budget. The additional training epochs (≈3.6 vs 2.5) should improve convergence on the weak pore and stain classes, raising mAP.
+- Change: MODEL = "efficientnet_b0" → MODEL = "mobilenetv3_large_100"

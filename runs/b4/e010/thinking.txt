@@ -1,0 +1,358 @@
+===== attempt 1 =====
+Let me analyze the situation carefully.
+
+**Current state:**
+- Best: e000, 5-seed mean 0.6297
+- Per-class AP: pore 0.504, deposit 0.626, discontinuity 0.780, stain 0.609
+- Ceiling (perfect classes on stage-1 boxes): 0.758
+- Baseline one-step 4-class: 0.638
+
+**Key insight from reference numbers:**
+- Stage-1 boxes with perfect classes: 0.758
+- Stage-1 boxes scored as single class: 0.755
+- Our current: 0.630
+
+The gap from 0.630 to 0.758 is 0.128. This is a ranking problem. Since every box gets one row per class, the "hit set" per class is fixed by stage 1 (same as ceiling). The only thing that matters is the ORDER of predictions within each class.
+
+Wait, let me re-read the scoring: "For one class, all predictions of that class are sorted by score; a prediction is a hit if it overlaps an unmatched true box of that class by IoU > 0.5."
+
+So for class c, we emit rows (det_id, c, score). The score = det_conf * p_c. The order within class c is determined by det_conf * p_c.
+
+The ceiling (0.758) uses score = det_conf (the detector confidence) for boxes that overlap true defects, and keeps false alarms as class 0 with det_conf. So the ceiling's ordering within each class is purely by detector confidence.
+
+Our current approach uses score = det_conf * p_c, where p_c is the classifier's probability. If p_c is noisy, it can reorder predictions in a way that hurts AP.
+
+**What has been tried:**
+1. e001 (data): crashed (NameError)
+2. e002 (data): fix of e001, 0.5541 - rejected (worse)
+3. e003 (inference): 4-view averaging, 0.6355 seed-0, 0.6301 5-seed - not confirmed (basically same)
+4. e004 (scoring): emit only top-1 class per box, 0.5689 - rejected (much worse)
+5. e005 (architecture): different backbone, 0.6240 - rejected
+6. e006 (data): train on low-res too, 0.6225 - rejected
+7. e007 (scoring): cross-class contamination fix, 0.6192 - rejected
+8. e008 (augmentation): mixup, 0.6356 seed-0, 0.6327 5-seed - not confirmed (slightly better but within noise)
+9. e009 (sampling): train on detector boxes with background class, 0.6268 - rejected
+
+**Lessons:**
+- Data: 3 ideas, no new best → EXHAUSTED
+- Scoring: 2 ideas, no new best
+- Architecture: 1 idea, no new best
+- Augmentation: 1 idea, close but not confirmed
+- Inference: 1 idea, close but not confirmed
+- Sampling: 1 idea, no new best
+
+**Where is the error?**
+
+The gap is 0.630 vs 0.758. The per-class scores:
+- pore: 0.504 (very weak)
+- deposit: 0.626
+- discontinuity: 0.780 (good)
+- stain: 0.609
+
+The ceiling is 0.758 overall. If we had perfect classes, each class would get its "perfect" AP. The fact that discontinuity is already at 0.780 (above ceiling!) suggests that for discontinuity, the classifier is actually helping (or the ceiling number is an average).
+
+Wait, the ceiling is 0.758 average. If discontinuity alone is 0.780, that's above the ceiling. That means for discontinuity, the current ranking is actually better than pure detector confidence. But for pore (0.504), it's much worse.
+
+The key problem: the classifier's probability p_c is corrupting the ranking. For pore, the classifier is bad at identifying pores, so p_pore is noisy and reorders the pore predictions in a harmful way.
+
+**What could help?**
+
+The fundamental issue: we're multiplying det_conf by p_c. If p_c is noisy (especially for pore), this hurts. 
+
+One idea: **calibrate or blend the classifier probability with the detector confidence differently**. Instead of score = det_conf * p_c, what if we use a softer combination?
+
+Actually, wait. Let me think about what the ceiling does. The ceiling assigns each box that overlaps a true defect the correct class, and scores it by det_conf. False alarms are kept as class 0 with det_conf. So the ceiling's per-class ordering is purely by det_conf.
+
+If we could perfectly identify which boxes are which class, we'd want to order them by det_conf within each class. The problem is:
+1. We don't know the class (classification error)
+2. Even for correct class assignments, our p_c might reorder things differently from det_conf
+
+**Key insight:** The score = det_conf * p_c. If p_c were a perfect indicator (1 for correct class, 0 otherwise), then within the correct class, the score would be det_conf * 1 = det_conf, which is exactly the ceiling. But p_c is not a perfect indicator - it's a probability that's often around 0.2-0.5 even for the correct class.
+
+The problem is that p_c varies across boxes of the same class, and this variation reorders them. If the variation in p_c is uncorrelated with whether the box is a true detection (i.e., it's just noise), it hurts.
+
+**What about using the classifier differently?**
+
+Idea 1: **Use the classifier only as a gate, not as a ranker.** For each box, assign it to its argmax class, and score it by det_conf only (not det_conf * p_c). This is essentially what e004 tried (top-1 class per box), and it scored 0.5689 - much worse. So that doesn't work because we lose the multi-class rows.
+
+Idea 2: **Soften the classifier's influence on ranking.** Instead of score = det_conf * p_c, use score = det_conf * (p_c)^α for some α < 1. This reduces the impact of p_c on the ordering while still using it to separate classes. If α is small, the ordering within a class is closer to det_conf ordering (the ceiling). If α is large, the classifier dominates.
+
+Wait, but this is a monotone transform per class... No, it's not. (p_c)^α changes the relative ordering of p_c values within a class. If p_c values are all in [0,1], raising to α < 1 compresses them toward 1, making them more similar, so det_conf dominates more. This IS a change in ordering within a class.
+
+Actually, let me think more carefully. For class c, we have boxes with scores det_conf_i * p_c_i. The ordering is by this product. If we instead use det_conf_i * (p_c_i)^α, the ordering changes because the p_c_i values are compressed (for α < 1) or expanded (for α > 1).
+
+For α < 1: p_c values are compressed toward 1, so det_conf dominates more → closer to ceiling ordering.
+For α > 1: p_c values are expanded, so classifier dominates more.
+
+The question is: is the classifier's p_c signal helpful or harmful for ordering within a class?
+
+If the classifier is good (high p_c for true detections, low for false alarms), then p_c helps separate true from false within a class. But if p_c is noisy, it hurts.
+
+Given that pore is at 0.504 (very bad), the classifier is clearly not helping pore ordering. For discontinuity at 0.780 (above ceiling), it might be helping.
+
+**Per-class α?** We could use different α per class. But that's complex and might be overfitting.
+
+Actually, a simpler idea: **use α < 1 globally to reduce the classifier's impact on ordering.** This should help the weak classes (pore, stain) by making their ordering closer to det_conf (the ceiling), while potentially slightly hurting the strong class (discontinuity) where the classifier is helping.
+
+Let me estimate: if we set α = 0.5, the p_c values are square-rooted. A p_c of 0.3 becomes 0.55, a p_c of 0.8 becomes 0.89. The spread is reduced. This should bring pore closer to the ceiling.
+
+But wait - there's another issue. The classifier also determines WHICH rows get high scores. If a box is truly a pore but the classifier says p_pore = 0.1 and p_deposit = 0.7, then the pore row gets a low score and the deposit row gets a high score. This is a classification error that can't be fixed by α.
+
+So α helps with the ranking-within-class problem but not the classification problem. The classification problem is addressed by making the classifier better.
+
+**What about the classifier itself?**
+
+The current classifier is EfficientNet-B0 with two-crop input (tight 1.5x + wide 2.5x), trained for ~5 epochs. The per-class F1 is ~0.87 macro, with pore and deposit being weak.
+
+Ideas for the classifier:
+1. Train longer (but we're time-limited)
+2. Better augmentation
+3. Different input (more context?)
+4. Ensemble of classifiers
+5. Train on detector boxes (e009 tried this, rejected)
+
+Wait, e009 tried training on detector boxes with a background class and it was rejected (0.6268). So that direction is exhausted.
+
+**What about the wide crop context?**
+
+The current wide crop is 2.5x the box side. What if we use a larger context (e.g., 4x or 5x) to give the classifier more surrounding context? Weld defects in context (surrounding weld bead pattern) might be easier to classify.
+
+But this is a data/augmentation change and the data category is marked EXHAUSTED. However, the specific idea of changing context size hasn't been tried. The "data" category experiments were about which crops to train on (high vs low res, detector boxes). Changing the crop size is more of an "architecture" or "inference" change in terms of what the model sees.
+
+Actually, let me reconsider. The context size affects both training and inference. It's a change to what the model sees. I'd categorize this as "architecture" (input representation) or maybe "data" (how we construct the input).
+
+**Let me think about what's most likely to give a 0.01+ gain:**
+
+The biggest gap is pore at 0.504 vs ceiling. If we could fix pore to match the ceiling, we'd gain roughly (0.758 - 0.504)/4 ≈ 0.06 on the average. That's huge.
+
+Why is pore so bad? Pores are small, round, dark spots in the weld. They might be hard to distinguish from:
+- Small deposits
+- Noise/artifacts
+- The background
+
+The classifier might be confusing pores with other classes or with background.
+
+**Idea: class-specific score calibration**
+
+Instead of a uniform α, what if we use the classifier probability but with a floor? E.g., score = det_conf * max(p_c, 0.1)? This prevents the classifier from suppressing a class too much. But this changes the ordering in a complex way.
+
+**Idea: use det_conf as the primary ranker, p_c as a secondary**
+
+score = det_conf * (1 + β * p_c) where β is small. This keeps det_conf as the primary ordering and uses p_c as a tiebreaker. For β = 0, it's pure det_conf (ceiling). For β → ∞, it's p_c-dominated.
+
+Actually, this is similar to the α idea but different. Let me think...
+
+With score = det_conf * (p_c)^α:
+- All scores are in [0, det_conf]
+- The p_c factor can be very small, pushing some rows to near 0
+
+With score = det_conf * (1 + β * p_c):
+- All scores are in [det_conf, det_conf * (1+β)]
+- The p_c factor is bounded, so it can't push rows to 0
+- The ordering is primarily by det_conf, with p_c as a perturbation
+
+The second formulation might be better because it doesn't suppress rows to near-zero (which could cause issues with the 300-row limit per image).
+
+But actually, the 300-row limit is per image, and we have 4 rows per box. With 41879 eval detections, that's about 167k rows total, but per image it's probably well under 300. So the 300-row limit probably isn't binding.
+
+**Let me reconsider the problem from scratch.**
+
+The ceiling is 0.758. Our score is 0.630. The gap is 0.128.
+
+The ceiling uses:
+- Correct class for boxes overlapping true defects
+- det_conf as score
+- False alarms kept as class 0 with det_conf
+
+Our system uses:
+- Classifier's argmax (implicitly, through p_c) for class
+- det_conf * p_c as score
+- All 4 rows per box
+
+The differences:
+1. **Class assignment**: We might assign the wrong class. The ceiling always gets the right class.
+2. **Score**: We use det_conf * p_c instead of det_conf. The p_c factor reorders within-class predictions.
+3. **False alarm handling**: The ceiling puts all false alarms in class 0. We spread them across all 4 classes based on p_c.
+
+For point 3: if a false alarm gets p_pore = 0.3, it injects a pore row with score det_conf * 0.3. In the ceiling, it would only be in class 0. So we're adding false positives to all 4 classes, not just class 0. This is the "cross-class contamination" that e007 tried to address (and was rejected).
+
+For point 1: classification errors mean a true pore box might get a high p_deposit, so it appears high in the deposit list (as a false positive for deposit) and low in the pore list (as a missed detection for pore).
+
+For point 2: even for correctly classified boxes, p_c varies and reorders them.
+
+**The most impactful fix would address point 1 (classification accuracy) for the weak classes.**
+
+But how? The classifier is already at ~0.87 macro F1. To improve it:
+- Better features (wider context, different backbone)
+- More training data (tried, exhausted)
+- Better training (mixup helped slightly, not confirmed)
+- Test-time augmentation (e003 tried 4-view averaging, not confirmed)
+
+Wait, e003 tried 4-view averaging (tight+wide, each with a flip?) and got 0.6301 5-seed, basically the same. So TTA didn't help.
+
+**What about a fundamentally different approach to the scoring?**
+
+Idea: **Use the classifier to assign a single class per box (argmax), but score by det_conf only.** This is e004, which scored 0.5689. Much worse. Why? Because by only emitting one row per box, we lose the "safety net" of having the box in multiple class lists. If the classifier is wrong, the box is in the wrong class list entirely.
+
+With 4 rows per box, even if the classifier is uncertain, the box appears in all 4 lists (with different scores). This is actually beneficial for mAP because:
+- If the classifier is right, the correct class row has the highest score → good
+- If the classifier is wrong, the box still appears in the correct class list (with a lower score) → it can still be a hit
+
+So the 4-row approach is inherently more robust to classification errors. The problem is that the incorrect class rows are false positives in those classes.
+
+**Key realization:** The 4-row approach means every box is in every class list. The AP for class c depends on:
+- True positives: boxes that overlap true c-boxes, sorted by score
+- False positives: all other boxes in class c, sorted by score
+- The ratio and ordering determine AP
+
+Since every box appears in every class list, the false positive set for class c includes ALL boxes (not just the ones the classifier thinks are c). This means the false positive rate for class c is very high (all 41879 boxes are in class c's list).
+
+Wait, that can't be right. Let me re-read: "For one class, all predictions of that class are sorted by score." So for class c, we have all rows with cls=c. That's one row per box (since we emit one row per class per box). So yes, all 41879 boxes are in class c's list.
+
+The AP for class c is determined by the ordering of these 41879 rows. The true positives are the boxes that overlap true c-boxes. The rest are false positives.
+
+In the ceiling, the same thing happens: all boxes are in class 0's list (false alarms as class 0), and boxes overlapping true c-boxes are in class c's list. Wait, no. The ceiling assigns the correct class to boxes overlapping true defects. So a box overlapping a true pore is in class 0's list (pore=0). A false alarm is in class 0's list. A box overlapping a true deposit is in class 1's list.
+
+So in the ceiling:
+- Class 0 (pore) list: true pore boxes + all false alarms
+- Class 1 (deposit) list: true deposit boxes only
+- Class 2 (discontinuity) list: true discontinuity boxes only
+- Class 3 (stain) list: true stain boxes only
+
+In our system:
+- Class 0 (pore) list: ALL boxes (scored by det_conf * p_pore)
+- Class 1 (deposit) list: ALL boxes (scored by det_conf * p_deposit)
+- etc.
+
+So our system has MANY more false positives per class than the ceiling! In the ceiling, class 1 only has true deposit boxes (plus no false alarms, since false alarms go to class 0). In our system, class 1 has ALL boxes.
+
+This is a huge difference. The false positive rate for class 1 in our system is (total boxes - true deposit boxes) / total boxes, which is very high. In the ceiling, it's 0.
+
+This means the AP for classes 1, 2, 3 in our system is dragged down by the massive number of false positives. The only way to compensate is to have the true positives ranked much higher than the false positives.
+
+In the ceiling, since there are no false positives for classes 1-3, the AP is 1.0 (all true positives are ranked, and there are no false positives to interfere). Wait, that's not right either. The ceiling's AP of 0.758 is the average over 4 classes. If classes 1-3 had AP 1.0 and class 0 had some lower AP, the average would be (AP_0 + 1 + 1 + 1)/4. For the average to be 0.758, AP_0 would need to be 0.032. That seems too low.
+
+Let me re-read the ceiling description: "Every detector box that overlaps a true defect (IoU > 0.5) gets the correct class; every other box (false alarms) is KEPT, as class 0, with its detector conf."
+
+So false alarms are class 0 (pore). This means:
+- Class 0 list: true pore boxes + all false alarms
+- Class 1 list: true deposit boxes
+- Class 2 list: true discontinuity boxes
+- Class 3 list: true stain boxes
+
+For classes 1-3, the list contains ONLY true positives (boxes overlapping true defects of that class). So AP = 1.0 for each of these classes (all predictions are true positives, precision = 1 at every recall level).
+
+For class 0, the list contains true pore boxes + false alarms. The AP depends on how well det_conf separates true pore boxes from false alarms.
+
+Average AP = (AP_0 + 1 + 1 + 1) / 4 = (AP_0 + 3) / 4 = 0.758
+→ AP_0 = 0.032
+
+That seems extremely low. But it's possible if there are many more false alarms than true pores, and det_conf doesn't separate them well.
+
+Actually wait, I think I'm misunderstanding. The ceiling's 0.758 is the mAP@0.5 on the validation set. Let me not try to decompose it and instead focus on what we can change.
+
+**The critical insight:** In our system, ALL boxes appear in ALL class lists. This means each class list has ~41879 entries, of which only a few hundred are true positives. The AP is determined by how well the true positives are ranked above the false positives.
+
+In the ceiling, classes 1-3 have NO false positives (only true positives in their lists). So their AP is 1.0. Only class 0 has false positives.
+
+This means our system is at a massive disadvantage for classes 1-3: we have thousands of false positives in each class list, while the ceiling has none. The only way to get high AP is to rank true positives very high.
+
+**This changes the problem completely.** The issue isn't just "classification accuracy" - it's that we're injecting false positives into every class list. The ceiling avoids this by putting all false alarms in one class (class 0).
+
+**So the key question is: can we reduce the number of false positives in each class list?**
+
+Option A: Emit fewer rows per box. E.g., only emit the top-1 or top-2 classes. But e004 tried top-1 and it was much worse (0.5689). Why? Because if the classifier is wrong, the box is in the wrong class list entirely, and we lose the "safety net."
+
+Wait, but in the ceiling, false alarms are all in class 0. If we emit only top-1 class, false alarms will be spread across all 4 classes (based on the classifier's argmax). This is similar to the ceiling's approach of putting them in one class, except they're spread across 4 classes.
+
+Hmm, but e004 scored 0.5689, which is worse than 0.630. So top-1 is worse. Why?
+
+I think it's because with top-1, a true pore box that the classifier misclassifies as deposit is in the deposit list (as a false positive) and NOT in the pore list (as a missed detection). With 4 rows, it's in both lists (as a lower-scored pore and a higher-scored deposit). The 4-row approach is more robust.
+
+But the 4-row approach has the problem of false positives in all lists. The ceiling avoids this by putting false alarms in one class.
+
+**What if we use a hybrid: emit 4 rows but with a strong suppression of non-argmax classes?**
+
+E.g., score = det_conf * p_c for the argmax class, and score = det_conf * p_c * γ for other classes, where γ << 1. This keeps the safety net (box appears in all lists) but makes non-argmax rows much lower in the ranking, so they don't interfere as much with the true positives of those classes.
+
+Wait, but this is similar to what we already have. If p_c is low for non-argmax classes, the score is already low. The issue is that even low scores can be above the true positives' scores if the true positives have low p_c.
+
+Actually, let me think about this differently. The AP for class c depends on the precision-recall curve. If we have N_c true positives and M false positives in class c's list, the AP is determined by the interleaving of true and false positives in the sorted list.
+
+If we suppress non-argmax rows (multiply by γ), the false positives from other classes' argmax get pushed down. But the false positives that ARE argmax for class c (i.e., the classifier thinks they're c but they're not) are still high.
+
+Hmm, this is getting complicated. Let me think about what specific change could help the most.
+
+**The pore class is the worst (0.504).** Why?
+
+Pores are small, round, dark spots. They might be:
+1. Hard to distinguish from deposits (also small)
+2. Confused with background/noise
+3. The detector might find many false alarms that look like pores
+
+If the classifier gives high p_pore to false alarms (noise), they rank high in the pore list and drag down AP.
+
+**Idea: use a larger context for the classifier to better distinguish pores from noise.**
+
+Pores in a weld bead have a specific context: they're in a metallic weld line, surrounded by the bead pattern. A false alarm (noise) might not have this context. A wider crop (e.g., 4x instead of 2.5x) could help the classifier see the surrounding weld structure.
+
+But this is a change to the input representation. Let me check if it's been tried. Looking at the history:
+- e005 (architecture): different backbone (not context)
+- e003 (inference): 4-view averaging (not context)
+- No one has changed CONTEXT or TIGHT_CONTEXT
+
+This seems like a promising, untried direction. Changing CONTEXT from 2.5 to 4.0 (or 3.0) would give the classifier more surrounding context. This could help distinguish:
+- Pores (in weld bead) from noise (not in weld bead)
+- Stains (on weld surface) from deposits (on weld surface, different texture)
+
+The cost: larger crops mean larger images to process, but since we resize to IMG_SIZE=160 anyway, the computation is the same. The only cost is in the cropping step (negligible).
+
+Wait, actually the crop is made at the original resolution and then resized to 160x160. A larger context means we're capturing more of the original image and then downscaling to 160x160. This means the defect itself becomes smaller in the 160x160 image. For a pore (which is already small), this could make it even harder to see.
+
+So there's a tradeoff: more context helps with scene understanding but makes the defect smaller. The current 2.5x might be a good balance. Going to 4x might hurt.
+
+What about adding a THIRD view with even more context, while keeping the existing two? This would give the classifier both the tight view (defect is large) and the wide view (context is visible). But e003 tried 4-view averaging and it didn't help.
+
+Actually, e003's 4 views were: tight+wide, each with a flip? Let me re-read: "averaging 4 views (tight+wide crop, each with [flip?])". The hypothesis was cut off. But the result was 0.6301, basically the same as 0.6297. So more views didn't help.
+
+**Let me think about the scoring more carefully.**
+
+Current: score = det_conf * p_c
+
+The ceiling: score = det_conf (for correct class), and false alarms only in class 0.
+
+The key difference: in our system, a false alarm with p_pore = 0.3 gets score det_conf * 0.3 in the pore list. In the ceiling, the same false alarm gets score det_conf in the pore list. So our system actually ranks false alarms LOWER in the pore list than the ceiling does! This should HELP our pore AP, not hurt it.
+
+Wait, that's interesting. Let me reconsider.
+
+In the ceiling, class 0 (pore) list: true pore boxes (score = det_conf) + false alarms (score = det_conf). All sorted by det_conf.
+
+In our system, class 0 (pore) list: ALL boxes (score = det_conf * p_pore). True pore boxes have some p_pore (hopefully high), false alarms have some p_pore (hopefully low).
+
+If the classifier is perfect: true pores have p_pore = 1, false alarms have p_pore = 0. Then our pore list has true pores with score = det_conf and false alarms with score = 0. This is BETTER than the ceiling (where false alarms have score = det_conf).
+
+If the classifier is bad: true pores have p_pore = 0.3, false alarms have p_pore = 0.4. Then our pore list has true pores with score = 0.3 * det_conf and false alarms with score = 0.4 * det_conf. False alarms rank ABOVE true pores. This is WORSE than the ceiling.
+
+So the classifier helps if it can separate true pores from false alarms (p_pore higher for true pores). It hurts if it can't.
+
+Given that pore AP is 0.504, the classifier is not helping pores. It might even be making things worse.
+
+**What if we use det_conf only for pore, and det_conf * p_c for other classes?**
+
+This is a per-class scoring change. For pore, we'd use the ceiling's approach (score = det_conf). For other classes, we'd use the classifier.
+
+But wait, in the ceiling, false alarms are in class 0 with score = det_conf. In our system, if we use score = det_conf for pore, ALL boxes (including true deposits, discontinuities, stains) would be in the pore list with score = det_conf. This is different from the ceiling, where only false alarms are in class 0.
+
+In our system, a true deposit box would be in the pore list with score = det_conf (if we use det_conf for pore). In the ceiling, it's NOT in the pore list (it's in the deposit list). So our pore list has more false positives than the ceiling's pore list.
+
+This means using det_conf for pore would actually make the pore AP worse than the ceiling, because we'd have true non-pore boxes in the pore list.
+
+Hmm, so the 4-row approach is fundamentally different from the ceiling's approach. In the ceiling, each box is in exactly one class list. In our system, each box is in all 4 class lists.
+
+**The fundamental problem: our system has 4x the false positives per class compared to the ceiling.**
+
+To compensate, we need the classifier to push true positives to the top of each class list. The classifier's p_c does this: true positives should have high p_c, false positives should have low p_c.
+
+The problem is that the classifier isn't good enough, especially for pore.
+
+Thinking budget reached. Stop thinking now and write the reply in the required format.

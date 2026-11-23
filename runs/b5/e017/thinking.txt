@@ -1,0 +1,157 @@
+===== attempt 1 =====
+Let me analyze the situation.
+
+Current best: e012, 5-seed mean 0.6342. Per-class: pore 0.536, deposit 0.616, discontinuity 0.778, stain 0.606.
+
+e016 (optimization) failed because the probe measurement was wrong: it measured 281s for prediction, but actual prediction was ~58s. Why? The probe ran `model(xt); model(xw); model(x2)` on eval batches, but... wait, why 281s? The probe ran 10 batches of 256 with 3 forward passes each. That's 30 forward passes of 256 images. Actual prediction: 41879/256 = 164 batches, 3 forwards each = 492 forwards. If 10 batches took X seconds, est = X/10 * 164. The log shows "prediction cost 281s" → per_batch = 281/164 ≈ 1.71s → 10 batches ≈ 17s. Hmm, but actual prediction in e012 was ~58s for 492 forwards → 0.118s per forward → 0.35s per batch of 3 forwards. So the probe measured ~5x slower per batch. Why?
+
+Ah — the probe ran before training, i.e., at the very start of GPU work. The first forward passes include CUDA kernel compilation/autotuning, and probably DataLoader worker startup. The first 10 batches include the cost of worker startup (8 workers, persistent_workers=True, first batch generation is slow). Also the probe consumed the first 10 batches of dl_ev — but that's fine since it's a fresh iterator... wait, actually the probe consumed 10 batches from dl_ev, and then the later prediction loop iterates dl_ev again — a new iterator, so no issue.
+
+Actually, there's another subtle point: the probe ran with `model.eval()`, and then set `model.train()` afterward. No problem.
+
+But the 5x slowdown: the first 10 batches include worker startup and CUDA initialization. In e012, prediction took 58s total, which included worker startup too. Hmm, e012 total 183s, training ended at 125s, so prediction ≈ 58s. 492 forwards in 58s = 0.118s/forward. Probe: 30 forwards in ~17s = 0.57s/forward. So the probe was ~5x slower per forward. That's consistent with the first ~10 batches being slow: DataLoader worker startup (8 workers each loading images? no — images are already in memory; the dataset does crop generation in workers). First batch generation can take several seconds. Plus CUDA kernel compilation for the model's first forward (bfloat16 autocast kernels). So the estimate was inflated.
+
+Fix approach: warm up the probe (run a few throwaway batches first, or measure more batches and take the minimum rate), or simply keep a fixed reserve but reduce it. Actually, the simplest and most robust fix: measure prediction cost with a longer probe that includes warmup: e.g., run 20 batches, discard the first 5, and estimate from the rest. Or even simpler: keep RESERVE_S but set it to 40 (actual prediction ~58s... wait, that was at the T=180 budget; is T the same every time? The harness runs with --seconds T; in the log total 183s, so T is probably 180 or 190. Hmm, e012 total 183s, and it wasn't killed, so T ≥ 183. e016 total 118s.
+
+Actually, wait — do I know T? "python train.py --data /work/data --out /work/out --seed S --seconds T" — T is the total wall-clock budget. e012 finished at 183s and wasn't killed, so T > 183. Probably T = 180? No, it finished at 183s, so T ≥ 183. Maybe T=200? Unclear. e011 timed out with 8 views: prediction would be ~58s * (8/6 forwards?) hmm.
+
+Let me think: e012 prediction = 3 forwards per box (3 views), 41879 boxes, batch 256 → 164 batches × 3 forwards = 492 forwards, ~58s → 0.118s/forward (256 images) → ~4.6e-4 s/image.
+
+e011 (8 views at inference): 8 forwards per box → ~154s for prediction + training. If T is ~180-200, training gets squeezed. It timed out.
+
+So T is probably 180? But e012 finished at 183s... so T ≥ 183. Let's say T=200. Then e016: probe estimated 281s prediction → t_end = max(t_start+30, deadline - 281 - 20) = t_start + 30 → only 30s of training (23 steps). Then actual prediction was 118-61 = 57s. Total 118s, well within budget. So the run wasn't even close to the limit; it just undertrained (23 steps, loss 1.44). That's the bug: the probe overestimated.
+
+Now, what to do next? The instructions say: if a run crashed or timed out, read the log and fix the cause. e016 was "suspicious (likely bug)". I can fix e016 with BASE: last. The idea (use more of the budget for training) is sound: the model was cut off at ~291 steps with loss still dropping (0.275→0.259). More training should help. But is the gain ≥0.01? Hard to say. The loss curve is flattening. More steps with cosine LR... the current schedule decays LR over the whole budget; if we train longer, the cosine extends and the effective LR at a given step is higher. Hmm.
+
+Alternatively, pick a different experiment. Let me think about where the error is.
+
+Reference numbers:
+- one-step 4-class: 0.638 (baseline to beat; we're at 0.6342, just below)
+- perfect classes on stage-1 boxes: 0.758
+- class-agnostic single class: 0.755
+
+So the ceiling for stage 2 with the current stage-1 boxes is 0.758. We're at 0.634. Gap ≈ 0.124. Per-class AP: pore 0.536, deposit 0.616, discontinuity 0.778, stain 0.606.
+
+The crop classifier with perfect boxes reaches macro-F1 ~0.87. So classification accuracy is decent, but mAP depends on ranking too: score = conf × p_class. For a true box of class c, the score is conf × p_c; for false alarms, the score is conf × p_c for the class they get assigned. Ranking matters.
+
+Key insight from the paper: merging into 1 class gives 0.77 vs 4-class 0.69 → many errors are wrong type. The perfect-class ceiling 0.758 vs class-agnostic 0.755: nearly identical, meaning boxes that overlap true defects are almost all correctly... wait, no: the perfect-class ceiling keeps false alarms as class 0 with their conf. The 0.003 difference between 0.758 and 0.755 means the placement of boxes is nearly perfect; the difference is only in class assignment for boxes that overlap true boxes.
+
+So the remaining 0.124 gap is almost entirely class assignment + the ranking of false alarms per class.
+
+What has been tried:
+- data: detector boxes for training (e001, rejected), low-res (e002, not confirmed), background class (e003, rejected) — exhausted.
+- scoring: temperature (e004, rejected), argmax only (e014, rejected).
+- architecture: 224px (e005, not confirmed), some architecture change (e007, rejected — "the model's argmax is often wrong and..." probably something like a second head or ensemble?), efficientnet_b2 (e009, not confirmed), third view 4x context (e012, new best).
+- augmentation: rotation (e006, rejected).
+- inference: flip TTA (e008, not confirmed, 0.6306 vs 0.6342? wait e008 was based on e000; e000's score is... e012 is 0.6342, e008 is 0.6306 — both "not confirmed" against the best at the time), 8-view TTA (e011, timeout), flip TTA replacing the 3rd view (e013, rejected).
+- sampling: class weighting / upsampling (e010, not confirmed).
+- loss: focal (e015, rejected).
+- optimization: budget fix (e016, bug).
+
+Hmm, what's left that could plausibly gain ≥0.01?
+
+Ideas:
+1. Fix e016 (BASE: last) — train longer. Risk: the gain from more training may be small (<0.003). Loss went 0.72→0.37→0.275→0.259 over 4 epochs (291 steps). The last epoch only had 9 steps (282→291) because the time ran out mid-epoch. Actually epoch 3: 282→291 steps, so only 9 steps of epoch 3. So the model effectively trained ~3.1 epochs. More training might help a bit. But the schedule: cosine over the whole budget; if we train longer, the LR decays more slowly. Hmm, but is the gain ≥0.01? Unclear, probably 0.002-0.005. Borderline.
+
+2. Use the budget more cleverly: the real issue is that prediction takes 58s out of ~180-200s. If T=200, training gets ~140s (reserve 55). Actually wait: t_end = deadline - 55. t_start is ~14s after T0 (loading). So training runs from 14s to T-55. If T=200, training = 131s → 291 steps. Prediction 58s + write. Total 183s. OK.
+
+3. Speed up inference to free training time: e.g., reduce prediction cost. Currently 3 views × 41879 boxes. Can we subsample? No — we need predictions for all eval boxes. Can we make prediction faster: larger batches (batch 256 → 512?), but GPU memory... EfficientNet-B0 at 160px, batch 256 in bfloat16 — probably fine, 512 might OOM. Or use torch.compile? Risky in a sandbox, compilation time eats budget. Or reduce views at inference: e013 tried replacing the 3rd view with flip TTA (4 views) — rejected (0.6273). So the 4x view is important; 2 views at inference would hurt.
+
+Actually, wait: can we cache crops? The dataset generates crops in workers each epoch — 8 workers, crops are computed from in-memory images, fast enough. Training is 291 steps in 111s (14s→125s) → ~0.38s/step with 3 forwards of batch 64 = 192 images → 2ms/image. Prediction is 0.118s/forward of 256 = 0.46ms/image. So training is ~4x slower per image (backward + optimizer + data gen). If we speed up data loading... images are in memory; crop generation is numpy/PIL per item in 8 workers. Probably fine.
+
+4. A fundamentally different approach to scoring: the score is conf × p_c. The ranking within a class determines AP. False alarms: a false alarm box assigned to class c with score conf×p_c competes with true class-c boxes. The class-agnostic single-class score is 0.755 — if we could perfectly assign classes, we'd get 0.758. The ranking of true boxes within a class is driven by conf×p_c. For true boxes, p_c is the model's confidence in the correct class; for false alarms, p_c might be high for the wrong class.
+
+Idea: calibrate the score to better separate true vs false within a class. E.g., train the classifier on detector boxes (e001 tried training on detector boxes — rejected, 0.6264). Hmm.
+
+Idea: use the detector conf more cleverly — e.g., score = conf^a × p_c with a tuned a? That's a scoring tweak; e004 (temperature) and e014 (argmax) failed. But a different angle: the 300-row-per-image cap. Currently we output 4 rows per box (54985 rows for 41879 boxes... wait, 41879 boxes × 4 = 167516, but only 54985 rows were written because of the MIN_SCORE=0.001 filter). Per image, at most the top 300 rows count. If an image has many boxes, low-score rows are dropped anyway. The cap probably doesn't matter much.
+
+5. Ensemble of two models trained with different seeds? We have the budget for one model. Train two smaller/shorter models and average? E.g., train model A for half the budget, model B for the other half, average logits. Two models with different seeds → different errors → ensemble usually gains 0.01-0.02 on classification. But each model gets half the training → weaker individually. Net effect unclear. Hmm.
+
+6. Better use of the "low" resolution: e002 was not confirmed (0.6261 vs e000's 0.6288? actually e000's score — e001 was based on e000 with 0.6264 seed-0; e000's 5-seed mean is probably ~0.6288? e010's seed-0 was 0.6288. Hmm, e000's mean is probably ~0.629).
+
+7. What about the box placement? The perfect-class ceiling keeps boxes as-is and gets 0.758, so placement is fine.
+
+8. Class-specific fine-tuning: e.g., stain vs deposit confusion. Stain 0.606, deposit 0.616, pore 0.536. Pore is weakest. Pore is small holes; maybe the tight crop matters most for pore. Could try per-class view weighting? That's a scoring tweak.
+
+9. Two-stage refinement: use the model's predictions on train-split detector boxes to build pseudo-labels, then retrain? E001 already trained on detector boxes (rejected).
+
+10. Increase training data utilization: currently 6052 boxes, 291 steps × 64 = ~18600 samples seen (3 epochs). The dataset is small; more epochs = more memorization. The loss is still dropping. Maybe the model is undertrained — that's the e016 idea.
+
+Let me reconsider: what's the biggest lever? The gap to the ceiling is 0.124. The classifier's macro-F1 with perfect boxes is 0.87. But our mAP is 0.634. Even with perfect boxes we'd get a lower mAP than 0.87 suggests, because mAP@0.5 requires IoU>0.5 with true boxes — the detector boxes are slightly misplaced. The class-agnostic score is 0.755 with detector conf as score. With perfect classes it's 0.758. So if our classifier were perfect, we'd get ~0.758. Our classifier's error costs 0.124.
+
+Where does the 0.124 go? Two parts:
+(a) Boxes that overlap true defects get the wrong class → they become FPs for the assigned class and miss for the true class.
+(b) Ranking: for the correct class, the score conf×p_c may rank a true box below FPs.
+
+From the paper: one-step 4-class 0.638 vs 1-class 0.77 → the one-step detector also has class errors. Our stage-2 is slightly below one-step (0.6342 vs 0.638).
+
+Per-class: pore 0.536 is worst. Pores are small, numerous, and confused with...? Pore and deposit are the weak classes; stain is often confused with deposit.
+
+Ideas targeting pore: pore detection benefits from the tight crop; maybe add an even tighter view (1.2x)? Or higher resolution for the tight view? e005 raised the resolution to 224 — not confirmed (0.6251 vs e000's ~0.629? hmm, actually e005's seed-0 was 0.6303, 5-seed 0.6251, "not confirmed" — so below best).
+
+What about training at higher resolution for the tight view only? That changes the architecture (different input sizes per view — possible: the tight view at 224, the others at 160). More compute per step. Hmm.
+
+Let me think about the ensemble idea more concretely. The seed-to-seed std is 0.0044 — quite high, suggesting the model's behavior varies a lot with initialization. An ensemble of 2 models (different seeds, averaged logits) would reduce variance and probably raise the mean. Cost: each model gets ~half the training steps. With only ~3 epochs each, both are undertrained. Net: unclear, probably slightly negative or neutral. Risky.
+
+Alternative: train one model for the full budget, but with a better schedule? E.g., the current cosine decays to 1e-3×LR at the end. Fine.
+
+What about freezing the backbone and training only the classifier head longer? No — the backbone needs adaptation.
+
+Let me reconsider the e016 fix. The idea of using the full budget is sound and the fix is simple: the probe overestimated because of warmup. Fix: run a warmup (e.g., 3 batches), then measure 10 batches, estimate from the steady state. Or simpler and safer: keep a fixed reserve but reduce it to 45s (actual prediction ~58s... wait, that doesn't fit — a 45s reserve with 58s prediction would be killed).
+
+Hmm wait, let me recompute e012's timing: total 183s, training ended at 125s (t_end = deadline - 55 → deadline = T0 + T; if T=240? then t_end = T0+185, but training ended at 125s because... no, training runs until t_end or the epoch ends. Epoch 3 ended at 125s with only 9 steps? no wait: epoch 3: 282→291 steps, 125s. Epoch 2 ended at 282 steps, 121s. So epoch 3 had 9 steps in 4 seconds?? That's 0.44s/step, consistent. But why did epoch 3 end at 125s if t_end is later? Because... the while loop: after the epoch-3 batch, time.time() >= t_end → done. So t_end ≈ 125s. Therefore deadline - 55 = 125 → deadline = T0 + 180 → T = 180?? But total was 183s and it wasn't killed. Hmm, the harness kills "at the limit" — maybe with a small grace, or T=180 and it squeaked by at 183s? Risky. Actually e011 (8-view TTA) timed out: prediction would be ~58×(8/3)≈154s... training until t_end≈125s, then prediction 154s → total ~280s > 180 → killed. Consistent with T=180.
+
+But e012 finished at 183s > 180? Contradiction. Unless T is slightly larger, like 190. Then t_end = 135, but training ended at 125s?? No — training should run until 135s. Unless the epoch boundary: the loop breaks only on time inside the batch loop; epoch 3 had 282→291 steps... wait, that's only 9 steps = 1 batch? 6052/64 = 94 steps/epoch. Epoch 3 should have 94 steps (282→376) if time allowed. It stopped at 291 steps at 125s. So t_end ≈ 125s → T ≈ 180. And total 183s. So T=180 with a ~3s grace, or T=185. Either way, e012 was right at the edge. e016 finished at 118s, fine.
+
+So T ≈ 180. Prediction takes ~58s. Training gets ~111s (14s→125s). To train longer, we must cut prediction time. Options:
+- Faster prediction: bigger eval batch (512), or fewer views at inference (risky, e013 rejected), or skip the 3rd view for low-conf boxes? Interesting: the 3rd view (4x) mainly helps stain/deposit separation. For boxes with very low conf, the score is low anyway and rarely counts. We could run the 3rd view only for boxes with conf above some threshold. E.g., conf > 0.1: what fraction of boxes? Unknown. If 50%, prediction time drops ~25% (1/3 of the forwards). Saves ~15s → ~40 more training steps. Gain probably <0.003. Not worth it.
+
+- Actually, a cleaner big idea: reduce prediction cost by caching crops across the whole run? No, prediction is one pass.
+
+- Use a smaller/faster backbone for prediction? No.
+
+Hmm, what about the number of training steps: 291 steps, batch 64. If we increase batch size to 128 (fewer steps but each step 2x time — same samples/sec, no gain). Batch 128 with the same wall time = same number of samples. No.
+
+Speed up training: data loading? 8 workers generating crops with PIL resize — 3 crops per item, 160px. Probably a bottleneck? 291 steps in 111s = 0.38s/step. GPU forward+backward for 3×64 EfficientNet-B0 160px bf16: forward ~0.05s, backward ~0.1s, total ~0.15-0.2s. So ~0.2s of data loading per step — significant! If data loading is the bottleneck, we could precompute crops once (all 6052 boxes × 3 views = 18156 crops of 160×160×3 float32 = 18156×76800×4 bytes = 5.6GB — too much? maybe OK, but training-time jitter (random crop offsets) needs regeneration; we could precompute a few jittered versions per box, or precompute the base canvas and apply jitter cheaply... complex).
+
+Alternative: reduce per-item cost: the workers do 3 PIL resizes per item. We could resize once to max side (4x context) and derive the others by center crop + resize — still 2 resizes. Marginal.
+
+Actually, a simpler big lever: the model is undertrained (loss still dropping, only ~3 epochs on 6052 samples). The e016 idea was right; the fix is to estimate prediction cost correctly. With a correct estimate (~58s + margin 20s = 78s), t_end = deadline - 78 = T0 + 102 → training from 14s to 102s = 88s → fewer steps than now?? Wait no — currently t_end = deadline - 55 = T0+125, training 14→125 = 111s. With a correct estimate of 58s, we'd need a reserve of ~70s (58 + 12 write margin), so t_end = T0+110 → training 96s. That's less training than now! The current reserve of 55s is actually too small for a 58s prediction — e012 squeaked by (finished at 183s vs T≈180). So we can't train longer without cutting prediction time.
+
+So the e016 fix as-is doesn't gain training time; it just avoids the bug. To actually gain training time, cut prediction time. How?
+
+Prediction cost breakdown: 41879 boxes × 3 views. What if we predict with batch 512? If GPU memory allows, ~2x throughput per batch? Forward throughput is compute-bound; bigger batches improve GPU utilization slightly (maybe 10-20%), not 2x.
+
+What if we drop one view at inference for most boxes? e013 (replace 3rd view with flip TTA, 4 views) was rejected at 0.6273 — but that had 4 views (more compute) and lost the 4x context. What about 2 views at inference (tight + wide), skipping 4x? That halves... no, cuts 1/3 of the forwards → ~40s prediction → reserve 55 works → training until 125s, same as now. No gain in training, and probably loses stain performance (the 4x view helped in e012).
+
+Hmm, OK. So the budget is tight; training time is fixed at ~111s unless we cut prediction.
+
+Let me step back and think about what could plausibly gain ≥0.01:
+
+The classifier's macro-F1 with perfect boxes is ~0.87 (starting recipe, 2 crops). We're at 3 crops. Our mAP 0.634 vs ceiling 0.758. Even a perfect classifier gets 0.758, so the classifier must be well below perfect on the eval boxes. Expected F1 on eval boxes is probably ~0.75-0.8.
+
+Per-class AP: pore 0.536. Pore is probably the most frequent class? If pore is frequent and hard, it drags the mean. What makes pore hard? Small, dark spots; confused with stain? The paper says stain is confused with deposit; pore and deposit are weak.
+
+Idea: per-class input — give pore boxes a tighter crop? We already have a 1.5x tight view. A 1.0x view (the box itself) might help pore: the hole fills the frame. Add a 4th view? More training compute (4 forwards/step → 25% fewer steps) and 33% more prediction time (→ timeout risk). Not good.
+
+Idea: train with a second head for the 2 most-confused pairs (stain/deposit)? e007 was an architecture change about argmax being wrong — rejected. What exactly was e007? "The dominant error is class assignment... the e004 temperature result shows the model's argmax is often wrong and [cut off]" — I don't know exactly; it was rejected.
+
+Idea: label smoothing? Unlikely to gain 0.01.
+
+Idea: better LR schedule / longer warmup? Marginal.
+
+Idea: mix precision — train in fp32? No.
+
+Idea: use the detector conf in training: weight training samples by the conf of the overlapping detector box? Boxes that the detector is confident about matter more for ranking. Hmm, that's a sampling tweak; e010 (class weighting) was not confirmed.
+
+Idea: the score. score = conf × p_c. Consider a true pore box with conf 0.8 and p_pore 0.6 → 0.48. A false alarm with conf 0.9, p_pore 0.5 → 0.45. The ranking is conf-dominated. The class-agnostic 0.755 uses conf only. With perfect classes, 0.758 — so adding the p_c factor barely changes the ranking (0.003). That means p_c is nearly constant across boxes?? No — it means that within the set of boxes overlapping true class-c defects, the conf ranking is already good, and p_c doesn't reorder much. But FPs: with perfect classes, FPs are all class 0 (pore!) with score conf. With our model, FPs are spread across classes by argmax.
+
+Interesting: the perfect-class ceiling puts all FPs in class 0 (pore) — that inflates pore's AP?? No wait, FPs hurt pore's precision. Hmm, but 0.758 > 0.755, so putting FPs in class 0 with conf scores is slightly better than the single-class pooling. Whatever.
+
+Key: to approach 0.758, we need (a) correct class for true boxes, (b) FPs to have low scores in the class where true boxes exist, or to be ranked below true boxes.
+
+Currently FPs get score conf × p_argmax. If p_c is well calibrated, FPs get low p. The temperature experiment (sharper) hurt — so sharpening made FPs' top-class scores higher relative to true boxes' p_c? Or made true boxes' p_c drop for hard ones. So the model's probabilities are not great at separating true vs false.
+
+Idea: train the model to predict "defect or not" as well? e003 added a background class — rejected (0.5935). That was training on detector boxes with a background class; it hurt.
+
+Hmm, what about a different scoring: score = conf × p_c^γ with γThinking budget reached. Stop thinking now and write the reply in the required format.

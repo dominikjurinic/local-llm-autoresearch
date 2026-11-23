@@ -1,0 +1,372 @@
+===== attempt 1 =====
+Let me analyze the situation carefully.
+
+**Current state:**
+- Best: e000, 5-seed val mAP@0.5 = 0.6288
+- e001: crashed (IoU broadcasting bug)
+- e002: fixed e001's bug, seed-0 0.6330, 5-seed 0.6307, not confirmed (gain +0.0019, needed >0.0046)
+- e003: stage-1 error simulation (bigger jitter), seed-0 0.6342, 5-seed 0.6294, not confirmed (gain +0.0006)
+
+**Key diagnostics:**
+- Per-class AP: pore 0.502, deposit 0.624, discontinuity 0.780, stain 0.609
+- Confusion: pore→stain (20/63=32%!), stain→deposit (46/585=8%), deposit→stain (55/310=18%)
+- mAP if every box had correct class: 0.7461 (vs 0.6288) → the gap is 0.117, mostly wrong classes
+- Perfect classes ceiling: 0.758; class-agnostic: 0.755
+- Stage 1 misses 74 true defects (can't fix)
+
+**What the guide says:**
+1. Consolidate: detector boxes from train split (e001/e002 tried, not confirmed)
+2. Close box-quality gap: simulate detector errors (e003 tried, not confirmed), weight/sample by box quality, combine views better
+3. Buy training steps
+4. Fine-grained classes after 2 and 3
+
+**What's been tried and failed:**
+- Detector boxes as training data (e002): 5-seed 0.6307, not confirmed
+- Stage-1 error simulation (e003): 5-seed 0.6294, not confirmed
+- The "data" category is marked EXHAUSTED? (3 ideas, no new best)
+
+Wait, but e002 and e003 are both "data" category. The harness says data is EXHAUSTED. But the guide says to continue with box-quality gap closure. Let me think about what's fundamentally different.
+
+Actually, looking more carefully:
+- e001/e002: adding detector boxes as training data → not confirmed
+- e003: bigger jitter to simulate detector errors → not confirmed
+
+The guide's plan step 2 says:
+- simulate detector errors (e003 did this, not confirmed)
+- weight or sample training boxes by box quality
+- combine the two views better than averaging logits
+
+And step 3: buy training steps.
+
+Let me think about what would actually help. The key issue is:
+1. Pore is the weakest class (0.502 AP)
+2. Pore→stain confusion is severe (20 out of 63 true pores predicted as stain)
+3. Stain→deposit confusion (46 out of 585)
+4. Deposit→stain confusion (55 out of 310)
+
+The mAP gap from wrong classes is 0.7461 - 0.6288 = 0.117. That's huge.
+
+Now, what hasn't been tried?
+- The guide suggests "combine the two views better than averaging logits, for example one shared backbone whose pooled features from both crops are joined before a small head"
+- Weighting by box quality
+- Buying training steps (preparing crops once instead of per step)
+
+Let me think about the time budget:
+- Load: 13s
+- Training: ~112s (from 13s to 125s at last epoch)
+- Prediction: 162-125 = 37s
+- Total: 162s out of 180s
+
+So we have about 18s of slack. RESERVE_S = 55, so training ends at 180-55 = 125s. That checks out.
+
+**What about the "combine views better" idea?**
+
+Currently: two forward passes through the same model, logits averaged. This means the model sees each crop independently. A shared backbone with concatenated features before a head would let the model learn interactions between the tight and wide views. But this requires architectural changes.
+
+Actually wait - the current approach does TWO forward passes (model(xt) + model(xw)). That's 2x the compute per sample. If we could do it in 1x, we'd get 2x the training steps. But the guide says "one forward pass per view, no extra cost" - meaning the shared backbone processes both views in one batch, then concatenates features before a small head.
+
+Actually, let me re-read: "one shared backbone whose pooled features from both crops are joined before a small head (one forward pass per view, no extra cost)". This means: backbone(xt) and backbone(xw) are computed (2 forward passes through backbone), then the pooled features are concatenated and passed through a small head. The "no extra cost" is relative to the current approach which does 2 full forward passes (backbone + head). The new approach does 2 backbone passes + 1 head pass, which is slightly cheaper.
+
+But actually, the bigger win would be: if we use a single forward pass that processes both views together (e.g., concatenate along spatial dimension or channel dimension), we'd halve the compute. But that's harder to implement.
+
+Let me think about what's most impactful and feasible.
+
+**Option A: Pre-compute crops (buy training steps)**
+Currently, crops are computed on-the-fly in the DataLoader workers. This means PIL resize operations happen during training. If we pre-compute all crops once (for both views) and store them in memory or on disk, the DataLoader just loads tensors. This could significantly speed up training.
+
+Let me estimate: 6052 boxes × 2 views × 160×160×3 float32 = 6052 × 2 × 76800 × 4 bytes = ~3.7 GB. That's a lot of RAM. Maybe we can use uint8 and normalize on the fly, or store as float16.
+
+Actually, 6052 × 2 × 160 × 160 × 3 = 93,619,200 pixels × 3 channels = 280M values. As float32: 1.12 GB. As uint8: 280 MB. That's manageable.
+
+But wait, the training jitter (random crop positions) means we can't pre-compute the exact crops. Unless we pre-compute the full image crops at a slightly larger size and then randomly crop within them.
+
+Hmm, actually the current jitter is: center shift ±0.1*side (or 0-0.3*L for e003) and scale 0.85-1.2 (or 0.7-1.4). If we pre-compute a larger crop (say 2x the tight crop size) and then randomly crop a 160×160 region from it, we'd get similar jitter without PIL operations.
+
+Actually, a simpler approach: pre-compute the crops without jitter (deterministic), store them, and then apply jitter as tensor operations (random crop from a slightly larger pre-computed region, or random affine). This avoids PIL resize during training.
+
+Let me think about the time savings. Currently, each batch of 64 samples requires 64×2=128 PIL resize operations. With 433 steps, that's 433×128 = 55,424 resize operations. Each PIL resize of a small image to 160×160 takes maybe 1-2ms. So ~55-110s of PIL operations spread across the training. But they're done in parallel by 8 workers, so the actual wall-clock cost is less.
+
+Actually, looking at the log: 94 steps in the first epoch (6052/64 ≈ 94.6). The first epoch takes 59-13 = 46s. That's 46/94 = 0.49s per step. Subsequent epochs: (77-59)/94 = 0.19s per step. So the first epoch is slower (warmup, data loading), and subsequent epochs are ~0.19s per step.
+
+If we pre-compute crops, the first epoch would be faster (no PIL in workers), and subsequent epochs would also be faster. Maybe we'd save 10-20s, giving us 20-40 more steps. With 433 steps currently, 40 more steps is ~9% more training. That could be worth 0.005-0.01 mAP.
+
+**Option B: Shared backbone with concatenated features**
+This changes the architecture. The current model does 2 forward passes and averages logits. The new approach would:
+1. Extract features from both views through the shared backbone
+2. Concatenate the feature vectors
+3. Pass through a small head (e.g., 2×4 → 4)
+
+This is architecturally different and could help the model learn interactions between views. But it requires modifying the timm model to expose intermediate features, which is doable but adds complexity.
+
+Actually, a simpler version: instead of averaging logits, concatenate the two logit vectors (8-dim) and pass through a linear layer to get 4-dim logits. This is a 1-layer change and doesn't require modifying the backbone. The model would learn to weight the two views differently.
+
+Wait, but the metric says "Any change that keeps the order of a class's predictions leaves its AP unchanged." So if the concatenated-logits approach just re-scales scores monotonically, it won't help. It only helps if it re-orders predictions (true detections above false ones). The key question is: does learning a non-uniform combination of the two views' logits help re-order?
+
+If the tight view is better for some classes and the wide view for others, a learned combination could help. For example, if pore detection benefits from the tight view (small texture) and stain detection benefits from the wide view (context), the model could learn to weight them differently per class.
+
+But this is a relatively small change. The bigger architectural change would be to concatenate features before the head, allowing the model to learn cross-view interactions.
+
+**Option C: Weight training samples by box quality**
+The idea: boxes that the detector placed well (high IoU with true box) are "easy" and the model already handles them. Boxes that are poorly placed (low IoU) are where the model fails. So we should oversample poorly-placed boxes.
+
+But wait, we don't have detector boxes for all training boxes. We only have detector boxes for the train split in dets.csv. We could compute IoU between each training box and the detector boxes on the same image, and use that as a quality proxy.
+
+Actually, this is getting complicated. Let me think about what's most likely to work.
+
+**Re-reading the guide:**
+"2. Close the box-quality gap (main phase). Make the classifier robust to imperfect boxes. Directions, roughly in order of expected value:
+- simulate detector errors on the true boxes during training (e003 tried, not confirmed)
+- weight or sample training boxes by box quality
+- combine the two views better than averaging logits"
+
+e003 tried the first direction and it wasn't confirmed. The guide says "Two failed variants of a direction: move to the next direction." But only one variant was tried (e003). However, the "data" category is marked EXHAUSTED.
+
+Wait, let me re-read the lessons:
+"data | 3 | 2 | 0 | 2 | 1 | EXHAUSTED? (3+ ideas, no new best)"
+
+3 ideas in data category, 2 ran, 0 new best, 2 close but not confirmed, 1 crashed. The harness marks it as EXHAUSTED? with a question mark.
+
+But the guide explicitly says to continue with box-quality gap closure. And the "combine views better" direction hasn't been tried. Let me go with that.
+
+Actually, let me reconsider. The most impactful thing might be to buy training steps. Let me look at the log more carefully:
+
+```
+train 6052 boxes, eval 41879 detections, 1022 images (13s)
+epoch 0: loss 0.7217, 94 steps, 59s
+epoch 1: loss 0.3735, 188 steps, 77s
+epoch 2: loss 0.2881, 282 steps, 95s
+epoch 3: loss 0.2532, 376 steps, 114s
+epoch 4: loss 0.2189, 433 steps, 125s
+done: 5 epochs, 433 steps, 53606 prediction rows, 162s total
+```
+
+Training: 13s to 125s = 112s for 433 steps = 0.259s/step
+Prediction: 125s to 162s = 37s for 41879 detections
+
+The loss is still falling at the cut (0.2189 at the end). More training would help.
+
+If we can save 15s on training (say by pre-computing crops), we get ~58 more steps (15/0.259). That's 13% more training. The loss is still decreasing, so this should help.
+
+But actually, the first epoch is much slower (46s for 94 steps = 0.49s/step) vs subsequent (19s for 94 steps = 0.20s/step). The first epoch slowness is likely due to data loading (PIL operations in workers). If we pre-compute crops, the first epoch would be ~0.20s/step too, saving ~27s in the first epoch alone.
+
+Wait, but with persistent_workers=True, the workers are already warmed up after the first epoch. The first epoch slowness might be due to:
+1. Worker initialization
+2. PIL operations (crops computed on the fly)
+3. GPU warmup
+
+If we pre-compute crops, we eliminate #2. Let me estimate the savings:
+- First epoch: 94 steps × (0.49-0.20)s = ~27s saved
+- Subsequent epochs: maybe 5-10s saved each (less PIL in workers)
+- Total: maybe 30-40s saved
+
+That would give us ~120-150 more steps. That's a significant increase in training.
+
+But wait, pre-computing crops means we lose the random jitter (center shift, scale). We need to handle that. Options:
+1. Pre-compute a larger crop (e.g., 2x the target size) and randomly crop a 160×160 region during training
+2. Pre-compute the exact crop and apply random affine transforms as tensor operations
+3. Pre-compute multiple jittered versions and randomly select
+
+Option 1 is cleanest. For each box, compute a crop of size 2*160=320 (or some multiple) centered on the box, then during training, randomly crop a 160×160 region from it. This simulates center jitter. For scale jitter, we'd need to pre-compute at multiple scales, which is more complex.
+
+Actually, a simpler approach: pre-compute the crops at the exact size (no jitter), store them, and then during training, apply random affine transforms (translation, scale) as tensor operations. This is fast (just torch operations, no PIL).
+
+Let me think about memory: 6052 boxes × 2 views × 160×160×3 float32 = 6052 × 2 × 76800 × 4 = 3.72 GB. That's a lot. As uint8: 930 MB. We can store as uint8 and normalize in the DataLoader.
+
+Actually, let me reconsider. The images are already loaded in memory (1022 images). The crops are computed from these images. If we pre-compute all crops as uint8 arrays, that's 6052 × 2 × 160 × 160 × 3 = 93.6M × 3 = 280.8M bytes ≈ 281 MB. That's fine.
+
+But we also need to handle the jitter. If we pre-compute without jitter, we lose the data augmentation. We could:
+1. Pre-compute the crop at a larger size (e.g., 256×256) and randomly crop 160×160 during training
+2. Pre-compute at exact size and apply random affine during training
+
+Let me go with option 1: pre-compute at 256×256 (or maybe 192×192 to keep memory down), and randomly crop 160×160.
+
+Wait, actually the current jitter is:
+- Center shift: ±0.1 * side (where side = max(box_w, box_h) * context)
+- Scale: 0.85-1.2
+
+The crop size is `side` pixels in the original image, then resized to 160×160. The center shift is ±0.1*side in the original image coordinates.
+
+If I pre-compute a crop of size `side * 1.3` (to accommodate the center shift and scale jitter), centered on the box, and then randomly crop a `side`-sized region from it (with random offset up to 0.15*side), and then resize to 160×160... but the resize is the expensive part.
+
+Hmm, actually the PIL resize is from variable size (side) to 160×160. If I pre-compute at a fixed size (say 256×256) and then resize to 160×160, that's still a resize. But I could pre-compute at exactly 160×160 (no resize needed) and apply jitter as tensor operations.
+
+Let me think about this differently. The most impactful change might be simpler:
+
+**Pre-compute all crops as 160×160 float32 tensors (no jitter), store in a tensor array. In the DataLoader, apply random jitter as tensor operations (random crop from a slightly padded version, or random affine).**
+
+Actually, the simplest approach: pre-compute the crops at the exact size (no jitter), store as uint8. In the DataLoader, convert to float32, normalize, and apply random affine (translation, scale) using torch.nn.functional. This eliminates all PIL operations from the training loop.
+
+For the affine:
+- Translation: shift the image by a random amount (up to 0.1*160 = 16 pixels)
+- Scale: resize the image by a random factor (0.85-1.2) and crop/pad to 160×160
+
+These can be done with torch operations on the GPU, which is fast.
+
+But wait, the current code does the jitter in the DataLoader workers (CPU). If I move it to the GPU, it's faster. But the DataLoader workers also do the PIL resize, which is the expensive part.
+
+Let me just pre-compute the crops (no jitter) as uint8 arrays, and in the DataLoader, do:
+1. Convert to float32
+2. Normalize
+3. Apply random affine (translation + scale) using torch
+
+This should be much faster than PIL resize + numpy operations.
+
+Actually, I realize there's an even simpler approach that doesn't require changing the jitter logic:
+
+**Pre-compute all crops (with jitter, multiple versions) and store them. During training, randomly select a pre-computed version.**
+
+But this uses a lot of memory. 6052 × 2 × 5 versions × 160×160×3 uint8 = 6052 × 2 × 5 × 76800 = 466M bytes ≈ 466 MB. That's doable but a lot.
+
+Let me go with the simpler approach: pre-compute crops without jitter, store as uint8, apply jitter as tensor operations in the DataLoader.
+
+Actually, let me step back and think about what's the highest-impact experiment.
+
+The guide says:
+1. Consolidate (detector boxes as training data) - tried, not confirmed
+2. Close box-quality gap - e003 tried (bigger jitter), not confirmed
+3. Buy training steps
+4. Fine-grained classes
+
+Given that:
+- The "data" category is marked EXHAUSTED
+- e003 (bigger jitter) wasn't confirmed
+- The loss is still falling at the cut (more training would help)
+- The first epoch is 2.5x slower than subsequent epochs (data loading bottleneck)
+
+I think the highest-impact experiment is to **pre-compute crops to buy training steps**. This is a "sampling" or "other" category change. It should help all classes equally (more training for all).
+
+Let me design the experiment:
+
+1. After loading images, pre-compute all training crops (both views) as uint8 arrays
+2. Store them in a numpy array or list
+3. In the DataLoader, load the pre-computed crop, convert to float32, normalize, apply jitter as tensor operations
+4. This eliminates PIL resize from the training loop
+
+For the jitter, I'll apply:
+- Random translation: shift by up to 0.1*160 pixels (using torch.nn.functional.pad + crop)
+- Random scale: resize by a random factor (using torch.nn.functional.interpolate)
+
+Wait, but the current jitter is applied before the resize. The crop is taken at a variable size (side pixels), then resized to 160×160. The jitter changes the crop center and size. If I pre-compute at the exact size (no jitter), the jitter would need to be applied after the resize, which is different.
+
+Hmm, let me think about this more carefully.
+
+Current pipeline:
+1. Compute crop center and size from box coordinates
+2. Apply jitter: shift center, change size
+3. Extract crop from image at (jittered center, jittered size)
+4. Resize to 160×160
+5. Normalize
+
+If I pre-compute step 1 (no jitter), extract crop, resize to 160×160, store. Then in DataLoader:
+- Load pre-computed 160×160 crop
+- Apply jitter: this would be a post-resize jitter, which is different from pre-resize jitter
+
+The difference: pre-resize jitter changes what part of the image is visible. Post-resize jitter changes the pixel values (shift, scale the already-resized image). These are different augmentations.
+
+To properly simulate the original jitter, I'd need to pre-compute at a larger size (to accommodate the jitter) and then randomly crop the 160×160 region.
+
+Let me do this:
+1. For each box, compute the crop center and size (no jitter)
+2. Compute a larger crop: center same, size = max_size * 1.3 (to accommodate jitter)
+3. Extract this larger crop from the image, resize to 256×256 (or 192×192)
+4. Store as uint8
+5. In DataLoader: randomly crop a 160×160 region from the 256×256 pre-computed crop, normalize
+
+The random crop from 256×256 to 160×160 simulates both center jitter and scale jitter (if the crop is from the center, it's the original; if offset, it's shifted; if the 256×256 was computed at a larger size, the scale is different).
+
+Actually, this is getting complicated. Let me simplify:
+
+**Pre-compute the exact crop (no jitter) at 160×160, store as uint8. In the DataLoader, apply random affine transforms (translation, scale) as tensor operations. This is a slightly different augmentation than the original, but it should still provide useful data augmentation.**
+
+The key benefit is eliminating PIL resize from the training loop, which should speed up training significantly.
+
+Let me estimate the time savings:
+- Current: 433 steps in 112s = 0.259s/step
+- First epoch: 94 steps in 46s = 0.49s/step (2.5x slower)
+- If pre-computed: first epoch should be ~0.20s/step (like subsequent epochs)
+- Savings in first epoch: 94 × (0.49-0.20) = 27s
+- Savings in subsequent epochs: maybe 5s each (less PIL in workers)
+- Total savings: ~35-40s
+- Additional steps: 35/0.259 ≈ 135 steps (31% more training)
+
+That's a significant increase. The loss is still falling (0.2189 at the end), so 31% more training should help.
+
+But wait, I need to be careful about the time budget. Currently:
+- Load: 13s
+- Training: 112s (13s to 125s)
+- Prediction: 37s (125s to 162s)
+- Total: 162s
+
+If I pre-compute crops during the load phase, the load time increases. Let's say pre-computing 6052 × 2 crops takes 10s (PIL operations). Then:
+- Load + pre-compute: 23s
+- Training: 112s - 35s = 77s (23s to 100s)
+- Prediction: 37s (100s to 137s)
+- Total: 137s
+
+That's well within the 180s budget. And we get 35s more training.
+
+Actually, the pre-computation time depends on the number of PIL operations. 6052 × 2 = 12104 crops. Each crop involves:
+1. Extract region from image (numpy slicing)
+2. Pad if needed (numpy)
+3. PIL resize to 160×160
+
+Each operation takes maybe 1-2ms. So 12104 × 2ms = 24s. That's a lot. But it's a one-time cost during loading.
+
+Hmm, 24s for pre-computation + 13s for loading = 37s. Then training: 112s - 35s = 77s. Total: 37 + 77 + 37 = 151s. Still within budget.
+
+But wait, the training savings might not be as much as I estimated. The PIL operations in the DataLoader workers are done in parallel (8 workers). So the actual wall-clock cost of PIL in the training loop is less than the total PIL time. The first epoch slowness might be due to worker initialization, not just PIL.
+
+Let me look at the numbers again:
+- First epoch: 94 steps in 46s = 0.49s/step
+- Second epoch: 94 steps in 18s = 0.19s/step
+- Third epoch: 94 steps in 18s = 0.19s/step
+
+The difference between first and second epoch is 46-18 = 28s. This could be:
+- Worker initialization: ~5-10s
+- PIL operations: the workers need to compute crops for the first epoch. With 8 workers, each worker handles ~12 batches. Each batch has 64 samples × 2 views = 128 crops. 128 crops × 1.5ms = 192ms per batch. 12 batches × 192ms = 2.3s per worker. But workers run in parallel, so the wall-clock cost is ~2.3s, not 12 × 2.3s.
+
+Hmm, that doesn't add up to 28s. Maybe the first epoch slowness is due to:
+- GPU warmup (CUDA context, cuDNN autotune)
+- Worker initialization
+- Data loading (reading images from disk)
+
+Actually, the images are already loaded in memory (1022 images). So data loading shouldn't be the issue.
+
+Let me reconsider. Maybe the first epoch slowness is just GPU warmup and worker initialization. In that case, pre-computing crops won't help much.
+
+But even if the savings are smaller (say 15s instead of 35s), that's still 58 more steps (13% more training). And the loss is still falling.
+
+Let me go with this experiment. It's a "sampling" category change (changing how training data is prepared).
+
+Actually, wait. Let me reconsider the category. The change is about how data is prepared (pre-computing crops), which is more of an "optimisation" or "other" change. Let me use "optimisation" since it's about making training more efficient.
+
+Hmm, actually the categories are: data, augmentation, architecture, loss, sampling, optimisation, inference, scoring, other. "Optimisation" seems right for making training faster.
+
+Let me now write the code.
+
+Key changes:
+1. After loading images, pre-compute all training crops (both views) as uint8 arrays
+2. Store them in a list or numpy array
+3. Modify BoxDataset to use pre-computed crops instead of computing them on the fly
+4. Apply jitter as tensor operations in the DataLoader
+
+Let me write the code:
+
+```python
+def precompute_crops(crops, images):
+    """Pre-compute all training crops as uint8 arrays."""
+    all_crops = []
+    for r in crops:
+        img = images[r["image"]]
+        views = []
+        for ctx in (TIGHT_CONTEXT, CONTEXT):
+            crop = make_crop(img, r, ctx, train=False)  # no jitter, returns float32 [0,1]
+            crop = (crop * 255).astype(np.uint8)  # convert to uint8
+            views.append(crop)
+        all_crops.append(views)
+    return all_crops
+```
+
+Wait, but make_crop returns float32 in [0,1] range. Converting to uint8 loses some precision, but it should be fine for training.
+
+ActuallyThinking budget reached. Stop thinking now and write the reply in the required format.

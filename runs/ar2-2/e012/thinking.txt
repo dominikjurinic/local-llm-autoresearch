@@ -1,0 +1,225 @@
+===== attempt 1 =====
+Let me analyze the current situation:
+
+Current best: e009 with 5-seed val mAP@0.5 of 0.6387
+- Single wide-crop (2.5x) EfficientNet-B0
+- TTA with horizontal flip
+- Trained on GT crops + matched detector boxes
+- 2 epochs, 771 steps in ~147s
+
+Per-class AP: pore 0.528, deposit 0.637, discontinuity 0.779, stain 0.611
+
+What's been tried and rejected:
+- e001: Background class (5th class) - 0.5691
+- e004: Squaring probability - 0.6211
+- e005: Background class with (1-p_bg) scoring - 0.6039
+- e006: Focal loss - 0.6123
+- e007: Mixup - 0.6233
+- e010: Batch size 32 - 0.6229
+- e011: WeightedRandomSampler for pore/stain - 0.6305
+
+What's worked:
+- e002: Adding detector boxes (matched) - new best
+- e003: Adding low-res crops - new best
+- e008: Single wide-crop (halving forward cost) - new best
+- e009: TTA horizontal flip - new best
+
+Let me think about what to try next. The key observations:
+
+1. The classifier is trained on perfect boxes + matched detector boxes. It has no notion of "not a defect" - false alarms will get some class probability assigned.
+
+2. Background class attempts (e001, e005) both failed badly. This is interesting - maybe the issue is that adding background dilutes the training signal too much.
+
+3. The scoring is conf × prob. The detector's conf might not be well-calibrated.
+
+4. Pore (0.528) and stain (0.611) are the weakest classes.
+
+Let me think about what could help:
+
+**Idea 1: Score calibration / temperature scaling**
+The classifier probabilities might be miscalibrated. We could apply a temperature scaling at inference time. But this is a bit of a shot in the dark.
+
+**Idea 2: Multi-crop TTA (more augmentations)**
+Currently we do original + horizontal flip. We could add vertical flip, 90° rotation, or other augmentations. But this costs more inference time.
+
+**Idea 3: Ensembling with a different architecture**
+We could train two models (e.g., EfficientNet-B0 and ConvNeXt-Atto) and average their predictions. But this might not fit in the time budget.
+
+**Idea 4: Better use of detector confidence**
+Currently score = conf × prob. Maybe we should use conf^α × prob^β for some α, β. Or maybe we should use a different combination.
+
+Wait, e004 tried prob² and it hurt. Let me think about what else to try with scoring.
+
+**Idea 5: Train longer / different LR schedule**
+Currently 2 epochs. With single crop, we got ~2.3 epochs in the budget. Maybe we could try a different LR schedule or train for more epochs with a lower LR.
+
+**Idea 6: Data augmentation improvements**
+Currently: light geometric jitter (center ±10%, side 0.85-1.2), horizontal flip, vertical flip, brightness 0.8-1.2. 
+Could try: color jitter (contrast, saturation), random erasing, etc.
+
+**Idea 7: Different pretrained backbone**
+The current model is EfficientNet-B0. Maybe ConvNeXt-Nano or RegNetY-016 would work better. But this is a big change.
+
+**Idea 8: Use both tight and wide crops but with a lighter model**
+e008 went from two-crop to single wide-crop. What if we go back to two-crop but with a smaller model (convnext_atto or convnext_pico) to fit more epochs?
+
+Actually wait, let me re-read the history. e008 switched from two-crop to single wide-crop and it improved. The hypothesis was that halving forward cost allows ~2.3× more training epochs. But the actual improvement was small (0.6317 → 0.6386).
+
+**Idea 9: Inference-time augmentation with more flips/rotations**
+Currently: original + H-flip. Could add V-flip or 180° rotation. This would give 4 views instead of 2. The cost is 2× more inference time, but inference is only a small part of the budget.
+
+Let me check: the log shows 147s total, with 17s for loading. Training takes ~130s. Inference + writing takes ~10s. So adding more TTA views would add maybe 5s, which is fine.
+
+**Idea 10: Score = conf × prob, but with a floor on conf**
+If the detector conf is very low, the score is very low regardless of class probability. Maybe we should use max(conf, some_floor) × prob, or conf^0.5 × prob to be less aggressive in suppressing low-conf detections.
+
+Actually, let me think about this more carefully. The mAP@0.5 scoring rewards:
+(a) right class on boxes that overlap a true defect
+(b) good ranking: true detections should score higher than false ones
+
+For (b), we want true detections to have high scores and false detections to have low scores. The detector conf already provides some signal for this. The classifier prob provides the class-specific signal.
+
+If a detection is a false alarm (no true defect nearby), the classifier will still assign some probability to each class. The highest class prob might be, say, 0.3. So the score would be conf × 0.3. If the detector conf is 0.5, the score is 0.15.
+
+If a detection is a true detection but the classifier gets the class wrong, the correct class prob might be 0.2 while the wrong class prob is 0.4. The score for the correct class would be conf × 0.2, which is lower than the false alarm score of 0.15 if conf is 0.5.
+
+So the ranking is complicated. Let me think about what would help most.
+
+**Idea 11: Use the maximum class probability as a "defect confidence" and scale by it**
+Instead of score = conf × prob[c], use score = conf × prob[c] / max(prob) or something. No, that doesn't make sense.
+
+Actually, let me think about this differently. The issue is that for false alarms, the classifier still assigns probabilities. The sum of all 4 class probs is 1. For a true detection, the correct class should have high prob. For a false alarm, all probs are relatively low (maybe 0.2-0.3 each).
+
+What if we use score = conf × (prob[c] - 0.25)? This would make false alarms (where all probs are ~0.25) have near-zero scores. But this might hurt true detections where the correct class prob is only 0.3.
+
+Hmm, that's risky. Let me think of something safer.
+
+**Idea 12: Two-stage scoring - use max prob as a gate**
+score = conf × prob[c] if max(prob) > threshold, else conf × prob[c] × penalty
+
+This is getting complicated. Let me think of simpler ideas.
+
+**Idea 13: Train with a different image size**
+Currently IMG_SIZE = 160. What about 128 or 192? Smaller would be faster (more epochs), larger might capture more detail.
+
+Actually, 160 is already a good size. Let me think about other things.
+
+**Idea 14: Cosine LR with a longer warmup or different schedule**
+Currently: 5% warmup, then cosine decay. What about 10% warmup? Or a step schedule?
+
+**Idea 15: Use a different optimizer**
+Currently AdamW. What about SGD with momentum? Or LAMB?
+
+Actually, let me focus on what's most likely to help. The key weakness is pore (0.528) and stain (0.611). 
+
+Let me reconsider the TTA idea. Currently we do H-flip. What about also doing V-flip? That would give 4 views: original, H-flip, V-flip, both-flip. This is a cheap change that could help with classification accuracy.
+
+Actually, let me think about what other TTA options there are:
+- H-flip (already done)
+- V-flip
+- 90° rotation
+- 180° rotation
+- Slight scaling (e.g., 0.9x, 1.1x)
+
+The most natural addition is V-flip, since it's the same cost as H-flip and complements it.
+
+Let me go with: **Add vertical flip to TTA** (4 views: original, H-flip, V-flip, both-flip).
+
+Hypothesis: Adding vertical flip to the existing horizontal-flip TTA will improve classification accuracy by providing an additional view that helps disambiguate pore from stain (which may have different vertical vs horizontal patterns), especially for the weak pore and stain classes.
+
+This is a focused, low-risk change. The inference cost doubles (from 2 to 4 forward passes per batch), but inference is only ~10s out of 147s total, so it should be fine.
+
+Let me write the code change:
+
+Current inference code:
+```python
+    model.eval()
+    probs = []
+    with torch.no_grad(), torch.autocast(**amp):
+        for x, _ in dl_ev:
+            x = x.to(device).to(memory_format=torch.channels_last)
+            p1 = torch.softmax(model(x).float(), 1)
+            p2 = torch.softmax(model(x.flip(-1)).float(), 1)
+            probs.append(((p1 + p2) / 2).cpu())
+```
+
+New inference code:
+```python
+    model.eval()
+    probs = []
+    with torch.no_grad(), torch.autocast(**amp):
+        for x, _ in dl_ev:
+            x = x.to(device).to(memory_format=torch.channels_last)
+            p1 = torch.softmax(model(x).float(), 1)
+            p2 = torch.softmax(model(x.flip(-1)).float(), 1)
+            p3 = torch.softmax(model(x.flip(2)).float(), 1)
+            p4 = torch.softmax(model(x.flip(2, -1)).float(), 1)
+            probs.append(((p1 + p2 + p3 + p4) / 4).cpu())
+```
+
+Wait, let me check the flip dimensions. x has shape (B, C, H, W).
+- x.flip(-1) flips the last dimension (W) → horizontal flip ✓
+- x.flip(2) flips dimension 2 (H) → vertical flip ✓
+- x.flip(2, -1) flips both H and W → 180° rotation ✓
+
+This looks correct.
+
+Let me also think about whether there's a better idea. 
+
+Actually, let me reconsider. The per-class APs are:
+- pore: 0.528 (weakest)
+- deposit: 0.637
+- discontinuity: 0.779 (strongest)
+- stain: 0.611
+
+The gap between the best (discontinuity) and worst (pore) is 0.25. This is significant.
+
+What if the issue is that pore and stain look similar to the classifier? The research brief says "stain is often confused with deposit and background." And pore is the weakest.
+
+Let me think about what data augmentation could help specifically with pore/stain discrimination:
+- Color jitter (contrast, saturation, hue) - might help with stain which is a color-based defect
+- Random erasing - might help the model focus on texture rather than color
+
+Actually, the current augmentation already includes brightness (0.8-1.2). What about adding contrast and saturation jitter?
+
+Hmm, but e007 (mixup) was rejected, and e011 (oversampling) was rejected. So data-side changes have been underperforming.
+
+Let me stick with the TTA idea. It's low-risk, focused, and directly addresses inference quality.
+
+Actually, wait. Let me reconsider the time budget. The log shows:
+- Loading: 17s
+- Epoch 0: 87s (411 steps)
+- Epoch 1: 125s (771 steps total, so 360 more steps in 38s)
+- Total: 147s
+
+So inference + writing takes about 147 - 125 = 22s. With 4 views instead of 2, inference would take about 2× longer, so maybe 34s instead of 22s. Total would be about 159s. The budget is 180s with 55s reserve, so the training cutoff is at 125s. Wait, let me re-read.
+
+RESERVE_S = 55. So t_end = deadline - 55. If deadline is 180s, t_end = 125s. Training runs until 125s. Then inference and writing must complete by 180s, giving 55s for inference + writing.
+
+Currently inference + writing takes about 22s. With 4 views instead of 2, it would take about 34s (the model forward pass doubles). 34s < 55s, so we're fine.
+
+Actually wait, let me recalculate. The model forward pass is the main cost. With 2 views, it's 2 forward passes per batch. With 4 views, it's 4 forward passes per batch. The eval set has 41879 detections with batch size 256, so about 164 batches. Each batch with 2 forward passes takes some time. With 4 forward passes, it would be 2× the inference time.
+
+If inference currently takes ~15s (out of the 22s for inference + writing), then with 4 views it would be ~30s. Total would be ~45s for inference + writing, which is still under 55s. Should be fine.
+
+Let me go with this. It's a clean, focused change.
+
+Let me write the SEARCH/REPLACE blocks:
+
+```
+<<<<<<< SEARCH
+            p1 = torch.softmax(model(x).float(), 1)
+            p2 = torch.softmax(model(x.flip(-1)).float(), 1)
+            probs.append(((p1 + p2) / 2).cpu())
+=======
+            p1 = torch.softmax(model(x).float(), 1)
+            p2 = torch.softmax(model(x.flip(-1)).float(), 1)
+            p3 = torch.softmax(model(x.flip(2)).float(), 1)
+            p4 = torch.softmax(model(x.flip(2, -1)).float(), 1)
+            probs.append(((p1 + p2 + p3 + p4) / 4).cpu())
+>>>>>>> REPLACE
+```
+
+This should appear exactly once in the file. Let me verify by looking at the current best train.py... Yes, this is the only place where p1 and p2 are defined in the inference loop.
+
+This is a clean, focused change. Let me finalize.

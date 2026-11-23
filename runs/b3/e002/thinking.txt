@@ -1,0 +1,293 @@
+===== attempt 1 =====
+Let me think through this carefully.
+
+**History review:**
+- e000 (current best): 5-seed mean 0.6302. Per-class: pore 0.502, deposit 0.628, discontinuity 0.781, stain 0.610.
+- e001 (rejected): Switched from emitting 4 rows per box (one per class) to emitting only the argmax class row. This dropped the score to 0.5749 on seed 0. Why? Because if the classifier gets the class wrong, the box is lost entirely (false negative for the true class), whereas with 4 rows, at least the true class's row exists and can be a hit (though it pollutes other classes' precision). The multi-row approach is actually better for mAP because a hit in the true class counts as TP for that class, and the rows in other classes are just extra FPs that hurt precision of those other classes — but since the detector conf is the same for all rows, and there are 4x more rows per image... hmm wait, actually there's a 300-row cap per image, so emitting 4 rows per box means only the top 300 rows per image count. With 4 rows per box, that's 75 boxes per image vs 300 boxes with 1 row.
+
+Wait, let me reconsider. The 300-row cap per image: if we emit 4 rows per box, the top 300 rows by score count. If we emit 1 row per box, the top 300 boxes count. So with 4 rows, we're effectively limiting to ~75 boxes per image, and within those, each box appears in all 4 classes (unless some rows fall below MIN_SCORE).
+
+Actually the multi-row approach: for class c, the predictions are all boxes where row (box, c) exists, sorted by score = conf * p_c. A box is a hit for class c if it overlaps a true box of class c. So for class c, the "predictions" include boxes that are true for class c (potential TPs) and boxes that are true for other classes or false alarms (FPs). The ordering is by conf * p_c.
+
+With single-row argmax: for class c, the predictions are only boxes where argmax = c. A box that is truly class c but where the classifier said class d is completely missing from class c's prediction list → false negative. That's a big loss.
+
+So the multi-row approach is fundamentally better for recall. The question is how to optimize it.
+
+**Where is the error?**
+
+Reference numbers:
+- One-step 4-class baseline: 0.638 (we're at 0.630, just below)
+- Stage-1 boxes with perfect classes: 0.758 (ceiling)
+- Stage-1 boxes as single class: 0.755
+
+So the ceiling for stage 2 with perfect classes is 0.758. We're at 0.630. The gap is 0.128. This gap comes from:
+1. Wrong class assignments on boxes that overlap true defects (classification errors)
+2. Wrong ranking of false alarms vs true detections (scoring)
+3. Box placement issues (but boxes are fixed from stage 1, so this is baked in)
+
+With perfect classes, we'd get 0.758. Our crop classifier gets macro-F1 ~0.87 on perfect boxes. So classification errors cost us. But also, the scoring matters: with multi-row, the score is conf * p_c. For a box that's truly class c, its row for class c has score conf * p_c. For a false alarm box, its row for class c has score conf * p_c where p_c is whatever the classifier says.
+
+The key insight: the ranking within each class matters. For class c, we want true boxes of class c to rank above false alarms and boxes of other classes. The score conf * p_c does this partially: true boxes of class c should have higher p_c, and true boxes should have higher conf (detector conf). But the classifier's p_c and the detector's conf might not be perfectly aligned.
+
+**Per-class analysis:**
+- pore 0.502 (weakest)
+- deposit 0.628
+- discontinuity 0.781 (strongest)
+- stain 0.610
+
+Pore is the weakest. Stain and deposit are confused (stain often confused with deposit). Pore and deposit are weak classes per the background.
+
+**What could help?**
+
+Let me think about the scoring more carefully. The current score is conf * p_c. 
+
+Idea 1: Better scoring. Instead of conf * p_c, maybe we should use a score that better separates true class-c boxes from non-class-c boxes. The issue is that for a box truly of class c, we want high score; for a box truly of class d ≠ c, we want low score in class c's ranking; for a false alarm, we want low score.
+
+conf * p_c: 
+- True class c: conf * p_c where p_c is high (classifier confident it's c) → high score. Good.
+- True class d: conf * p_c where p_c is low (classifier says d) → low score. Good.
+- False alarm: conf * p_c where p_c is whatever → could be high if classifier is confidently wrong.
+
+So the main problem is false alarms that the classifier confidently misclassifies. But we can't easily fix that without a "is this a defect at all" signal.
+
+Actually, wait. The detector conf already encodes "is this a defect." A false alarm has low conf. So conf * p_c downweights false alarms. That's already reasonable.
+
+Hmm, but the issue is the relative ranking. Let me think about what's suboptimal.
+
+Actually, let me reconsider the multi-row vs the metric. The metric: for class c, sort all rows of class c by score. A row is a hit if it overlaps an unmatched true box of class c. So the number of "positive" predictions for class c is the number of eval boxes that overlap a true box of class c (regardless of what class we assign). Wait no — a row (box, c) is a hit if box overlaps true box of class c. So for class c, the candidate rows are ALL boxes (since we emit a row for every box and every class). Each box contributes one row to class c's list. So class c has N rows (one per box), and the number of TPs is the number of boxes overlapping true class-c boxes.
+
+So for class c, we're ranking ALL boxes by score_c = conf * p_c. The true class-c boxes should rank at the top. 
+
+The AP for class c depends on: among the boxes, how well do the true class-c boxes (the "positives") rank above the non-class-c boxes (the "negatives").
+
+So score_c = conf * p_c should ideally be high for true class-c boxes and low for everything else.
+
+Now, p_c is the classifier's probability of class c. For a true class-c box, p_c should be high. For a true class-d box, p_c should be low (p_d high). For a false alarm, p_c could be anything.
+
+The detector conf: for a true box, conf is higher (detector confident). For a false alarm, conf is lower. So conf helps separate true from false.
+
+So conf * p_c is a reasonable score. What's suboptimal?
+
+One issue: the classifier p_c might not be well-calibrated. E.g., the classifier might be overconfident. But since we only care about ranking (order), calibration within a monotone transform doesn't matter... but conf * p_c is not a monotone transform of p_c alone because conf varies per box.
+
+Hmm. Let me think about what changes could plausibly gain ≥0.01.
+
+**Idea: Train the classifier better / on more data.**
+
+Currently TRAIN_ON = ("high",). The crops.csv has "high" and "low" resolutions. We're only training on high-res. Maybe including low-res would help? Or maybe high-res is better. Let me think. The eval images — what resolution are they? The dets.csv has boxes on eval images. The crops.csv has both high and low res training boxes. 
+
+Actually, the background says "0.69 mAP@0.5 on high-res images" for the one-step detector. And the baseline to beat is 0.638. The eval images are probably high-res (since we're comparing to high-res numbers). Let me not assume.
+
+Actually, including more training data (low-res) could help the classifier generalize, or could hurt if low-res is noisier. This is a data experiment.
+
+**Idea: Better architecture / model.**
+
+The current model is EfficientNet-B0 with two crops (tight 1.5x + wide 2.5x), logits averaged. Maybe a bigger model (efficientnet_b2) or a different one. But bigger model = slower, and we're at 162s of 180s budget. EfficientNet-B2 is ~3x params of B0, so step time would roughly triple, cutting epochs drastically. Risky for budget.
+
+Actually, let me reconsider the budget. Current: 5 epochs, 432 steps, 162s total. Load 13s. Training ~149s for 432 steps. So ~0.34s/step. Prediction for 41879 eval boxes: that's part of the 162s. Let me estimate: 13s load, training 432 steps in ~149s (from 13s to ~162s minus prediction). Actually "done: 5 epochs, 432 steps, 52653 prediction rows, 162s total". The last epoch print was at 125s. So training ended around 125-140s, then prediction took the rest. Prediction of 41879 boxes in batches of 256 = 164 batches. If prediction took ~20-30s, that's ~0.15s/batch.
+
+If I switch to efficientnet_b2, step time ~3x → ~1s/step → in 140s budget, ~140 steps. That's 3x fewer steps. The classifier might not train as well. Risky.
+
+**Idea: The two-crop averaging.** Currently we average logits of tight and wide crops. Maybe the wide crop (2.5x) introduces noise, or maybe it helps. Could test single crop. But that's a minor change.
+
+**Idea: Scoring refinement.** 
+
+Let me think harder about the scoring. The current score is conf * p_c. 
+
+One thought: the detector conf is the same for all 4 rows of a box. So within a box, the 4 rows are ordered by p_c. Across boxes, it's conf * p_c. 
+
+What if we use a score that's more discriminative? For example, for class c, use score = conf * p_c / (sum of p) — but sum of p = 1, so that's just conf * p_c. No change.
+
+What if we use score = conf * (p_c - max_{d≠c} p_d)? This emphasizes boxes where the classifier is confident it's c specifically, not just some class. But this could go negative. For ranking, we could use conf * p_c * (1 - max_{d≠c} p_d) or something. Hmm, this is getting complicated and might not help much.
+
+Actually, let me reconsider. The biggest lever might be improving the classifier itself, since the gap to ceiling (0.758) is large (0.128) and much of it is classification error.
+
+Wait, but the background says "Tuning hyperparameters alone helped little in earlier experiments; changes of method helped more." and "A crop classifier given perfect boxes reaches macro-F1 ~0.87 with the starting recipe." So the classifier is already decent. The issue is that the boxes aren't perfect (they're detector boxes, some misplaced, some false alarms).
+
+Let me reconsider where the 0.128 gap comes from:
+- Perfect classes on stage-1 boxes: 0.758. This means IF we assigned perfect classes, we'd get 0.758. The current 0.630 means our class assignment + scoring loses 0.128.
+- But the scoring also matters. Even with perfect classes, the score is detector conf (in the ceiling calc). In our case, the score is conf * p_c. So even if we had perfect classes, using conf * p_c as score might rank differently than using conf.
+
+Hmm, actually in the ceiling, "the score of each box is its detector conf." So the ceiling uses conf as score. If we used perfect classes with conf as score, we'd get 0.758. 
+
+So the gap 0.758 - 0.630 = 0.128 is due to:
+1. Wrong classes (we assign wrong class to some boxes that overlap true defects)
+2. Different scoring (conf * p_c vs conf)
+
+If we could get perfect classes, we'd want to score by conf (to match the ceiling). But we don't have perfect classes. 
+
+Interesting: what if we could improve the classifier to be closer to perfect? Each point of classifier F1 improvement... hard to quantify directly.
+
+Let me think about the scoring differently. The problem with conf * p_c: for a box that's truly class c but the classifier is uncertain (p_c = 0.5, spread over classes), the score is 0.5*conf. For a false alarm that the classifier confidently calls class c (p_c = 0.9), the score is 0.9*conf_fa. If conf_fa is not much lower than conf_true, the false alarm ranks above the true box. 
+
+So the classifier's confidence on false alarms is a problem. The detector conf should downweight false alarms, but if the detector conf for false alarms is still reasonably high, and the classifier is confidently wrong, we get misranking.
+
+**Idea: Use a "defect-ness" gate.** But we don't have a separate defect detector; the stage-1 conf is our only defect signal.
+
+**Let me reconsider: maybe the biggest win is including low-res training data.**
+
+Actually, wait. Let me reconsider the eval setup. The dets.csv has "train" and "eval" splits. The "train" boxes are on training images. The crops.csv has training boxes with res "high"/"low". So the training images come in high and low res. The eval images — are they high or low res? 
+
+The reference numbers: "0.69 mAP@0.5 on high-res images" and the baseline 0.638. The eval is probably high-res (matching the paper's high-res setup). So training on high-res is appropriate. But including low-res might add data diversity.
+
+Hmm, but if eval is high-res, training on low-res might not help and could hurt. Let me not go there without more info.
+
+**Let me reconsider the architecture.** 
+
+Actually, here's a thought: the two-crop approach averages logits. But maybe instead of two separate crops through the network, we should use a single crop that's more informative. Or use the wide crop only (more context helps distinguish stain vs deposit, which are texture/pattern differences that need context). The background says "stain is often confused with deposit" — context might help. But we already have the wide crop.
+
+**Idea: Train for longer / better optimization.** We're at 5 epochs, loss 0.2164 and still decreasing. The budget is the limit. If we could train longer, the classifier would be better. But we're budget-limited.
+
+Could we make training faster to fit more steps? E.g., use a smaller image size (IMG_SIZE=160 → 128)? That would speed up each step, allowing more steps. But smaller images might reduce classifier accuracy. Trade-off.
+
+Or use a smaller/faster model but train longer. E.g., convnext_nano or mobilenetv3. Hmm.
+
+Actually, let me reconsider. The loss is still decreasing at epoch 5 (0.2164). More training would help. The question is how to fit more effective training in the budget.
+
+Options to speed up per-step:
+- Smaller IMG_SIZE (160→128 or 112)
+- Smaller model
+- Larger batch (but we're already at 64; larger batch = fewer steps per epoch but each step more compute... net similar)
+- Use bfloat16 (already using autocast bfloat16)
+
+Actually, the two forward passes (tight + wide) double the compute. If we drop to one crop, we halve per-step time → double the steps. But we'd lose the wide-crop benefit.
+
+Hmm, let me think about what's the highest-value experiment.
+
+**Let me reconsider the scoring once more, because it's cheap (no retraining) and could be a clean test.**
+
+Actually, retraining is required for most changes. The scoring change (e001) was rejected but that was a bad direction (argmax single row). 
+
+What about a scoring change that's in the right direction? E.g., for the multi-row output, use a score that better separates. But the metric says "Any change that keeps the order of a class's predictions leaves its AP unchanged." So scoring changes only help if they change the order within a class.
+
+Current order within class c: by conf * p_c. 
+
+What order would be better? We want true class-c boxes at top. The signal for "true class c" is: high p_c (classifier says c) AND high conf (detector says defect). The current score uses both. 
+
+Alternative: what if the classifier's p_c is noisy and the detector conf is more reliable for the "is it a defect" part, while p_c is good for "which class"? Then conf * p_c is reasonable.
+
+What if we use a higher power of p_c to sharpen? E.g., score = conf * p_c^2. This sharpens the ordering: boxes where the classifier is very confident in c rank higher, boxes where it's uncertain rank lower. This changes the order (not a monotone transform of the original because p_c^2 reorders relative to conf... wait, conf * p_c^2 vs conf * p_c: for two boxes with same conf, the one with higher p_c has higher ratio p_c^2/p_c = p_c, so higher p_c box ranks higher — same order. For two boxes with different conf, the order can change). Hmm, actually conf * p_c^2 = conf * p_c * p_c. Compared to conf * p_c, it's multiplied by p_c. Since p_c varies, this reorders. Boxes with high p_c get boosted relative to low p_c. This could help if high-p_c boxes are more likely to be true class-c.
+
+But this is a subtle change, might be within noise.
+
+**Let me step back and think about the biggest lever.**
+
+The gap to ceiling is 0.128. The classifier F1 is ~0.87 on perfect boxes. On detector boxes (imperfect), it's probably lower. The per-class AP: pore 0.502 is the weakest. 
+
+If I could improve pore classification, that'd help. Pore and deposit are weak. Stain confused with deposit.
+
+**Idea: Class-specific handling.** But the background says class-weighted loss hurt. So no.
+
+**Idea: More training data / better data.** 
+
+Let me reconsider: TRAIN_ON = ("high",). What if the eval images are actually a mix, or what if including low-res helps? 
+
+Actually, I realize I should look at whether there's a data issue. The crops.csv has 6052 high-res boxes used for training. Is that enough? More data would help. But we can only use what's in crops.csv.
+
+Wait — could we use the "train" split of dets.csv to get more training signal? The dets.csv "train" boxes are on training images, and their true class can be found by overlap with crops.csv. So we could use detector boxes on training images as additional training examples! The detector boxes might cover defects that the crops.csv doesn't, or provide additional boxes. But actually crops.csv IS the training boxes (labelled). The dets.csv train boxes are the detector's output on training images. Their "true class" is found by overlap with crops.csv. So a detector box that overlaps a crop gets that crop's class. This could give us more training boxes (the detector found boxes, some overlapping crops → labelled by overlap).
+
+But this is essentially the same boxes as crops, just as detected. Might add boxes that don't overlap any crop (false alarms or missed defects). Using false alarms as training (labelled as what?) — we don't know their true class. So we can only use detector train boxes that overlap crops. That's basically a subset of crops. Not much new.
+
+Hmm, unless we use them for something else.
+
+**Let me reconsider the whole thing. What's the cleanest high-value experiment?**
+
+Given:
+- We're at 0.630, ceiling 0.758.
+- Classifier F1 ~0.87 on perfect boxes.
+- Per-class: pore weakest (0.502).
+- Budget is tight (162/180s).
+- Hyperparameter tuning helped little; method changes helped more.
+- Class-weighted loss hurt.
+
+I think the highest-value experiment is to improve the classifier's training, specifically by training longer with a faster per-step cost, OR by using a better training recipe.
+
+Actually, wait. Let me reconsider the two-crop design. We do two forward passes per box (tight + wide). That's 2x compute. What if the wide crop is actually hurting? Or what if we should train on more views?
+
+Let me think about the "method change" that helped before. The background mentions "changes of method helped more" but doesn't specify which. 
+
+Let me think about a concrete, high-value method change:
+
+**Option A: Train on both tight and wide crops as separate samples (not averaged), or use a crop that includes context more effectively.**
+
+**Option B: Use a larger model but fewer, more effective steps.**
+
+**Option C: Data augmentation improvements.**
+
+**Option D: Include low-res training data.**
+
+**Option E: Better scoring (cheap, no retrain, but subtle).**
+
+**Option F: Train longer by speeding up per-step (smaller image or model).**
+
+Let me estimate the potential gain of each.
+
+For pore (0.502), if we could get it to ~0.6 (matching deposit), that's +0.1/4 = +0.025 mAP. That's a big lever. So improving the weak classes (pore, stain) is high value.
+
+What makes pore hard? Pores are small dark spots. In a crop, they might be small. The tight crop (1.5x) might zoom in enough. The wide crop (2.5x) might dilute the pore. Hmm.
+
+Actually, let me reconsider. Maybe the issue is that the classifier needs to see the pore clearly. A pore is a small hole in the weld. In a 1.5x crop resized to 160px, the pore might be a few pixels. In a 2.5x crop, even smaller. So maybe for pore, the tight crop is more informative, and averaging with the wide crop dilutes it.
+
+But we don't know that for sure.
+
+**Let me think about a cleaner experiment: increase IMG_SIZE.**
+
+Currently 160. If we increase to 224 (EfficientNet's native-ish size), the classifier would see more detail, helping distinguish pore (small) from other defects. But larger image = slower per step. 224/160 = 1.4x side → 1.96x pixels → ~2x per-step time. That halves our steps (432 → ~216). The classifier would train less but see more detail. Net effect unclear.
+
+Hmm, this is a trade-off. Risky.
+
+**Let me reconsider: what's the single most likely to give ≥0.01?**
+
+I think training longer with a better-trained classifier is the safest bet, but we're budget-limited. The cleanest way to get more training is to reduce per-step cost without hurting quality much.
+
+Actually, here's a cleaner idea: **the two forward passes (tight + wide) double compute. What if we train on a single crop but a better one?** If the wide crop's main benefit is context for stain/deposit, and the tight crop's benefit is detail for pore, maybe we should keep both but... no, that's the current design.
+
+Wait, actually, let me reconsider whether we even need two crops. What if a single well-chosen crop trains faster (2x more steps) and the extra training compensates for losing one view? That's a testable hypothesis: "A single crop (wide 2.5x, for context) trained for 2x longer outperforms two crops trained for 1x, because the extra training steps matter more than the second view." Or the opposite.
+
+Hmm, but that's a coin flip.
+
+**Let me think about the scoring more, because it's the cheapest experiment (no retraining, just change the output).**
+
+Wait, but scoring changes require the model to be trained (we still train, just change output). So it's not free, but the training is the same. The change is only in how we write preds.csv. So the experiment is: same training, different scoring. The cost is one full run (same as any run). 
+
+But the metric says scoring changes only help if they change the order within a class. And e001 (argmax) hurt. So what scoring change helps?
+
+Let me think about what's suboptimal in conf * p_c.
+
+For class c, the score is conf * p_c. Consider a true class-c box with conf=0.8, p_c=0.7 → score 0.56. Consider a false alarm with conf=0.6, p_c=0.9 → score 0.54. Close. Consider a true class-d box with conf=0.8, p_c=0.1 (p_d=0.8) → score 0.08. Good, ranks low.
+
+So the main misranking risk is false alarms with high conf and high p_c. The detector conf for false alarms — how high can it be? If the detector has a high false-alarm rate with decent conf, these pollute.
+
+But we can't distinguish "true box misclassified" from "false alarm confidently classified" without more info.
+
+**Alternative scoring: use the margin.** For class c, score = conf * (p_c - second_p). This is high only when the classifier is confident it's c specifically. For a true class-c box, p_c high, second_p low → high score. For a false alarm confidently class c, p_c high, second_p low → also high score. So same problem. Doesn't help distinguish false alarms.
+
+**Alternative: downweight by total defect-ness.** We don't have a separate defect score.
+
+Hmm. I don't think scoring is the big lever. The big lever is the classifier accuracy on the weak classes.
+
+**Let me reconsider the data.** 
+
+Actually, you know what, let me reconsider including low-res. Here's the thing: the eval images might actually be low-res, or a mix. The reference "0.69 on high-res" suggests the paper reports high-res. But our eval could be either. If our eval is low-res, then training on high-res only is a mismatch!
+
+Wait, but the baseline 0.638 and ceiling 0.758 are "on validation (same images your score is computed on)." So they're computed on the eval images. The one-step detector gets 0.638 on eval. The paper says 0.69 on high-res. So eval might be high-res (0.638 ≈ 0.69, close-ish) or the eval is a different split.
+
+Hmm, 0.638 vs 0.69 — the eval one-step is lower than the paper's high-res. Could be eval is low-res, or a harder split. 
+
+I can't tell for sure. Let me look at the data more carefully. The crops.csv has res "high"/"low". If I include both, I train on more data. If eval is high-res, low-res data is extra (might help generalization or slightly hurt). If eval is low-res, then currently training on high-res only is a mismatch and including low-res would help a lot.
+
+This is actually a reasonable experiment: **include low-res training data** (TRAIN_ON = ("high", "low")). Hypothesis: if eval images include low-res (or the classifier benefits from more/diverse data), including low-res improves the classifier, especially on weak classes. Risk: if eval is purely high-res, low-res data might slightly hurt, but the extra data likely helps generalization.
+
+Actually, this is a clean, testable, potentially high-value experiment. And it's a "data" category change. Let me estimate: if it helps, could be +0.01 to +0.03. If eval is low-res, it'd be a big win.
+
+But wait, there's a subtlety: the crops from low-res images are lower quality (more blur, smaller). The classifier might learn to rely on low-res features. If eval is high-res, that's a mismatch. But with 2x data, the classifier might be more robust.
+
+Hmm, let me reconsider. Actually, I think the safest high-value experiment is to improve training, but the data change is also good.
+
+Let me reconsider the budget for the data change. If I double the training data (high + low), the number of steps per epoch doubles, but per-step time is the same (same image size, same model). So in the same time budget, I'd do the same number of steps but each epoch is 2x longer, so fewer epochs. Net: same number of steps, but each step sees a different (larger) dataset. Actually, the number of steps in the time budget is determined by per-step time, not dataset size. So doubling data → same steps, but each step is a different random batch from a 2x larger set. The total number of unique samples seen is the same (same steps × same batch). So it's like training on a 2x larger pool for the same number of steps. That should help generalization (more diverse batches) without costing time. 
+
+Wait, but drop_last=True and the dataset is 2x larger, so each epoch has 2x steps. In the time budget, we do the same total steps. So we see the same number of batches, but drawn from a 2x pool. That's strictly more diverse. Should help or be neutral. Good, no budget risk.
+
+Actually, this is appealing: **include low-res data, no budget risk, potentially helps generalization and covers the case where eval is low-res.** Let me go with this? 
+
+But hold on — is there a risk that low-res crops are so different that the classifier gets confused? The crops are resized to 160px regardless. A low-res image crop, resized to 160, is blurrier than a high-res crop resized to 160. So the classifier sees blurrier versions of the same defects. This is actually a form of dataThinking budget reached. Stop thinking now and write the reply in the required format.

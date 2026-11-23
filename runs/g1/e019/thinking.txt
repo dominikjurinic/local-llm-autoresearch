@@ -1,0 +1,161 @@
+===== attempt 1 =====
+Let me carefully analyze the situation.
+
+**Current state:**
+- Best: e005 (5-seed 0.6345), two-view (1.5x tight + 2.5x wide) EfficientNet-B0 with MLP head over concatenated backbone features.
+- Diagnostic: gap between my mAP (0.6345) and "all boxes with correct class but my scores" (0.7464) is 0.112 — the wrong-class cost. The confusion matrix shows:
+  - pore: 62% correct, 21 of 74 wrong are predicted as stain (28%), 5 as deposit
+  - deposit: 80% correct, 48 of 267 wrong are predicted as stain (18%)
+  - discontinuity: 96% correct
+  - stain: 90% correct, 41 of 611 wrong are predicted as deposit (7%)
+
+So the big error: pore→stain (21), deposit→stain (48), stain→deposit (41). Stain/deposit confusion is dominant, plus pore→stain.
+
+**History analysis:**
+
+Data families:
+- e001/e002: train-split detector boxes as extra training data — e002 got 0.6307 5-seed (not confirmed, actually below e005's 0.6345). Earlier runs (5 past) got 0.6337/0.6342 accepted with a looser rule. So this idea is roughly neutral; e009 rejected at 0.6325; e016/e017 crashed. This direction has been tried 3+ times tonight (e009, e016, e017) plus e001/e002. Exhausted.
+- e003/e010: stage-1 error simulation (random shift/scale on true boxes) — e003 0.6294 not confirmed, e010 0.6335 not confirmed. Two attempts, both slightly negative. Per the guide: "two failed variants of a direction: move to the next direction." Hmm, but wait — e003 was based on e000 (logit-averaging), e010 was based on e005. Both not confirmed, both below best. So box-quality jitter simulation is exhausted for now.
+- e008: random zoom per sample — crashed.
+- e014: on-demand image loading — 0.6322 not confirmed.
+
+Optimisation:
+- e004: pre-computed crops — bug (0.0531).
+- e012: pre-compute + reserve 45 — crashed.
+- e013: num_workers=0 — timeout.
+- e015: uint8 views from workers — rejected 0.6209 (this is suspicious; probably a bug in the edit).
+- So optimisation has 3+ attempts with no new best. The category summary says EXHAUSTED?. But the guide says "buy training steps whenever the log shows the GPU waiting." Hmm. The log shows: epoch 0 is 44s (94 steps), later epochs ~18s (94 steps). So epoch 0 has a big one-time cost — probably the DataLoader worker setup / pickling the images dict, or the first batch of crop computation. Actually, with persistent_workers and 8 workers, the first epoch includes worker startup and pickling the big images dict to workers. Steps: 436 in ~125s of training → ~0.286 s/step including overhead. Epochs 1-4: (125-57)/342 ≈ 0.199 s/step.
+
+Wait, let me recompute: total 162s. Load 13s. Reserve 55s → t_end = T0+125s. Training from ~13s to 125s = 112s, 436 steps = 0.257 s/step. Prediction ~37s (162-125).
+
+Epoch 0: 94 steps in 44s = 0.47 s/step. Epochs 1-4: 342 steps in 68s = 0.199 s/step. So the first-epoch overhead is ~26s. If I can eliminate that, I get ~90 more steps (26/0.199 ≈ 130 steps actually). That's a lot.
+
+Why is epoch 0 slow? With num_workers=8 and persistent_workers=True, the workers are spawned at DataLoader construction, and the images dict (1022 images, probably large) is pickled to each worker. That's the one-time cost. e013 (num_workers=0) timed out — that's strange; with 0 workers, crop computation happens in the main process and probably the main process can't keep up with the GPU (crop computation is slow in the main process, serially). Actually with num_workers=0, data loading is synchronous with training; if crop computation takes longer than the GPU step, the GPU starves. The per-batch crop computation for 64 samples × 2 views... with 8 workers it's parallelized. So num_workers=0 is slow per step → timeout.
+
+e014 (on-demand decode in worker with bounded cache) got 0.6322 — slightly worse, probably because decode is slower per batch.
+
+e004/e012 pre-compute crashed/bug. e004 scored 0.0531 — "suspicious (likely bug)". e012 crashed. So pre-compute has 2 failures. Per the rule: "bug: fix once; second failure: drop." Hmm, e004 was a likely bug, e012 crashed. That's two failures of the pre-compute idea. By the rule, I should drop it. But wait — what was the actual bug? I don't know exactly; e004's hypothesis was cut off. The likely bug in e004: pre-computing crops at load time... maybe a memory issue, or a bug in how the dataset returns pre-computed tensors (e.g., augmentation not applied, or a shape issue). 0.0531 suggests the model was barely trained or the data was broken (e.g., all crops identical, or normalization wrong).
+
+Actually, let me think about what a correct pre-compute implementation looks like and whether it's worth trying a third time. The rule says drop after two failures. e004 (likely bug) + e012 (crash) = two failures. I should drop pre-compute.
+
+Hmm, but the guide explicitly lists "buy training steps" as a main phase with ideas: "prepare crops once instead of per step." But my own rule of thumb says two failed variants → move on. The category summary says optimisation is EXHAUSTED? (3+ ideas, no new best). I'll respect that and not do more optimisation... unless there's a fundamentally different idea.
+
+Wait, actually, let me reconsider. What is the epoch-0 overhead actually? Another possibility: the first epoch is slow because the DataLoader workers are computing crops while the GPU is also warming up (cudnn benchmark, etc.). But 44s vs 18s is a big gap. With 8 workers pickling the images dict... the images dict contains 1022 full-res images. High-res weld images could be e.g. 2000×2000×3 = 12MB each → 12GB total?? That can't be in RAM. Probably smaller. Anyway, pickling 8× that is the one-time cost.
+
+Alternative idea to buy steps that's fundamentally different from what's been tried: reduce the number of images shipped to workers by pre-extracting crops... that's pre-compute (dropped). Or: use a smaller batch... no.
+
+Hmm, what about reducing prediction time to free up training time? Prediction is ~37s for 41879 boxes × 2 views. 41879/256 = 164 batches. 37s/164 = 0.225 s/batch. The model does 2 backbone forwards per sample. If I could halve prediction time... e.g., skip the wide view at inference? That changes the model (asymmetric train/test) — bad.
+
+Actually wait — what about the reserve? RESERVE_S = 55 but prediction takes ~37s. e012 tried reserve 45 and crashed (probably for another reason — pre-compute bug). Hmm, e012's crash was probably the pre-compute code, not the reserve.
+
+Let me think: is there a way to get more training steps without pre-compute?
+
+Option A: reduce per-step cost. The step is 0.199s. What's the bottleneck? 8 workers each compute crops (PIL extract + resize 160×160 × 2 views per sample, plus normalization). 64 samples/batch/8 workers = 8 samples/worker/batch, 16 crops. Each crop: extract from full-res image + resize to 160. Probably ~5-10ms each → 80-160ms per batch per worker, parallelized → ~100ms. GPU: EfficientNet-B0 at 160×160, batch 64, 2 views (128 total forwards), bf16. Probably ~80-100ms. So it's roughly balanced; data loading might be the bottleneck.
+
+Option B: fewer, larger batches? Batch 64 → 128 halves the number of steps but each step does 2× the work... same total FLOPs, slightly more efficient GPU utilization, but data loading per step also doubles. Not clearly better.
+
+Option C: use a faster backbone to get more steps. But "larger or other backbones" family: 8 attempts, no gain (best 0.636 unconfirmed). That family included larger backbones; smaller/faster ones? The table says "larger or other backbones (EfficientNet-B2, ResNet-50, 2-3 model ensembles): 8 attempts, no gain." So "other backbones" was tried. convnext_nano, regnety_016, resnet18... were probably in those 8. I shouldn't repeat.
+
+Option D: reduce the number of views at training? No, that's the model.
+
+Option E: TTA at inference — tried, no gain (8 attempts in past runs), e011 timed out.
+
+OK, so let me think about what's fundamentally untried and could move the needle.
+
+**Where is the error?**
+- 0.7464 (correct class, my scores) vs 0.6345 → 0.112 lost to wrong class.
+- 0.755 (single class 'defect') vs 0.7464 → scores are near-optimal; the gap to the perfect-class ceiling 0.758 is small.
+- So: fix the class decision. The confusion: pore→stain (21/74 wrong), deposit→stain (48/267), stain→deposit (41/611), plus pore→deposit 5.
+
+Total wrong-class boxes: pore 27, deposit 53, stain 56, discontinuity 7 → ~143 out of ~958 TP boxes.
+
+Per-class AP: pore 0.505 (weak!), deposit 0.639, discontinuity 0.781, stain 0.613.
+
+Pore is the weakest class. Pore: 74 TP boxes, 47 correct. 21 predicted as stain. If I could fix pore→stain, pore AP would jump.
+
+What distinguishes pore from stain? Pores are small dark holes/dots in the weld bead; stains are surface discolorations. At the tight crop scale, pores are small dots; the model may need to see texture. The wide crop gives context.
+
+Ideas that could help the whole confusion cluster (pore/deposit/stain):
+
+1. **Higher input resolution for the tight view.** Pores are small; at 160px, a small pore box resized to 160 may blur the dot structure. But "resolution and small-box handling (224px, larger MIN_CROP, enlarged tight crops for small boxes): 9 attempts, no gain" in past runs. Exhausted.
+
+2. **Box-quality weighting/sampling** — the guide lists it as a direction: "weight or sample training boxes by box quality so the model sees enough poorly placed boxes." But wait — training is on true boxes with jitter; the detector boxes as training data (e002, e009) was the data version of this and was neutral/slightly negative. Box-quality weighting on true boxes... hmm, what does "box quality" mean for true boxes? All true boxes are perfect. The idea was to simulate detector errors (e003, e010) — two attempts, not confirmed. So this direction is exhausted per my rule of thumb (two failed variants).
+
+3. **Combine the two views better** — e005 did exactly this (MLP over concatenated features) and it was the new best (+0.0057). e006 widened the MLP — rejected. So the "better combination" direction: one success, one failed follow-up. The guide says "after a success, one or two follow-ups are good; after two failed follow-ups, switch." I've had one failed follow-up (e006). Another fundamentally different combination idea could be tried. What's different from e006 (wider MLP)?
+
+Ideas for view combination:
+- **Cross-attention / feature interaction**: concat is already there.
+- **Difference feature**: concatenate [ft, fw, ft-fw] — the difference between tight and wide views highlights what's inside vs outside the box (object vs background). This is cheap (one extra concat, no extra forward). Hmm, but is it fundamentally different from e006? e006 changed the head width; this changes the head input. It's a different mechanism: explicitly giving the head the tight-minus-wide residual, which encodes "what's in the box beyond the surrounding context." For stain vs deposit vs pore, the tight view shows the defect texture, the wide view shows the weld context; their difference isolates the defect.
+
+Actually wait. Let me think more carefully about what information each view carries. The tight crop (1.5× box) is mostly the defect + margin. The wide crop (2.5× box) is the defect + more context. Both are resized to 160×160, so the defect occupies a different fraction of the image in each view. The backbone extracts features at different scales. Concatenation lets the head use both. The difference ft - fw is not scale-invariant in a useful way... actually, the two views are different images (different zoom), so ft - fw is a weird quantity. Probably not useful.
+
+4. **Third view** — past runs: "third, very wide view (4× box): accepted twice (5-seed 0.6342, +0.005), gain mostly from pore; close to time limit." That was on the old base (logit-averaging, e000). On e005's base (MLP head), a third view would add one more backbone forward per sample (+33% compute). Time: training step 0.199s → ~0.26s, prediction 37s → ~48s. Reserve 55s is enough for 48s prediction. Training: 112s / 0.26 ≈ 430 steps vs 436 — actually fewer steps but each step does 3 views. Net: more total view-classifications? 430 steps × 3 views = 1290 view-batches vs 436 × 2 = 872. Hmm, that's a lot more compute on views, but the question is whether it helps. Past result: +0.005 mostly from pore. But that was with logit-averaging; with the MLP head, a third view's features go into the concat. The gain was "mostly from pore" — small-class gain, which tonight's acceptance rule won't accept ("gains from one small class usually don't hold"). Risky.
+
+5. **Score-level ideas** — "fewer or reweighted score rows: 16 attempts, no gain." Exhausted.
+
+6. **Background class** — 9 attempts, no gain. Exhausted.
+
+7. **Loss** — e018 margin loss not confirmed. Focal loss no gain in past. Class-weighted loss hurts. Label smoothing? Not tried explicitly? Hmm. "Label smoothing improves calibration in some settings but can reduce the information in class probabilities that ranking metrics use." Our score is conf × p_c. AP depends on the ordering of rows within each class. For a given box, the row for class c has score conf × p_c. The ordering of class c's rows across boxes depends on conf × p_c. Label smoothing changes p_c levels... it's a monotone-ish transformation? No — label smoothing shrinks p_c toward 0.25, so high-confidence predictions get relatively lower p_c. This changes the ordering across boxes: boxes where the model is very confident in class c vs boxes where it's moderately confident. Whether that helps AP is unclear. Probably a small effect; the loss category has 1 attempt (not confirmed). I could try label smoothing as a second loss attempt... but the expected effect is small (<0.005). Not great.
+
+8. **Learning rate / optimisation schedule** — "tuning hyperparameters alone helped little in past experiments." Exhausted-ish.
+
+9. **Data: use low-res crops for training?** "Low-resolution crops added to training: 4 attempts, no gain." Exhausted.
+
+10. **Training augmentation** — 5 attempts in past, no gain. Exhausted.
+
+11. **Box size/aspect as input** — e007 tonight (not confirmed, 0.6317), 4 attempts in past (never properly tested). Hmm, "never properly tested: 2 crashes, 1 edit failure, 1 run at 0.629." So it's been tried but never properly. e007 was a proper test on e005's base: 0.6317, not confirmed. So now it has a proper test and it was negative. Exhausted.
+
+So what's left? Let me re-read the guide's plan:
+
+1. Consolidate: train on detector boxes — tried 3 times tonight (e009 rejected 0.6325, e016/e017 crashed). "If it fails twice, drop it and move on." e002 (0.6307, below best), e009 (0.6325, rejected), e016/e017 crashes. Drop.
+
+2. Close the box-quality gap:
+   - Simulate detector errors — e003, e010: two attempts, not confirmed. Drop per rule of thumb.
+   - Weight/sample by box quality — hmm, this is subtly different from error simulation. But on true boxes, all boxes are "perfect quality." Unless we weight detector boxes... which we're dropping. Or: sample training boxes non-uniformly by size? Not clearly different.
+   - Combine views better — e005 succeeded, e006 failed. One more fundamentally different combination idea allowed.
+
+3. Buy training steps — optimisation category exhausted (3+ no best). But wait, is it really? e013 (num_workers=0) timed out, e014 (on-demand decode) 0.6322 not confirmed, e015 (uint8 from workers) rejected 0.6209 — that 0.6209 is suspiciously low; probably a bug in the edit (sending uint8 and forgetting to normalize?). e004/e012 pre-compute: likely bug + crash.
+
+Hmm, actually, let me reconsider the epoch-0 overhead problem. It's 26s out of 112s of training. If I can fix it, that's ~130 extra steps — a big deal. The guide lists it as a main idea. But my rule of thumb says drop after two failures. The failures were: e004 (0.0531, likely bug — I don't know the cause), e012 (crash — probably same pre-compute bug), e013 (timeout, different idea: num_workers=0), e015 (0.6209, probably bug).
+
+What was the pre-compute bug? Let me hypothesize: pre-compute crops at load time with train=False (no jitter) and store them; then in the dataset, apply flip/brightness on the pre-computed crop. That should work... unless the bug was something like storing crops for the wrong rows, or a memory explosion (6052 boxes × 2 views × 160×160×3 uint8 = 6052×2×76800 = ~930MB — fine). Or the bug: the pre-computed crops were computed with the train jitter using the main process's RNG... that wouldn't break it.
+
+Actually, 0.0531 mAP is essentially "random." That suggests the model wasn't trained on real data — e.g., all crops were the same image, or the labels were wrong, or the dataset returned garbage. Common bug: pre-computing in a loop over `crops` but indexing images wrong, or `Image.fromarray` on a float array, or the dataset returning (tensor, tensor, cls) but cls was lost... I can't diagnose without the code.
+
+Given two failures, the rule says drop. But the potential is high (26s = 130 steps). Hmm. The rule: "bug: fix once; second failure: drop." e004 was a likely bug (first failure), e012 was a crash (second failure). Drop pre-compute. OK.
+
+What about e015's idea (uint8 views from workers, normalizing on GPU)? 0.6209 — that's a 0.014 drop, almost certainly a bug in that edit (e.g., normalizing with the wrong mean/std on GPU, or forgetting to convert). But it was "rejected," not "likely bug." The harness flags likely bugs; e015 wasn't flagged. Hmm, 0.6209 vs 0.6345... could be a real (bad) result? Returning uint8 and normalizing on GPU should be mathematically identical. Unless the edit also changed something else. I can't know. One attempt; I could retry with care, but the category is flagged exhausted and I have better options.
+
+Let me think about what's truly untried and high-value.
+
+**Rethinking the problem.** The classifier is trained on true boxes (perfect) and tested on detector boxes (imperfect). Error simulation (e003, e010) didn't help. Training on detector boxes (e002, e009) didn't help. Interesting — both "match the test distribution" ideas failed. What does that tell us? Maybe the class decision error is not (only) about box placement. The diagnostic says 62-96% correct class on TP boxes. The remaining 4-38% wrong: pore is 38% wrong. Pore→stain 21.
+
+Maybe the issue is representational: at 160×160 with a 1.5× tight crop, pores (small dark dots) and stains (dark patches) look similar. What would distinguish them? Pores are small, round, dark, with a sharp boundary; stains are diffuse, irregular, often on the base metal. The wide crop (2.5×) shows whether the dark region is a small dot or a large patch relative to the weld.
+
+Hmm wait, actually there's a key detail: both views are resized to 160×160. In the tight view, the defect fills ~1/1.5 = 67% of the crop side. In the wide view, the defect fills ~1/2.5 = 40%. So the model sees the defect at two different apparent sizes. The backbone's receptive field at 160×160 is fixed.
+
+**Idea: give the model the box geometry implicitly via a third crop that's the raw box (1.0×).** The tight is 1.5×. A 1.0× crop would be exactly the detector box. Hmm, but that's a "third view" variant — the past family was "third, very wide view (4×)." A 1.0× view is a different third view, but the same family ("add a third view"). The family's result was +0.005 from pore (small class) — tonight's rule won't accept it. And it adds +33% compute. Risky and probably not accepted.
+
+**Idea: multi-scale training — randomly render the tight view at different zooms (e008 crashed).** e008 was "per-sample random tight zoom (1.0–1.8) and random wide zoom (2.0–4.0)." Crashed. Why? Probably a bug in the edit. That's a fundamentally interesting idea (expose the model to the range of detector box sizes), but it's in the "simulate detector errors" family (e003, e010) which is exhausted... or is it? e003/e010 shifted centers and scaled boxes around the true box. e008 changed the zoom of the views (what the model sees), not the box. Hmm, they're related: scaling the box and changing the view zoom are the same thing (view side = context × box side). Actually, if you scale the box by s and keep the context fixed, the crop side scales by s — same as changing the context. So e008 is in the same family. Exhausted (2 failed + 1 crash). Drop.
+
+**Idea: train the head on features from a frozen backbone with more data?** No.
+
+**Idea: use the detector confidence as a training signal?** The detector boxes have a conf. In training, true boxes don't have a conf. Could use conf as a weight... that's the "weight by box quality" direction. Hmm.
+
+**Idea: change what the model sees — add a "difference" or "ring" view**: a crop of the annulus between the tight and wide boxes (context around the defect, with the defect masked out). This tells the model about the surrounding weld without the defect itself. For stain vs deposit: stains are often on the base metal around the weld; deposits are on the weld. The ring view shows whether the dark region extends beyond the weld bead. This is a fundamentally new view (not tight, not wide, not a 4× wide). But it's still "add a view" — +33% compute, same time risk as the third-view family. Hmm.
+
+Actually wait — I could replace the wide view with the ring view instead of adding. Same compute. The wide view currently shows defect + context; the ring shows only context (defect region filled with gray or blurred). For distinguishing stain (which bleeds into the base metal) from deposit (confined to the bead), the ring is informative. For pore (small dot) vs stain: the ring shows whether there's diffuse darkening around the dot. Hmm, but replacing the wide view loses the wide view's information. Risky.
+
+**Idea: improve the score.** The diagnostic says "mAP@0.5 if all boxes had the correct class but kept my scores: 0.7464" — so my scores are already near the ceiling (0.758). The score is conf × p_c. The 0.755 single-class vs 0.7464 four-class-with-correct-class: the detector's conf ranking is already near-optimal. So scoring is not the lever. Confirmed by 16 failed attempts.
+
+**Idea: reduce false positives of the wrong class.** Wait — the confusion matrix is on boxes that overlap a true defect. What about boxes that don't overlap (false alarms)? They get some class and score conf × p_c. If the model gives high p_c to false alarms, they pollute the class's ranking. The "background class" family tried to suppress them (9 attempts, no gain). Hmm.
+
+But wait — there's a subtlety in the metric: "at most the 300 highest-scoring rows per image count." With 4 rows per box and 41879 boxes... per image, how many boxes? 41879 / ~1000 eval images ≈ 42 boxes/image × 4 rows = 168 rows < 300. So the cap doesn't bind. OK.
+
+**Idea: ensemble of two different models within budget?** "2-3 model ensembles" was tried in the backbone family (8 attempts, no gain). Drop.
+
+**Idea: SWA / weight averaging** — from the background reading: "weight averaging along the trajectory (SWA)." Not in the list of past families! Families tried: score rows, background class, detector boxes, third view, low-res crops, backbone/ensemble, resolution, TTA, longer training, class-balanced sampling/weighted loss, training augmentation, focal loss, box size input. Plus tonight: detector boxes, error sim, MLP head, wider head, box size input, random zoom, TTA flip, pre-compute (×3), on-demand decode, uint8 workers, margin loss.
+
+SWA: average weights over the last part of training (e.g., last 25-30% of steps, or a few snapshots at the end). Cheap: just keep a running average of parameters during the last N steps and use the averaged weights for prediction. No extra compute (a tiny per-step overhead). This is a genuinely new family. Expected effect: usually small (0.1-0.5% on classification tasks), but under a fixed budget with cosine decay to near-zero LR, SWA can help because the final model is well-trained but a single point; averaging over the late trajectory reduces variance. Hmm, but with cosine decay the LR goes to ~0, so late weights barely change — SWA over a near-frozen tail is basically the final weights. To make SWA effective, keep the LR at a small constant (e.g., 0.1×LR) during the SWA phase instead of decaying to zero. That's a schedule change + SWA.
+
+Actually, a simpler variant: **snapshot ensemble** — take 3-5 snapshots at the end of training (e.g., last 5 checkpoints spaced across the last 20% of training) and average their predictions. This needs storing model weights (EfficientNet-B0 ~4M params × 4 bytes × 5 = 80MB, fine) and 5× prediction time at inference... prediction is 37s → 185s. No way. Unless I average only the last 2 snapshotsThinking budget reached. Stop thinking now and write the reply in the required format.

@@ -1,0 +1,141 @@
+===== attempt 1 =====
+Let me think about this carefully.
+
+Current state:
+- Best: e002, 5-seed mean 0.6337. Per-class: pore 0.515, deposit 0.627, discontinuity 0.781, stain 0.611.
+- Ceiling (stage-1 boxes with perfect class): 0.758. Class-agnostic: 0.755.
+- e003 crashed due to a NameError: `make_crop(img, r, ctx, self.train)` — inside `make_crop`, the parameter is named `context`, not `ctx`. The diff added `size = TIGHT_SIZE if ctx == TIGHT_CONTEXT else IMG_SIZE` but the function signature is `def make_crop(img, r, context, train):`. So `ctx` is undefined. Fix: use `context` instead of `ctx`.
+
+So the immediate task: fix e003's bug (BASE: last) to actually test the higher-resolution tight crop idea.
+
+But wait — I should consider whether to fix e003 or pick something else. The instructions say: "If a run crashed or timed out, read the log and fix the cause." e003 crashed on a trivial NameError. The idea (224px tight crop for pores) is reasonable and untested. Fixing it is the natural next step.
+
+But let me also do budget arithmetic: 224px tight crop vs 160px. Training steps: currently 424 steps in ~110s of training (97s to end of epoch 0, 125s to end of epoch 1... wait, total 162s, reserve 55s, so training budget = 180-55 = 125s. Training ran from ~14s to ~125s+? Actually "epoch 1: loss 0.2468, 424 steps, 125s" — that's 125s from T0. Then prediction: 54447 rows, total 162s. So prediction took ~37s.
+
+With 224px tight crop: forward pass cost scales roughly with pixels: (224/160)^2 = 1.96x for the tight view. The wide view stays 160. So per-step time roughly increases by (1 + 1.96)/(1+1) = 1.48x for training. Steps: 424 → ~285. Prediction: 41879 boxes × 2 views; tight view 1.96x cost, so prediction time ~ (1+1.96)/2 ≈ 1.48x → ~55s. Total: 14 (load) + ~165 (training) + ~55 (pred) = 234s > 180s. That would time out!
+
+Hmm wait, let me recompute. Current: load 14s, training 14→125s = 111s for 424 steps (~0.26s/step), prediction 125→162s = 37s.
+
+With 224 tight: step time ~0.26 × 1.48 ≈ 0.385s. Training budget 125-14=111s → ~288 steps. Prediction: 37 × 1.48 ≈ 55s. Total = 14 + 111 + 55 = 180s. Right at the limit — too risky. The reserve is 55s but prediction now takes 55s, and there's also CSV writing time (54447 rows, probably a few seconds).
+
+So to make it safe, I should either:
+- Reduce IMG_SIZE for the wide crop too? No, the idea is specifically high-res tight crop.
+- Reduce RESERVE_S? Dangerous.
+- Reduce batch size? Doesn't change step count much (time-bound training).
+- The training is time-bound, so fewer steps but each step slower. Total training time fixed at 111s. The risk is prediction time: 37s → ~55s, plus writing ~3-5s. 14 + 111 + 55 + 5 = 185 > 180. Risky.
+
+Alternative: keep both views but make the tight crop 224 and reduce wide crop to say 160 (already is). Hmm.
+
+Actually wait — is the tight crop even helping? The hypothesis is that pores are tiny and under-resolved at 160px. Let me estimate: pore boxes... the tight crop side = 1.5 × long side of box, rendered at 160px. If a pore box is, say, 20px in the original image, the tight crop is 30px upscaled to 160 — that's actually upscaling, so resolution isn't the issue for small boxes; the issue is the box is small in the image and the crop contains mostly context. Hmm, actually for small boxes the crop is upscaled, so 224 vs 160 doesn't add real information. For large boxes (stains, deposits can be big), 224 adds detail. Pores are small... so the 224 tight crop may not help pores much. Hmm.
+
+But wait, the per-class weakness: pore 0.515. Pores are small dark holes. If the detector box is small, the tight crop is mostly the hole region. At 160px from a 30px crop, it's already upscaled. 224 would be a slightly sharper upscale. Marginal.
+
+Alternatively, maybe a better idea: the wide crop at 2.5 context provides context; pores in a bead have a characteristic texture. Hmm.
+
+Let me think about what would actually move the needle. Reference numbers:
+- Current: 0.6337 (4-class).
+- Class-agnostic (single class 'defect', scored by conf): 0.755.
+- Perfect class: 0.758.
+
+So the gap from 0.634 to 0.755 is mostly about... wait, class-agnostic 0.755 means: if we ignore class, AP is 0.755. Our 4-class is 0.634. The gap includes: (a) wrong class assignments causing misses per class, (b) score ranking: our score = conf × prob. For the correct class, score = conf × p_correct. If p_correct is low (say 0.5), the score is halved relative to conf, which changes ranking against false alarms. In the class-agnostic case, score = conf. So part of the gap is score degradation from multiplying by p_correct < 1.
+
+Interesting: in the perfect-class ceiling, score = detector conf. In our system, score = conf × p_c. For a true detection of class c, if p_c = 0.6, the score is 0.6×conf. False alarms (boxes not overlapping GT) get 4 rows with scores conf×p_c for each class; the best row for a class is conf×max p. So false alarms are also scaled by max p. The relative ranking of true vs false within a class: true detections with uncertain class (p=0.5) vs false alarms with high p (p=0.9) — the false alarm ranks higher. That's a real ranking loss.
+
+One scoring idea: instead of score = conf × p_c, use score = conf × p_c / max_p or normalize... but any monotone transformation per class doesn't change AP. The issue is cross-class: for class c, a false alarm's row score is conf×p_c(false box). A true detection's row is conf×p_c(true box). If the classifier is confident on false alarms (e.g., looks like a stain), they rank high.
+
+Alternative scoring: use only the argmax class per box (one row per box, score = conf × p_argmax). That reduces false-positive rows: currently we emit 4 rows per box, so each box contributes up to 4 false positives across classes. The 300-row cap per image: 41879 eval dets / 1022 images ≈ 41 boxes per image, 4 rows each = 164 rows < 300, so the cap rarely binds. But emitting 4 rows means each box is a potential FP in all 4 classes. If we emit only the argmax row, FPs concentrate in one class. Does that help mAP? For a true detection whose argmax is wrong, we emit a row of the wrong class (a FP in that class, and a miss in the true class). Currently we emit rows for all classes, so the true class's row exists with score conf×p_true (low), and it can still match if it ranks high enough... actually for mAP, a prediction matches if IoU>0.5 with an unmatched GT of that class. The true class's row exists (score conf×p_true), so it's not a "miss" due to missing row; it's ranked lower. Emitting only argmax: the true class's row is absent → definite miss. So 4 rows is better or equal for recall; the cost is more FPs in each class. Hmm, it's a tradeoff. Probably keep 4 rows.
+
+What about score = conf × p_c^γ with γ<1? That's a monotone transformation of p_c per class... wait, for a fixed class c, score = conf × p_c^γ. Is this monotone in the original score conf×p_c? No! Because conf varies across boxes. conf×p_c^γ is not a monotone function of conf×p_c. So it changes the ranking: it compresses the spread of p_c. If p_c is in [0,1], p_c^γ with γ<1 pushes low probabilities up (e.g., 0.2^0.5=0.45). That would make uncertain true detections rank higher relative to... hmm, it also pushes up FPs with low p_c. Not clearly beneficial.
+
+Let me think about the biggest error source. Per-class AP: pore 0.515, deposit 0.627, stain 0.611, discontinuity 0.781. The ceiling per class is unknown (only overall 0.758). The class-agnostic is 0.755.
+
+Given "pore and deposit are the weak classes; stain is often confused with deposit" from the known info, and macro-F1 ~0.87 with the starting recipe on perfect boxes.
+
+Ideas that change what the model sees/learns:
+1. Fix e003: 224px tight crop. Bug fix, tests a real idea. Budget risk — need to check. Actually, let me reconsider: is the budget OK? Let me estimate more carefully.
+
+Current step time: 424 steps in 111s = 0.262s/step. Each step: 2 forward+backward passes of EfficientNet-B0 at 160×160, batch 64, bf16.
+
+With tight at 224: forward cost ∝ pixels (roughly, for conv nets). 160² = 25600, 224² = 50176, ratio 1.96. Step cost: (1 + 1.96)/(1+1) = 1.48× → 0.388s/step. Training budget is fixed at 111s → 286 steps.
+
+Prediction: currently 37s for 41879 boxes × 2 views at 160. With tight 224: cost ratio (1+1.96)/2 = 1.48 → 55s. Plus writing 54447 rows: currently included in the 37s? Total 162s, prediction loop + writing. Let's say writing ~3s. So prediction ~34s → 50s + 3 = 53s.
+
+Total: 14 + 111 + 53 = 178s. Too tight — no margin. Risk of timeout.
+
+To make it safe: reduce RESERVE_S from 55 to 40? Then training gets 125s... wait, reserve is for prediction. If prediction takes 53s, reserve must be ≥ ~55. Hmm, reserve 55 gives training until t=125, prediction must finish by 180: 55s available. Prediction ~53s. Margin 2s. Too risky.
+
+Options to cut prediction cost:
+- Reduce eval batch? No effect on compute.
+- Use AMP (already using bf16 on CUDA). Is CUDA available? The log doesn't say. If CPU, bf16 autocast is disabled and steps are slow... 424 steps of 2×B0@160 in 111s on CPU with batch 64 = 54k samples in 111s = 490 img/s... that's plausible for a fast CPU, or a slow GPU. Actually EfficientNet-B0 on a modern CPU at 160px: maybe 30-60 img/s single-threaded, more with multi-threading. 490 img/s suggests GPU or many cores. Can't tell. Either way, relative scaling holds.
+
+Alternative: make the tight crop 200 instead of 224? Ratio (200/160)² = 1.56. Step: (1+1.56)/2 = 1.28× → 0.335s. Prediction: 34×1.28 = 44s. Total: 14+111+47 = 172s. Margin 8s. Safer but still thin.
+
+Or: keep tight at 224 but drop the wide crop size to 128? That changes the wide view too (confounds). Hmm.
+
+Or: reduce IMG_SIZE to 160 for wide and 224 for tight, and reduce RESERVE_S to 45, accepting the risk? The harness kills at the limit and it counts as failed — wasting a run. I want margin ≥ ~10s.
+
+Actually, wait. Let me reconsider whether the 224 tight crop is the right experiment at all. For pores (small boxes), the crop is upscaled from a small region; 224 vs 160 adds no real pixels. The benefit would be for large boxes (stains/deposits). Pore AP is 0.515 — the weakest. If pores are small, the tight crop at 160 is already an upscale; the limiting factor is the detector box being small/misplaced, and the class confusion (pore vs other). Hmm.
+
+Actually, what does "pore" look like? Tiny holes in the weld bead. In a high-res image, a pore might be 5-20px. The detector box around it is similar size. Tight crop = 1.5× box → 8-30px region → resized to 160. So the model sees an upscaled blob. At 224, a slightly larger upscale. The classifier already distinguishes pore fairly well? Macro-F1 0.87 overall, pore is weak.
+
+Alternatively, a better idea for pores: include a zoomed-in view at the box center at higher magnification? That's similar to what we have.
+
+Let me think about other ideas:
+
+A. Training data: we train on GT crops + detector boxes (12219 of them). What about using "low" resolution crops too? TRAIN_ON = ("high",). The data has high and low res. Using low-res crops adds data (more boxes) but at lower resolution — could hurt (blurry pores) or help (more diversity, domain matching if eval images are low-res?). Hmm, what's the split? "res (high/low)". The paper: 0.69 on high-res. Our stage-1 detector — which res? Unknown. The eval images could be mixed. If the detector was run on both, our boxes include low-res images. The classifier trained only on high-res crops might not transfer to low-res images (blurrier). Adding low-res crops to training could help on low-res eval boxes. This is a data idea, potentially meaningful. But it also dilutes high-res training. Risky but testable. Actually wait — do we know the eval images' res? dets.csv doesn't have a res column... it has image names. crops.csv has res. We could check overlap: which images in eval also appear in crops with res=low? But we can't inspect the data in the reply; we can only write code. We could add low-res crops to training and see.
+
+Hmm, but actually, is it plausible that eval includes low-res images? The reference numbers are on "validation (same images your score is computed on)". The paper's 0.69 is on high-res. d1_val_map50 = 0.638 is "one-step 4-class detector" — lower than 0.69, maybe because of low-res images included? Or a different validation split. Hard to say.
+
+B. Scoring: use a better score than conf × p_c. Idea: the class-agnostic score is 0.755 with score=conf. Our score conf×p_c loses. What if score = conf × (p_c / max_i p_i)? That's p_c normalized to sum... no, dividing by max makes argmax = 1. For the true class, score = conf × p_c/p_max ≤ conf. Still ≤ conf. Doesn't fix.
+
+What about score = conf × p_c but with p_c from an ensemble of views... that's model-side.
+
+Actually, the key insight: in the perfect-class ceiling, score = conf and AP = 0.758. In class-agnostic, score = conf, AP = 0.755. The difference (0.003) is just per-class matching. So if we had perfect classes, we'd get 0.758. We're at 0.634. The gap 0.124 is entirely class errors: wrong-class rows ranking above true rows, and true rows with low p_c ranking below FPs.
+
+So the whole game is: make p_c high for true boxes and low for FPs, especially for the weak classes.
+
+C. Class-specific handling: stain/deposit confusion. Maybe a two-step: first binary "defect vs not" then class? The detector already gives conf. Hmm.
+
+D. Ensembling views: currently two views (1.5×, 2.5×) averaged. What about adding a third view at a different context (e.g., 1.0× tight)? More views = more compute. A 1.0× view gives the tightest look at the box. For pores, the box itself is the pore. A 1.0× crop at 160 might show the hole structure better than 1.5×. Compute: 3 views → step time 1.5× → 0.39s/step, prediction 1.5× → 51s. Total 14+111+54=179. Also tight. Hmm, all multi-view changes blow the budget.
+
+E. Better model: try convnext or regnet? Model swap at same size: convnext_nano is bigger than effnet-b0 (~50M vs 40M params?). EfficientNet-B0: 40M? No — EfficientNet-B0 is ~4M params? Let me recall: EfficientNet-B0 is 3.9M? No... EfficientNet-B0: 3.9M? Actually EfficientNet-B0 is ~4M? Hmm: EfficientNet-B0 has 3.9M? I think B0 is ~4M params? No wait. EfficientNet-B0: 3.9M? Let me think: MobileNetV3-large is 5.4M, EfficientNet-B0 is 3.9M? I recall EfficientNet-B0 ≈ 3.9M? Hmm, actually I think EfficientNet-B0 is ~4M... no, it's 3.9M? I'm fairly sure EfficientNet-B0 ≈ 3.9M? That seems too low; I've seen 4.0M? Whatever — it's small. convnext_nano is 28M, convnext_base 88M. regnety_016 is 9M. resnet50 is 25M.
+
+A bigger model = better classification but slower steps. Budget: training is time-bound so fewer steps; prediction cost scales with model size. E.g., convnext_nano (28M vs 4M, ~4-5× FLOPs?). Prediction 34s → ~150s. Way over budget. Not feasible unless we cut views.
+
+Actually, is the current model underfitting? Loss went 0.458 → 0.247 in 2 epochs, 424 steps. 18271 samples, batch 64 → 285 steps/epoch. So ~1.5 epochs. Loss still dropping fast. More steps would help — but we're time-bound. Reducing per-step cost gives more steps. E.g., drop to 1 view (just tight crop at 1.5×)? That halves step time → ~850 steps, prediction ~17s. Total 14+111+20 = 145s. But dropping the wide view might hurt (context matters for stain/deposit distinction?). The "two-crop input" is the starting recipe with macro-F1 0.87. Single crop is probably worse.
+
+F. Optimisation: LR, batch size. "Tuning hyperparameters alone helped little in earlier experiments" (from the paper's known info? "Tuning hyperparameters alone helped little in earlier experiments; changes of method helped more." — that's from "What is already known"). So avoid pure hyperparameter tuning.
+
+G. Data: use low-res crops (idea A). Let me evaluate: if eval boxes include low-res images, training only on high-res is a domain gap. The detector boxes on train images: 12219 labeled. crops high: 18271-12219 = 6052 high-res GT crops. If there are also low-res crops (say similar count), adding them doubles training data. Domain matching could be a real gain if eval has low-res. But if eval is all high-res, low-res crops are a slight dilution (blurry labels) — probably small loss.
+
+Hmm, how to decide? I can't inspect the data. But I can make the code adaptive: check whether eval images appear in crops.csv with res=low... actually, we can compute in code: for eval images, look at the res of crops on the same image (crops.csv has image names; eval images might also have crops? No — crops are on training images only, presumably; eval images are hidden, no labels. But res is a property of the image; if the same image name appears in both... unlikely; eval images are different images).
+
+Alternative: dets.csv has image names; crops.csv has image names with res. If eval image names don't appear in crops, we can't infer res. But maybe the res is encoded in the filename? We can't check.
+
+We could print diagnostics: count train dets on images that have low-res crops. If a significant fraction of train dets are on low-res images, then eval likely is too (same distribution). But we only get the log's last lines... "Log of its seed-0 run (last lines)". So we can print extra lines and see them if they're at the end? Risky — "last lines" suggests truncation. We could print a diagnostic near the end of the run. Hmm, that wastes part of a run on diagnostics.
+
+Actually, simpler: just add low-res crops to training. If eval is high-res only, the dilution is mild (6k high + 6k low vs 6k high). If eval includes low-res, it helps a lot. Expected value positive? Maybe. But it's a coin-flip-ish data change.
+
+H. The 224 tight crop (fix e003). Let me reconsider its merit. Pore AP 0.515. Pores: small. In a tight 1.5× crop resized to 160, a 15px pore box → 22px region → 160: the pore is ~100px of the 160 image, plenty resolved. So resolution is NOT the bottleneck for pores; the pore is well-resolved. Then why is pore AP low? Probably: (a) class confusion — pores confused with...? "Pore and deposit are the weak classes; stain is often confused with deposit." So pore is confused with deposit? Pores are small holes; deposits are extra material. Hmm. (b) detector boxes on pores are small and misplaced → crop shows mostly background → classifier sees background → wrong class. (c) ranking: pore p is low.
+
+If pores are well-resolved at 160, the 224 tight crop helps little for pores. It might help stain/deposit (larger boxes where 160 downsamples). Stain AP 0.611, deposit 0.627. Hmm.
+
+Actually wait — maybe I have it backwards. If a pore box is small (say 10px), the tight crop = 15px region resized to 160 = 10× upscale. The "detail" is just interpolation of 15 pixels. The model sees a smooth blob. At 224, a 15× upscale — even smoother relatively? No, same information, larger canvas. The pore's sub-pixel structure isn't there. So no gain from 224 for small boxes. For large boxes (stains 100px+), 1.5× = 150px crop → 160 ≈ 1:1, so 160 is native; 224 downsamples less (150→224 is upscale). Hmm wait, if crop side 150 < 160, it's upscaled to 160 anyway. 224 upscales more. For crop side 300 (large stain), 160 = 2× downsample, 224 = 1.34× downsample — more detail retained. So 224 helps large-box classes (stain, deposit, discontinuity) retain texture.
+
+Given the weak classes are pore (small) and deposit/stain (larger?), the 224 tight might help deposit/stain a bit. Expected gain: maybe +0.005-0.01? Uncertain.
+
+I. A fundamentally different idea: train the classifier to also learn "is this box a real defect" — i.e., add a 5th class "background/FP" using detector boxes that don't overlap any GT. Then at test time, score = conf × p_c × p_defect? Hmm, but that changes ranking: FPs get p_defect low → all their rows drop. True boxes get p_defect high. This directly targets the ranking of FPs vs true — which is part of the gap to class-agnostic 0.755? Wait, but the class-agnostic 0.755 uses score=conf and keeps all boxes (FPs included). Our 4 rows per box with score conf×p_c: for a FP box, the rows are conf×p_c for each c. In class c's ranking, FPs compete with true c boxes. If we multiply by p_defect (low for FPs, high for trues), true c boxes rank higher relative to FPs → AP up toward the ceiling. This is a real method change (adds negative training data + a new scoring factor).
+
+But careful: does it help? The ceiling 0.758 uses score=conf with FPs kept. Our current 0.634. If our p_c were perfect (1 for true class, 0 otherwise), score = conf for the true class row, 0 for others — that's exactly the ceiling 0.758. So the gap is: p_c < 1 on true boxes (pushes true rows down) and p_c > 0 on FP boxes (pushes FP rows up). Adding an explicit "defect vs not" head: score = conf × p_c × p_def... hmm, but p_c for a FP box: the classifier might give p_stain=0.8 to a FP (looks like a stain). With p_def=0.2, score = conf×0.8×0.2 = 0.16conf. True stain box: p_stain=0.7, p_def=0.9 → 0.63conf. Ranking improves.
+
+But there's a subtlety: training the 5-class (4 defect + 1 FP) on detector boxes: 12219 labeled train dets, of which some overlap GT (positives) and the rest are FPs (negatives). Plus GT crops (6052, all positives). The FP negatives: boxes on training images that don't overlap any GT. How many? Total train dets = ? det_by_img covers train images; 12219 got labels... wait, "det_boxes = 12219" is the count that got cls assigned (IoU>0.5). Total train dets unknown from the log. If, say, 20k train dets, then ~8k FPs. Adding them as class 4 negatives: the model learns to reject FPs.
+
+At test time: 5 logits. Score for class c: conf × softmax_c × softmax_4? Or use p_def = softmax_4 as a multiplier. But wait — is this just re-ranking? For class c, score = conf × p_c × p_4. This is NOT monotone in conf×p_c (p_4 varies). So it changes ranking meaningfully. It suppresses FP rows (high p_4) and boosts true rows (low p_4). This directly targets the ranking error.
+
+But risk: the "FP" class on training images — a box not overlapping any GT on a training image might still be a real defect that the GT missed? GT is presumably complete. Also, a box overlapping GT with IoU≤0.5 but still a real defect (misplaced box) would be labeled FP — mild label noise. Acceptable.
+
+Also, the negatives change the class distribution; with 5 classes and cross-entropy, the model spends capacity on defect-vs-not. The crop classifier's job splits into two easier jobs. This is a method change (data + architecture + scoring combined). Hmm, "one idea per turn" — this is one coherent idea: "train an explicit false-alarm class and use it to down-weight FP rows."
+
+But wait, is there a simpler version: keep 4 classes but train on FP boxes with a "background" target? That's the same thing.
+
+Alternatively, even simpler: use the detector conf differently — e.g., score = conf^α × p_c.Thinking budget reached. Stop thinking now and write the reply in the required format.

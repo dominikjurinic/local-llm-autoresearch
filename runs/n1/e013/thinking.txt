@@ -1,0 +1,785 @@
+===== attempt 1 =====
+Let me analyze the situation carefully.
+
+Current state:
+- Best validation mAP@0.5: 0.6318 (5-seed mean)
+- Per-class APs: pore 0.478, deposit 0.649, discontinuity 0.789, stain 0.610
+- The pore class is the main weakness (60% accuracy), often confused with stain (12/41) and deposit (4/41)
+- Ceiling with perfect classes: 0.758 mAP@0.5
+- Current gap: 0.758 - 0.6318 = 0.1262
+
+History analysis:
+- Architecture experiments: 9 ideas, 6 ran, 0 new best, 6 close but not confirmed, 3 crashed → EXHAUSTED?
+- Data experiments: 3 ideas, 3 ran, 0 new best, 3 close but not confirmed → EXHAUSTED?
+
+The e012 experiment combined two previously confirmed ideas:
+1. Third wide view (3.5x) - helped pore class (+0.005 mAP in earlier runs)
+2. Training on detector boxes from train split matched to GT - gave ~+0.004 mAP in earlier runs
+
+Combined gain: +0.0135 over e000, but not confirmed because it didn't hold on held-out validation images.
+
+Key insight from diagnostics:
+- mAP@0.5 if every box had correct class but kept current scores: 0.7530
+- Current mAP: 0.6318
+- Difference (wrong classes cost): 0.1212
+- The confusion matrix shows pore is mainly confused with stain (12/41) and deposit (4/41)
+- Stain is confused with deposit (31/335) and pore (9/335)
+- Deposit is confused with stain (27/132) and pore (2/132)
+
+The problem is primarily classification errors on boxes that DO overlap true defects (IoU > 0.5). The classifier is confusing pore with stain/deposit, and stain with deposit.
+
+What hasn't been tried effectively:
+1. The "background" class approach (5th class for false alarms) was tried 9 times with no gain
+2. Score row manipulation (argmax only, margin, entropy, temperature) - 16 attempts, no gain
+3. Box size/aspect ratio as input - 4 attempts, mostly crashed
+4. Larger backbones - 8 attempts, no gain (fewer steps fit)
+5. TTA - 8 attempts, no gain
+6. Class-weighted loss - hurt every time
+7. Focal loss - no gain
+8. Stronger augmentation - no gain
+
+What could work:
+- The pore class needs better features. It's small and round. The 3.5x context helped but not enough.
+- The stain/deposit confusion is also significant.
+- The classifier sees crops resized to 160x160, losing absolute size info.
+- Earlier attempts to add box features (log area, aspect ratio) crashed or didn't confirm.
+
+Let me think about what's fundamentally different:
+1. The box feature idea (e007/e008) had a bug fix but still didn't confirm. The implementation added features to the model's head. Maybe the way it was done wasn't effective.
+2. The third view helped pore but the gain didn't hold on held-out images - maybe it overfits to the specific validation set.
+3. Training on detector boxes helped slightly but not confirmed.
+
+New idea: The classifier is trained with standard cross-entropy on perfect crops, but at test time it sees noisy detector boxes. The distribution shift is real. What if we train with a loss that's more robust to label noise or that explicitly models the detector's confidence?
+
+Actually, looking at the confusion matrix again: pore→stain (12), pore→deposit (4), stain→deposit (31), deposit→stain (27). These are the main confusions.
+
+The stain/deposit confusion is symmetric and large. Pore is mostly confused with stain.
+
+What if we use a different training strategy: train the classifier on the detector boxes directly (with their imperfections) but with a curriculum - start with perfect crops, then add detector boxes? Or use the detector confidence as a weight?
+
+Wait, the detector confidence is already used at inference time (score = det_conf * cls_prob). But during training, we don't use it.
+
+Another angle: The current model averages logits from multiple views. What if the views are not equally informative for all classes? The tight view (1.5x) might be better for pore (small), wide view (2.5x) for stain/deposit (need context), extra-wide (3.5x) for pore context. But we average them equally.
+
+What about learning to weight the views per class? Or using attention?
+
+But that adds complexity and compute.
+
+Simpler idea: The classifier currently outputs 4 classes. What if we add a "background" class but train it differently - not as a 5th class from false alarms (which didn't work), but as a "none of the above" trained on detector boxes with IoU < 0.5 with any GT? That's what was tried before and failed.
+
+Let me re-read the background section on losses: "Focal loss helps dense detectors with extreme foreground/background imbalance; for a crop classifier with moderate imbalance its benefit is less clear." But we have class imbalance: pore is the smallest class.
+
+Per-class counts from confusion matrix: pore ~41, deposit ~132, discontinuity ~222, stain ~335. That's imbalanced.
+
+Class-weighted loss was tried and hurt every time. But maybe the weighting was wrong?
+
+Wait, the brief says: "Class-weighted loss hurt classification every time it was tried." So that's out.
+
+What about label smoothing? "Label smoothing improves calibration in some settings but can reduce the information in class probabilities that ranking metrics use." Since AP depends on ranking, label smoothing might hurt.
+
+Mixup/CutMix: "typically need longer training to pay off." We have limited time.
+
+Let me think about the box features again. The e008 experiment added log relative area and aspect ratio as inputs to the classifier head. It crashed initially (bug), then ran but didn't confirm (0.6343 vs 0.6318). The gain was tiny.
+
+Maybe the issue is how the features were added. They were concatenated to the backbone features before the final FC. But the backbone is EfficientNet-B0 which outputs 1280 features. Adding 2 features is negligible.
+
+What if the box features need to be integrated earlier? Or what if we need more features?
+
+Actually, the absolute size and aspect ratio are lost when cropping and resizing to 160x160. The pore is small and round, stain is larger and irregular, deposit is elongated. These are strong cues.
+
+The e001/e004/e007/e008 experiments all tried this. e001: "add log-area and a" (cut off). e004: similar. e007: crashed. e008: fixed bug, ran, 0.6343 (not confirmed).
+
+The gain was only +0.0025, which is below the noise threshold.
+
+What if we do it differently: instead of adding to the head, we condition the backbone on the box features? Like FiLM layers? Too complex.
+
+Another idea: The detector boxes have a confidence score. The classifier currently ignores it during training. What if we use the detector confidence to weight the loss? High-confidence detector boxes are more likely to be true defects with good localization; low-confidence ones are more likely false alarms or poorly localized.
+
+But the training data (crops.csv) are perfect GT boxes, not detector boxes. The detector boxes from train split were added in e012 but with hard labels (IoU > 0.5). What if we use soft labels weighted by detector confidence and IoU?
+
+Actually, in e012, the matched detector boxes get the GT class label (hard). But the detector confidence varies. What if we use the detector confidence as a weight for those samples?
+
+Or: what if we train on detector boxes with label smoothing based on IoU? Higher IoU = sharper label.
+
+But this is getting complex.
+
+Let me think about the pore class specifically. It's the smallest class (41 samples in the confusion matrix), AP 0.478. The main confusion is with stain (12) and deposit (4). Pores are small and round. Stains are larger, irregular. Deposits are elongated.
+
+The 3.5x wide view helped pore in earlier runs (+0.005 mAP, pore-driven). But in e012 with 2-of-3 sampling, the gain didn't hold on held-out images.
+
+What if we use a pore-specific view? Like a very tight crop (1.0x or 1.2x) for pore? But we don't know the class at test time.
+
+What about using the box size to select the view? Small boxes get tighter crops, large boxes get wider crops? But the crop size is already proportional to the box (context * long side).
+
+Wait, the crop is `context * max(w, h)`. So a small pore gets a small crop in pixels, then resized to 160x160. A large stain gets a large crop, resized to 160x160. The absolute size information is lost.
+
+The box features (log area, aspect ratio) should recover this. But they didn't help much.
+
+Maybe the model doesn't learn to use them effectively because the backbone features dominate. What if we add a small MLP that takes box features and predicts class, then combine with the visual features? Or use the box features to modulate the visual features (FiLM)?
+
+But that's architecture change, and architecture experiments are "EXHAUSTED?".
+
+Let me look at the data experiments: "EXHAUSTED? (3+ ideas, no new best)". The three ideas were:
+1. e002: detector boxes from train split as extra training data
+2. e009: same idea, slightly different
+3. e011: 5th background class from detector false alarms
+
+All three didn't confirm.
+
+What about sampling? "Class-balanced sampling or class-weighted loss" - 4 attempts, no gain.
+
+What about the scoring/inference? "Fewer or re-weighted score rows" - 16 attempts, no gain. "Test-time augmentation" - 8 attempts, no gain.
+
+The only things that showed any confirmed gain in earlier 5-hour runs (with looser acceptance):
+- Detector boxes from train split: accepted twice (5-seed 0.6337 and 0.6342, +0.004)
+- Third wide view (4x): accepted twice (5-seed 0.6342 both, +0.005), pore-driven
+
+But in this run, e012 combined both and got +0.0135 but didn't confirm on held-out images.
+
+The fact that it didn't confirm suggests the gain was overfitting to the specific validation images.
+
+What's different about this run's validation? "In this run your validation scores use only part of the validation images, so they are a little different from the numbers above; compare ideas with each other, not with those numbers."
+
+So the validation set is a subset. The held-out validation images are another subset. The test images are hidden.
+
+The e012 gain was on the subset but not on the held-out subset. This means the improvement was specific to the validation subset.
+
+What could cause that? The third view (3.5x) helps pore on some images but not others. The detector boxes added are from the training split, matched to GT. Maybe the matching introduces bias?
+
+Let me think of a fundamentally different approach.
+
+The confusion matrix shows:
+- pore → stain (12), pore → deposit (4)
+- stain → deposit (31), stain → pore (9)
+- deposit → stain (27), deposit → pore (2)
+
+The stain/deposit confusion is the largest in absolute numbers. These two classes are visually similar? Both are "surface" defects vs pore (hole) and discontinuity (break).
+
+What if we restructure the classification: first binary (pore vs non-pore), then non-pore into deposit/stain/discontinuity? But that's a cascade, more compute.
+
+Or: use a different loss that explicitly penalizes confusing pore with stain/deposit more? But we don't know which confusions are worse a priori.
+
+Another idea: The classifier is trained on crops from high-res images only (TRAIN_ON = ("high",)). What about low-res crops? The data has "res" field. Low-res might have different characteristics. But earlier "Low-resolution crops added to training" had 4 attempts, no gain.
+
+What about the fact that the detector boxes on eval images have a confidence score, and we multiply det_conf * cls_prob. The ranking within a class depends on this product. If the classifier's probabilities are poorly calibrated, the ranking could be suboptimal.
+
+But "Temperature scaling and other calibration methods fix probability levels, not rankings." So calibration doesn't help AP.
+
+However, if the classifier is overconfident on wrong predictions, that could hurt ranking. But the product with det_conf might mitigate this.
+
+Wait, the score is det_conf * cls_prob. For a given class, the ranking is by det_conf * cls_prob. If two boxes have same det_conf, ranking is by cls_prob. If cls_prob is miscalibrated but monotonically related to correctness, ranking is preserved.
+
+What if we train the classifier to output scores that, when multiplied by det_conf, give better ranking? That's like learning to rank.
+
+But we don't have det_conf for training crops (they're GT boxes, not detector boxes). Unless we use the detector boxes from train split with their conf scores.
+
+In e012, we added matched detector boxes but didn't use their conf. What if we use the detector conf as a sample weight? Or as a target for the classifier's confidence?
+
+Actually, the classifier outputs class probabilities. The final score is det_conf * p(class). For a true positive, we want this high. For a false positive (detector box with no GT), we want this low for all classes.
+
+But the classifier never sees false positive detector boxes during training (only in e011 with background class, which failed).
+
+What if we add false positive detector boxes (IoU < 0.5 with any GT) as a "background" class, but instead of a 5th class, we train the 4-class classifier to output low probabilities for all classes on these boxes? That's like training with a "none of the above" target - but cross-entropy requires a single class.
+
+We could use a multi-label approach: for false positive boxes, target is [0,0,0,0] (all zeros), and use BCE loss. For true positives, target is one-hot. But that changes the loss function significantly.
+
+Or: add a 5th "background" class, but train it only on false positive detector boxes, and at inference, we don't output the background class predictions (or use 1 - p_bg to scale the other classes). This was tried 9 times and failed.
+
+Let me re-read: "5th 'background' class from detector false alarms (scores times 1 - p_bg)" - 9 attempts, no gain, 2 crashes, 1 bug.
+
+So that's exhausted.
+
+What about the box features again? The e008 experiment added log relative area and aspect ratio. Relative to what? The image size? The code in e007/e008 had `compute_box_feats` that used `img_w` and `img_h`.
+
+The gain was tiny. Maybe the features need to be more informative. What about:
+- log(box_area / image_area)
+- aspect_ratio = w/h
+- box_area (absolute)
+- detector_conf (for detector boxes)
+
+But for GT crops, we don't have detector_conf.
+
+Another thought: The current model uses EfficientNet-B0 pretrained on ImageNet. The crops are 160x160. EfficientNet-B0 was trained at 224x224. "Pretrained backbones are typically trained at a fixed resolution and often work best near it." (from background). But earlier "Resolution and small-box handling (224 px, larger MIN_CROP, enlarged tight crops for small boxes)" had 9 attempts, no gain, best 5-seed 0.634 not confirmed.
+
+So 224 didn't help.
+
+What about using a different backbone that's faster, allowing more steps? "Bigger or other backbone (EfficientNet-B2, ResNet-50, 2-3 model ensembles)" - 8 attempts, no gain, best 5-seed 0.636 not confirmed, 1 timeout.
+
+The current best is 0.6318. The unconfirmed best from other runs was 0.636.
+
+What about the training schedule? "Longer training (smaller reserve, measured prediction time)" - 6 attempts, no gain, best 5-seed 0.6355 not confirmed, 2 bugs.
+
+The current RESERVE_S = 55. The run took 162s out of 180s. So 18s margin. Could reduce reserve to 40s, get more training time. But earlier attempts didn't confirm.
+
+Let me think about the pore class again. It's the smallest class, most confused. The third wide view helped. What if we add a fourth view, very tight (1.0x or 1.2x), specifically for small defects? But we'd need to select views based on box size at test time.
+
+Or: during training, for small boxes (area < threshold), use tighter crops; for large boxes, use wider crops. At test time, same logic.
+
+But the crop context is already proportional to box size (context * long_side). So small boxes get small crops in absolute pixels, then upscaled to 160x160. The issue is that a 10px pore becomes 160px, same as a 100px stain becomes 160px. The absolute size is lost.
+
+The box features (log area, aspect ratio) should recover this. But they didn't help much in e008.
+
+Maybe the way they were added was wrong. Let me look at the e008 change (not shown fully, but e007 had the idea). The e007 change was cut off: "add log-area and a". e008 fixed a bug.
+
+What if we add the box features not just to the head, but as a conditioning to the backbone? Like AdaIN or FiLM? That's a bigger architecture change.
+
+But architecture is "EXHAUSTED?".
+
+Wait, the harness says "EXHAUSTED? (3+ ideas, no new best)" for architecture. But that's based on the 5 earlier runs (90 ideas). In this current run, we've had 12 experiments, 6 architecture, 3 data. The architecture ones: e001, e003, e004, e005, e006, e007, e008, e010, e012 (9 total across runs? No, the table says 9 architecture ideas in the 5 earlier runs. In this run, we have e001, e003, e004, e005, e006, e007, e008, e010, e012 - that's 9 architecture experiments in this run alone? No, the history shows 12 experiments total for this run.
+
+Let me count: e001 (arch), e002 (data), e003 (arch), e004 (arch), e005 (arch), e006 (arch), e007 (arch), e008 (arch), e009 (data), e010 (arch), e011 (data), e012 (arch). That's 9 architecture, 3 data in this run.
+
+And the harness says for this run: architecture 9 ran 6, data 3 ran 3. So 6 architecture ran (e001, e003, e004, e008, e010, e012), 3 crashed (e005, e006, e007). Data all 3 ran (e002, e009, e011).
+
+None became new best. e012 was closest (+0.0135) but not confirmed.
+
+So in this run, architecture and data are both exhausted per the harness's criteria.
+
+But the harness also says: "A direction where three or more attempts gave no confirmed gain is exhausted: do not propose another variant of it unless you can say what is fundamentally different."
+
+So I need something fundamentally different from:
+- Adding views (tried: 3rd view, 2-of-3 sampling)
+- Adding box features (tried: log area, aspect ratio)
+- Adding detector boxes as training data (tried: matched with IoU>0.5)
+- Background class (tried and failed in earlier runs)
+- Score manipulation (tried and failed in earlier runs)
+- Backbone changes (tried and failed)
+- Resolution changes (tried and failed)
+- TTA (tried and failed)
+- Longer training (tried and failed)
+- Class weighting (tried and failed)
+- Augmentation (tried and failed)
+- Focal loss (tried and failed)
+
+What's left?
+- Loss function changes (beyond focal, class-weighted, label smoothing)
+- Training curriculum / scheduling
+- Data augmentation (beyond what's tried)
+- Inference strategy (beyond TTA, score manipulation)
+- Model architecture (but exhausted?)
+- Using detector confidence during training
+- Semi-supervised / self-training
+- Ensemble (but time limited)
+- Different optimizer / learning rate schedule
+- Gradient accumulation / larger effective batch
+- Mixed precision improvements (already using bfloat16)
+- Channels-last (already using)
+- Data loading optimizations to get more steps
+
+Wait, the current run gets 433 steps in ~125s training time (162s total - 13s load - ~24s prediction?). Actually log: load 13s, epoch 0 59s (46s training), epoch 1 77s (18s), epoch 2 95s (18s), epoch 3 114s (19s), epoch 4 125s (11s), done 162s. So ~112s training, 433 steps, ~0.26s/step.
+
+RESERVE_S=55, deadline=180, so t_end=125. Training from ~13s to 125s = 112s. Yes.
+
+What if we reduce RESERVE_S to 40? Get 15 more seconds of training, ~57 more steps. But "Longer training" didn't confirm.
+
+What about the learning rate schedule? Current: 5% warmup, then cosine decay to 1e-3 * LR. The schedule is time-based, not step-based. With more steps, the decay is faster per step.
+
+What if we use a step-based schedule instead? Or a different schedule?
+
+The background says: "Learning-rate schedules that decay to zero by the end of the budget usually beat schedules designed for longer training." Current schedule decays to 0.001*LR, not zero.
+
+What if we decay to zero? Change `max(f, 1e-3)` to just `f`?
+
+But that's a small tweak.
+
+Let me think about the pore/stain/deposit confusion again. The confusion matrix shows pore→stain (12), stain→pore (9). These are bidirectional. Stain→deposit (31), deposit→stain (27). Also bidirectional.
+
+This suggests the features for these classes are similar. The classifier can't distinguish them well.
+
+What if we add a small auxiliary task: predict the box size (or log area) as a regression target, alongside classification? This would force the backbone to preserve size information. Multi-task learning.
+
+Or: use the box size to gate the features.
+
+But again, architecture.
+
+Another idea: The detector confidence is correlated with localization quality. High conf → good box → tight crop is good. Low conf → bad box → wide crop is better (more context to compensate for misalignment).
+
+What if we use the detector confidence to choose the crop context at test time? But we don't have detector confidence for training crops.
+
+For the matched detector boxes in e012, we have their conf. What if we train with context proportional to (1 - conf)? Low conf → wider crop.
+
+But that's complex.
+
+Let me think about the scoring again. The final score is det_conf * cls_prob. For a given class, AP depends on the order of det_conf * cls_prob.
+
+The classifier is trained to maximize cls_prob for the correct class. But the product with det_conf means that a box with high det_conf but medium cls_prob can outrank a box with low det_conf but high cls_prob.
+
+Is this optimal? The detector conf reflects "is there a defect here?" The classifier reflects "what type is it?". For a true defect of class C, we want high det_conf * high cls_prob_C. For a false alarm, det_conf might be medium but cls_prob_C should be low for all C.
+
+The current training doesn't consider det_conf at all for GT crops (they're perfect boxes, no det_conf). For matched detector boxes, we have det_conf but didn't use it.
+
+What if we use det_conf as a weight for the loss on matched detector boxes? High conf boxes get higher weight.
+
+Or: what if we train the classifier to predict the class, but the target is smoothed by det_conf? No, the class is known from GT.
+
+Actually, for matched detector boxes (IoU > 0.5 with GT), we know the true class. The det_conf is the detector's confidence that there's a defect (any class). High det_conf means the detector is confident there's a defect. This should correlate with the box being a true positive and well-localized.
+
+So we could weight the loss by det_conf for these boxes. For GT crops, weight = 1 (or max det_conf).
+
+This is a form of importance weighting.
+
+Let me check if this was tried. The e012 added matched boxes but with equal weight. The earlier runs "Detector boxes from the train split as extra training data" were accepted twice (+0.004). But not in this run (e002: 0.6389 not confirmed, e009: 0.6403 not confirmed).
+
+In this run, e002 and e009 didn't confirm. e012 combined with 3rd view and didn't confirm.
+
+What if the issue is that the matched detector boxes have label noise? IoU > 0.5 doesn't guarantee the detector box covers the same defect perfectly. But the class is from the GT with max IoU.
+
+What if we use soft labels based on IoU? For a detector box, compute IoU with all GT boxes. If max IoU > 0.5, use that GT's class as target, but weight by IoU. Or use a distribution over classes weighted by IoU.
+
+But there's only one defect per box usually? The crops.csv has one class per box. A detector box could overlap multiple GT boxes if they're close. But probably rare.
+
+Let me think of a completely different angle: The current model averages logits from two (or three) views. What if we concatenate the features from multiple views and then classify? That would allow the model to learn cross-view interactions. But it increases the feature dimension and the classifier head size.
+
+Current: model(xt) + model(xw) → average → FC → logits.
+Alternative: concat(model.features(xt), model.features(xw)) → FC → logits.
+
+But the backbone is EfficientNet-B0, we'd need to extract features before the final FC. timm models have `forward_features` and `forward_head`.
+
+This is an architecture change. But maybe it's fundamentally different from just adding views.
+
+The current averaging assumes the views are equally informative and independent. Concatenation lets the model learn to weigh them.
+
+But compute doubles for the head (input dim 2560 vs 1280). Still cheap.
+
+Let me check if this was tried. The background mentions "several views at different scales can be combined (multi-scale or multi-crop inputs), at a proportional compute cost." The current approach averages logits (late fusion). Early fusion (concat features) or mid fusion hasn't been tried.
+
+In the 5 earlier runs, "Third, very wide view (4x the box) next to the 1.5x and 2.5x crops, logits averaged" was tried. That's late fusion.
+
+What about early fusion? Not mentioned.
+
+But the harness says architecture is exhausted. However, this specific variant (early fusion vs late fusion) hasn't been tried in this run.
+
+But the rule says: "A direction where three or more attempts gave no confirmed gain is exhausted: do not propose another variant of it unless you can say what is fundamentally different."
+
+The "direction" is "adding views / multi-view". We've tried 3rd view, 2-of-3 sampling, logit averaging. Early fusion is a different fusion method. Is it fundamentally different? It changes how views are combined, from fixed averaging to learned combination. That could be significant.
+
+But it's still in the architecture category.
+
+What about the data category? "Detector boxes from train split" was tried 3 times in this run (e002, e009, e012). All not confirmed. In earlier runs, accepted twice. So it's a real effect but small and not confirming in this run's validation subset.
+
+What if we combine detector boxes with a better labeling strategy? Instead of hard IoU>0.5, use soft labels from the detector's own class predictions? But the detector is class-agnostic.
+
+Wait, the detector is class-agnostic! It only outputs "defect" vs background, with conf. It doesn't predict class. So we can't get class predictions from it.
+
+Another idea: The classifier's errors are systematic. Pore is confused with stain. What if we add a "pore vs stain" binary classifier as an auxiliary head, trained on pore and stain samples only? Multi-task.
+
+But again, architecture.
+
+Let me think about the time budget. We have 180s. Current: 13s load, 112s train, ~37s prediction? 162s total. 18s margin.
+
+What if we use a smaller model (MobileNetV3, ConvNeXt atto/nano/pico) to get more steps? "Bigger or other backbone" tried 8 times, no gain. But smaller backbones weren't specifically mentioned. The list includes convnext_atto, convnext_nano, convnext_pico, mobilenetv3_large_100, regnety_016, resnet18, resnet26d, resnet34, resnet50, tf_efficientnetv2_b0.
+
+EfficientNet-B0 is the current. Smaller: convnext_pico, mobilenetv3_large_100, regnety_016, resnet18, resnet26d. Faster, more steps. But "Bigger or other backbone" says no gain, best 5-seed 0.636 not confirmed. That includes smaller ones? The list says "EfficientNet-B2, ResNet-50, 2-3 model ensembles" - those are bigger. But the available models include smaller.
+
+The background says: "Efficient backbone families trade accuracy against speed differently... some need different learning rates or warm-up to fine-tune stably."
+
+Maybe a smaller model with more steps could work better under time constraint. But 8 attempts with other backbones didn't confirm.
+
+What about the optimizer? AdamW with LR=1e-3, WD=0.05. What about SGD with momentum? Or different LR schedule?
+
+The background: "Learning-rate schedules that decay to zero by the end of the budget usually beat schedules designed for longer training."
+
+Current schedule: 5% warmup, then cosine to 0.001*LR. Not to zero.
+
+Let me try changing the schedule to decay to zero. That's a small change, optimization category.
+
+But "Longer training (smaller reserve, measured prediction time)" was tried 6 times, no gain. That's about training duration, not schedule.
+
+What about the warmup? 5% of time. With 112s training, 5.6s warmup. Maybe too short/long?
+
+Another idea: The current training uses `drop_last=True` and `persistent_workers=True`. Batch size 64. 6052 crops / 64 = 94.5 batches/epoch. 433 steps / 94.5 = 4.58 epochs. Matches log (5 epochs, last partial).
+
+What if we increase batch size? Fewer steps per epoch, but maybe better gradient estimates. Or decrease for more steps.
+
+But batch size changes are optimization.
+
+Let me look at the pore class again. 60% accuracy. The confusion with stain (12) and deposit (4). Stain has 335 samples, deposit 132. Pore only 41 in the confusion matrix (but that's only on detector boxes overlapping GT). The training set has 6052 boxes total. Class distribution unknown.
+
+If pore is rare, the classifier sees few pore examples. But class-weighted loss hurt.
+
+What about oversampling pore? "Class-balanced sampling" tried 4 times, no gain.
+
+What about using the detector boxes from train split that are matched to pore GT? That would add more pore samples. In e012, we added all matched detector boxes. If pore GT boxes have matching detector boxes, that adds pore samples.
+
+But e012 didn't confirm.
+
+What if we specifically oversample pore from the matched detector boxes?
+
+This is getting into data manipulation.
+
+Let me think about the most promising direction based on the diagnostics:
+
+The ceiling with perfect classes is 0.758. Current is 0.6318. Gap is 0.1262.
+
+The mAP with correct classes but current scores is 0.7530. So the scoring (det_conf * cls_prob) is almost as good as detector conf alone (0.755 for class-agnostic). The main loss is wrong classes.
+
+The wrong classes are primarily:
+- pore → stain, deposit
+- stain → deposit, pore
+- deposit → stain
+
+These three classes are confusing each other. Discontinuity is fine (97%).
+
+So the problem is a 3-class confusion among pore, stain, deposit.
+
+What distinguishes them?
+- Pore: small, round, hole-like
+- Stain: larger, irregular, discoloration
+- Deposit: elongated, buildup
+
+Visual cues: size, shape, texture.
+
+The crops are resized to 160x160, losing absolute size. Aspect ratio is preserved in the crop? The crop is square (side x side), centered on box. The box may not be square. The crop includes context. So the defect's aspect ratio in the crop depends on the box aspect ratio and the context.
+
+If context is large (2.5x), the defect is small in the crop, aspect ratio less visible. If context is tight (1.5x), defect fills more of the crop, aspect ratio more visible.
+
+The two views (1.5x and 2.5x) provide different context. Averaging logits combines them.
+
+What if the model needs to see the defect at a fixed physical scale (e.g., mm/pixel) rather than fixed pixel scale? But we don't have physical calibration.
+
+The box features (log area, aspect ratio) provide the missing size info. But e008 didn't help much.
+
+Maybe the features need to be used to select or weight the views. For small boxes (pores), trust the tight view more. For large boxes (stains), trust the wide view more.
+
+This is view weighting based on box size. Could be implemented as: learn a small network that takes box features and outputs weights for the views.
+
+But that's architecture.
+
+Simpler: at inference, for each box, compute its size, and weight the views accordingly. But we don't know the optimal weighting.
+
+What if we train separate classifiers for different size bins? Too many parameters.
+
+Another idea: The current model is trained on high-res images only. The detector boxes on eval might be from both high and low res? The dets.csv has no "res" field. The crops.csv has "res". The images are in the same folder.
+
+The eval detections are on "hidden evaluation images" - could be high or low res. The training crops are only high res (TRAIN_ON = ("high",)).
+
+What if low-res images have different defect appearances? The classifier trained only on high-res might not generalize.
+
+But "Low-resolution crops added to training" had 4 attempts, no gain.
+
+What about test-time adaptation? No.
+
+Let me consider the possibility that the current best (e000) is actually quite good and the remaining gains are small. The harness expects gains > 0.005 to be confirmed. e012 got +0.0135 but didn't confirm because it was validation-set-specific.
+
+What if we try to make the third view more robust? In e012, the third view was 3.5x, and at inference all 3 views averaged. At training, 2-of-3 random.
+
+The gain was pore-driven. But didn't hold on held-out images.
+
+What if the 3.5x view helps on some images but hurts on others? The held-out images might have different pore characteristics.
+
+What if we make the third view adaptive: only use it for small boxes (likely pores)?
+
+At inference, we can compute the box area and decide. At training, we'd need to do the same.
+
+But the model expects fixed number of views. The current BoxDataset returns 2 views for train, 3 for eval (in e012). The model forward pass handles 2 or 3.
+
+In e012, training uses 2-of-3, so the model sees pairs of views. Inference uses all 3.
+
+What if we always use 2 views at inference too (the best 2 for each box)? But we don't know which are best.
+
+What if we train with all 3 views (slower) and infer with all 3? e005 tried fixed 3 views (4x) and crashed. e012 used 2-of-3 to keep compute same.
+
+The compute for 3 views is 1.5x. With 433 steps for 2 views, 3 views would give ~288 steps. Might hurt.
+
+But e003 (fixed 3 views, 4x) got 0.6447 seed-0, 0.6455 5-seed (not confirmed). e010 (2-of-3, 4x) got 0.6435 seed-0, 0.6493 5-seed (not confirmed). Both pore-driven.
+
+The 3.5x in e012 got 0.6441 seed-0, 0.6454 5-seed.
+
+So the third view helps pore but the gain doesn't confirm.
+
+Why? Maybe because the validation subset has pores that benefit from wide context, but held-out pores don't. Or the third view adds noise for non-pore classes.
+
+In e012, at inference all 3 views are averaged equally. For non-pore classes, the 3.5x view might be too wide, adding irrelevant context.
+
+What if we average with learned weights? Or what if we only use the third view for boxes below a certain size?
+
+Let's try: at inference, for each box, if box area < threshold, use all 3 views; else use only tight and wide (1.5x, 2.5x). At training, similarly.
+
+But the model is trained on 2-of-3 random. It learns to handle any pair. At inference, if we give it 2 views for large boxes and 3 for small, it should work.
+
+But we need to modify the inference code to condition on box size.
+
+This is an inference strategy change. Category: inference.
+
+"Test-time augmentation (flips, extra views at inference)" - 8 attempts, no gain. But this is not TTA, it's adaptive view selection.
+
+"Fewer or re-weighted score rows" - 16 attempts, no gain. Different.
+
+This is a new idea: adaptive number of views based on box size.
+
+Hypothesis: The extra-wide view (3.5x) helps small defects (pores) by providing context, but adds noise for larger defects (stains, deposits). Using it selectively for small boxes should retain the pore gain while avoiding noise on other classes, leading to a more robust improvement that holds across validation splits.
+
+Expected gain: +0.01-0.02 mAP, primarily from pore class.
+
+How it differs: Previous third-view experiments used it for all boxes (fixed or 2-of-3 sampling). This uses it conditionally on box size, matching the visual need.
+
+Let me check if box size is available at inference. Yes, the detector boxes have x1,y1,x2,y2. We can compute area.
+
+At training, the crops have x1,y1,x2,y2. We can compute area.
+
+We need to modify BoxDataset to return the box area (or size category) along with views. And modify inference to use different number of views based on size.
+
+But the model forward pass expects either 2 or 3 views. In e012, the model forward is called 3 times for 3 views. We can do the same: for large boxes, run model on tight and wide, average. For small boxes, run on all three, average.
+
+This adds a conditional in the inference loop. Training can stay 2-of-3 (so model sees all pairs).
+
+Actually, in e012 training, the dataset returns 2 views (randomly sampled from 3). The model forward is called twice per batch. The loss is on averaged logits.
+
+At inference, the dataset returns 3 views. The model forward is called 3 times.
+
+If we make inference conditional, for large boxes we call model twice, for small boxes three times. This saves compute on large boxes (majority?), allowing more steps or faster inference.
+
+But the time budget is tight. Current inference takes ~37s (162-125). With conditional, maybe similar or less.
+
+Let me design the change:
+
+1. Add a threshold for "small box" (e.g., area < median area of training boxes, or a fixed pixel threshold).
+2. In BoxDataset, compute and return box area (or a flag).
+3. In inference loop, for each batch, split into small and large, process accordingly.
+
+But batches are mixed. We'd need to process per-sample or split the batch.
+
+Simpler: in the inference loop, for each sample (or small batch), decide.
+
+But the current inference processes batches of 256. We'd need to loop within batch.
+
+Alternatively, modify BoxDataset to return the views needed for each sample. But the number of views differs.
+
+We could always return 3 views, but for large boxes, make the third view a copy of one of the others (so averaging 3 with one duplicate = weighted average). But that's hacky.
+
+Better: in inference, don't use DataLoader with fixed batch. Iterate through the dataset manually, process each sample with appropriate views, batch the model calls.
+
+But that's slower in Python.
+
+Alternatively, keep the 3-view inference for all (as in e012) but change the training to also use 3 views for small boxes, 2 for large? But training uses 2-of-3 random.
+
+What if we change the training to use 3 views for small boxes (all 3), 2 views for large (tight+wide)? Then the model learns to use 3 views for small. At inference, use 3 for small, 2 for large.
+
+But the model forward pass in training currently averages 2 logits. If we give 3, we average 3. The model architecture doesn't change.
+
+Let me check the e012 training code: it returns 2 views (randomly sampled from 3). The training loop does `(model(xt) + model(xw)) / 2`. If we return 3 views, we'd need to change to average 3.
+
+But the dataset returns a tuple. In e012 train: `return views[idx[0]], views[idx[1]], r.get("cls", -1)` - two views + label.
+
+In e012 eval: `return views[0], views[1], views[2], r.get("cls", -1)` - three views + label.
+
+The training loop unpacks as `xt, xw, y` and does `(model(xt) + model(xw)) / 2`.
+
+The eval loop unpacks as `xt, xw, x3, _` and does `(model(xt) + model(xw) + model(x3)) / 3`.
+
+So the number of views is hardcoded in the loops.
+
+To make it adaptive, we need to change both dataset and loops.
+
+This is a significant change but doable.
+
+Let me propose this as the next experiment.
+
+Category: inference (or architecture? It changes both training and inference). The hypothesis is about inference strategy primarily.
+
+But the training also needs to match. So it's a combined change.
+
+The harness says inference category: "Test-time augmentation (flips, extra views at inference)" - 8 attempts, no gain. But this is not TTA, it's adaptive view selection.
+
+I'll categorize as "inference" since the key idea is test-time adaptation based on box size.
+
+Hypothesis: The extra-wide view (3.5×) helps small defects (pores) but adds noise for larger defects. Using it only for boxes below a size threshold (e.g., area < 1000 px²) at both training and inference will retain the pore improvement while avoiding degradation on stain/deposit, yielding a more robust gain that generalizes across validation splits.
+
+Expected gain: +0.01 mAP, primarily from pore class.
+
+Differs from e003/e010/e012: those used the third view for all boxes (fixed or random sampling); this uses it conditionally on box size, matching the visual need.
+
+Now, I need to write the code change. Base is e000 (current best) or e012 (last)? The best is e000 (0.6318). e012 is 0.6454 but not confirmed. The harness says "current best train.py (e000, 5-seed val mAP@0.5 0.6318)". So BASE: best.
+
+But e012 has the third view infrastructure. If I start from e000, I need to add the third view AND the adaptive logic. If I start from e012, I just modify the adaptive logic.
+
+The instruction: "Every change is applied on top of the current best train.py (or the most recent version with BASE: last)."
+
+Current best is e000. But e012 is the most recent version. I can choose BASE: last to edit e012.
+
+But e012 was not confirmed as best. The current best is e000.
+
+The reply format says: "BASE: best (or: last -- to edit the most recent version instead of the best)"
+
+I think I should use BASE: best (e000) and implement the adaptive third view from scratch, or BASE: last (e012) and modify it.
+
+Since e012 already has the third view and 2-of-3 training, it's closer. But it's not the best. However, the harness will apply the change on top of the specified base.
+
+If I use BASE: last, the change will be applied to e012. If I use BASE: best, applied to e000.
+
+I think BASE: last is better because e012 has the third view code. I just need to modify it to be adaptive.
+
+But the harness might expect the base to be the current best for confirmation runs. The instruction says "Every change is applied on top of the current best train.py (or the most recent version with BASE: last)."
+
+So I can choose. I'll use BASE: last to build on e012's third view implementation.
+
+Now, the change:
+
+1. Add a threshold for small boxes. Compute from training data? Or fixed. Let's use a fixed threshold based on box area in original image coordinates. The box area = (x2-x1)*(y2-y1). For pores, typically small. Let's say area < 2000 pixels² (approx 45x45). Or use the median area of training crops.
+
+But we need the threshold at training time to decide training views, and at inference time.
+
+Simpler: compute the threshold as the median area of the training crops (crops.csv). Then use that same threshold for inference.
+
+In the code, we can compute it when loading crops.
+
+2. Modify BoxDataset to take the threshold and return a flag `is_small` along with views.
+
+3. Modify training loop to handle variable views: if is_small, use 3 views (or 2-of-3?); if large, use 2 views (tight+wide).
+
+But the current e012 training uses 2-of-3 for all. We could change to: for small boxes, use all 3 views (average 3); for large boxes, use tight+wide (average 2). This matches inference.
+
+But the dataset returns a fixed number of tensors. We can't return variable number easily.
+
+Alternative: always return 3 views, but for large boxes, set the third view to be the same as wide (or tight), so averaging 3 gives 2/3 weight to tight+wide, 1/3 to duplicate. Not ideal.
+
+Better: in the training loop, check the `is_small` flag and compute loss accordingly.
+
+The dataset can return `(view_tight, view_wide, view_extra, is_small, cls)`.
+
+Then in training loop:
+```python
+xt, xw, x3, is_small, y = batch
+...
+if is_small.any():
+    # process small boxes with 3 views
+if (~is_small).any():
+    # process large boxes with 2 views
+```
+
+But `is_small` is per-sample. We'd need to split the batch.
+
+Since batch size is 64, we can loop over samples in the batch? Too slow.
+
+Vectorized: compute logits for all three views for all samples (3 forward passes), then combine based on is_small.
+
+For small boxes: (logits_t + logits_w + logits_3) / 3
+For large boxes: (logits_t + logits_w) / 2
+
+We can do:
+```python
+logits_t = model(xt)
+logits_w = model(xw)
+logits_3 = model(x3)
+logits = torch.where(is_small.unsqueeze(1), (logits_t + logits_w + logits_3) / 3, (logits_t + logits_w) / 2)
+```
+
+This requires 3 forward passes for all samples, even large ones. That's 1.5x compute for large boxes. But we save by not needing the third view for large boxes at inference.
+
+At inference, we can do the same: always run 3 views, combine adaptively. But that wastes compute.
+
+Or at inference, we can split the batch.
+
+Given the time budget, maybe it's okay to always run 3 views at training (since e012 already does 2-of-3 which is 2 views, 3 views is 1.5x). But e012's 2-of-3 keeps compute same as 2 views. If we do 3 views for all, compute increases 50%, steps decrease.
+
+But we only need 3 views for small boxes. If small boxes are rare (pore is rare), the overhead is small.
+
+What fraction of boxes are small? Pore is the smallest class. In confusion matrix, pore has 41 samples out of ~750 total (41+132+222+335=730). So ~5%. But "small" might include small stains/deposits too.
+
+If we define small as area < median, then 50% are small. Then 3 views for 50% = 1.5x compute on average if we do per-sample. But with the vectorized approach above, we always do 3 forward passes.
+
+Better: at training, keep 2-of-3 random sampling (as e012) which is 2 views per sample. At inference, do adaptive: 3 views for small, 2 for large.
+
+The model is trained to handle any pair of views (since 2-of-3 random). At inference, for small boxes we give all 3 (average 3), for large we give tight+wide (average 2). The model has seen tight+wide during training (one of the 3 pairs), so it should work.
+
+This way, training compute unchanged (2 views), inference compute slightly higher for small boxes (3 vs 2), lower for large (2 vs 3 in e012). Net inference compute similar or less.
+
+Let's do this.
+
+Changes to e012:
+1. Compute size threshold (median area of training crops).
+2. In BoxDataset, compute box area and return `is_small` flag.
+3. In training: keep 2-of-3 random sampling (no change needed, but need to pass is_small? Not needed for training if we keep 2-of-3).
+4. In inference: split batch by is_small, process small with 3 views, large with 2 views.
+
+But the dataset currently returns 3 views for eval. We need to return is_small too.
+
+In e012, eval dataset returns `views[0], views[1], views[2], r.get("cls", -1)`.
+
+We need to return `views[0], views[1], views[2], is_small, r.get("cls", -1)`.
+
+And in inference loop, unpack 5 items.
+
+Then for each batch, we have is_small tensor. We can't easily split in DataLoader. We'll process the whole batch but mask.
+
+Actually, we can do:
+```python
+xt, xw, x3, is_small, _ = batch
+xt = xt.to(device)...
+xw = xw.to(device)...
+x3 = x3.to(device)...
+logits_t = model(xt)
+logits_w = model(xw)
+logits_3 = model(x3)
+logits = torch.where(is_small.unsqueeze(1).to(device), (logits_t + logits_w + logits_3) / 3, (logits_t + logits_w) / 2)
+```
+
+This runs 3 forward passes for all samples. For large boxes, we waste the third forward pass. But if small boxes are rare, it's okay. If 50% small, it's 1.5x inference compute.
+
+Current inference: 3 forward passes for all (e012). This would be same compute for all. But we want to save on large boxes.
+
+To save, we need to actually skip the third forward pass for large boxes. We can do:
+```python
+logits_t = model(xt)
+logits_w = model(xw)
+logits = (logits_t + logits_w) / 2
+if is_small.any():
+    x3_small = x3[is_small]
+    logits_3_small = model(x3_small)
+    logits[is_small] = (logits_t[is_small] + logits_w[is_small] + logits_3_small) / 3
+```
+
+This requires masking and indexing. Doable.
+
+Let's implement this.
+
+First, compute the threshold. In main(), after loading crops:
+```python
+areas = [(r["x2"]-r["x1"])*(r["y2"]-r["y1"]) for r in crops]
+area_threshold = np.median(areas)
+```
+
+Then pass to BoxDataset.
+
+BoxDataset.__init__: store threshold, compute is_small for each row.
+
+BoxDataset.__getitem__: return is_small (bool or float).
+
+For training: keep 2-of-3 random sampling, but also return is_small? The training loop in e012 expects 3 returns: xt, xw, y. We need to add is_small.
+
+Change training loop to unpack 4 items: xt, xw, is_small, y. But we don't use is_small in training (keep 2-of-3). So we can just ignore it.
+
+But the dataset returns 3 items for train (xt, xw, y) in e012. We need to change to 4 items.
+
+Let's write the SEARCH/REPLACE blocks.
+
+I'll base on e012 (BASE: last). The e012 code is shown in the diff.
+
+Let me extract the full e012 train.py from the diff. The diff shows changes from e000. I need to apply those mentally.
+
+But the SEARCH must match the current file exactly. The current file for BASE: last is e012's version. The harness has it.
+
+I'll write the SEARCH blocks based on the e012 code shown in the diff.
+
+First, add THIRD_CONTEXT = 3.5 (already in e012).
+Add area_threshold computation.
+Modify BoxDataset to compute and return is_small.
+Modify training loop to handle 4 returns (ignore is_small).
+Modify inference loop to use adaptive views.
+
+Let's do it step by step.
+
+Note: The e012 code has `self.contexts = (TIGHT_CONTEXT, CONTEXT, THIRD_CONTEXT)` and uses `for ctx in self.contexts` to generate 3 views.
+
+In __getitem__, for train: returns 2 views (random sample of 3) + cls.
+For eval: returns 3 views + cls.
+
+We need to add is_small to both.
+
+Also, the training loop in e012: `for xt, xw, y in dl_tr:` - needs to become `for xt, xw, is_small, y in dl_tr:` but we don't use is_small.
+
+The inference loop: `for batch in dl_ev: xt, xw, x3, _ = batch` - needs to become `xt, xw, x3, is_small, _ = batch`.
+
+Then adaptive logic.
+
+Let me write the changes.

@@ -1,0 +1,319 @@
+===== attempt 1 =====
+Let me carefully analyze the situation.
+
+**Current state:**
+- Best: e002, 5-seed mean 0.6337
+- Ceiling (stage-1 boxes + perfect classes): 0.758
+- Class-agnostic: 0.755
+- One-step baseline: 0.638
+- Per-class AP: pore 0.515, deposit 0.627, discontinuity 0.781, stain 0.611
+
+**History summary:**
+- e002 (data): training on detector boxes (slightly misplaced) — new best 0.6337
+- e004 (architecture): 224px tight crop — rejected (0.6325)
+- e005 (data): higher resolution / different context — not confirmed (0.6315)
+- e006 (augmentation): color jitter etc — rejected (0.6241)
+- e007 (scoring): timeout
+- e008 (scoring): bug
+- e009 (data): background class — rejected (0.5984)
+- e010 (data): low-res crops — rejected (0.6331)
+- e011 (architecture): tf_efficientnetv2_b0 — not confirmed (0.6361)
+- e012 (scoring): rejected (0.5708)
+- e013 (augmentation): mixup — not confirmed (0.6309)
+- e014 (architecture): drop wide crop — rejected (0.6243)
+- e015 (inference): TTA flip — not confirmed (0.6310)
+
+**Lessons:**
+- Architecture: exhausted (3+ ideas, no new best)
+- Scoring: exhausted (3+ ideas, no new best)
+- Data: 5 ideas, 1 new best, 1 close — still active
+- Augmentation: 2 ideas, 0 new best, 1 close
+- Inference: 1 idea, 0 new best, 1 close
+
+**Where is the error?**
+
+The gap to ceiling is 0.758 - 0.634 = 0.124. This is all class-decision error. The weak classes are pore (0.515), stain (0.611), deposit (0.627). Discontinuity is strong (0.781).
+
+Key insight from the background: "Pore and deposit are the weak classes; stain is often confused with deposit."
+
+Let me think about what hasn't been tried and could matter.
+
+Let me reconsider the problem. The classifier is a two-crop input (tight 1.5x + wide 2.5x) through EfficientNet-B0, logits averaged. It's trained on GT crops + detector boxes (with IoU>0.5 overlap).
+
+What's the nature of the remaining error? Let me think about the per-class numbers:
+- pore 0.515 (weakest)
+- deposit 0.627
+- discontinuity 0.781 (strong)
+- stain 0.611
+
+Pore is the weakest. Pores are tiny dark holes. When you take a 1.5x crop of a tiny pore box and downscale to 160px, the pore is barely resolved. But e004 tried 224px tight crop and it was rejected (0.6325). So resolution isn't the fix.
+
+Actually, wait. Let me reconsider. The issue might be that pores are small and the tight crop at 1.5x with MIN_CROP=16 means small pores get a very small crop that's then upscaled to 160. Actually make_crop does: side = max(long_side * context, MIN_CROP=16). So for a tiny pore, side is small, then it's resized to 160x160. So the pore is upscaled. Hmm.
+
+Actually let me think about what's fundamentally different that I could try.
+
+Let me reconsider the score. Currently score = detector conf × class probability. The scoring experiments have been exhausted (and mostly failed). So I shouldn't touch scoring.
+
+Let me reconsider the training. The classifier is trained with CrossEntropyLoss on the class label. The detector boxes are labeled by IoU>0.5 overlap with GT crops.
+
+One thing I notice: the training uses a fixed batch size of 64 and runs until time budget. The model is EfficientNet-B0 with pretrained weights, fine-tuned for only ~2 epochs (424 steps). That's very little training. The loss went from 0.4582 to 0.2468 in 2 epochs. So the model is still far from converged!
+
+Wait, this is important. The model only trains for 424 steps over 2 epochs. That's a very small amount of training. The loss is still decreasing (0.4582 → 0.2468). So the model is undertrained.
+
+But the time budget is fixed at 180s with RESERVE_S=55, so training gets ~125s. Each epoch is ~285 steps at ~45s... wait let me recompute.
+
+Log:
+- epoch 0: loss 0.4582, 285 steps, 97s
+- epoch 1: loss 0.2468, 424 steps, 125s
+
+So epoch 0 took 97s for 285 steps. Epoch 1 took 125-97=28s for 424-285=139 steps. Wait that doesn't add up. Let me re-read.
+
+"epoch 0: loss 0.4582, 285 steps, 97s" — this is cumulative. So after epoch 0, 285 steps done, 97s elapsed (including the 14s loading, so ~83s for epoch 0).
+
+"epoch 1: loss 0.2468, 424 steps, 125s" — cumulative. After epoch 1, 424 steps, 125s elapsed. So epoch 1 took 125-97=28s for 424-285=139 steps.
+
+Hmm, that's inconsistent: 285 steps in 83s = 3.4 steps/s, but 139 steps in 28s = 4.96 steps/s. The first epoch includes warmup and maybe data loading overhead. Actually the first epoch might be slower due to data loading / warmup.
+
+Anyway, total training is ~111s (from 14s to 125s). With t_end = deadline - 55 = 180-55 = 125s. So training runs from 14s to 125s = 111s.
+
+The number of training samples: 18271 boxes. Batch size 64. So one epoch = 18271/64 = 285 steps. Yes, epoch 0 = 285 steps (full epoch). Epoch 1 = 139 steps (partial, cut off by time).
+
+So the model sees the data ~1.5 times. That's very little. The loss is still dropping fast. More training should help!
+
+But wait — the time budget is fixed. To train more, I'd need to either:
+1. Reduce per-step time (smaller model, smaller resolution, fewer views)
+2. Increase the number of steps per second
+
+Actually, the key insight: the model is undertrained. If I can make each step faster, I get more steps, which means better training.
+
+But reducing resolution/model size might hurt accuracy. Let me think.
+
+Actually, let me reconsider. The two-crop input means each step does 2 forward passes (model(xt) and model(xw)). That's 2x the compute of a single-crop model. If I could combine the two crops into a single input (e.g., concatenate along a dimension, or use a single crop), I'd halve the compute and get 2x the steps.
+
+But e014 tried dropping the wide crop and it was rejected (0.6243). So the wide crop helps. Hmm.
+
+Wait, but dropping the wide crop AND training for the same total time... actually no. e014 dropped the wide crop, so each step is 1 forward pass instead of 2. That should have given 2x the steps. But it was rejected. So the wide crop genuinely helps more than the extra training steps it enables. Interesting.
+
+Hmm wait, let me reconsider. Actually if e014 dropped the wide crop, it would have 2x the steps (faster per step). But it was worse (0.6243 vs 0.6337). So the wide crop's information content is worth more than 2x the training. That's a strong signal that the wide crop is valuable.
+
+OK so let me think differently.
+
+Let me reconsider the undertraining angle. The model trains for ~1.5 epochs. That's genuinely too little for fine-tuning a pretrained model. Typically you'd want 5-20 epochs. The loss is still dropping fast.
+
+To get more epochs, I need faster steps. Options:
+1. Reduce IMG_SIZE from 160 to something smaller (e.g., 128). This reduces compute per step.
+2. Reduce the model size.
+3. Use a single combined input instead of two separate forward passes.
+
+Actually, option 3 is interesting. Instead of two separate forward passes (model(xt) + model(xw)), I could create a single input that contains both crops. For example, stack them into a 4-channel or 6-channel image, or place them side by side in a larger image. But that changes the model input.
+
+Actually, a cleaner approach: concatenate the two crops into a single image. E.g., make a 160x320 image (two 160x160 crops side by side) and... no, the model expects a square-ish input.
+
+Hmm, let me think about the compute. Two forward passes of EfficientNet-B0 at 160px. If I instead do one forward pass at a larger resolution that contains both... no, that's more compute.
+
+Actually, the simplest way to halve the compute: use a single crop. But e014 showed that hurts.
+
+Let me reconsider. What if I keep both crops but make them smaller? E.g., IMG_SIZE=128 instead of 160. That's (128/160)^2 = 0.64x the compute per forward pass. So each step is 0.64x as slow, giving 1/0.64 = 1.56x the steps. Combined with... hmm, but does 128px hurt accuracy?
+
+Actually, e004 tried 224px (higher res) and it was rejected. So higher res doesn't help. Lower res (128) might be fine and give more steps.
+
+But wait, is undertraining really the bottleneck? Let me think about the macro-F1 number: "A crop classifier given perfect boxes reaches macro-F1 ~0.87 with the starting recipe (two-crop input)." So the classifier reaches 0.87 macro-F1. That's decent but not great. If it were overtrained it might be higher.
+
+Actually, the fact that macro-F1 is 0.87 suggests the model isn't perfectly learning the classes. More training could push it higher.
+
+Let me reconsider the whole thing. The time budget is 180s. Loading is 14s. Training is ~111s. Prediction is ~41s (162-125=37s, plus writing). 
+
+Actually, let me reconsider the prediction time. 41879 eval detections, 2 views each = 83758 forward passes. At batch 256, that's 327 batches. Over ~37s, that's ~10 batches/s. So ~0.1s per batch of 256 = ~0.4ms per forward pass. EfficientNet-B0 at 160px on GPU is indeed that fast.
+
+Training: 424 steps, each step = 2 forward + 1 backward. Over ~111s, that's ~3.8 steps/s. So ~0.26s per step (2 fwd + 1 bwd). Forward is ~0.13s each (with batch 64). Hmm, batch 64 forward at 160px ~0.13s = 2ms per image. That's reasonable for EfficientNet-B0.
+
+So to get more training steps, I could:
+- Reduce IMG_SIZE to 128: forward ~0.05s, step ~0.1s, so ~10 steps/s. Over 111s that's ~1100 steps = ~4 epochs. That's a big increase in training!
+
+But does 128px hurt? The crops are already downscaled to 160. Going to 128 loses some detail. For tiny pores, that might matter. But e004 showed 224 doesn't help, so the model isn't detail-limited at 160. 128 might be fine.
+
+Actually, wait. Let me reconsider. The real question is: is the bottleneck undertraining or something else?
+
+Let me look at the per-class APs again: pore 0.515, deposit 0.627, discontinuity 0.781, stain 0.611. The weak classes are pore, deposit, stain. These are the visually similar ones.
+
+Hmm, one thing I haven't tried: the class imbalance. Pores are probably very common (tiny holes everywhere), while discontinuities might be rare. Let me think about the class distribution. Actually I don't have the exact counts, but typically in weld data, pores are the most common defect.
+
+Actually, the "What is already known" says: "Class-weighted loss hurt classification every time it was tried." So I shouldn't do class weighting.
+
+Let me think about what's fundamentally different and untried.
+
+Categories tried:
+- data: 5 ideas (detector boxes, higher res, background class, low-res crops, +1 close)
+- architecture: 4 ideas (224px, efficientnetv2, drop wide crop, +1)
+- augmentation: 2 ideas (color jitter, mixup)
+- scoring: 3 ideas (all failed)
+- inference: 1 idea (TTA)
+
+What's NOT tried:
+- Optimisation: nothing! The optimisation category has 0 experiments.
+- Loss: nothing! The loss category has 0 experiments (though class-weighted loss was tried and failed, that might be under "loss" or "data").
+
+Wait, "Class-weighted loss hurt classification every time it was tried" — that's in the "What is already known" section, so it was tried before the history shown, or it's a general lesson. Either way, I shouldn't do class-weighted loss.
+
+But other loss changes are untried. E.g., label smoothing. Or focal loss. Or a different temperature.
+
+And optimisation is completely untried: learning rate, optimizer (AdamW is used), warmup, schedule, batch size, weight decay.
+
+Let me focus. The model is undertrained (loss still dropping fast, only 1.5 epochs). The most impactful thing might be to train longer / better.
+
+Actually, here's a clean idea: the model is undertrained because each step does 2 forward passes (two crops). If I reduce the per-step cost, I get more steps. The cleanest way to reduce per-step cost without losing the two-crop information:
+
+Option A: Reduce IMG_SIZE from 160 to 128.
+Option B: Reduce the model size (but EfficientNet-B0 is already small; convnext_atto/pico are smaller).
+Option C: Use a single forward pass by combining crops.
+
+Hmm, but actually, let me reconsider whether undertraining is the real issue. Let me think about the loss values. 0.4582 → 0.2468 in 1.5 epochs. If I extrapolate, after 5 epochs it might be ~0.15, after 10 epochs ~0.10. The model would be more confident and accurate.
+
+But there's a risk: overfitting. With 18271 training boxes and a small model, overfitting is less of a concern. And we have augmentation (geometric jitter, flips, brightness).
+
+Actually, let me reconsider. The number of training samples is 18271. That's a decent amount. A small EfficientNet-B0 (~4M params) shouldn't overfit badly with 18k samples and augmentation.
+
+So I think more training is a good bet. The question is how to get more training within the fixed budget.
+
+Let me reconsider the two forward passes. Actually, I realize I could do something clever: instead of two separate forward passes, I could batch them together. But that doesn't reduce compute, just might improve GPU utilization. Not a big win.
+
+Let me go with reducing IMG_SIZE to get more steps. But wait, I need to be careful. Let me estimate.
+
+Current: IMG_SIZE=160, 2 views, ~3.8 steps/s, 424 steps in 111s.
+If IMG_SIZE=128: compute per forward ~0.64x, so step ~0.64x, ~6 steps/s. Over 111s, ~670 steps = ~2.35 epochs.
+
+Hmm, that's only 1.55x more steps. Not a huge jump. Because the two forward passes dominate.
+
+If I also reduce to a single combined view... no, e014 showed dropping wide crop hurts.
+
+Alternatively, reduce the model. convnext_atto is much smaller than EfficientNet-B0. EfficientNet-B0 is ~4M params, ~0.4 GFLOP at 224px. convnext_atto is ~1.9M params, ~0.1 GFLOP at 224px. So convnext_atto is ~4x faster. But it's a smaller model, so it might have lower accuracy.
+
+Hmm, but the tradeoff: 4x faster steps means 4x more training (4x epochs). Would a smaller model trained 4x longer beat a bigger model trained 1.5x? Unclear.
+
+Actually, let me step back and think about what's the highest-leverage change.
+
+Let me reconsider the problem from the metric's perspective. mAP@0.5 per class, averaged. Within each class, AP depends only on the RANK ORDER of that class's predictions. So what matters is: for each class, are the true detections ranked above the false alarms?
+
+The score is detector conf × class prob. Since scoring is "exhausted" and mostly failed, I shouldn't change scoring.
+
+Wait, but actually, let me reconsider. The scoring experiments that failed:
+- e007: timeout
+- e008: bug (0.1692)
+- e012: 0.5708 (rejected)
+
+e008 was a bug (0.1692 is way too low, likely wrong). e012 was 0.5708, genuinely worse. e007 timed out.
+
+So the scoring idea (drop detector conf, use only class prob, or re-rank) was tried and failed. The current score = conf × prob is probably near-optimal for scoring. OK.
+
+So the remaining lever is the CLASS DECISION quality — getting the classifier to assign the right class with higher confidence on true detections and lower confidence on false alarms. That's a model quality issue.
+
+So: make the classifier better. Options:
+1. More training (undertrained model).
+2. Better model (but architecture is "exhausted").
+3. Better data (data is active, 1 new best).
+4. Better augmentation (2 ideas, 1 close).
+
+Hmm. Let me think about what's most likely to give a 0.01+ gain.
+
+Actually, let me reconsider the undertraining hypothesis more carefully, because it's the most concrete and testable.
+
+The loss is 0.2468 after 1.5 epochs and still dropping. For a fine-tuned classifier, a loss of 0.2468 with macro-F1 0.87 suggests there's still room. If I train for 5-10 epochs, the loss would drop to ~0.1 and macro-F1 might reach 0.90+.
+
+To train longer, I need faster steps. The cleanest way: reduce the per-step cost. 
+
+Let me reconsider: the two views each do a full forward pass. What if I make the second view (wide crop) cheaper? No, that doesn't make sense.
+
+What if I reduce IMG_SIZE to 128? Let me estimate more carefully.
+
+Actually, you know what, let me reconsider the batch size and the number of steps. The issue is total steps. Let me think about what determines total steps: (time budget for training) / (time per step). Time per step = (time per forward) × 2 (two views) + (time per backward).
+
+For a CNN, forward and backward are roughly equal (backward ~2x forward actually). So step ≈ 2×(2fwd) = 4 forward-equivalents... no. Let me just say step = 2 forward + 1 backward ≈ 2f + 2f = 4f (if backward ≈ 2×forward). Hmm, or backward ≈ 1.5-2× forward.
+
+Anyway, reducing IMG_SIZE from 160 to 128 reduces f by (128/160)² = 0.64x. So step is 0.64x, giving 1.56x steps. 424 → ~660 steps. That's ~2.3 epochs.
+
+Alternatively, reduce to 112: (112/160)² = 0.49x, 2x steps, ~850 steps, ~3 epochs.
+
+Or use convnext_atto (4x faster): ~1700 steps, ~6 epochs. But smaller model.
+
+Hmm. Let me think about which is most likely to help.
+
+Actually, I realize there might be a subtlety. The model is pretrained on ImageNet. Fine-tuning a pretrained model usually needs only a few epochs. 1.5 epochs might actually be... hmm, actually for fine-tuning, 5-15 epochs is typical. 1.5 is low. But the model might be close to a good solution already given the strong pretrained features.
+
+Let me reconsider. The loss after epoch 0 is 0.4582, after epoch 1 is 0.2468. That's a big drop in one epoch. If I had more epochs, it'd keep dropping. The question is whether the mAP keeps improving as the loss drops, or whether it plateaus.
+
+I think the safest high-leverage bet is: reduce per-step cost to get more training. And the cleanest way that doesn't sacrifice the two-crop design is to reduce IMG_SIZE.
+
+But wait — I should double check: does reducing IMG_SIZE actually reduce step time? The crops are created by make_crop which resizes to IMG_SIZE. So yes, smaller IMG_SIZE = smaller tensor = faster forward/backward.
+
+Actually, hold on. Let me reconsider. There's another lever I'm missing: the number of training samples per epoch. Currently 18271 samples, batch 64 = 285 steps/epoch. If I increase the batch size, I get fewer steps per epoch but each step is... no, larger batch = fewer steps but each step processes more data. Total compute per epoch is the same. So batch size doesn't change total compute, just the number of optimizer steps. Actually larger batch with same LR might train worse. Not the lever.
+
+OK let me also reconsider: maybe the issue isn't undertraining but the model capacity or the input. Let me look at the per-class numbers once more.
+
+pore 0.515 — weakest. Pores are tiny. The 1.5x tight crop of a tiny pore, downscaled to 160. The pore might be a few pixels. Hard to classify.
+
+deposit 0.627
+stain 0.611 — stain confused with deposit.
+
+discontinuity 0.781 — strong.
+
+So the problem is distinguishing pore/deposit/stain. These are all "blob-like" defects on the weld bead. The distinguishing features are subtle texture/color differences.
+
+Hmm. What could help distinguish them?
+- Higher resolution (tried, failed).
+- More context (the wide crop is already there).
+- Better training (more epochs).
+- A bigger model (architecture exhausted, but efficientnetv2 was "not confirmed" not "rejected" — it was 0.6361, slightly above best 0.6337 but not confirmed due to noise).
+
+Wait, e011 (tf_efficientnetv2_b0) got 0.6361, which is ABOVE the best 0.6337 but "not confirmed" (within noise). So a bigger model didn't clearly help.
+
+Let me reconsider the "not confirmed" results:
+- e005 (data, higher res): 0.6315
+- e011 (architecture, efficientnetv2): 0.6361
+- e013 (augmentation, mixup): 0.6309
+- e015 (inference, TTA): 0.6310
+
+These are all within noise of the best (0.6337 ± 0.005). So none clearly helped.
+
+The "rejected" (clearly worse):
+- e004 (224px): 0.6325
+- e006 (color jitter): 0.6241
+- e009 (background class): 0.5984
+- e010 (low-res crops): 0.6331
+- e012 (scoring): 0.5708
+- e014 (drop wide crop): 0.6243
+
+So the best is still e002. Nothing has clearly beaten it.
+
+Given that, I need a change that's likely to give a real 0.01+ gain. The most concrete hypothesis I have is undertraining. Let me go with that.
+
+Actually, wait. Let me reconsider. Let me re-examine the training dynamics. The model trains for ~111s. If I could make the model train for, say, 200s (by reducing prediction time or reserve), I'd get ~2x the training. But prediction is 41s and reserve is 55s. Total is 14 (load) + 111 (train) + 41 (predict) = 166s, within 180s.
+
+Hmm, the reserve is 55s but prediction only takes 41s. So there's some slack. But I can't easily increase training time without risking timeout.
+
+Actually, the real lever is per-step speed. Let me commit to reducing IMG_SIZE to get more steps.
+
+But actually, let me reconsider once more. Is there a way to get more training without reducing resolution? 
+
+What about the two forward passes? Currently model(xt) and model(xw) are separate. What if I concatenate them into a single batch and do one forward pass? That doesn't reduce compute but might improve GPU efficiency slightly. Not a big win.
+
+What if I use a smaller model? convnext_atto is ~4x faster. Let me think about the tradeoff. A smaller model trained 4x longer... 
+
+Actually, you know, let me reconsider the whole approach. The model is undertrained. The cleanest, most defensible change: reduce IMG_SIZE from 160 to 128 to get ~1.5x more training steps. This is a focused, testable change. Hypothesis: the model is undertrained (loss still dropping at 0.2468 after 1.5 epochs), so more training steps should improve class decisions, especially for the weak pore/deposit/stain classes. Reducing IMG_SIZE to 128 reduces per-step compute by ~36%, giving ~1.5x more steps (~660 steps, ~2.3 epochs) within the same budget, without changing the model or the two-crop design.
+
+Wait, but is 1.5x more steps enough to matter? The difference between 1.5 and 2.3 epochs... the loss would drop from 0.2468 to maybe 0.20. Would that translate to 0.01 mAP? Uncertain.
+
+Let me think bigger. What if I reduce IMG_SIZE to 128 AND use a faster model? No, one idea per turn.
+
+Alternatively, what if the real issue is that 1.5 epochs is just too few and I need a much bigger jump? Then reducing IMG_SIZE to 128 (1.5x) might not be enough. I'd need convnext_atto (4x) for a real jump.
+
+Hmm. Let me reconsider. Actually, let me reconsider whether the model is really undertrained or whether it's just that the task is hard.
+
+The macro-F1 is 0.87. For a 4-class task where some classes are confusable, 0.87 is reasonable but not great. If the model were well-trained, I'd expect higher. So undertraining is plausible.
+
+But also, the task might be inherently hard (0.87 might be near the ceiling for this input). The ceiling for stage 2 is 0.758 mAP (with perfect classes). We're at 0.634. So there's 0.124 to gain. If the classifier's macro-F1 were perfect (1.0), we'd be at 0.758. At 0.87 macro-F1, we're at 0.634. So the relationship isn't linear, but roughly, improving macro-F1 from 0.87 to ~0.93 might get us to ~0.70.
+
+So improving the classifier is the key. And undertraining is a plausible cause.
+
+Let me go with reducing IMG_SIZE to get more training. But let me pick a size that gives a meaningful jump. 128 gives 1.5x. Let me consider 112 (2x) or even 96 (2.7x).
+
+Actually, wait. There's a risk that reducing resolution hurts the weak classes (pores are tiny). e004 showed 224 (higher) doesn't help, which suggests the model isn't detail-limited at 1Thinking budget reached. Stop thinking now and write the reply in the required format.

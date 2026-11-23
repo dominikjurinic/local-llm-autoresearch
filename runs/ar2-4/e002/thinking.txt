@@ -1,0 +1,422 @@
+===== attempt 1 =====
+Let me carefully analyze the current state.
+
+Current best: e001, 5-seed mean 0.6302, per-class: pore 0.517, deposit 0.622, discontinuity 0.776, stain 0.605.
+
+Reference values:
+- One-step 4-class detector: 0.638 (the target to beat)
+- Stage 1 boxes with perfect classes: 0.758 (ceiling)
+- Class-agnostic: 0.755
+
+So the gap from the ceiling is 0.758 - 0.630 = 0.128. The class decision is losing a lot. The crop classifier with perfect boxes reaches macro-F1 ~0.87 with the starting recipe. So the classifier itself is decent, but the mAP is much lower. Why?
+
+Possible reasons:
+1. The model is undertrained: only 2 epochs, 428 steps in about 110s of training. The loss went from 0.59 to 0.31 — still dropping fast. More training would help.
+2. The crop context: the tight crop at 1.5x might be too tight, or the wide crop at 2.5x might be too wide.
+3. The score: score = detector conf × class probability. This is a product. In mAP, only the ordering within a class matters. For class c, the score is conf * p_c. A box with high conf but low p_c is ranked low. Is this the right ranking? The ceiling experiment uses detector conf as the score for all boxes (with perfect classes). That got 0.755 as a single class. If we had perfect classes and scored by conf, per-class AP would be… each class's predictions sorted by conf. That's the 0.758 ceiling. So conf is a decent score. Multiplying by class probability reorders things: a box that the classifier is very confident about but the detector is uncertain about goes up in rank. Hmm.
+
+Actually wait — there's a subtle point. In the ceiling, false alarms are kept as class 0 with detector conf. So the class 0 (pore) AP in the ceiling includes all false alarms as class 0 predictions. Our system assigns false alarms to various classes.
+
+Let me think about the error decomposition:
+- Ceiling with perfect classes: 0.758.
+- Us: 0.630.
+- Loss: 0.128.
+
+The crop classifier reaches macro-F1 0.87 with perfect boxes. But our boxes are detector boxes (imprecise, false alarms). At F1 0.87, about 13% of boxes are misclassified. But mAP is more sensitive: wrong class = both a false positive in the predicted class and a false negative in the true class. So per misclassification, the damage is doubled.
+
+Also, the ranking of false alarms matters.
+
+What are the biggest levers?
+
+1. **More training time**: only 2 epochs in 428 steps. Loss is still dropping (0.59 → 0.31). The reserve is 55s. Total 162s out of 180s. Actually, the run used 162s total, with 14s loading, so training was about 110s. We could reduce RESERVE_S to, say, 40s, and gain about 15s of training. But more importantly, the training speed is limited by the model. 220 steps/epoch × about 0.5s/step. Hmm, 85s for 220 steps = 0.39s/step (including the first-epoch overhead).
+
+Actually, the biggest lever might be: the model is severely undertrained. 428 steps of AdamW at lr 1e-3 for EfficientNet-B0 fine-tuning — that's very little. Typical fine-tuning is 50-200 epochs at lr 1e-3… well, it depends. The loss is still dropping fast. More steps = better classifier = better mAP.
+
+Options to get more training:
+- Reduce RESERVE_S (55 → 35): prediction takes about 14s (162-148? let me compute: training ended at 125+? actually, "done" is at 162s total; prediction loop + writing is maybe 20-30s). Reserve 55 gives t_end = 180-55 = 125s. The run ended at 162s. So actual prediction + writing took about 37s. So we can safely reduce RESERVE_S to about 45, gaining 10s. Modest.
+- Speed up training: bfloat16 is already used. Increase batch size? 64 → 128: fewer, larger steps; per-sample speed is similar, but fewer optimizer steps. Hmm, at the same lr, larger batch = fewer updates. Might be fine with lr scaling.
+- Use a smaller/faster model? convnext_pico or regnety_016 are faster. But model capacity matters. EfficientNet-B0 at 160px… actually, we could increase IMG_SIZE for better discrimination? That slows things down.
+
+2. **Better crop context**: the tight crop at 1.5x might cut off the defect; pores are small. The wide crop at 2.5x gives context. We could add a third view, or change the context.
+
+3. **Score**: score = conf * p_c. Alternative: score = conf * p_c / p_max, or rank by p_c alone? Let me think about what matters. Within class c, AP depends on the order of predictions for class c. If we output all 4 rows per box, then for class c, all boxes with s_c > MIN_SCORE are in the ranking, sorted by conf * p_c.
+
+The ceiling uses score = conf for all boxes with the perfect class (false alarms as class 0). So in the ceiling, class 0 is sorted by conf, and other classes are also sorted by conf.
+
+If our classifier were perfect, the optimal score would be… well, for each class, we want true positives first. Detector conf correlates with whether the box is a true defect. So conf is a good base score. Multiplying by p_c: a box with conf 0.9 and p_c 0.9 → 0.81; a box with conf 0.5 and p_c 0.99 → 0.495. The ordering is roughly conf-dominated. But consider false alarms: the detector conf for false alarms can be high. The classifier should give low p_c for false alarms (they look like background). So conf * p_c pushes false alarms down in rank. That's good.
+
+Actually, the product might be fine. But there's a subtlety: for a true box of class c, p_c is high (say 0.8), score = 0.8*conf. For a true box of class c' ≠ c, p_c is low, so it's ranked low in class c — good, it's a false positive in class c anyway.
+
+Hmm, but here's the issue: the metric counts at most 300 rows per image. We output 4 rows per box. If an image has 75+ boxes, we exceed 300 rows, and the lowest-scoring rows get cut. That's fine.
+
+4. **Handling false alarms**: the detector has false alarms. The classifier sees crops of background. If the classifier is trained only on true defects, it will assign some class to background crops (it has to pick one of the 4). We could add a "background" class to training (crops from non-overlapping detector boxes on training images, or random background patches) and only output a class row if p_defect is high enough. This changes the score: score = conf * p_c / (sum of defect probabilities)… effectively, we could multiply by a "is-defect" gate. This could improve the ranking of false alarms vs true detections.
+
+Wait, but is that the biggest error? Let me estimate. Stage 1 alone (class-agnostic) is 0.755. Ceiling with perfect classes is 0.758. So the detector boxes are quite good; the class-agnostic score is essentially the same as the ceiling. That means the box placement/false alarms are fine — the loss is almost entirely in class assignment (and the interaction of the ranking with class).
+
+Our per-class: pore 0.517, deposit 0.622, discontinuity 0.776, stain 0.605. The ceiling per-class is unknown, but the average is 0.758. So each class is losing about 0.15-0.25. The classifier's macro-F1 of 0.87 with perfect boxes suggests that the confusion is the main issue, plus the model is undertrained.
+
+Given that the loss is still dropping fast at 428 steps, I think **more training** is the highest-value single change. But how to get more training within the budget?
+
+Options:
+a) Reduce RESERVE_S from 55 to 40: +15s of training (about 15% more steps). Modest but safe. Prediction took about 37s, so reserve 40 is cutting it close? 162s total with reserve 55 → training ended at 125s, prediction + writing 37s. If we set reserve to 45, t_end=135s, prediction starts at 135s, ends at about 172s. OK with a margin. Reserve 40 → ends at about 177s. Risky. Let's go with 45.
+
+b) Speed up per-step: increase batch size 64→128. With the same total time, we get about the same number of samples seen, but half the optimizer steps. Hmm, that's worse for optimization. Actually, per-sample throughput might improve slightly with a larger batch (better GPU utilization). At 160px with B0, batch 64, we're probably already GPU-bound.
+
+c) Use a faster backbone to get more steps: e.g., regnety_016 or convnext_pico. But capacity drops; the classifier F1 might drop. Risky.
+
+d) Reduce IMG_SIZE? 160 → 128. Pores are small; 160 might be needed. Risky.
+
+e) Reduce the number of views: 2 crops → 1 crop (tight only, or wide only). Halves the forward-pass time → about 2x the steps. But the two-crop design was part of the recipe that reached F1 0.87. Hmm. Actually, which crop matters more? The tight 1.5x crop centers on the defect; the wide 2.5x gives context. For pore vs deposit discrimination, the tight crop is probably more informative. For stain vs deposit, context might matter.
+
+Actually, wait. Let me reconsider: is undertraining really the issue, or is 428 steps enough and the loss is just plateauing? Loss 0.59 → 0.31 in epoch 1 (208 steps). If it continues, epoch 2 would be about 0.25. Cross-entropy 0.25 for 4 classes = quite good (chance 1.39). Actually, 0.31 is already pretty good. Hmm, but fine-tuning from ImageNet pretrained usually needs more steps to converge. With 14k samples, 428 steps at batch 64 = 27k samples seen = about 2 epochs. Typical fine-tuning is 10-50 epochs. So yes, undertrained.
+
+Let me also think about the **class imbalance / weak classes**: pore 0.517 is the weakest. Pores are small and look similar to each other; deposit is 0.622. Stain is confused with deposit (known). Class-weighted loss previously hurt (known from "what's already known": "class-weighted loss hurt classification every time it was tried"). So avoid that.
+
+Ideas for improving pore:
+- Pores are small; the tight crop at 1.5x might be too tight or too loose. A smaller context (1.2x) might zoom in more on the pore. But that changes the recipe for all classes.
+- Higher input resolution for small defects.
+
+But the single biggest lever is probably more training. Let me combine: reduce reserve to 45 AND… no, one idea per turn. The rule says one idea per turn. So I should pick one change.
+
+Hmm, but actually, let me reconsider the problem. Let me re-read the knowns:
+
+- "A crop classifier given perfect boxes reaches macro-F1 ~0.87 with the starting recipe (two-crop input)."
+- "Tuning hyperparameters alone helped little in earlier experiments; changes of method helped more."
+- "Class-weighted loss hurt classification every time it was tried."
+
+So hyperparameter tuning (lr, batch, context size?) helped little. Method changes helped more. Interesting — so in earlier experiments (before e000?), tuning didn't help. But that was probably on the high-res-only, undertrained setup.
+
+Wait, the history only shows e001 (1 experiment). But "what's already known" refers to earlier experiments in the paper/original research. So I should trust: hyperparameter tuning → little help; method changes → more help.
+
+Given that, what method changes are available?
+
+1. **Add a background class** (learn to reject false alarms). Method change. Target: ranking of false alarms vs true detections. But the class-agnostic score is 0.755 ≈ ceiling 0.758, so false alarms are already well handled by conf… wait, is that so? Class-agnostic 0.755 means: all boxes scored by conf, single class. The ceiling keeps false alarms as class 0. So per-class in the ceiling: class 0 has all false alarms + true pores; classes 1-3 have only true defects. The average is 0.758.
+
+Hmm, let me actually think about what the per-class ceiling would be. If false alarms are all class 0, class 0's AP is hurt by false alarms. Classes 1-3 have no false alarms, so their AP is high (limited only by missed detections and box placement). The average is 0.758.
+
+Our system: pore 0.517. If the ceiling's pore AP is, say, 0.6 (hurt by false alarms as class 0), and classes 1-3 are about 0.8, then our loss is mainly in class assignment: true pores being classified as other classes (losing pore AP) and creating false positives in other classes (hurting their AP).
+
+So the main error = misclassification. The fix = a better classifier = more training + better features.
+
+2. **More training via faster steps or less reserve.**
+
+3. **Ensemble / test-time augmentation**: average predictions over flips at test time. Costs prediction time (reserve). We have about 37s for prediction; 4x TTA (2 flips) would be about 74s — too much with reserve 55. We'd need to cut training. Hmm.
+
+4. **Use the detector's train-split boxes for pseudo-labeling / auxiliary training**: dets.csv has "train" boxes on training images. We could augment the training set with detector boxes that overlap true crops (already in crops.csv? crops.csv is "labelled training boxes" — probably the ground-truth boxes). Detector boxes on training images that overlap a true crop could be used as additional training samples with the true class (boxes at slightly different positions). That's a data change: train on detector-style boxes, not just ground-truth boxes. This is a method change that targets the domain gap between ground-truth boxes and detector boxes (imprecise boxes). The classifier is trained on tight ground-truth boxes but evaluated on detector boxes that are "slightly misplaced." Training on detector boxes (with class from overlap) would close that gap.
+
+Hmm wait, but crops.csv is the labelled boxes; detector boxes on training images overlap crops. The known gap: "detector boxes contain false alarms and slightly misplaced boxes." If we train the classifier on detector boxes (with class from overlap), the classifier learns to classify imprecise boxes. That's a solid method change.
+
+But how many train-split detector boxes are there? Unknown. dets.csv has 41879 eval boxes; train boxes are probably a similar count. Those that overlap a crop get a class. That could add thousands of samples.
+
+However, there's a risk: detector boxes often overlap multiple crops (a detector box covering two defects) or are large. Overlap rule: IoU > 0.5 with a true box? The ceiling uses IoU > 0.5. For training, we could take detector boxes with the best overlap (IoU or containment) with a crop and use that class.
+
+Hmm, but actually, is the box-placement gap the main error? The classifier with perfect boxes gets F1 0.87. With detector boxes, it's probably lower. The mAP loss of 0.128 from the ceiling is large.
+
+Let me estimate the contribution: if the classifier's F1 with detector boxes is, say, 0.75, then about 25% of true boxes are misclassified. Each misclassification: -1 TP in the true class, +1 FP in the predicted class. That's a big mAP hit. Plus ranking effects.
+
+I think the most impactful and safe change is **more training**. The loss is clearly still dropping. Let me see how to get more training cheaply:
+
+- RESERVE_S 55 → 45: +10s of training (about 8% more steps). Small.
+- Single crop instead of two: 2x the steps. But the two-crop recipe is known to be good (F1 0.87). Risky.
+- Larger batch with the same time: fewer steps, bad.
+- Smaller model: fewer steps but less capacity.
+- IMG_SIZE 160 → 144 or 128: faster per step. 128 is 0.64x the pixels → about 1.5x the speed (not linear due to fixed overhead). Pores at 128px might still be OK (a pore box is probably 10-30px in the image; the crop is 1.5x the box). Hmm.
+
+Actually, wait. Let me reconsider. What's the per-step time? 220 steps in about 71s (from 14s to 85s) = 0.32s/step. That's slow for a B0 at 160px batch 64 on GPU… unless the GPU is small or there's DataLoader overhead. 14k samples / 64 = 220 steps/epoch. 0.32s/step = 0.5ms/sample. That's slow; a decent GPU would do B0@160 in about 0.05ms/sample. So either the GPU is weak or the DataLoader (PIL resize in workers) is the bottleneck.
+
+DataLoader: 8 workers, persistent_workers. make_crop does PIL resize per sample, per view (2 views). That's CPU work. With 8 workers and batch 64, each batch needs 128 crops; if the GPU is fast, the CPU might be the bottleneck. 0.32s/step with 8 workers → each worker produces 8 samples per 0.32s → 40ms/sample for 2 crops + overhead. Plausible as a CPU bottleneck.
+
+To speed up: increase num_workers? workers = min(8, cpu_count). If cpu_count is 8, we're using all of them. Hmm.
+
+Precompute crops? Memory: 14k boxes × 2 views × 160×160×3 float32 = 14k × 2 × 76800 × 4 = 8.6 GB. Too much. uint8: 2.1 GB. Maybe OK but risky. Actually, we could precompute crops for training as uint8 and normalize in the collate… still 2.1GB, plus the images dict. Hmm, risky.
+
+Alternative: reduce views to 1 to halve the CPU work and the GPU forward pass. That doubles the steps. And we could test which view matters. But "changes of method helped more" — switching to one view is a method change, but it's a step backward in information.
+
+OK, another thought: **the score formula**. Currently score = conf * p_c. Consider: what if we output only the argmax class per box (1 row per box) with score = conf * p_argmax? That changes the per-image row count (fewer rows) and removes the "4 rows per box" structure. In mAP, outputting 4 rows per box means: for each class c, the box appears in class c's ranking with score conf*p_c. If p_c is low, it's ranked low — harmless unless it's ranked high enough to count as a FP. Outputting only the argmax: for the true class, the score is conf*p_true (same as before if argmax = true); for other classes, the box doesn't appear at all (fewer FPs). So argmax-only is strictly better or equal in mAP? Let me verify: in the 4-row scheme, a box with true class t and predicted argmax a ≠ t appears in class t's ranking with score conf*p_t (low, probably below the threshold) and in class a's ranking with conf*p_a (high → FP). In the argmax scheme, it appears only in class a (FP). Same FP! And in class t, the 4-row scheme has a low-scoring entry that's probably a missed TP either way (ranked below the FPs). Hmm, so it's roughly equivalent. Not a big lever.
+
+What about the score: conf * p_c vs p_c * conf^k or something? The ordering within a class: conf*p_c. For true boxes of class c, p_c is high (0.7-0.9), so the ordering ≈ conf. For false alarms assigned to class c, p_c is moderate (the classifier has to pick something; for background, the probabilities might be spread out, say 0.3-0.5 for the max). So FPs in class c are ranked by conf * p_c, with p_c around 0.3-0.5, while TPs are around 0.8. So the product already separates them somewhat.
+
+Alternative: score = conf * (p_c / p_max)^2 or conf * p_c * (p_c - p_second)? Sharper separation. But that's score-shaping — "changes that only reorder scores in a way the metric ignores"… no wait, the metric cares about order within a class; any reordering matters. But is the current ordering bad? Hard to say without experiments.
+
+Let me step back and think about what's most likely to give ≥0.01.
+
+The classifier is undertrained (loss dropping fast, 2 epochs). If we get 3-4x more training, the F1 might go from about 0.80 (with detector boxes) to 0.85+. That could be +0.02-0.04 mAP. That's the biggest lever.
+
+How to get 3-4x more training:
+- Single view (halves the cost): 2x.
+- RESERVE 55→40: about 1.15x.
+- IMG_SIZE 160→128: about 1.4x (pixels 0.64x; with overhead, maybe 1.3-1.5x).
+- Combined single view + smaller reserve: about 2.3x.
+
+But single view loses information. Hmm.
+
+Alternatively, **use a faster model**: regnety_016 is much faster than B0 (0.16B vs 0.34B params? actually, B0 is 0.4M… wait, EfficientNet-B0 is 4M params, RegNetY-0.16 is 0.16M? no: regnety_016 = 16M? Let me recall: regnety_016 has 0.16B? no. RegNetY-0.16: 0.16 GFLOPs? The timm name regnety_016 = RegNetY with 0.16 GFLOPs, about 4M params? Hmm, I think regnety_016 is about 4.2M params, 0.16 GFLOPs at 224. EfficientNet-B0: 4.1M params, 0.39 GFLOPs at 224. So regnety_016 is about 2x faster per step. convnext_pico: 1.5M? convnext_pico is about 1.5M params, 0.19 GFLOPs? Something like that.
+
+But a smaller model might have lower F1. The knowns say the starting recipe (B0, two-crop) reaches F1 0.87. Switching the model is risky.
+
+Hmm, let me reconsider the problem from the metric's perspective.
+
+Actually, wait. Let me reconsider the reserve. RESERVE_S = 55, and prediction + writing took about 37s. The 55s reserve is too conservative. Setting it to 45 gains 10s. Setting it to 40 gains 15s (prediction ends at about 135+37 = 172 < 180, 8s margin). That's safe enough. But 15s = about 40 more steps = about 9% more training. Small.
+
+The bigger lever: **step speed**. Let me look at the DataLoader. 8 workers, batch 64. Each sample: 2 crops × (PIL resize to 160) + normalize + transpose. The image is loaded once into memory (np array). make_crop: slicing, padding, PIL resize. PIL resize of a small crop to 160×160 is fast (about 1-2ms). So per sample about 4-8ms + overhead. With 8 workers, throughput about 1000-2000 samples/s? But we're seeing 64 samples per 0.32s = 200 samples/s. That suggests the bottleneck is elsewhere — probably the GPU forward pass (2 forward passes per batch: model(xt) + model(xw)). 2 × B0@160 forward + backward at batch 64. On a weak GPU (e.g., T4 or a small A100 slice), B0@160 forward is about 5ms, backward about 10ms → per batch 2×(15) = 30ms forward-backward + optimizer. That's about 0.03s, not 0.32s. Hmm, 0.32s/step is really slow.
+
+Maybe the GPU is very weak (e.g., a single-core CPU? no, cuda is probably available). Or maybe the DataLoader is the bottleneck: 8 workers, each doing 2 crops… let me estimate: 220 steps × 64 samples = 14080 samples in 71s = 198 samples/s. With 8 workers, 25 samples/s/worker = 40ms/sample. That's slow for a crop+resize. Unless the image is huge (high-res weld images could be 2000×2000+; slicing is fine, but the canvas creation and PIL ops are… still should be fast).
+
+Hmm, or maybe pin_memory + non_blocking on a slow GPU. Or bfloat16 on a CPU? If device.type is "cuda", amp is enabled. If there's no CUDA, amp is disabled and everything is CPU — that would explain the slowness! 0.32s/step on CPU for B0@160 batch 64 with 2 forward passes: plausible (CPU B0 forward is about 50-100ms per image? no, that's too slow; CPU B0@160 forward might be about 10-20ms per image → batch 64 = 1s per forward. With 2 views = 2s forward + backward 3x = 6s. No, that's too slow. We're seeing 0.32s/step.)
+
+I can't tell the hardware. Let me not overthink it.
+
+Given the uncertainty, the safest high-value change: **train longer by reducing the reserve AND making the loop cheaper**. But one idea per turn…
+
+Let me pick the single change with the best expected value:
+
+**Option A: RESERVE_S 55 → 40.** +15s of training. Expected gain: small, maybe +0.002-0.004. Below the noise threshold. Not great.
+
+**Option B: Single view (drop the wide crop, keep the tight 1.5x).** Doubles the steps (about 850+ steps). Risk: the wide crop helped (context for stain vs deposit). But the tight crop is the main signal for defect type. If the tight-only model trains 2x more, it might beat the two-crop undertrained model. This is a real method change with a plausible ≥0.01 effect. Hmm, but "the two-crop input" was part of the recipe that reached F1 0.87 — probably with more training (the paper's recipe). Undertrained, the two-crop model might be worse than a well-trained one-crop model.
+
+Actually, wait — I should maybe reconsider: which view is more important? For pore detection (small holes), the tight crop zooms in. For stain (a surface discoloration, often large), the wide crop shows the extent. Stain is confused with deposit. Hmm.
+
+**Option C: Train on detector boxes (pseudo-labels from dets.csv train split).** A data change. Adds imprecise-box samples, closing the train/test box distribution gap. Effect: the classifier handles misplaced boxes better → fewer misclassifications. Plausible ≥0.01. But implementation complexity: matching detector boxes to crops (IoU > 0.5 rule, pick the best). Risk: if a detector box overlaps multiple crops, or if the overlap rule is off, the labels are noisy. Also, we don't know how many train detector boxes there are or their overlap rate.
+
+**Option D: Add a background class.** Train on random background crops (or non-overlapping detector boxes) as class 4. At test time, score = conf * p_c * p_defect (or gate: only output if p_defect > threshold). Targets the ranking of false alarms. But the class-agnostic 0.755 ≈ ceiling suggests false alarms are already well ranked by conf… actually, wait, let me reconsider. The class-agnostic 0.755 is a single class. Our per-class average is 0.630. The difference includes: (a) FPs in the wrong class (misclassified true boxes), (b) FPs from false alarms in each class, (c) ranking.
+
+In the ceiling, false alarms are all dumped into class 0. So class 0's ceiling AP is lower than classes 1-3. Our system spreads false alarms across 4 classes by the classifier's guess. If the classifier's guess for a false alarm is random, each class gets about 1/4 of the false alarms as FPs. In the ceiling, class 0 gets all of them. So our system should be better than the ceiling on classes 1-3 and comparable on class 0… but our system is much worse (0.630 vs 0.758). So the loss is dominated by misclassified true boxes (each is a FN in the true class + a FP in the predicted class).
+
+Therefore: **the main error is misclassification of true boxes. The fix is a better classifier.** More training, better features, better data.
+
+Given that, Option B (single view for 2x training) or Option C (detector-box training data) or Option A (more training time).
+
+Hmm, let me also consider **increasing IMG_SIZE**: 160 → 192 or 224. Pores are small; more pixels help discrimination. But per-step cost goes up (224/160 = 1.4x pixels → about 1.4-1.6x the time). That halves the steps. Bad for undertraining. No.
+
+**Learning rate**: the knowns say tuning helped little. Skip.
+
+Let me reconsider Option B more carefully. Two views: tight 1.5x and wide 2.5x, logits averaged. If we drop the wide view, we halve the forward/backward cost → about 2x the steps in the same time (about 850-900 steps). The tight crop contains the defect itself; the wide crop adds context. For type discrimination (pore vs deposit vs stain), the defect's appearance is the main signal; context helps for stain (which might be a large faint discoloration) and for distinguishing a deposit (a blob of extra material) from the bead.
+
+Risk assessment: if the wide view contributes little, B is a clear win (2x training). If it contributes a lot, B might lose. Given the undertraining (loss 0.31 and dropping), I lean toward B being a win. But it's a gamble.
+
+Alternatively, **keep two views but reduce the cost another way**: e.g., precompute the crops on CPU once (as uint8) to eliminate the per-epoch crop overhead. If the DataLoader is the bottleneck, this could 2-3x the steps without changing the model. Let me think: precompute 14k × 2 crops at 160×160 uint8 = 14k × 2 × 76800 = 2.15 GB. Plus the images dict (2255 images; high-res could be big — 2255 × 2000×2000×3 = 27 GB! no wait, the images are already loaded: "2255 images (14s)" — loading took 14s, so they're on disk and loaded into RAM. If each is 2000×2000×3 = 12MB, 2255 × 12MB = 27GB. That's a lot of RAM but the machine probably has it. Hmm, actually, the low-res images are smaller. Whatever.)
+
+Precomputing 2.15GB of crops is probably OK if RAM allows, but it's risky if the machine is tight. And the training-time jitter (position/size jitter) would be lost — we'd need to keep the jitter, which requires on-the-fly crops. We could precompute a larger crop (e.g., 2.5x context at 160px) and jitter within it… complicated.
+
+Simpler: **increase num_workers** if cpu_count > 8? workers = min(8, cpu_count). If the machine has 16+ cores, we're capping at 8. Raising the cap to 16 might speed up the DataLoader. One-line change, low risk. But if the GPU is the bottleneck, no effect.
+
+Hmm. I keep going back and forth. Let me make a decision based on the strongest hypothesis:
+
+**Hypothesis: the classifier is undertrained; the loss is still dropping fast at 428 steps. The biggest single lever is more optimizer steps. The cheapest way to get 2x the steps is to drop the wide-crop view (halving the per-step cost), keeping the tight 1.5x crop that contains the defect itself.**
+
+Wait, but actually, hmm. Let me reconsider whether dropping the wide view loses too much. The known F1 0.87 was "with the starting recipe (two-crop input)." That was probably with proper training (many epochs). Our 428-step two-crop model is undertrained. A 900-step one-crop model might beat a 428-step two-crop model. I think that's likely.
+
+But actually, there's an even better option: **keep both views but train the model on them more efficiently… no.**
+
+Or: **half-precision on CPU? no.**
+
+Or: **reduce the training set?** No, more data is better.
+
+Let me also reconsider Option C (train on detector boxes) once more. Actually, it's complementary to B and could be a follow-up. For now, B.
+
+Hmm wait, actually, let me reconsider the reserve option combined with… no, one idea per turn.
+
+Actually, you know what? Let me reconsider the numbers. 428 steps, batch 64 = 27,392 samples = 1.94 epochs of 14,128. Loss 0.31. For a 4-class fine-tune from ImageNet, 2 epochs is very little. Typical recipes: 20-100 epochs at lr 1e-3 with cosine. We're at epoch 2 of a cosine schedule that was supposed to run until the deadline… the schedule's frac is based on the budget; at 428 steps, frac = 110/110 = 1.0? no wait, t_end = deadline - 55 = 125s. Training started at about 14s. Budget = 111s. The run ended at 125s (t_end), so frac reached 1.0, and the cosine LR decayed to about 1e-6 by the end. So the LR schedule completed! The model trained for the full budget with a full cosine decay. So it's not "cut short" — it's just that the budget is too small for the amount of training needed.
+
+So the fix is definitely: more steps. Either a cheaper step or a bigger budget. The budget is fixed (180s). So a cheaper step.
+
+Cheapest step: drop one view (2x), or smaller image (1.4x), or smaller model (1.5-2x), or faster data loading (unknown).
+
+I'll go with dropping the wide view. Actually wait — instead of dropping it, what if we use the wide crop as the only view? The wide crop (2.5x) contains the defect + context. For stain (a large faint discoloration), the wide crop is essential. For pores (small), the tight crop is better. The tight crop at 1.5x of the box: the box is around the defect (from the detector), so 1.5x contains the defect with a small margin. The defect occupies about 2/3 of the crop. At 160px, the defect is about 100px. Pores are small holes — they should be visible.
+
+I'll keep the tight view.
+
+Hmm, one more consideration: instead of dropping a view, **average the two views but compute them with a shared… no, they're different inputs.**
+
+OK, here's my decision: **drop the wide-crop view; train on the tight 1.5x crop only; this roughly doubles the number of optimizer steps in the same time.** The hypothesis targets undertraining (the loss is still dropping at 428 steps; the full cosine schedule completed in about 2 epochs). Expected gain ≥0.01 if the tight crop carries most of the type-discrimination signal. It differs from the hyperparameter-tuning experiments (this changes what the model sees and how much it trains).
+
+Wait, but is this a "hyperparameter" change (context) or a "method" change? It's a change to the input recipe. The knowns say "tuning hyperparameters alone helped little" — but that was probably things like lr, batch, context size, while keeping the same training amount. Here, the point is to double the training. I'll frame it that way.
+
+Let me write the edit:
+
+1. In BoxDataset.__getitem__: build only one view.
+2. In the training loop: model(xt) only.
+3. In the eval loop: model(xt) only.
+4. Keep the CONTEXT setting unused, or set TIGHT as the only context.
+
+Let me write the code changes:
+
+In __getitem__:
+```python
+        views = []
+        for ctx in (TIGHT_CONTEXT, CONTEXT):
+            x = make_crop(img, r, ctx, self.train)
+            if fh:
+                x = x[:, ::-1]
+            if fv:
+                x = x[::-1, :]
+            if self.train:
+                x = np.clip(x * bright, 0, 1)
+            x = (x - MEAN) / STD
+            views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))
+        return views[0], views[1], r.get("cls", -1)
+```
+→
+```python
+        x = make_crop(img, r, TIGHT_CONTEXT, self.train)
+        if fh:
+            x = x[:, ::-1]
+        if fv:
+            x = x[::-1, :]
+        if self.train:
+            x = np.clip(x * bright, 0, 1)
+        x = (x - MEAN) / STD
+        return torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))), r.get("cls", -1)
+```
+
+Training loop:
+```python
+        for xt, xw, y in dl_tr:
+```
+→
+```python
+        for xt, y in dl_tr:
+```
+and
+```python
+            xt = xt.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            xw = xw.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            y = y.to(device, non_blocking=True)
+            with torch.autocast(**amp):
+                loss = crit((model(xt) + model(xw)) / 2, y)
+```
+→
+```python
+            xt = xt.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            y = y.to(device, non_blocking=True)
+            with torch.autocast(**amp):
+                loss = crit(model(xt), y)
+```
+
+Eval loop:
+```python
+        for xt, xw, _ in dl_ev:
+            xt = xt.to(device).to(memory_format=torch.channels_last)
+            xw = xw.to(device).to(memory_format=torch.channels_last)
+            probs.append(torch.softmax(((model(xt) + model(xw)) / 2).float(), 1).cpu())
+```
+→
+```python
+        for xt, _ in dl_ev:
+            xt = xt.to(device).to(memory_format=torch.channels_last)
+            probs.append(torch.softmax(model(xt).float(), 1).cpu())
+```
+
+Also, we could reduce RESERVE_S a bit? No — one idea. Actually, with a single view, prediction is also faster (about 18s instead of 37s), so the reserve of 55 is even more conservative. But I'll keep the reserve as is for this experiment; it's a follow-up.
+
+Hmm wait. Actually, let me reconsider once more whether to drop the tight or the wide view.
+
+Arguments for keeping the tight (1.5x):
+- The defect occupies most of the crop → high effective resolution for the defect texture (pore holes, deposit blobs).
+- Pore is the weakest class (0.517); pores are small; the tight crop gives the most pixels per defect.
+
+Arguments for keeping the wide (2.5x):
+- Context for stain vs deposit (stain is a faint large discoloration; deposit is a localized blob).
+- The detector boxes are imprecise; the wide crop is more robust to box misplacement (the defect is still inside even if the box is off).
+
+I think the tight crop is more informative for type. And robustness: if the box is off by, say, 30% of its size, the 1.5x crop still contains most of the defect (the crop is 1.5x the box, centered on the box center; a 30% shift of the box center → the defect is still inside the crop). OK, tight it is.
+
+Actually, hmm, wait. Let me reconsider whether we should keep both views and instead just reduce the reserve and accept a smaller gain… no. The gain from the reserve is about +0.003 (at the noise level). The gain from 2x training could be +0.01-0.03. B is the play.
+
+Let me also double-check the budget arithmetic for the single-view run:
+- Loading: 14s.
+- Training: previously about 111s for 428 steps (0.26s/step after the first epoch: (125-85)/208 = 0.19s/step in epoch 1… let me recompute: epoch 0 ended at 85s with 220 steps (started at about 14s) → 71s/220 = 0.32s/step (includes worker warmup). Epoch 1: 85s→125s = 40s/208 steps = 0.19s/step. So steady-state is about 0.19s/step with two views. With one view, if the GPU forward pass is the bottleneck, about 0.12-0.15s/step; if the DataLoader is the bottleneck (2 crops → 1 crop), about 0.10s/step. Either way, about 1.3-1.9x more steps in the same 111s → about 600-800 steps. Good.
+- Prediction: previously about 37s for 41,879 boxes × 2 views. With one view, about 20-25s. Total: 14 + 111 + 25 = 150s < 180s. Safe.
+
+One more thing to check: the dataset returns (x, y) — the DataLoader collates fine. The eval dl returns (x, _). OK.
+
+Also, `views` is no longer used; I'll remove it. And the CONTEXT/TIGHT_CONTEXT settings — I'll keep TIGHT_CONTEXT, and CONTEXT becomes unused (I'll leave the line to minimize the diff, or update the comment). I'll leave the settings as is (unused variables are fine).
+
+Let me write the SEARCH/REPLACE blocks. I need to copy the exact lines from the current file.
+
+Block 1 — __getitem__:
+SEARCH:
+```
+        views = []
+        for ctx in (TIGHT_CONTEXT, CONTEXT):
+            x = make_crop(img, r, ctx, self.train)
+            if fh:
+                x = x[:, ::-1]
+            if fv:
+                x = x[::-1, :]
+            if self.train:
+                x = np.clip(x * bright, 0, 1)
+            x = (x - MEAN) / STD
+            views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))
+        return views[0], views[1], r.get("cls", -1)
+```
+REPLACE:
+```
+        x = make_crop(img, r, TIGHT_CONTEXT, self.train)
+        if fh:
+            x = x[:, ::-1]
+        if fv:
+            x = x[::-1, :]
+        if self.train:
+            x = np.clip(x * bright, 0, 1)
+        x = (x - MEAN) / STD
+        return torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))), r.get("cls", -1)
+```
+
+Block 2 — training loop:
+SEARCH:
+```
+        for xt, xw, y in dl_tr:
+```
+REPLACE:
+```
+        for xt, y in dl_tr:
+```
+
+Block 3:
+SEARCH:
+```
+            xt = xt.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            xw = xw.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            y = y.to(device, non_blocking=True)
+            with torch.autocast(**amp):
+                loss = crit((model(xt) + model(xw)) / 2, y)
+```
+REPLACE:
+```
+            xt = xt.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            y = y.to(device, non_blocking=True)
+            with torch.autocast(**amp):
+                loss = crit(model(xt), y)
+```
+
+Block 4 — eval:
+SEARCH:
+```
+        for xt, xw, _ in dl_ev:
+            xt = xt.to(device).to(memory_format=torch.channels_last)
+            xw = xw.to(device).to(memory_format=torch.channels_last)
+            probs.append(torch.softmax(((model(xt) + model(xw)) / 2).float(), 1).cpu())
+```
+REPLACE:
+```
+        for xt, _ in dl_ev:
+            xt = xt.to(device).to(memory_format=torch.channels_last)
+            probs.append(torch.softmax(model(xt).float(), 1).cpu())
+```
+
+Let me verify each SEARCH appears exactly once.
+- "for xt, xw, y in dl_tr:" — appears once (training). The eval is "for xt, xw, _ in dl_ev:" — different. OK.
+- The xt/xw/y to-device block: appears once in the training loop. The eval has a different line (no non_blocking). OK.
+- The eval block: unique.
+- The views block: unique.
+
+Category: "architecture" or "data"? It changes the input views. I'd say "architecture" (the model's input) — or "data" (the crop recipe). The two-crop input is part of the model's design. I'll use "architecture."
+
+Hypothesis: "Train on a single tight crop (1.5x) instead of averaging two views (tight 1.5x + wide 2.5x), halving the per-step cost and roughly doubling the number of optimizer steps in the same time (about 430 → 700+). The current run completes a full cosine schedule in only about 2 epochs with the loss still dropping fast (0.59→0.31), so the classifier is undertrained, and the main error is misclassification of true boxes (0.630 vs the 0.758 ceiling). The tight crop keeps the defect at the highest effective resolution, which should help the weak pore class; unlike earlier hyperparameter tweaks, this changes how much the model trains."
+
+That's good. Let me also double-check the expected step count: steady-state 0.19s/step (two views) → single view, if the GPU is the bottleneck: the forward pass is halved, the backward pass is halved → about 0.11s/step → 111/0.11 ≈ 1000 steps. If the CPU is the bottleneck: about 0.10s/step → about 1100 steps. Either way, 2-2.4x.
+
+One risk: if the wide view really matters (stain vs deposit), we might lose a little on stain/deposit. But stain is 0.605 and deposit is 0.622 — both could improve with more training. I'll accept the risk.
+
+Let me finalize. I'll keep the reply concise.

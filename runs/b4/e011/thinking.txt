@@ -1,0 +1,308 @@
+===== attempt 1 =====
+Let me think carefully about this.
+
+Current state:
+- Best: e000, 5-seed mean 0.6297, seed std 0.0044
+- Baseline to beat: one-step 4-class detector 0.638 mAP@0.5
+- Ceiling: stage-1 boxes with perfect classes: 0.758
+- Class-agnostic: 0.755
+
+Per-class: pore 0.504, deposit 0.626, discontinuity 0.780, stain 0.609
+
+History summary:
+- e001 (data): crashed (NameError)
+- e002 (data): fix of e001, 0.5541 rejected — this was a "data" experiment that restored the writer... actually e002 was based on e001 and got 0.5541. Hmm, that's low. The hypothesis was about emitting 4 class rows... 0.5541 is way below best, so rejected.
+- e003 (inference): 4-view averaging, 0.6301 not confirmed (close)
+- e004 (scoring): 0.5689 rejected — some change to emit fewer rows?
+- e005 (architecture): backbone swap, 0.6240 rejected
+- e006 (data): training on both resolutions, 0.6225 rejected
+- e007 (scoring): 0.6192 rejected
+- e008 (augmentation): mixup, 0.6327 not confirmed (close, slightly above 0.6297 but within noise)
+- e009 (sampling): training on detector boxes, 0.6268 rejected
+- e010 (scoring): p_c^0.5, 0.6289 rejected
+
+Lessons:
+- data: exhausted (3 ideas, no new best)
+- scoring: exhausted (3 ideas, no new best)
+- inference: 1 idea, close but not confirmed
+- architecture: 1 idea
+- augmentation: 1 idea, close
+- sampling: 1 idea
+
+So what's left? Let me think about what the actual problem is.
+
+Key insight from the problem statement: mAP@0.5 depends only on the ordering of predictions within each class. The hit set is fixed by stage-1 boxes (ceiling 0.758). So the gap 0.630 vs 0.758 is purely a ranking problem: within each class's list of ~41k rows, we need true positives (boxes that overlap a true defect of that class) ranked above false positives.
+
+Wait, but actually, the hit set isn't exactly fixed: "a prediction is a hit if it overlaps an unmatched true box of that class by IoU > 0.5". If we emit 4 rows per box, then a box that overlaps a true pore is a TP in the pore list and an FP in the other 3 lists. The AP for each class depends on the ranking of that class's rows.
+
+Actually wait — there's a subtlety. If we emit all 4 rows per box, then for class c, the list contains all 41879 boxes. The TPs are boxes overlapping a true c-defect. The AP is determined by how these TPs rank among all 41879 entries.
+
+Alternatively, if we emit only 1 row per box (the argmax class), then for class c the list contains only boxes whose argmax is c. The hit set could change: a box overlapping a true pore whose argmax is deposit would be missing from the pore list — but that box is a TP for pore (IoU > 0.5 with true pore). If we don't emit it in the pore list, we lose a TP. But AP is precision@k averaged... losing TPs reduces recall, which hurts AP.
+
+Hmm, but the ceiling experiment (0.758) keeps false alarms as class 0. So the ceiling is: each box gets the correct class if it overlaps a true defect, else class 0. That's 1 row per box. And it achieves 0.758. So 1 row per box with perfect class is 0.758.
+
+The class-agnostic (0.755): all boxes as a single class 'defect'. Wait, that's single-class mAP. In single-class mAP, all boxes are in one list, TPs are boxes overlapping any true defect. 0.755.
+
+So: perfect class assignment (1 row per box) → 0.758. Single class → 0.755. Interesting: perfect 4-class is slightly higher than class-agnostic. That's because in 4-class, a box overlapping a true pore is a TP in the pore list and doesn't pollute... no wait, it's 1 row per box, so a box overlapping a true pore is only in the pore list. In class-agnostic, it's in the single list. The difference is small.
+
+Our current approach: 4 rows per box, score = conf * p_c. For class c, the list is all 41879 boxes ranked by conf * p_c(box, c).
+
+The key question: what ranking within class c's list maximizes AP? We want boxes overlapping true c-defects at the top. The signal is p_c (and conf).
+
+Now, the important consideration: the per-class AP is averaged. Pore is weakest (0.504). Pore defects are probably small and rare? Let me think about class balance.
+
+Actually, let me reconsider. The metric: for class c, sort all rows of class c by score. A row is a TP if it overlaps an unmatched true box of class c. AP = average precision over this ranking.
+
+With 4 rows per box, class c's list has 41879 entries (all boxes). The number of TPs for class c = number of boxes overlapping a true c-defect (roughly, assuming each true defect is overlapped by ~1 box).
+
+Now here's a thought: emitting 4 rows per box means for class c, we have 41879 candidates. If instead we emitted only rows where p_c is above some threshold, or only the top rows... but the per-image limit is 300 rows. With 4 rows per box, 41879 boxes → but per image at most 300 rows count. How many boxes per image? 41879 / 1022 ≈ 41 boxes per image on average. So 4 rows × 41 = 164 rows per image, under 300. OK.
+
+Now, the ranking within class c: score = conf * p_c. Both conf and p_c matter. Actually, since we emit 4 rows per box and the per-class list includes all boxes, the ranking is by conf * p_c.
+
+Hmm, wait. Let me reconsider whether 4 rows per box is optimal. Consider class c. The ideal ranking puts TP boxes first. A TP box for class c has high p_c (hopefully). An FP box (overlapping no true c-defect) — but it might overlap a true defect of another class! E.g., a box overlapping a true deposit. For the pore list, that box is an FP (doesn't overlap a true pore). Its p_pore is probably low (it's a deposit). So p_c naturally separates.
+
+But here's the thing: the 3 "wrong class" rows for a box. For a box that's a true deposit, we emit a pore row with score conf * p_pore. If p_pore is small, that row ranks low in the pore list — fine. But if p_pore is not small (misclassification), it ranks high and counts as an FP in the pore list, hurting pore AP.
+
+So the cross-class contamination is real but it's inherent to the ranking problem. The question is whether we can do better.
+
+Alternative: emit only 1 row per box (argmax), score = conf * p_argmax or just the max prob. Then:
+- For class c, the list contains only boxes whose argmax = c.
+- A true c-defect box whose argmax is c is in the list (TP).
+- A true c-defect box whose argmax is c'≠c is NOT in the c list → we lose a TP. This hurts recall for class c.
+- But we also remove the cross-class FPs: a true deposit box is no longer in the pore list at all.
+
+Which is better? This depends. If the classifier is good (argmax correct most of the time), then 1-row-per-box might be better because it removes the 3x contamination. But we lose the TPs where argmax is wrong.
+
+Actually, the ceiling (perfect classes, 1 row per box) is 0.758. Our 4-row approach is 0.630. The difference is the ranking quality.
+
+Let me think about what e004 and e007 tried. e004 (scoring) 0.5689 — "emitting fewer rows"? The hypothesis was truncated. e007 (scoring) 0.6192. e010 (scoring) p_c^0.5 → 0.6289.
+
+Hmm, the scoring category is marked exhausted (3 ideas, no new best). But those were all about the score formula / row emission. Let me not repeat scoring tweaks.
+
+Let me reconsider the fundamental problem. The classifier's macro-F1 is ~0.87. Pore and deposit are weak. The per-class AP: pore 0.504 is the worst.
+
+Key realization: mAP@0.5 per class depends on the ORDER. The order for class c is by conf * p_c. Now, conf is the stage-1 detector confidence. Is conf informative about whether the box overlaps a true c-defect? conf is class-agnostic (stage 1 is class-agnostic). So conf tells us "is this a defect at all" but not the class. So for ranking within class c, conf helps separate true defects (any class) from false alarms, but p_c separates class c from other classes.
+
+Actually, here's a subtle point. For class c's AP:
+- TP boxes: overlap true c-defect. These have high conf (true defects) and high p_c (correct class).
+- FP boxes of type "true defect, wrong class": overlap a true c'≠c defect. These have high conf but low p_c.
+- FP boxes of type "false alarm": overlap nothing. These have low conf and low p_c.
+
+So the ranking by conf * p_c: TP boxes should be at top (high conf, high p_c). Wrong-class boxes have high conf but low p_c → mid. False alarms low conf, low p_c → bottom.
+
+The main error source: wrong-class boxes (true defects misclassified). If p_c for a wrong-class box is high enough, it ranks above some TP boxes.
+
+So to improve, we want better p_c (better classifier) OR a better combination of conf and p_c.
+
+Now, the classifier is the bottleneck. Let me think about what could improve the classifier meaningfully.
+
+Ideas not yet tried:
+1. Better training: more data (both resolutions — tried in e006, rejected). 
+2. Better augmentation (mixup — e008, close but not confirmed).
+3. Better architecture (backbone swap — e005, rejected).
+4. Better sampling (train on detector boxes — e009, rejected).
+5. Inference: multi-view (e003, close).
+
+Hmm. What's fundamentally different and could give ≥0.01?
+
+Let me reconsider the problem. The per-class AP for pore is 0.504. Why is pore so bad? Pore defects are small, numerous, maybe visually similar to other things. 
+
+Wait — maybe the issue is class imbalance in training. If pore is rare in training, the classifier under-predicts pore, so p_pore is low for true pore boxes, ranking them low in the pore list. Let me check: the problem says "Class-weighted loss hurt classification every time it was tried." So class weighting is out.
+
+But class imbalance could still matter for the RANKING even if not for classification F1. Hmm.
+
+Let me think differently. What about the relationship between the two crops? Currently tight (1.5x) and wide (2.5x) are averaged. 
+
+Actually, let me reconsider the whole approach. The key insight: the gap is a ranking problem. Let me think about what signal we're throwing away.
+
+We have conf (stage-1 confidence) and p_c (classifier prob). Currently score = conf * p_c. 
+
+What if the issue is that conf is not the right thing to multiply? Actually, for the ranking within class c, we want to rank TP-c boxes above everything else. conf helps separate true defects from false alarms. But conf is the same for all classes (it's class-agnostic). So conf * p_c: the conf factor is a monotone... no, conf varies per box, so it does affect the order.
+
+Hmm, let me think about whether we should use conf at all in the per-class ranking, or use a different combination.
+
+Actually, here's a cleaner idea. Let me reconsider: the per-class list for class c contains all 41879 boxes. The ideal is to rank TP-c boxes first. 
+
+What determines a box being TP for class c? (a) it's a true defect (high conf), AND (b) it's class c (high p_c). So score should be high when both are high. conf * p_c does that. But maybe the product over-weights or under-weights one.
+
+Actually, let me step back and think about the biggest lever.
+
+The classifier macro-F1 is 0.87. To improve mAP, we need better class decisions on the boxes that matter. The weak classes are pore (0.504 AP) and stain (0.609 AP).
+
+Let me think about the data. 6052 training boxes (high-res). 4 classes. If pore is rare, say 1500 boxes, the classifier sees fewer pore examples.
+
+Idea: What if we train on BOTH resolutions but the e006 attempt failed? Let me re-read e006: "The current recipe trains only on high-res crops; crops.csv [has low-res too]". It got 0.6225, rejected. So adding low-res hurt. OK, data is exhausted.
+
+Let me think about the inference side more. e003 (4 views) was close (0.6301 vs 0.6297). Not confirmed. 
+
+What about test-time: instead of averaging the two crops' logits, what if we use a different combination? Or what about using the wide crop more, since stain/deposit context matters?
+
+Actually, let me reconsider. The problem says "stain is often confused with deposit." And pore/deposit are weak.
+
+Let me think about a fundamentally different idea: **use the detector boxes' geometry as a feature**. Pore defects are small and round; deposit is larger; discontinuity is elongated (a gap in the bead); stain is... The box aspect ratio and size could be a strong class signal. Currently the classifier only sees the image crop, not the box geometry explicitly (though the crop size encodes scale somewhat).
+
+Hmm, but the crop is resized to 160x160, so the absolute size is lost. The aspect ratio is preserved in the crop (since we crop a square of side = context * long side). Wait, we crop a square (side x side), so aspect ratio of the box is lost too. Actually the box's aspect ratio: we take side = context * long_side, and crop a square. So a very elongated box (discontinuity) gets a square crop that's wide relative to the box height — the box appears as a thin horizontal strip in the middle of the crop. So aspect ratio IS encoded in how much of the crop the box fills vertically.
+
+Hmm, this is getting complicated. Let me think about what's most likely to give a clean ≥0.01 gain.
+
+Let me reconsider the ranking problem more carefully, because I think there's a clean win here.
+
+The per-class AP for class c. Consider that we emit 4 rows per box. For class c, ALL 41879 boxes appear. Now, the number of TP boxes for class c is, say, N_c. The AP is computed over 41879 ranked items.
+
+Now here's a thought: what if we DON'T emit all 4 rows, but emit rows more selectively? The problem is we want, for each class c, the TP-c boxes ranked high. 
+
+Actually, the cleanest framing: for each box, we want to assign it to the class it most likely is, and rank boxes within that class. But the metric allows multiple rows per box. 
+
+Let me reconsider: is 4-rows-per-box actually good? Consider a box that's a true deposit. We emit:
+- deposit row: score conf * p_deposit (high) → ranks high in deposit list, it's a TP. Good.
+- pore row: score conf * p_pore (low) → ranks low in pore list. It's an FP in pore list but ranked low. Minor harm.
+- etc.
+
+Now consider a box that's a false alarm (no true defect). We emit 4 rows, all with low scores (low conf, low p_c). They rank low in all lists. Minor harm.
+
+Now consider a box that's a true deposit but the classifier is unsure, p_deposit = 0.4, p_stain = 0.3, p_pore = 0.2, p_discontinuity = 0.1. We emit deposit row (conf*0.4), stain row (conf*0.3), etc. In the deposit list, this box ranks by conf*0.4. In the stain list, by conf*0.3 (FP). 
+
+The harm from cross-class rows: a true deposit box contributes an FP to the stain list at rank determined by conf*p_stain. If p_stain is high (misclassification), it ranks high in the stain list as an FP, hurting stain AP.
+
+So the cross-class contamination is exactly the misclassification error. It's inherent.
+
+Now, could 1-row-per-box (argmax) be better? Let's see:
+- True deposit box, argmax deposit: deposit row only. TP in deposit list. No FP in other lists. 
+- True deposit box, argmax stain (misclassified): stain row only. It's an FP in stain list (doesn't overlap true stain), AND it's missing from the deposit list (lost TP). Double harm.
+
+So 1-row-per-box: removes cross-class FPs but loses TPs on misclassified boxes. 4-row-per-box: keeps all TPs but adds cross-class FPs.
+
+Which is better depends on the error rates. If misclassification is ~13% (1 - 0.87 F1), then:
+- 4-row: keeps 100% of TPs, adds ~13% of boxes as cross-class FPs (roughly).
+- 1-row: keeps ~87% of TPs, adds 0 cross-class FPs but the 13% misclassified become FPs in the wrong class.
+
+Hmm, actually both have similar FP counts. The difference is in the ranking.
+
+This is getting too deep. Let me think about what's a clean, testable, likely-to-help experiment.
+
+Let me reconsider the numbers:
+- 4-row current: 0.630
+- ceiling (1-row perfect): 0.758
+- class-agnostic (1-row all same class): 0.755
+
+The class-agnostic being 0.755 (nearly the ceiling 0.758) is very informative. It means: if we just put ALL boxes in ONE class list ranked by conf, we get 0.755. The per-class split only costs us 0.758 - 0.630 = 0.128. 
+
+Wait, class-agnostic is 0.755 as a SINGLE-class mAP. The ceiling 4-class is 0.758. So the "class assignment" itself (when perfect) barely matters (0.755 vs 0.758). The loss from 0.758 to 0.630 is entirely from IMPERFECT class assignment (ranking).
+
+So the whole game is: rank boxes within each class so that TP-c boxes come first. The class-agnostic ranking (by conf) gives 0.755 for the single class. 
+
+Now, here's a key insight: what if we could make each class's ranking as good as the conf ranking restricted to that class? The conf ranking separates true defects from false alarms. Within true defects, we need class separation via p_c.
+
+Let me think about the structure of the error. For class c:
+- True defects of class c: high conf, should be high p_c.
+- True defects of other classes: high conf, low p_c (ideally).
+- False alarms: low conf.
+
+The AP is hurt when:
+1. A true-defect-wrong-class box ranks above a true-c box (because its p_c is too high, i.e., misclassification).
+2. A false alarm ranks above a true-c box (because its conf is too high or p_c too high).
+
+To fix (1), we need better p_c (better classifier) — that's the main lever.
+To fix (2), we need better conf usage.
+
+Since the classifier is the bottleneck and data/scoring are exhausted, let me focus on improving the classifier in a way not yet tried.
+
+What's been tried for the classifier:
+- backbone swap (e005): rejected
+- mixup (e008): close, not confirmed
+- multi-view inference (e003): close, not confirmed
+- train on detector boxes (e009): rejected
+- both resolutions (e006): rejected
+- class-weighted loss: hurt (mentioned in "known")
+
+What's NOT tried:
+- Different augmentation (e.g., stronger geometric, color jitter, random erasing)
+- Different optimizer / LR schedule
+- Longer training (but budget-limited; we use ~150s of 180s)
+- Different crop strategy (e.g., 3 crops, or no tight crop)
+- Ensemble of two models (but budget)
+- Feature-level: adding box geometry features
+- Label smoothing
+- Different normalization
+- Training with focal loss (but class-weighted hurt; focal is different)
+- Using the wide crop only, or tight only
+- Higher IMG_SIZE (but slower)
+- Better pretrained init (all use pretrained)
+
+Let me think about the budget. Current: 162s total, 5 epochs, 432 steps. Budget 180s, reserve 55s. So training gets ~110s. We're using it.
+
+If I want to train longer or bigger, I need to be careful.
+
+Let me think about a clean idea with a good chance.
+
+**Idea: Add a third crop view (medium context) or change the crop combination.** Actually e003 tried 4 views (tight+wide, each with... something). Let me not.
+
+**Idea: Label smoothing.** CrossEntropyLoss with label_smoothing=0.1. This regularizes and could sharpen ranking. But it's a small change, might be <0.003. Risky.
+
+**Idea: Use the box size/aspect ratio as an explicit input.** This is more of an architecture change. Could be significant because pore (small, round) vs deposit vs discontinuity (elongated) have very different geometry. But it's a bigger edit and risky.
+
+**Idea: Train longer / more steps by reducing reserve or using a faster model.** We're at 0.630. More training might help. But the loss is still decreasing (0.218 at epoch 4). More steps could help. But budget-limited.
+
+Hmm, let me reconsider. Actually, let me reconsider the ranking problem from a different angle, because I think there's a clean win that hasn't been tried.
+
+**Key idea: The score should separate "is this a true defect" (conf) from "what class" (p_c) more cleverly.**
+
+Currently: score_c = conf * p_c.
+
+But consider: for the per-class ranking, we want TP-c boxes at top. A TP-c box has high conf AND high p_c. A wrong-class true-defect box has high conf but low p_c. A false alarm has low conf and low p_c.
+
+The product conf * p_c: for a wrong-class box, if p_c is, say, 0.15 and conf is 0.9, score = 0.135. For a TP-c box with p_c = 0.6, conf = 0.8, score = 0.48. So TP ranks higher. Good.
+
+But the issue is the RELATIVE ranking among TP-c boxes and among the FPs. And the absolute threshold doesn't matter for AP (only order).
+
+Hmm, what if we use a score that's more sensitive to p_c? Like score_c = conf * p_c^k for k>1? e010 tried p_c^0.5 (k=0.5) → 0.6289, slightly worse. So k>1 might be better? But that's a scoring tweak, and scoring is "exhausted." Also e010 with k=0.5 was 0.6289 vs 0.630, basically noise. So k=1.5 might be similar. Not a clean win.
+
+Let me think about the ACTUAL biggest error. Let me reconsider per-class: pore 0.504 is the worst. Why?
+
+Pore: small holes in the weld. They're small, numerous, and might look like noise/texture. The classifier might confuse pore with stain or deposit. Also, pore boxes are small, so the crop is small and low-res after resize — hard to classify.
+
+Actually, here's a thought: **the crop for small boxes is low quality.** MIN_CROP=16, and small pore boxes get a 1.5x crop that's small, then resized to 160. That's upscaling a tiny region — lots of noise. 
+
+What if for small boxes, we use a LARGER context (wider crop) to get more signal? Or what if we increase IMG_SIZE for better resolution? But IMG_SIZE affects all.
+
+Alternatively: **use the detector's box size to modulate the context.** Small boxes → wider crop (more context helps); large boxes → tighter crop. This is a data/architecture idea.
+
+Hmm, this is getting complicated. Let me think about what's the highest-EV experiment.
+
+Let me reconsider the "close but not confirmed" ones: e003 (inference, 4 views, 0.6301) and e008 (augmentation, mixup, 0.6327). Both are within noise of 0.6297. e008's 0.6327 is the highest single-seed among the "close" ones. 
+
+The problem says seed-to-seed noise is ±0.005, and a change with true effect <0.003 is a wasted run. So e008's 0.6327 (diff +0.003) is borderline.
+
+What if I COMBINE the two close ideas? Mixup + 4 views? But that's two ideas. The rules say one idea per turn.
+
+Hmm. Let me think about a genuinely new direction.
+
+**New direction: The classifier sees two crops (tight + wide) through the SAME backbone, logits averaged. What if the two views should be treated differently, or what if we should concatenate features instead of averaging logits?**
+
+Actually, averaging logits vs concatenating features: averaging logits is simpler. Concatenating features (or adding the two feature vectors before a head) might be better. But that's an architecture change.
+
+Let me reconsider. Actually, I realize I should think harder about the ranking structure, because I keep coming back to it.
+
+Let me reconsider: **What if we emit rows with a score that better reflects the joint probability, and importantly, what if we should NOT multiply by conf at all for the per-class ranking, but instead rank purely by p_c?**
+
+Wait, no. conf matters for separating false alarms. Without conf, a false alarm with high p_c (misclassified) would rank high. With conf, false alarms (low conf) rank low. So conf helps.
+
+But actually, here's a subtle point: for the per-class AP, the false alarms are the "easy" FPs (low conf). The "hard" FPs are the wrong-class true defects (high conf). conf doesn't help separate those from TP-c boxes — only p_c does. So conf mainly helps push false alarms down, which is good but maybe already well-handled.
+
+Let me think about whether there's a way to get more out of the classifier.
+
+**Idea: Train the classifier to directly optimize the ranking, not just classification.** E.g., a loss that pushes p_c higher for boxes that overlap true c-defects and lower otherwise. But that's basically classification.
+
+**Idea: Use the stage-1 detector boxes for training (e009 tried, rejected).**
+
+Let me reconsider e009: "train on detector boxes (slightly misplaced, plus ~25% false alarms)". Rejected (0.6268). So training on detector boxes didn't help.
+
+OK here's another angle. Let me reconsider the per-class imbalance and its effect on RANKING (not F1).
+
+Suppose pore is 1000 boxes in training, deposit is 2000. The classifier, trained with plain CE, will have p_pore generally lower than p_deposit for the same confidence level, because pore is rarer. This means true pore boxes get lower p_pore, ranking lower in the pore list → lower pore AP. This is a RANKING problem even if F1 is fine.
+
+The known result says "class-weighted loss hurt classification every time." But maybe a different approach to the imbalance would help the ranking without hurting F1. E.g., **temperature scaling on the logits** to boost rare classes? Or **reweighting the score by inverse class frequency** at inference time?
+
+Wait, but the score formula is a "scoring" change, and scoring is exhausted. Hmm. But reweighting by class frequency is different from the previous scoring tweaks (which were about the p_c^k and row emission). Actually, it's still a scoring change. The category is "exhausted?" but the rule is "do not propose another variant unless fundamentally different."
+
+Let me reconsider. Actually, reweighting the score by class frequency: score_c = conf * p_c / freq_c (or * sqrt(1/freq_c)). This would boost rare classes' scores. But wait — does this help the per-class AP? For class c's list, all boxes are ranked by conf * p_c / freq_c. Dividing by freq_c is a constant for class c (since we're ranking within class c's list, and freq_c is the same for all boxes in that list). So dividing by freq_c doesn't change the order within class c'sThinking budget reached. Stop thinking now and write the reply in the required format.

@@ -1,0 +1,284 @@
+===== attempt 1 =====
+Let me think carefully about the state of the research.
+
+Current best: e000, 5-seed mean 0.6288. Per-class: pore 0.502, deposit 0.624, discontinuity 0.780, stain 0.609.
+
+Reference numbers:
+- One-step 4-class baseline: 0.638 (slightly above our current best!)
+- Stage-1 boxes with perfect classes: 0.758
+- Stage-1 class-agnostic: 0.755
+
+So the gap to the perfect-class ceiling is about 0.13. The class-agnostic detector score is 0.755, which means the box placement itself is nearly perfect (0.758 vs 0.755). So essentially all the error is in class assignment.
+
+What we've learned from the history:
+- e001 (data): training on detector boxes rather than GT boxes — 0.6264, rejected. Slightly worse.
+- e002 (data): adding low-res crops — 0.6296 seed 0, 5-seed 0.6261, not confirmed (actually slightly worse in mean).
+- e003 (data): adding a background class from false alarms — 0.5935, rejected (bad).
+- e004 (scoring): temperature 0.5 (sharper softmax) — 0.6119, rejected. Interesting: sharpening hurt. This suggests the model's probabilities are already well-calibrated, or the argmax is wrong.
+- e005 (architecture): 224px resolution — 0.6303 seed 0, 5-seed 0.6251, not confirmed (slightly worse in mean).
+- e006 (augmentation): random rotation — 0.6246, rejected.
+- e007 (architecture): EfficientNet-B2 — 0.6231, rejected (worse, probably undertrained in the budget).
+
+So nothing has beaten the baseline yet. Data category is marked "EXHAUSTED?" (3 ideas, no new best). Architecture: 2 ideas, 1 close (224px was 0.6303 seed 0 but 0.6251 in 5-seed — actually slightly below the best mean 0.6288, so not confirmed).
+
+Now, where is the error? Let me think.
+
+The gap to the perfect-class ceiling is 0.13. The class-agnostic score is 0.755. So if we could perfectly classify, we'd get 0.758. We're at 0.6288. The weakness is in class assignment, especially pore (0.502) and stain (0.609), deposit (0.624).
+
+Key insight from the background: "A crop classifier given perfect boxes reaches macro-F1 ~0.87 with the starting recipe (two-crop input). Pore and deposit are the weak classes; stain is often confused with deposit."
+
+So the classifier itself is around 0.87 macro-F1 on perfect boxes. But our mAP is 0.6288. The gap between 0.87 F1 and the achievable mAP... Actually the perfect-class ceiling is 0.758, and our class-agnostic is 0.755. So the boxes are fine. The issue is purely: given a box, we need to get the class right AND rank the scores well.
+
+Wait, but there's a subtlety. mAP depends on the ORDER of predictions within each class. The score is detector_conf * class_prob. So for a given class, predictions are sorted by conf * p_class. A prediction is a hit if it overlaps an unmatched true box of that class.
+
+Now, the key issue: when the model misclassifies a box (argmax wrong), it puts that box in the wrong class's list. That hurts two things: the correct class is missing a detection (or has a lower-ranked one), and the wrong class has a false positive.
+
+Let me think about what would actually help. The macro-F1 is 0.87 on perfect boxes, but the boxes we classify are detector boxes (slightly misplaced, some false alarms). 
+
+Actually, let me reconsider. The biggest lever: the per-class AP is dominated by pore (0.502). If we could improve pore classification, we'd gain a lot.
+
+Let me think about why pore is hard. Pores are small dark spots in the weld. They might be visually similar to stains or deposits. The "stain is often confused with deposit" note.
+
+What hasn't been tried?
+- Different classification approach: e.g., using the detector's own features, or a different model.
+- Ensemble / TTA at test time.
+- Better use of the two crops — maybe weighted combination.
+- Training longer / different LR schedule.
+- Class balancing in a different way (class-weighted loss was tried and hurt, per the "known" section).
+- The "known" section says: "Class-weighted loss hurt classification every time it was tried." So avoid that.
+- "Tuning hyperparameters alone helped little in earlier experiments; changes of method helped more."
+
+So I should change the method, not tune a knob.
+
+Let me think about what's fundamentally different and likely to matter.
+
+Idea 1: Test-time augmentation (TTA). At inference, average over multiple views (flips, small shifts). This is a "method" change that changes what the model sees at test time. But wait — TTA averages probabilities, which doesn't change argmax much but could change the ranking. Actually TTA could help the probability estimates be more reliable, improving ranking. But the metric says "Any change that keeps the order of a class's predictions leaves its AP unchanged." TTA changes the class probabilities, which changes the order. So it could help.
+
+But TTA at test time costs inference time. We have 41879 eval detections, 53606 prediction rows. Currently prediction takes... let me estimate. Total 162s, training ~125s (up to epoch 4 done at 125s, then done). Actually "done: 5 epochs, 433 steps, 53606 prediction rows, 162s total". Training ended around 125s (epoch 4 at 125s), so prediction + writing took ~37s. Reserve is 55s. So we have some budget. TTA with 2-4x views would multiply prediction time. 37s * 4 = 148s, too much. 37s * 2 = 74s, plus training 125s = 199s > 180s. Not enough.
+
+Hmm, actually the budget is 180s total. Training used up to t_end = deadline - 55 = 180 - 55 = 125s. So training ran for 125s. Then prediction ran from 125s to 162s = 37s. Total 162s, under 180s with 18s margin.
+
+If I add TTA, I need more reserve. If TTA is 2x, prediction ~74s, I'd need reserve ~90s, leaving 90s for training. That cuts training significantly. Trade-off.
+
+Actually, let me reconsider. The model is already well-trained (loss 0.2189 at epoch 4). Maybe more training helps a little but the gains are diminishing.
+
+Idea 2: Change the scoring to better exploit the structure. The score is conf * p_class. But maybe we should think about this differently. Actually, the issue is that for mAP, within each class, we sort by score. The detector conf is a proxy for "is this a real defect box". The class prob is "which class". 
+
+Hmm, here's a thought: the class-agnostic score is 0.755, meaning if we just scored all boxes as one class with conf, we'd get 0.755. The perfect-class is 0.758. So the conf ranking is already near-optimal for box placement. The loss from 0.755 to 0.6288 is entirely from class assignment.
+
+Wait, let me reconsider what "class-agnostic" means for mAP. If all boxes are one class 'defect', then mAP@0.5 for that single class = 0.755. But we have 4 classes. When we split into 4 classes, each class's AP is computed separately and averaged.
+
+The key: a box that's a true pore but we classify as stain → it's a false positive in stain's list AND a missed detection in pore's list. Both hurt.
+
+Now, the macro-F1 of 0.87 on perfect boxes. But our boxes aren't perfect — they're detector boxes. Some are false alarms (no overlap with any true box). For those, any class we assign is a false positive. The conf * p_class scoring handles this: false alarms have lower conf (hopefully), so they rank lower.
+
+Actually wait, do false alarms have lower conf? Not necessarily. The detector conf is the detector's confidence, which for false alarms could be anything.
+
+Let me think about the "background class" experiment e003 which hurt (0.5935). That added a 5th background class. It hurt a lot. So explicitly modeling false alarms as a class and dropping them was bad. Probably because it reduced the number of predictions or mis-handled the scoring.
+
+Let me think about what a fundamentally different method would be.
+
+Idea 3: Instead of classifying each box independently with a crop classifier, use the detector's confidence more cleverly, or combine a crop classifier with something else.
+
+Actually, let me reconsider the whole problem. The macro-F1 ~0.87 on perfect boxes is the classifier's accuracy. Our mAP is 0.6288. Even if the classifier were perfect on detector boxes, we'd get 0.758. So the classifier's imperfection costs us 0.758 - 0.6288 = 0.13.
+
+To close this gap, we need a better classifier. The "changes of method helped more" hint suggests I should change how the classifier works.
+
+What methods haven't been tried?
+1. A different backbone (tried B2, hurt — probably undertrained).
+2. Higher resolution (tried 224, not confirmed).
+3. Different augmentation (tried rotation, hurt).
+4. Training data selection (tried detector boxes, low-res, background — all hurt or not confirmed).
+5. Scoring/temperature (tried, hurt).
+
+What about:
+- A larger but still fast model that trains well in budget? Like regnety or convnext. But B2 didn't help, suggesting the model isn't the bottleneck, or B2 specifically undertrained.
+- Actually, maybe the issue is that B2 needs more training time and we cut it off. Let me reconsider.
+
+Hmm, let me reconsider the "two-crop" recipe. The model sees a tight crop (1.5x) and a wide crop (2.5x), averages logits. What if the two crops are weighted differently, or what if we use more crops / different contexts?
+
+Actually, a cleaner idea: the wide crop (2.5x) gives context, the tight crop (1.5x) gives detail. What if we add a third view — the raw detector box at 1.0x (exact box)? Or what if the issue is that averaging dilutes the signal?
+
+Let me think about TTA more carefully because it's a clean "method" change that changes what the model sees at test time.
+
+Actually, here's a strong idea I haven't seen tried: **test-time augmentation with flips and small translations, averaged**. This directly changes the probability estimates at test time. For pore/stain confusion, seeing flipped versions could help. But the cost is inference time.
+
+Let me reconsider the budget. Currently:
+- Load: 13s
+- Training: ~112s (13s to 125s)
+- Prediction: ~37s (125s to 162s)
+- Total: 162s, reserve 55s (deadline 180s). Margin 18s.
+
+If I do TTA with N views at test, prediction time scales ~N. To keep total under 180s with margin:
+- N=2: prediction ~74s, total ~13+112+74 = 199s. Over budget! Need to cut training.
+- Actually the reserve is what protects prediction. Let me recompute: t_end = deadline - RESERVE_S = 180 - 55 = 125s. Training runs until 125s. Then prediction must finish by 180s, so prediction gets 55s. Currently prediction takes 37s, fits in 55s.
+
+If TTA N=2, prediction ~74s > 55s. So I'd need RESERVE_S ~ 90s, meaning training only until 90s. That cuts training from 112s to ~77s (from 13s to 90s). That's a big cut in training.
+
+Trade-off: less training but TTA. Given that "changes of method helped more" and the model is already reasonably trained, maybe TTA is worth it. But it's risky.
+
+Alternatively, TTA only on a subset, or cheaper TTA.
+
+Hmm, let me think differently. What's the single most likely-to-matter method change?
+
+Let me reconsider the per-class scores: pore 0.502, deposit 0.624, discontinuity 0.780, stain 0.609.
+
+Pore is the worst. Pores are small. At 160px with a 1.5x tight crop, a small pore might be only a few pixels. The e005 experiment (224px) was 0.6303 seed-0 but 0.6251 5-seed — not confirmed, roughly flat. So resolution isn't clearly helping.
+
+Let me think about the deposit/stain confusion. "stain is often confused with deposit." Deposit AP 0.624, stain 0.609.
+
+What if I use a **class-agnostic first, then fine-grained** approach? No, that's basically what we have.
+
+Let me think about the scoring more. The score = conf * p_class. For mAP, within a class, order matters. The conf is the same for all classes of a given box. So within a class, boxes are ordered by p_class (since conf is fixed per box, but different boxes have different conf). Actually no: for class c, each box has score conf_box * p_box[c]. So the ordering within class c is by conf_box * p_box[c]. 
+
+Now here's a subtle point: the detector conf is a proxy for box quality. But maybe we don't want to multiply by conf at all, or weight it differently. Actually, the class-agnostic score (0.755) uses just conf. So conf is a good box-quality proxy. Multiplying by p_class then re-ranks by class likelihood.
+
+Hmm, what if p_class is noisy and the conf is more reliable for ordering? Then maybe we should weight conf more. But e004 (temperature) tried sharpening and it hurt.
+
+Let me think about a fundamentally different idea: **use the detector's confidence to gate / and use a two-pass approach**.
+
+Actually, let me step back and think about what "changes of method helped more" most plausibly points to, and what's untried and cheap.
+
+One thing untried: **the model architecture choice among the fast models**. We tried B2 (bigger, hurt). What about a different family — convnext or regnety — at the same size? Probably similar to B2, risky.
+
+Another untried: **training longer / more epochs**. But the budget is fixed; we train until t_end. The number of epochs depends on step time. With B0 at 160px, we got 5 epochs in 112s. That's a lot of steps (433). The loss is still decreasing (0.2189 at epoch 4). Maybe more training helps? But we're already training until the reserve. To train longer, reduce reserve, but then prediction time is at risk. Prediction is 37s, reserve 55s, so we have 18s slack. We could reduce reserve to ~45s and gain 10s of training. Marginal.
+
+Let me reconsider. The loss curve: 0.7217, 0.3735, 0.2881, 0.2532, 0.2189. It's converging but slowly. More training might help a bit. But the hint says hyperparameter tuning (like LR schedule, epochs) helped little. So probably not the lever.
+
+Let me think about the **input representation** more. The two-crop approach averages logits from tight (1.5x) and wide (2.5x) crops. What if instead of averaging logits, we concatenate features, or use a different combination? Or what if the wide crop is too wide and dilutes the defect?
+
+Actually, here's a clean method idea: **add the exact detector box (1.0x context) as a third view**. The tight crop is 1.5x (already a bit wider than the box), wide is 2.5x. Adding the raw 1.0x box might help for small defects like pores where the box is tight. But this adds inference cost (3 views instead of 2) and training cost.
+
+Hmm, let me reconsider TTA once more, because I think it's the most principled untried method change.
+
+Actually, wait. Let me reconsider the problem from the mAP perspective. The macro-F1 on perfect boxes is 0.87. But there's a gap between macro-F1 0.87 and the achievable mAP 0.758 (perfect class). Why? Because mAP also depends on ranking (score order), not just argmax. Even with the right class (argmax), if the score ranking is off, mAP suffers. But with perfect classes, we get 0.758 which is basically the ceiling (0.755 class-agnostic). So the ranking is fine when classes are right.
+
+So the 0.13 gap is purely argmax errors (wrong class). To close it, we need better argmax. TTA improves probability reliability, which improves argmax on borderline cases.
+
+But actually, does TTA change argmax? TTA averages probabilities over augmented views. If the model is consistent, TTA doesn't change much. If the model is noisy (varies with flip/shift), TTA averages out the noise, making the probability more reliable, which could flip some borderline argmaxes to the correct class. This is a real effect.
+
+Given the "changes of method helped more" hint and that TTA is untried, I lean toward TTA. But the budget is a concern.
+
+Let me reconsider the budget for TTA more precisely. Actually, I can make TTA cheap by only flipping (2 views: original + horizontal flip) and maybe a vertical flip. Weld beads — are they symmetric under flip? A horizontal flip of a weld bead... the bead runs in some direction. Flipping might not be symmetric. But TTA with flips is standard and usually helps a little.
+
+Actually, let me reconsider. The training already uses flips (fh, fv random 0.5). So the model is somewhat flip-invariant. TTA with flips might help less.
+
+Let me think about a different, cleaner method change that's cheap: **the combination of the two crops**. Currently logits are averaged: (model(xt) + model(xw)) / 2. What if we train them as a single model but at inference we also consider the raw box? No.
+
+Alternatively: what about **using a larger effective receptive field via the wide crop being even wider**, or **removing the tight crop** and using only a single well-chosen crop? The "two-crop" is the starting recipe. Maybe the tight crop is hurting for pores (too much context) or the wide crop is hurting.
+
+Hmm, this is getting complicated. Let me make a decision.
+
+Let me reconsider what's most likely to give ≥0.01 gain and is untried:
+
+Option A: TTA (flips + small shifts) at test. Untried, principled, changes what model sees at test. Budget risk. Expected gain: maybe 0.005-0.015.
+
+Option B: Different backbone (convnext/regnet) at B0-equivalent size. Untried family. But B2 didn't help, so backbone might not be the lever. Risky.
+
+Option C: Change the crop combination / add a third view (raw box). Untried. Changes what model sees. Budget cost.
+
+Option D: Train on a larger effective batch or different optimizer. Hyperparameter-ish, "helped little".
+
+Option E: Reconsider the scoring — e.g., don't multiply by conf, or use a different score. But e004 (temperature) hurt, and the metric ignores monotone transforms. Changing score = f(conf, p) could re-order. Risky.
+
+Let me reconsider Option A (TTA) budget more carefully, because I think it's the best bet.
+
+Current prediction: 41879 detections, batch 256, 2 views each. ~37s.
+With TTA, say 4 views (original, hflip, vflip, both) → 4x the forward passes → ~148s. Too much.
+With TTA 2 views (original + hflip) → ~74s. Need reserve ~90s. Training would run until 180-90 = 90s, i.e., 77s of training (from 13s load). Currently training runs 112s. So we'd cut ~35s of training (from 5 epochs to ~3.5 epochs). 
+
+Trade-off: cut training by ~30%, add 2x TTA. Net effect uncertain. The model at 3.5 epochs has loss ~0.25 vs 0.22 at 5 epochs. Slightly worse model but TTA.
+
+This is a gamble. Given the hint "changes of method helped more", and TTA is a method change, I'll consider it. But I'm not fully confident.
+
+Let me reconsider Option C (third view / crop change) which changes what the model sees at BOTH train and test, so it's a cleaner "method" change and the model adapts.
+
+Actually, here's a cleaner idea for Option C: **the tight crop at 1.5x might be cutting off context that helps distinguish pore vs stain vs deposit**. Or the issue is the opposite. Hard to say without data.
+
+Let me reconsider. Actually, I realize I should think about what specifically distinguishes the classes:
+- Pore: small round dark holes.
+- Deposit: extra material, raised.
+- Discontinuity: gap/break in the bead.
+- Stain: discoloration, flat.
+
+Pore vs stain: both can be dark spots. Pore is a hole (dark, round), stain is discoloration (irregular). Deposit vs stain: deposit is raised material, stain is flat discoloration.
+
+The wide crop (2.5x) gives the surrounding weld bead context, which is important for discontinuity (need to see the bead to see a break) and for deposit (need to see the bead profile). The tight crop (1.5x) gives detail.
+
+Hmm. I think the two-crop is reasonable.
+
+Let me go with a decision. I'll pick **TTA** because:
+1. It's untried.
+2. It's a genuine method change (changes what the model sees at test time).
+3. It directly targets the argmax errors (the 0.13 gap) by making probabilities more reliable.
+4. It's a standard, well-understood technique with a reasonable expected gain.
+
+But the budget is the concern. Let me design it to fit.
+
+Actually, let me reconsider. Maybe a cheaper and safer method change: **increase the number of training views / change the crop contexts** is risky on budget too.
+
+Let me reconsider the budget for TTA with a smarter approach: I can do TTA only if it fits. Let me use 2 views (original + horizontal flip) for TTA, and reduce RESERVE_S appropriately. Actually, to be safe, let me compute.
+
+Wait, actually, I realize there might be a cleaner, higher-value idea. Let me reconsider the **class-agnostic to 4-class** structure.
+
+The class-agnostic score is 0.755 and perfect-class is 0.758. These are nearly equal, which tells us the box placement is excellent. The entire 0.13 gap is class assignment.
+
+Now, the classifier's macro-F1 on perfect boxes is 0.87. But we're classifying detector boxes, not perfect boxes. The detector boxes are slightly misplaced. Does misplacement hurt classification? A pore box that's slightly off might crop the pore partially. For small pores, this matters.
+
+Idea: **use a more robust crop** — e.g., center the crop on the box but with the exact box size (1.0x) for the detail, so small defects are centered and fully visible. Actually the tight crop is 1.5x which already centers on the box center with side = 1.5 * long side. For a small pore, the box is small, so 1.5x is still small and centered. Should be fine.
+
+OK let me just go with TTA. Let me design it carefully.
+
+Actually, hold on. Let me reconsider whether TTA will actually change the ordering enough to matter, and whether it's worth the training cut.
+
+The metric: within each class, order by score. TTA changes p_class, so it changes scores and order. If TTA makes the correct class more probable for misclassified boxes, those boxes move to the right class's list (as a hit) and out of the wrong class's list (removing a false positive). This is exactly the 0.13 gap.
+
+The expected gain from TTA in classification tasks is typically 0.5-2% in accuracy. For macro-F1 0.87, a 1% improvement → 0.88. That might translate to ~0.01 in mAP. Plausible but not guaranteed.
+
+Given the risk of cutting training, let me think if there's a way to do TTA without cutting training much.
+
+Alternative: reduce the number of training steps is bad. What if I keep training the same but make TTA cheaper by using a smaller batch or fewer views?
+
+Actually, the cleanest: 2-view TTA (original + hflip). Prediction goes from 2 forward passes per box (tight+wide) to 4 (tight+wide, each × 2 flips). Wait, currently each box does 2 forward passes (xt and xw). With hflip TTA, each box does 4 forward passes (xt, xw, xt_flip, xw_flip). So 2x prediction time → ~74s.
+
+To fit: total = load(13) + training + prediction(74) ≤ 180 with margin. So training ≤ ~85s. That means t_end = 13 + 85 = 98s, so RESERVE_S = 180 - 98 = 82s. Let me set RESERVE_S = 85 to be safe. Then training runs until 180-85 = 95s, i.e., 82s of training (from 13s). Currently 112s. So ~27% cut.
+
+Hmm, that's a meaningful cut. The model would be at ~epoch 3.5 with loss ~0.25.
+
+Alternatively, I could do TTA but also reduce training cost per step to fit more steps. E.g., the model is B0 at 160px, batch 64, 2 views. Each step does 2 forward+backward. That's the cost.
+
+Actually, you know what, let me reconsider. Maybe I'm overcomplicating. Let me reconsider whether there's a cheaper method change with similar upside.
+
+**Cheaper idea: increase the wide crop context or change the two contexts** — no, that's a guess.
+
+**Cheaper idea: use the detector confidence to reweight the two crops** — no.
+
+Let me reconsider the **scoring** category. It has only 1 experiment (e004 temperature, hurt). Not exhausted. The score is conf * p_class. 
+
+Here's a scoring idea: currently score = conf * p_class. For mAP, what matters is the order within each class. The conf is a box-quality proxy. But maybe we should separate "is this box real" (conf) from "what class" (p_class) more cleanly.
+
+Actually, here's a thought: the class-agnostic score (0.755) uses conf only. The 4-class uses conf * p_class. The difference (0.755 → 0.6288) is from p_class re-ranking. If p_class were perfect, we'd be at 0.758. So p_class is the issue.
+
+But what if we could use conf to suppress false alarms better? The false alarms (boxes with no true overlap) — we assign them a class with score conf * p_class. If a false alarm has high conf and high p_class, it ranks high in that class as a false positive. 
+
+Hmm, but we can't easily distinguish false alarms from true boxes without the labels.
+
+Let me reconsider. I think the cleanest high-value untried method change is TTA. Let me commit to it but design it to be budget-safe.
+
+Actually, let me reconsider the numbers once more. Let me re-examine: is prediction really 37s?
+
+Log:
+```
+train 6052 boxes, eval 41879 detections, 1022 images (13s)
+epoch 0: ... 59s
+epoch 1: ... 77s
+epoch 2: ... 95s
+epoch 3: ... 114s
+epoch 4: ... 125s
+done: 5 epochs, 433 steps, 53606 prediction rows, 162s total
+```
+So after epoch 4 (125s), prediction + writing took 162-125 = 37s. Yes.
+
+But wait, the training loop runs until t_end = 125s (deadline 180 - reserve 55). Epoch 4 finished at 125s. So training hit the limit exactly at 125s. Good, consistent.
+
+So prediction is 37s for 41879 boxes × 2 views = 83758 forward passes (well, 41Thinking budget reached. Stop thinking now and write the reply in the required format.

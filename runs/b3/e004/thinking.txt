@@ -1,0 +1,292 @@
+===== attempt 1 =====
+Let me think about the state of the research.
+
+Current best: e000, 5-seed average 0.6302. Baseline to beat: 0.638 (one-step detector). Ceiling: 0.758.
+
+Per-class AP: pore 0.502, deposit 0.628, discontinuity 0.781, stain 0.610.
+
+Experiments so far:
+- e001 (scoring): emit only the argmax class per box → 0.5749, rejected. Interesting: dropping the extra rows hurt. So emitting all 4 rows per box is better than argmax-only. Hmm, actually this is a known result: emitting all 4 rows with scores conf*p(c) is better than just the top one. Because… wait, why? If you emit all 4 rows, each true detection appears as a false positive in the other 3 classes, which should hurt precision. But mAP@0.5 with per-class AP: for class c, the predictions are all rows of class c. If you emit all 4 rows, class c's predictions include every box (scored by conf*p_c). If you emit only argmax, class c's predictions are only boxes where p_c is the max. The reason the all-rows version wins is probably because the ranking within class c is better (score = conf * p_c gives finer ranking), and the false positives from wrong-class boxes are ranked low enough that they don't hurt much… Actually, the false positives from other classes do hurt, but the precision at each recall level: with all rows, you can reach recall 1.0 for class c (every true box has a row of class c, score conf*p_c), whereas with argmax-only you can only reach the recall of boxes where c was the argmax. The gain from full recall apparently outweighs the precision loss from wrong-class boxes. OK.
+
+- e002 (data): add low-res crops to training → 0.6383 seed 0, 5-seed average 0.6293, not confirmed (within noise of 0.6302).
+- e003 (architecture): tf_efficientnetv2_b0 → 0.6389 seed 0, 5-seed average 0.6313, not confirmed.
+
+So no confirmed improvement yet. Seed noise ±0.005.
+
+Where is the error? Gap from 0.630 to 0.758. Two components:
+1. Class misassignment on true boxes (classifier error): perfect-class ceiling 0.758 vs class-agnostic 0.755 — wait, class-agnostic single-class is 0.755, which is close to the 0.758 ceiling. So box placement is essentially fine; the loss is almost entirely in the class decision. Our 0.630 vs 0.755: the classifier is losing 0.125 mAP compared to perfect classes.
+
+Known: crop classifier with perfect boxes reaches macro-F1 ~0.87. Pore and deposit are weak; stain is confused with deposit.
+
+Per-class AP: pore 0.502 is the weakest. Hmm.
+
+What can we do that could plausibly gain ≥0.01?
+
+Ideas:
+
+1. **Training data: use pseudo-labels from the detector on train-split boxes.** dets.csv has "train" boxes on training images; their true classes can be found by overlap with crops.csv. Wait — crops.csv is "labeled training boxes" — the true boxes. dets.csv train boxes are detector boxes on training images. We can assign classes to detector boxes that overlap true boxes (IoU > 0.5) and train on those. But we're already training on the true boxes (6052). The detector boxes are noisier (false alarms, misplacement). Training on true boxes is probably better. But there are more detector boxes than true boxes? 41879 eval detections… how many train dets? Unknown. The number of training crops is 6052 (high-res only). Hmm.
+
+2. **Multi-crop / more context views**: the classifier takes tight 1.5x and wide 2.5x crops. The paper's known results: two-crop input reaches F1 0.87. Adding more views (e.g. 3x context, or a larger context) might help stain vs deposit. But each extra view doubles the compute per forward. Budget: training 432 steps in ~110s, prediction 52653 rows in ~50s. Adding a third view: 50% more forward compute → training steps ~288, prediction time ~75s. Total ~185s > 180 budget. Tight. We could reduce IMG_SIZE or batch… risky.
+
+3. **Test-time augmentation (TTA)**: flip the eval crops (horizontal/vertical) and average. Doubles prediction compute: ~100s for prediction. Training unchanged. Total: 13 + 110 + 100 + a bit = ~225s > 180. Too much. Maybe TTA with only one flip (horizontal): prediction 1.5x → ~75s, total ~195s. Still over. Hmm, RESERVE_S=55 is for prediction and writing; actual prediction took 162-112=50s. With 1.5x views, ~75s, total ~13+110+75=198 > 180. Over. Unless we cut training time or reduce eval batch… no, prediction is fixed by number of boxes.
+
+Actually wait — we can reduce prediction cost by reducing IMG_SIZE at inference? No, the model is trained at 160.
+
+4. **Score calibration / scoring changes**: e001 showed argmax-only is worse. What about emitting rows for the top-2 classes? Or adjusting the score formula: score = conf * p(c)^gamma to sharpen? A monotone per-class transform doesn't change per-class order… wait, per-class order: within class c, score = conf * p_c. Multiplying p_c by a constant doesn't change order. Raising p_c to a power: for class c, score = conf * p_c^gamma — this reorders within class c (because conf varies), so it does affect AP. Hmm, but is there a principled reason? The metric: a prediction is a hit if it overlaps an unmatched true box of that class. For class c, what matters is the ranking of true boxes of class c vs false rows of class c. False rows of class c = boxes that are false alarms or true boxes of other classes, scored by conf * p_c.
+
+One idea: **suppress cross-class false positives by using a margin**: emit a row for class c only if p_c > p_{argmax} * margin, or p_c - p_{argmax}… but e001 showed dropping rows hurts (recall loss dominates). Hmm, but e001 dropped 3 out of 4 rows. Dropping only low-probability rows (e.g., p_c < 0.05) might be a middle ground: preserves recall on true boxes (p_c is usually decent for true boxes) while cutting low-confidence wrong-class rows. Effect size is uncertain, probably small.
+
+5. **Class imbalance**: pore 0.502 is weakest. Class counts? Unknown. Class-weighted loss was tried and hurt (per "What is already known": "class-weighted loss hurt classification every time it was tried"). So no.
+
+6. **More training data via detector boxes on train images with pseudo-labels**: dets.csv "train" boxes whose true class can be found by overlap with crops.csv. Boxes overlapping true boxes give (box, class) pairs — these are "harder" examples (detector boxes are noisier/more misplaced than ground truth). Training the classifier on them might improve robustness to detector box placement. But it also includes false alarms (no class) — can't use them directly for supervised learning… actually could we use them as an "other" class? No, the 4 classes are fixed.
+
+Hmm wait, actually there's a subtle point: crops.csv is the true boxes (labeled training boxes). We train on 6052 (high-res). How many total crops including low-res? e002 added low-res and got 0.6293 (not confirmed).
+
+7. **Ensemble of two models**: train both efficientnet_b0 and tf_efficientnetv2_b0 (or resnet50) with different seeds/architectures, average probabilities. Each model needs training time; halve the time per model, or train sequentially in the same budget. E.g., train model A for half the budget, model B for half, average. But each model gets half the steps → weaker. Alternatively, train one model fully and use the other with only pretrained… no.
+
+Actually, a smarter ensemble: train model A (efficientnet_b0) for the full budget as now, and in the remaining time… no, no remaining time.
+
+Ensemble via distillation: no.
+
+8. **Better use of the two views: concatenate instead of averaging logits?** Average of logits vs concatenation. Minor.
+
+9. **Larger IMG_SIZE**: 160 → 224. EfficientNet-B0's native is 224. More detail helps stain vs deposit (texture). Compute: 224/160 = 1.4x area → ~1.4x step time (roughly, conv is superlinear but roughly). Training: 432 → ~300 steps. Prediction: 50s → ~70s. Total ~13 + 77 + 70 = 160s. Feasible! And 224 is the pretrained resolution, so pretrained features are better matched. This is a plausible ≥0.01 gain. Hmm, but is it? EfficientNet at 160 vs 224: the difference in classification accuracy is usually small for fine-grained crops, but for texture defects it could matter.
+
+10. **Train on both resolutions** — tried (e002), not confirmed.
+
+11. **Longer training / lower LR**: budget is time-limited; 432 steps. LR 1e-3 with cosine. Loss at end 0.2164 — still decreasing. More steps would help but budget is fixed. Could reduce per-step cost to get more steps: e.g., smaller batch? No, batch 64 is fine. bf16 already. IMG_SIZE 160→128? That reduces detail — probably hurts.
+
+12. **Label smoothing**: minor.
+
+13. **Mixup / cutmix**: could help generalization, especially for weak classes. Minor-to-moderate effect, small compute cost. But "tuning hyperparameters alone helped little; method changes helped more."
+
+14. **The real structural idea: exploit the metric — emit rows per box with score = conf * p(c), but also exploit that "at most the top 300 rows per image count."** 41879 eval detections / 1022 images ≈ 41 boxes per image. 4 rows each = 164 rows per image < 300, fine.
+
+15. **Use detector conf better**: currently score = conf * p(c). If conf is poorly calibrated, the ranking is off. E.g., rank by p(c) * f(conf) with f sharpened. But per-class order is what matters; conf is shared across classes. Hmm.
+
+16. **Two-pass: train classifier on detector boxes (pseudo-labeled) instead of true boxes.** The classifier at inference sees detector boxes (noisy placement). Training on true boxes, the distribution mismatch (box placement) might hurt. The "perfect boxes" F1 0.87 was measured with perfect boxes; our actual F1 on detector boxes is lower. Training on detector boxes with pseudo-labels (IoU>0.5 with true boxes) would match the inference distribution. This is a method change (data). Risk: pseudo-label noise. But pseudo-labels from IoU>0.5 overlap are fairly reliable. And the number of such boxes: train dets overlapping true boxes… could be thousands.
+
+Actually wait — how many train dets are there? Total dets 41879 eval. Train split unknown, probably similar scale (images: 1022 needed = training + eval images). Let's think: crops 6052 high-res; total images probably ~500 train + ~500 eval. If eval has 41879 dets over ~500 images, train has similar ~40k dets. Of those, those overlapping true boxes: the detector catches most true boxes (class-agnostic 0.755 mAP means decent recall/precision). So probably 10-15k usable pseudo-labeled boxes, 2-3x the 6052 true boxes. Training on pseudo-labeled detector boxes = more data + matched distribution.
+
+Hmm, but is it fundamentally different from e002 (adding low-res)? Yes: e002 added another resolution of the same true boxes; this changes the box distribution to detector boxes.
+
+But wait — subtle point: pseudo-labels use IoU>0.5 overlap with crops.csv. The metric's hit is also IoU>0.5. Good alignment.
+
+17. **Context crop for stain/deposit confusion**: stain is often confused with deposit. Wider context might help. CONTEXT is already 2.5x.
+
+18. **Use both resolutions at inference?** No.
+
+19. **Per-class score boost for weak classes?** That reorders… per-class AP is independent; scaling class c's scores by a constant doesn't change class c's AP. So no effect. Cross-class competition doesn't exist in mAP (per-class AP is averaged). So scoring changes only matter within a class.
+
+Key insight: per-class AP depends only on the within-class order of rows of that class. Rows of class c = all eval boxes (or a subset) with score = conf * p_c. To improve class c's AP: better rank true boxes of class c above false rows of class c.
+
+False rows of class c come from: (a) false-alarm boxes (no true box), (b) true boxes of other classes. Both are scored by conf * p_c. The classifier should assign low p_c to them.
+
+So the whole game is: improve the classifier's p_c ranking. The classifier's quality is the lever.
+
+Given known weak classes (pore, deposit; stain↔deposit confusion), what method changes could gain ≥0.01?
+
+Option A: **Train on pseudo-labeled detector boxes** (data/distribution matching). Plausible gain: the gap between "perfect boxes F1 0.87" and our actual performance is partly box-placement mismatch. Training on detector boxes could close that. Also more data.
+
+Option B: **IMG_SIZE 224** (more detail for texture classes).
+
+Option C: **TTA** — budget problem.
+
+Option D: **Ensemble two architectures** — budget: train each for half the time. Each gets ~216 steps instead of 432. Ensemble of two half-trained models vs one full model: ensembles usually win, but halving steps hurts. Risky.
+
+Option E: **Add a third view (medium context 2.0x)** — compute +50%, over budget.
+
+Option F: **Train longer at lower base LR for more stable convergence** — hyperparameter, likely small.
+
+Option G: **Mixup** — moderate.
+
+Option H: **Use low-res images too, but only if eval contains low-res** — e002 not confirmed.
+
+Let me think about which is most likely to matter.
+
+Reference numbers: class-agnostic 0.755 vs perfect-class 0.758 — box placement is fine. Our 0.630. So the classifier is losing 0.125. Classifier F1 with perfect boxes 0.87. If the classifier were perfect on detector boxes, we'd be at 0.758. So the classifier on detector boxes is far from perfect.
+
+Where does the classifier lose? (1) misassignment on true boxes (wrong class), (2) false alarms get high p for some class → false positives in that class, (3) boxes slightly misplaced → crop is off → misclassification.
+
+Idea: **train on detector boxes with pseudo-labels** targets (3) and adds data. I think this is the strongest single idea. Let me also consider combining: train on both true boxes and pseudo-labeled detector boxes (mix).
+
+Implementation:
+- Load crops.csv (all? or TRAIN_ON high). Keep TRAIN_ON=("high",) as in best (e002 not confirmed, so stay with best's high-only).
+- Load dets.csv train rows. For each train det, find the overlapping crop (IoU > 0.5 with a crop of the same image). If exactly one (or the best), assign that class.
+- Add these to the training set. Weight? Just concatenate.
+
+Concern: number of train dets — could be ~40k; IoU computation against crops per image: group by image, vectorize with numpy. Fine.
+
+Concern: pseudo-label quality: detector boxes that overlap a true box with IoU>0.5 — the crop around them is close to the true box's crop. Class is correct (same defect). Good.
+
+But wait: could a det box overlap two true boxes (two defects close together)? Take the one with max IoU; skip if ambiguous (max IoU < 0.5). Also, the det box might be a false alarm overlapping a true box of a different defect? If IoU>0.5, it's mostly the same defect. Fine.
+
+Also: should we keep the true boxes too? Yes — mix true + pseudo. Ratio: 6052 true + maybe 10-15k pseudo. Pseudo dominates; that's OK, or sample.
+
+Hmm, but one risk: pseudo-labeled detector boxes include boxes that are "slightly misplaced" — training on them teaches robustness. And false alarms (no overlap) are excluded — but at inference the classifier sees false alarms; it can't learn to reject them without a negative class. Could we add false alarms as a 5th class "none"? Then at inference, we could use p_none to down-weight the score: score = conf * p(c) / (1 + p_none)? But that changes the score formula; per-class order is still affected (p_none varies per box). Hmm, interesting but more complex. Actually, adding a 5th class changes the model's num_classes and the score. Let me keep it simple: just pseudo-labeled positives.
+
+Actually wait, let me reconsider. Is there evidence that box-placement mismatch is a big part of the loss? "A crop classifier given perfect boxes reaches macro-F1 ~0.87 with the starting recipe." Our system's implied F1 on detector boxes is lower (mAP 0.630 vs 0.755). Part of the mAP gap is also from false alarms being kept (class-agnostic 0.755 includes false alarms as class 0… wait, class-agnostic single-class 0.755: all boxes as one class 'defect' — but there are 4 true classes; single-class mAP means all true boxes are class 'defect'? "Stage-1 boxes scored as a single class 'defect': 0.755" — presumably the true boxes are also merged into one class. So 0.755 = detector's mAP as a single class. And the perfect-class ceiling 0.758 is slightly higher (interesting — assigning correct classes to overlapping boxes and keeping false alarms as class 0 gives 0.758 > 0.755 single-class; because per-class mAP with 4 classes can beat single-class… anyway).
+
+So the detector's box quality ≈ 0.755-0.758. Our 0.630. The classifier is the bottleneck, period.
+
+Known: perfect-box F1 0.87 → if the classifier were 0.87 F1 on detector boxes, mAP would be ~0.75. So the classifier on detector boxes is much worse than 0.87 F1. Why? Distribution shift (detector boxes vs perfect boxes) + false alarms.
+
+So training on detector boxes (pseudo-labeled) directly targets the distribution shift. I'm fairly confident this is a good next experiment. It's a "data" category change, fundamentally different from e002 (which added low-res true boxes).
+
+Let me estimate the effect: if it closes part of the gap from perfect-box to detector-box performance, gain could be 0.01-0.03.
+
+Budget: training data grows from 6052 to maybe 15-20k → more steps per epoch, but budget is time-based so step count is roughly the same (time-limited loop). Actually more data per epoch = fewer epochs but same total steps. Fine. IoU computation at load: 40k dets × crops per image — vectorized, fast (<5s).
+
+Edge cases:
+- Train dets on images not in crops? dets train split is on training images, all should have crops.
+- Multiple crops overlapping: pick max IoU.
+- IoU threshold: 0.5 (matches metric).
+
+Implementation details:
+
+```python
+crops_all = read_csv(...)  # need all crops (both res?) for labeling
+```
+Wait — pseudo-labeling should use all crops (high+low) since dets are on all training images. crops.csv has a "res" column; TRAIN_ON filters for training. For labeling, use all crops.
+
+```python
+crops_all = read_csv(os.path.join(args.data, "crops.csv"))
+crops = [r for r in crops_all if r["res"] in TRAIN_ON]
+...
+# pseudo-label train dets
+train_dets = [d for d in dets if d["split"] == "train"]
+by_img = {}
+for r in crops_all:
+    by_img.setdefault(r["image"], []).append(r)
+pseudo = []
+for d in train_dets:
+    cs = by_img.get(d["image"], [])
+    if not cs:
+        continue
+    arr = np.array([[c["x1"], c["y1"], c["x2"], c["y2"], c["cls"]] for c in cs])
+    # IoU
+    ix1 = np.maximum(arr[:,0], d["x1"]); iy1 = np.maximum(arr[:,1], d["y1"])
+    ix2 = np.minimum(arr[:,2], d["x2"]); iy2 = np.minimum(arr[:,3], d["y2"])
+    iw = np.clip(ix2-ix1,0,None); ih = np.clip(iy2-iy1,0,None)
+    inter = iw*ih
+    a1 = (d["x2"]-d["x1"])*(d["y2"]-d["y1"])
+    a2 = (arr[:,2]-arr[:,0])*(arr[:,3]-arr[:,1])
+    iou = inter / np.clip(a1+a2-inter, 1e-9, None)
+    i = int(np.argmax(iou))
+    if iou[i] > 0.5:
+        d2 = dict(d); d2["cls"] = int(arr[i,4])
+        pseudo.append(d2)
+```
+
+Then train rows = crops (high) + pseudo. Print counts.
+
+Hmm wait, one consideration: should pseudo boxes be included with the same jitter etc.? Yes, they go through the same BoxDataset.
+
+Another consideration: class balance may shift (pore is already weak; pseudo-labels reflect the detector's behavior, might over-represent easy classes). Class-weighted loss hurt before; don't do it.
+
+Also, should we drop true boxes and use only pseudo? No — mix both; true boxes are cleaner.
+
+Potential downside: pseudo boxes are correlated duplicates of true boxes (same defect, nearby box) → effective data increase is less than the raw count suggests, but distribution matching is the point.
+
+Let me double-check the budget: load time 13s includes image loading. Adding IoU computation: train dets ~40k, each against ~10-20 crops per image → 40k × 15 = 600k IoU ops, vectorized per image → fast (<2s). Training: same steps (time-based). Prediction: unchanged. Safe.
+
+Now, is there anything better? Let me reconsider IMG_SIZE 224: pretrained at 224, more detail. Compute 1.4x → total ~160s, safe. But the effect is uncertain, probably small (0.00-0.01). The pseudo-label idea targets a known structural issue (distribution shift) and adds data. I'll go with pseudo-labels.
+
+Actually, wait. Let me reconsider the "scoring" angle once more, since e001 taught that keeping all 4 rows beats argmax. What about score = conf * p(c) but with p(c) sharpened by temperature? Within class c, score = conf * softmax(T·logits)_c. Temperature T>1 sharpens: true boxes of class c get higher relative p_c… but false rows of class c (other-class boxes) also get their p_c sharpened (lower if p_c was small). The within-class order changes. Hmm, this is a cheap experiment but the effect is probably <0.005. Skip.
+
+What about using the detector conf differently: score = conf^a * p(c)? If conf is noisy, conf^a with a<1 smooths it. Within-class order changes. Also probably small.
+
+The biggest lever remains classifier quality on detector boxes. Pseudo-label training.
+
+One more thought: combine pseudo-labels with… no, one idea per turn.
+
+Let me write the edit.
+
+Current file (best e000). I need to:
+1. After loading dets, compute pseudo-labeled train boxes.
+2. Add to crops for training.
+
+Where: in main(), after `crops = [r for r in read_csv(...) if r["res"] in TRAIN_ON]` and `dets = read_csv(...)`.
+
+Current lines:
+
+```python
+    crops = [r for r in read_csv(os.path.join(args.data, "crops.csv")) if r["res"] in TRAIN_ON]
+    dets = read_csv(os.path.join(args.data, "dets.csv"))
+    ev = [d for d in dets if d["split"] == "eval"]
+    needed = {r["image"] for r in crops} | {d["image"] for d in ev}
+```
+
+New:
+
+```python
+    crops_all = read_csv(os.path.join(args.data, "crops.csv"))
+    crops = [r for r in crops_all if r["res"] in TRAIN_ON]
+    dets = read_csv(os.path.join(args.data, "dets.csv"))
+    ev = [d for d in dets if d["split"] == "eval"]
+    # Pseudo-label the train-split detector boxes that overlap a true box (IoU > 0.5) with that
+    # box's class, and train on them too: the classifier sees detector boxes at inference, so
+    # training on detector boxes matches the inference distribution (and adds data).
+    by_img = {}
+    for r in crops_all:
+        by_img.setdefault(r["image"], []).append(r)
+    pseudo = []
+    for d in dets:
+        if d["split"] != "train":
+            continue
+        cs = by_img.get(d["image"], [])
+        if not cs:
+            continue
+        a = np.array([[c["x1"], c["y1"], c["x2"], c["y2"]] for c in cs])
+        ix1 = np.maximum(a[:, 0], d["x1"]); iy1 = np.maximum(a[:, 1], d["y1"])
+        ix2 = np.minimum(a[:, 2], d["x2"]); iy2 = np.minimum(a[:, 3], d["y2"])
+        inter = np.clip(ix2 - ix1, 0, None) * np.clip(iy2 - iy1, 0, None)
+        ad = (d["x2"] - d["x1"]) * (d["y2"] - d["y1"])
+        ac = (a[:, 2] - a[:, 0]) * (a[:, 3] - a[:, 1])
+        iou = inter / np.clip(ad + ac - inter, 1e-9, None)
+        i = int(np.argmax(iou))
+        if iou[i] > 0.5:
+            d2 = dict(d)
+            d2["cls"] = cs[i]["cls"]
+            pseudo.append(d2)
+    crops = crops + pseudo
+    ev = [d for d in dets if d["split"] == "eval"]
+    needed = {r["image"] for r in crops} | {d["image"] for d in ev}
+```
+
+Wait, `ev` is defined before; I'm redefining it — let me keep the original line and insert after. Let me structure the SEARCH/REPLACE carefully.
+
+Original:
+
+```python
+    crops = [r for r in read_csv(os.path.join(args.data, "crops.csv")) if r["res"] in TRAIN_ON]
+    dets = read_csv(os.path.join(args.data, "dets.csv"))
+    ev = [d for d in dets if d["split"] == "eval"]
+    needed = {r["image"] for r in crops} | {d["image"] for d in ev}
+```
+
+Replace with:
+
+```python
+    crops_all = read_csv(os.path.join(args.data, "crops.csv"))
+    crops = [r for r in crops_all if r["res"] in TRAIN_ON]
+    dets = read_csv(os.path.join(args.data, "dets.csv"))
+    ev = [d for d in dets if d["split"] == "eval"]
+    # Pseudo-label train-split detector boxes that overlap a true box (IoU > 0.5) with that box's
+    # class and train on them as well: inference sees detector boxes, so this matches the training
+    # distribution to it (and adds labelled data).
+    by_img = {}
+    for r in crops_all:
+        by_img.setdefault(r["image"], []).append(r)
+    pseudo = []
+    for d in dets:
+        if d["split"] != "train":
+            continue
+        cs = by_img.get(d["image"], [])
+        if not cs:
+            continue
+        a = np.array([[c["x1"], c["y1"], c["x2"], c["y2"]] for c in cs])
+        ix1 = np.maximum(a[:, 0], d["x1"]); iy1 = np.maximum(a[:, 1], d["y1"])
+        ix2 = np.minimum(a[:, 2], d["x2"]); iy2 = np.minimum(a[:, 3], d["y2"])
+        inter = np.clip(ix2 - ix1, 0, None) * np.clip(iy2 - iy1, 0, None)
+        ad = (d["x2"] - d["x1"]) * (dThinking budget reached. Stop thinking now and write the reply in the required format.

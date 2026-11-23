@@ -1,0 +1,314 @@
+===== attempt 1 =====
+Let me analyze the situation:
+
+1. Current best (e000): 0.6280 mAP@0.5 (5-seed mean)
+2. Per-class: pore 0.494, deposit 0.629, discontinuity 0.780, stain 0.610
+3. The ceiling with perfect classes is 0.758, so there's room to improve.
+4. Previous experiments:
+   - e001 (background class): 0.5512 - rejected (too aggressive suppression)
+   - e002 (low-res crops): 0.6209 - rejected (slightly worse)
+   - e003 (ConvNeXt-Nano): 0.3721 - suspicious bug
+   - e004 (detector boxes as training): 0.6234 - rejected (slightly worse)
+
+The key insight from the background: "When all types are merged into one class, the same detector reaches 0.77, so many errors are wrong types, not missed defects." This means the main issue is classification accuracy, not detection.
+
+The per-class scores show pore (0.494) and stain (0.610) are the weakest. The brief says "Pore and deposit are the weak classes; stain is often confused with deposit and background."
+
+Let me think about what could help:
+
+1. **Scoring strategy**: Currently score = detector_conf * class_prob. The detector conf is the same for all 4 classes of a box, so it doesn't help differentiate between classes. The ranking within a box is purely by class probability. But across boxes, the detector conf matters. 
+
+   One idea: instead of multiplying by detector conf, use a different combination. For example, use the class probability directly (since the detector conf is the same for all 4 rows of a box, it only affects the absolute scale, not the relative ranking within a box). But it does affect ranking across boxes.
+
+   Actually wait - the score is used for ranking ALL predictions across ALL boxes. So detector_conf * class_prob means a box with high detector conf but low class prob could outrank a box with low detector conf but high class prob. This might not be ideal.
+
+   Alternative: use class_prob^alpha * detector_conf^beta with different exponents. Or use class_prob * (1 - background_prob) where background is estimated somehow.
+
+2. **Test-time augmentation**: At inference, flip the crop and average predictions. This is free (no training change) and often helps 2-5% on classification.
+
+3. **Better training**: The model trains for ~5 epochs. Maybe we can train longer or with a better schedule.
+
+4. **Label smoothing**: Could help with calibration.
+
+5. **The scoring formula**: Currently `score = d["conf"] * float(p[c])`. Since we output one row per class per box, and the top 300 per image count, the ranking matters. If we use `score = p[c]` (without detector conf), then within each box the ranking is by class probability, and across boxes it's also by class probability. The detector conf would then only matter if we use it differently.
+
+   Actually, let me think more carefully. The mAP scoring works like this: for each class, sort all predictions by score, and compute precision-recall. So the score determines the order in which detections are considered. A true detection (IoU > 0.5 with a ground truth of that class) should appear before false detections.
+
+   If we use `score = conf * prob[c]`, then for a given box, the class with highest prob gets the highest score. Across boxes, a box with high conf but moderate prob might outrank a box with low conf but high prob. This seems reasonable.
+
+   But what about: `score = prob[c] ** 2 * conf`? This would make the model more selective about class assignment.
+
+   Or: `score = conf * prob[c] / sum(prob)` - but sum(prob) = 1 for softmax, so this is the same.
+
+   Actually, a key insight: since we output ALL 4 classes for each box, and the top 300 per image count, the relative ordering matters. If a box is truly a "pore", we want its pore row to be high and its other rows to be low. The softmax already does this. The question is whether multiplying by conf helps or hurts.
+
+   Let me think about what would help most given the constraints:
+
+6. **Test-time augmentation (TTA)**: At inference, compute predictions for the original crop, horizontal flip, and vertical flip, then average the probabilities. This is a well-known technique that typically improves accuracy by 1-3%. It costs ~3x inference time but we have 55 seconds reserved for prediction.
+
+   Current prediction time: 165s total - 125s training = ~40s for prediction. With 3x TTA it would be ~120s, which would exceed the 55s reserve. But we could reduce the reserve or use a faster approach.
+
+   Actually, looking at the log: training takes ~125s, prediction takes ~40s. Total 165s out of 180s budget. If we do 2x TTA (original + horizontal flip), prediction would be ~80s, total ~205s - too much.
+
+   Hmm, but we could reduce the number of training steps to free up time. Or use a smaller batch size for TTA.
+
+   Actually wait - the TTA at inference is just: for each crop, compute it 3 times (original, hflip, vflip) and average the logits. The dataset already computes the crop, so we'd need to modify the inference loop. Let me think about how to implement this efficiently.
+
+   Actually, the simplest TTA is: during inference, for each batch, also compute the horizontal flip of the input and average the logits. This doubles the forward passes during inference.
+
+   Current inference: 41879 detections / 256 batch = ~164 batches. Each batch does 2 forward passes (tight + wide). With TTA (hflip), it would be 4 forward passes per batch. So inference time roughly doubles from ~40s to ~80s. Total would be ~205s, exceeding 180s.
+
+   Alternative: reduce training time. The model seems to converge by epoch 3-4 (loss goes from 0.76 to 0.22). We could reduce RESERVE_S from 55 to 70, giving more time for prediction.
+
+   Or: do TTA only on the tight crop (skip the wide crop for the flipped version). This would be 3 forward passes instead of 4.
+
+   Actually, let me reconsider. The simplest and most impactful change might be:
+
+7. **Score calibration**: Instead of `score = conf * prob[c]`, use `score = prob[c]` directly. The detector conf is the same for all 4 classes of a box, so it doesn't help discriminate between classes. But it does help rank boxes against each other. However, if the detector conf is poorly calibrated (which is common for YOLO), it might hurt more than help.
+
+   Actually, the detector conf IS useful for ranking: a box with high conf is more likely to be a real defect, so all its class predictions should be boosted relative to low-conf boxes. So `conf * prob[c]` makes sense.
+
+   But what about using `conf^0.5 * prob[c]`? This would reduce the influence of conf and let the classifier's probabilities matter more. Or `conf * prob[c]^2` to make the classifier more selective.
+
+8. **Let me focus on TTA** since it's the most reliable improvement. Here's my plan:
+   - At inference, for each crop, compute predictions for original and horizontal flip, average the logits.
+   - Reduce RESERVE_S to accommodate the extra time.
+   - This should give a 1-3% improvement in classification accuracy.
+
+Let me implement this:
+
+In the BoxDataset, during eval (train=False), I'll add both the original and hflip views. Actually, it's easier to modify the inference loop directly.
+
+Wait, the dataset returns two views (tight and wide). For TTA, I want to also get the hflip of both. So I could modify the dataset to return 4 views during eval: tight, wide, tight_hflip, wide_hflip. Then average all 4 logits.
+
+Actually, simpler approach: in the inference loop, after getting xt and xw, also compute xt[:, :, ::-1] and xw[:, :, ::-1] (horizontal flip at the tensor level) and average all 4 logits.
+
+Let me write this:
+
+```python
+model.eval()
+probs = []
+with torch.no_grad(), torch.autocast(**amp):
+    for xt, xw, _ in dl_ev:
+        xt = xt.to(device).to(memory_format=torch.channels_last)
+        xw = xw.to(device).to(memory_format=torch.channels_last)
+        # TTA: average original and horizontal flip
+        logits = (model(xt) + model(xw) + model(xt.flip(3)) + model(xw.flip(3))) / 4
+        probs.append(torch.softmax(logits.float(), 1).cpu())
+```
+
+This doubles the forward passes during inference. Let me estimate the time:
+- Current inference: ~40s for 164 batches × 2 forward passes = 328 forward passes
+- With TTA: 164 batches × 4 forward passes = 656 forward passes → ~80s
+- Total: 125s training + 80s inference = 205s > 180s budget
+
+So I need to either:
+1. Reduce training time (fewer steps)
+2. Reduce inference time (larger batch, fewer images)
+3. Reduce RESERVE_S and let training use more time... wait, RESERVE_S is subtracted from the deadline to determine when to stop training. If I increase RESERVE_S, training stops earlier, giving more time for inference.
+
+Current: RESERVE_S = 55, so training stops at deadline - 55 = 180 - 55 = 125s. Training actually takes ~125s. Inference takes ~40s. Total 165s.
+
+If I set RESERVE_S = 80, training stops at 100s. Looking at the log, at 100s we're at epoch 2 (loss 0.2875, 282 steps). So we'd lose about 2 epochs of training. That might hurt.
+
+Alternative: do TTA only on the tight crop (skip wide crop flip):
+```python
+logits = (model(xt) + model(xw) + model(xt.flip(3))) / 3
+```
+This is 3 forward passes instead of 2, so inference would be ~60s. Total: 125 + 60 = 185s. Still over budget.
+
+Hmm. Let me think differently. What if I:
+- Reduce BATCH_SIZE for training to get more steps in the same time? No, that would be slower.
+- Use a smaller model? No, that would hurt accuracy.
+- Reduce IMG_SIZE? No, that would hurt accuracy.
+
+Actually, let me look at this more carefully. The training loop stops when `time.time() >= t_end` where `t_end = deadline - RESERVE_S`. With RESERVE_S=55 and deadline=180, t_end=125. The log shows training ends at 125s. Then inference takes 40s. Total 165s.
+
+If I do TTA with 3 forward passes (tight + wide + tight_hflip), inference would be ~60s. Total: 125 + 60 = 185s. Over by 5s.
+
+If I set RESERVE_S = 65, t_end = 115. Training would stop at ~115s (epoch 3, loss ~0.25, 376 steps). Inference with 3 passes: ~60s. Total: 115 + 60 = 175s. Under budget!
+
+But we lose one epoch of training. The loss goes from 0.2488 (epoch 3) to 0.2185 (epoch 4). Not a huge difference.
+
+Alternatively, with RESERVE_S = 70, t_end = 110. Training stops at ~110s. Inference: 60s. Total: 170s. Safe.
+
+Actually, let me reconsider. The most impactful TTA is horizontal flip since it's the most common augmentation. Let me just do 2x TTA (original + hflip) on both crops:
+
+```python
+logits = (model(xt) + model(xw) + model(xt.flip(3)) + model(xw.flip(3))) / 4
+```
+
+4 forward passes. Inference: ~80s. With RESERVE_S=85, t_end=95. Training stops at ~95s (epoch 2, 282 steps, loss 0.2875). Total: 95 + 80 = 175s. Under budget.
+
+But losing training from 398 steps to 282 steps (28% fewer) might hurt more than the TTA helps.
+
+Let me try a middle ground: TTA on just the tight crop (the more discriminative one):
+```python
+logits = (model(xt) + model(xw) + model(xt.flip(3))) / 3
+```
+3 forward passes. Inference: ~60s. With RESERVE_S=65, t_end=115. Training: ~115s (epoch 3, 376 steps). Total: 115 + 60 = 175s. Good.
+
+Actually, I realize I should think about what gives the best bang for the buck. Let me reconsider the options:
+
+1. TTA (hflip): +1-3% accuracy, costs ~20s extra inference
+2. Better scoring: free, might help 0-1%
+3. More training: already limited by time
+4. Different architecture: risky (e003 was a bug)
+
+I think TTA is the safest bet. Let me go with hflip on both crops, and adjust RESERVE_S.
+
+Actually, let me reconsider the time budget more carefully:
+- Loading: 14s
+- Training: starts at ~14s, ends at t_end
+- Inference: starts after training
+- Writing: small
+
+With RESERVE_S = 80:
+- t_end = 180 - 80 = 100s
+- Training: 14s to 100s = 86s of training (vs current 111s)
+- From the log: at 81s we're at epoch 1 (188 steps), at 101s we're at epoch 2 (282 steps)
+- So training would get ~250 steps (vs 398 currently)
+- Inference: 41879/256 = 164 batches × 4 forwards = 656 forwards
+- Current: 164 batches × 2 forwards = 328 forwards in 40s → ~0.12s per forward
+- New: 656 forwards × 0.12s = ~79s
+- Total: 100 + 79 + writing(~5s) = 184s. Tight but might work.
+
+With RESERVE_S = 90:
+- t_end = 90s
+- Training: 14s to 90s = 76s → ~220 steps
+- Inference: ~79s
+- Total: 90 + 79 + 5 = 174s. Safe.
+
+But 220 steps vs 398 is a big loss in training. The model might not converge well.
+
+Hmm, let me think of another approach. What if I do TTA more efficiently?
+
+Instead of 4 separate forward passes, I can batch them:
+- Concatenate [xt, xt.flip(3), xw, xw.flip(3)] into one batch and do one forward pass
+- This might be faster due to better GPU utilization
+
+Actually, the simplest efficient approach: interleave the TTA into the batch dimension.
+
+```python
+for xt, xw, _ in dl_ev:
+    xt = xt.to(device)
+    xw = xw.to(device)
+    # Stack original and flipped versions
+    x_all = torch.cat([xt, xw, xt.flip(3), xw.flip(3)], dim=0)
+    logits = model(x_all).view(4, -1, 4).mean(0)
+    probs.append(torch.softmax(logits.float(), 1).cpu())
+```
+
+This does one forward pass with 4x the batch size. If the GPU can handle it, it's faster than 4 separate passes. But if it can't, it'll be slower or OOM.
+
+Actually, for a 160x160 image with EfficientNet-B0, the batch size of 256 should be fine, and 4x = 1024 might be too much for GPU memory. Let me be safe and do 2 batches of 2x:
+
+```python
+for xt, xw, _ in dl_ev:
+    xt = xt.to(device)
+    xw = xw.to(device)
+    logits1 = (model(xt) + model(xw)) / 2
+    logits2 = (model(xt.flip(3)) + model(xw.flip(3))) / 2
+    probs.append(torch.softmax((logits1 + logits2).float() / 2, 1).cpu())
+```
+
+This is the same 4 forward passes but in 2 groups of 2. Should be about the same speed.
+
+OK let me just go with the straightforward approach and adjust RESERVE_S. I'll use RESERVE_S = 85 and do full TTA (hflip on both crops).
+
+Wait, actually I just realized: the current inference does 2 forward passes per sample (tight + wide). With TTA it's 4. That's 2x the inference time. Current inference is ~40s, so new inference is ~80s.
+
+Let me set RESERVE_S = 85. Then t_end = 95s. Training gets 95-14=81s. From the log, at 81s we have 188 steps (end of epoch 1). So we'd get about 200 steps.
+
+That's a significant reduction from 398 steps. The model might not train well enough.
+
+Alternative: reduce inference batch size to speed things up? No, that would be slower.
+
+What about: do TTA only on the tight crop (the more discriminative view)?
+- 3 forward passes instead of 4
+- Inference: ~60s
+- RESERVE_S = 70, t_end = 110s
+- Training: 110-14=96s → ~270 steps
+- Total: 110 + 60 + 5 = 175s ✓
+
+This seems like a good balance. Let me go with this.
+
+Actually, you know what, let me reconsider. The hypothesis should be clear and testable. Let me go with:
+
+**Hypothesis**: Test-time augmentation with horizontal flip at inference will improve classification accuracy by ~1-3% (especially for pore and stain which are the weak classes), because it provides a free data augmentation that the model hasn't seen during training (well, it has seen hflip during training, but TTA at test time still helps by averaging out position-dependent errors).
+
+Let me implement:
+1. TTA: hflip on both tight and wide crops at inference
+2. Adjust RESERVE_S to accommodate the extra inference time
+3. Keep everything else the same
+
+Let me write the code changes:
+
+Change 1: RESERVE_S from 55 to 85
+Change 2: Inference loop to include TTA
+
+Actually, let me be more careful about the time. Let me use RESERVE_S = 80 to be safe.
+
+t_end = 180 - 80 = 100s
+Training: 100 - 14 = 86s of actual training
+From log: at 62s = 94 steps, at 81s = 188 steps, at 101s = 282 steps
+So at 86s of training (100s total): ~210 steps
+
+Inference with 4 forward passes: 40s * 2 = 80s
+Total: 100 + 80 + ~5s writing = 185s. Over budget!
+
+RESERVE_S = 90:
+t_end = 90s
+Training: 90 - 14 = 76s → ~190 steps
+Inference: 80s
+Total: 90 + 80 + 5 = 175s ✓
+
+But only 190 steps of training... that's less than half. The model might be undertrained.
+
+Hmm, what if I reduce the number of eval batches by using a larger batch size? Currently 256. If I use 512, that's half the batches but each batch is bigger. The forward pass time scales with batch size, so total time should be similar.
+
+What if I use a smaller image size for inference? No, that would hurt accuracy.
+
+OK, let me try a different approach: TTA with only horizontal flip on the tight crop (3 forward passes instead of 4):
+
+Inference: 40s * 1.5 = 60s
+RESERVE_S = 70, t_end = 110s
+Training: 110 - 14 = 96s → ~270 steps
+Total: 110 + 60 + 5 = 175s ✓
+
+This gives us 270 steps (vs 398) and 3x TTA. I think this is a reasonable tradeoff.
+
+Actually, wait. Let me reconsider whether TTA is the best use of my turn. Looking at the experiment history:
+- e001 (background class): 0.5512 - much worse
+- e002 (low-res): 0.6209 - slightly worse
+- e003 (ConvNeXt): 0.3721 - bug
+- e004 (detector boxes): 0.6234 - slightly worse
+
+None of the "data" changes helped. The model seems to be at a local optimum for this architecture/training setup. TTA is a different kind of change - it's inference-time and doesn't require retraining.
+
+Let me go with TTA. I'll do hflip on both crops (4 forward passes) and set RESERVE_S to 90.
+
+Actually, I just want to double-check: the training already uses horizontal flip (fh = random.random() < 0.5). So the model has seen flipped images during training. TTA at test time still helps because it averages out the model's position-dependent biases.
+
+Let me finalize my implementation:
+
+```python
+RESERVE_S = 90  # was 55
+```
+
+And in the inference section:
+```python
+    model.eval()
+    probs = []
+    with torch.no_grad(), torch.autocast(**amp):
+        for xt, xw, _ in dl_ev:
+            xt = xt.to(device).to(memory_format=torch.channels_last)
+            xw = xw.to(device).to(memory_format=torch.channels_last)
+            # TTA: average original and horizontal flip
+            logits = (model(xt) + model(xw) + model(xt.flip(3)) + model(xw.flip(3))) / 4
+            probs.append(torch.softmax(logits.float(), 1).cpu())
+```
+
+Wait, I need to double-check: `xt.flip(3)` flips the last dimension (width) of a 4D tensor (N, C, H, W). Yes, that's horizontal flip. Good.
+
+Let me write the final diff.

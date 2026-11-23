@@ -1,0 +1,256 @@
+===== attempt 1 =====
+Let me carefully analyze the task.
+
+The research lead wants me to implement:
+1. Change IMG_SIZE from 160 to 224
+2. Change CONTEXT (wide crop) from 2.5 to 3.0
+3. Keep TIGHT_CONTEXT at 1.5 but drop the wide-crop average
+4. Remove the second view entirely so each training sample uses one crop
+5. In BoxDataset.__getitem__, build only one view using ctx = random choice between TIGHT_CONTEXT and CONTEXT during training (data augmentation via context jitter), and at inference use CONTEXT
+6. Keep model efficientnet_b0 pretrained, keep batch size 64 and LR
+7. With one view instead of two, step time drops ~40%, allowing more steps in the same budget
+8. Adjust RESERVE_S if needed so prediction still completes within 180s
+
+Let me think about the implications:
+
+- The dataset currently returns `views[0], views[1], r.get("cls", -1)` - two views plus label.
+- The training loop unpacks `for xt, xw, y in dl_tr:` and does `loss = crit((model(xt) + model(xw)) / 2, y)`
+- The eval loop unpacks `for xt, xw, _ in dl_ev:` and does `probs.append(torch.softmax(((model(xt) + model(xw)) / 2).float(), 1).cpu())`
+
+If I drop to a single view, I need to:
+- Change the dataset to return a single view (and label)
+- Change the training loop to unpack one view
+- Change the eval loop to unpack one view
+- The model call becomes just `model(x)` instead of averaging two
+
+Let me think about the time budget. Currently:
+- 433 steps in ~125s of training (from 59s to 125s? wait let me re-read)
+
+Actually the log shows:
+```
+train 6052 boxes, eval 41879 detections, 1022 images (13s)
+epoch 0: loss 0.7217, 94 steps, 59s
+epoch 1: loss 0.3735, 188 steps, 77s
+epoch 2: loss 0.2881, 282 steps, 95s
+epoch 3: loss 0.2532, 376 steps, 114s
+epoch 4: loss 0.2189, 433 steps, 125s
+done: 5 epochs, 433 steps, 53606 prediction rows, 162s total
+```
+
+So loading is 13s. Training runs from ~13s to 125s (about 112s for 433 steps). Then prediction + writing takes 125s to 162s (about 37s).
+
+Wait, let me recompute. RESERVE_S = 55, so t_end = deadline - 55 = 180 - 55 = 125s. So training stops at 125s. That matches "epoch 4: ... 125s". Then prediction runs from 125s to 162s = 37s. Total 162s, within 180s with 18s margin.
+
+Now if I go to a single view at 224px instead of two views at 160px:
+- Two views at 160px: 2 * 160^2 = 51200 pixels per sample
+- One view at 224px: 224^2 = 50176 pixels per sample
+
+So the compute per sample is roughly similar! 51200 vs 50176. Actually the single 224 view is slightly less compute than two 160 views. So step time should be roughly the same or slightly less, not 40% less.
+
+Hmm, wait. The lead said "step time drops ~40%". Let me reconsider. Two views at 160 = 2 * 160 * 160 = 51200. One view at 224 = 224*224 = 50176. So it's essentially the same pixel count. The step time would be about the same, maybe slightly less. So the lead's estimate of 40% drop is wrong.
+
+Actually, but there's a subtlety. The model is called twice per sample currently (model(xt) and model(xw)). With one view, the model is called once. The number of forward passes per step is halved. But each forward pass is at 224px vs 160px. 224/160 = 1.4, so 1.4^2 = 1.96x the pixels per pass. So two passes at 160 = 2 * 160^2 = 51200, one pass at 224 = 224^2 = 50176. Roughly equal. So step time is about the same.
+
+So actually the "40% drop" is not accurate. But the key point: since step time is about the same, we get about the same number of steps. That's fine — the experiment is still valid. We're not relying on the 40% drop being true; we're just changing what the model sees.
+
+Actually, let me reconsider whether the step time might be a bit different. The dominant cost in a CNN is the convolutions, which scale with spatial resolution squared (for a fixed network). So:
+- Current: 2 forward + 1 backward (backprop through both) at 160px. Actually backward cost is ~2x forward. So total per step ≈ 2*(1f + 2b) ... let me just think in terms of "forward-equivalent" ops. Forward at 160: cost C160. Two views forward = 2*C160. Backward = 2 * 2*C160 = 4*C160 (backward ~2x forward). Total ≈ 6*C160.
+- New: one view at 224. Forward = C224 = C160 * (224/160)^2 = C160 * 1.96. Two views... no, one view. Forward = 1.96*C160. Backward = 2*1.96*C160 = 3.92*C160. Total ≈ 5.88*C160.
+
+So roughly the same, slightly less. Good. So step count stays about the same. That's fine.
+
+Now, the important thing: the lead wants me to implement exactly this. Let me be careful about the details.
+
+Let me reconsider the plan more carefully:
+
+1) Change IMG_SIZE from 160 to 224 and CONTEXT (wide crop) from 2.5 to 3.0, keeping TIGHT_CONTEXT at 1.5 but dropping the wide-crop average; remove the second view entirely so each training sample uses one crop.
+
+2) In BoxDataset.__getitem__, build only one view using ctx = random choice between TIGHT_CONTEXT and CONTEXT during training (data augmentation via context jitter), and at inference use CONTEXT.
+
+3) Keep model efficientnet_b0 pretrained, keep batch size 64 and LR; with one view instead of two, step time drops ~40%, allowing more steps in the same budget.
+
+4) Adjust RESERVE_S if needed so prediction still completes within 180s.
+
+So the changes:
+- IMG_SIZE = 224
+- CONTEXT = 3.0
+- TIGHT_CONTEXT = 1.5 (unchanged)
+- BoxDataset: single view
+  - training: ctx = random.choice((TIGHT_CONTEXT, CONTEXT))
+  - inference: ctx = CONTEXT
+- Training loop: unpack single view
+- Eval loop: unpack single view
+- Model call: single
+
+Let me now write the code.
+
+Current BoxDataset.__getitem__:
+```python
+    def __getitem__(self, i):
+        r = self.rows[i]
+        img = self.images[r["image"]]
+        fh = fv = False
+        bright = 1.0
+        if self.train:  # same flips and brightness for both views
+            fh, fv, bright = random.random() < 0.5, random.random() < 0.5, random.uniform(0.8, 1.2)
+        views = []
+        for ctx in (TIGHT_CONTEXT, CONTEXT):
+            x = make_crop(img, r, ctx, self.train)
+            if fh:
+                x = x[:, ::-1]
+            if fv:
+                x = x[::-1, :]
+            if self.train:
+                x = np.clip(x * bright, 0, 1)
+            x = (x - MEAN) / STD
+            views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))
+        return views[0], views[1], r.get("cls", -1)
+```
+
+New BoxDataset.__getitem__:
+```python
+    def __getitem__(self, i):
+        r = self.rows[i]
+        img = self.images[r["image"]]
+        fh = fv = False
+        bright = 1.0
+        if self.train:  # random context scale + flips + brightness
+            ctx = random.choice((TIGHT_CONTEXT, CONTEXT))
+            fh, fv, bright = random.random() < 0.5, random.random() < 0.5, random.uniform(0.8, 1.2)
+        else:
+            ctx = CONTEXT
+        x = make_crop(img, r, ctx, self.train)
+        if fh:
+            x = x[:, ::-1]
+        if fv:
+            x = x[::-1, :]
+        if self.train:
+            x = np.clip(x * bright, 0, 1)
+        x = (x - MEAN) / STD
+        x = torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1)))
+        return x, r.get("cls", -1)
+```
+
+Wait, but make_crop already does geometric jitter (cx, cy offset and side scaling) when train=True. So the "context jitter" via random choice of ctx is an additional augmentation. That's fine.
+
+Now the training loop:
+```python
+        for xt, xw, y in dl_tr:
+            ...
+            xt = xt.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            xw = xw.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            y = y.to(device, non_blocking=True)
+            with torch.autocast(**amp):
+                loss = crit((model(xt) + model(xw)) / 2, y)
+```
+
+New:
+```python
+        for x, y in dl_tr:
+            ...
+            x = x.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            y = y.to(device, non_blocking=True)
+            with torch.autocast(**amp):
+                loss = crit(model(x), y)
+```
+
+The eval loop:
+```python
+        for xt, xw, _ in dl_ev:
+            xt = xt.to(device).to(memory_format=torch.channels_last)
+            xw = xw.to(device).to(memory_format=torch.channels_last)
+            probs.append(torch.softmax(((model(xt) + model(xw)) / 2).float(), 1).cpu())
+```
+
+New:
+```python
+        for x, _ in dl_ev:
+            x = x.to(device).to(memory_format=torch.channels_last)
+            probs.append(torch.softmax(model(x).float(), 1).cpu())
+```
+
+Now let me think about the time budget more carefully.
+
+Prediction: currently 41879 detections, batch 256, two views at 160px. Prediction takes ~37s (125s to 162s).
+
+With one view at 224px: pixel count per sample is 50176 vs 51200 (two views at 160). So prediction compute is about the same. Actually slightly less. So prediction time stays about the same, ~37s. Good.
+
+Training: ~112s for 433 steps. With one view at 224, step time about the same. So still ~433 steps. Good.
+
+Total: 13s load + 112s train + 37s predict = 162s. Same as before. Within 180s. 
+
+Actually wait, let me reconsider. The RESERVE_S = 55 means training stops at 125s. Then prediction runs from 125s. If prediction takes 37s, total 162s. That's fine, 18s margin.
+
+But should I adjust RESERVE_S? The lead says "Adjust RESERVE_S if needed so prediction still completes within 180s." Since prediction time is about the same (maybe slightly less), RESERVE_S = 55 should still be fine. Actually, if step time is slightly less, we might get a few more steps, which is good. Let me keep RESERVE_S = 55. Actually, let me reconsider — if prediction is slightly faster (one view at 224 vs two at 160, 50176 vs 51200 pixels, ~2% less), prediction might take ~36s. So 125 + 36 = 161s. Fine.
+
+Hmm, but actually there's a subtle issue: the model at 224px might be slightly slower per pixel due to less efficient memory access, but roughly linear. Let me not overthink. The budget is fine.
+
+Actually, let me reconsider whether I should reduce RESERVE_S to get more training steps. The lead's plan point 3 says "with one view instead of two, step time drops ~40%, allowing more steps in the same budget." But as I computed, step time doesn't drop 40% — it's about the same. So we don't get more steps. But that's fine; the experiment is about the crop/resolution change, not about more steps. I'll keep RESERVE_S = 55 to be safe. Actually, I could keep it as is. The lead says "adjust if needed" — it's not needed.
+
+Wait, but let me double check the step time claim. Actually, I realize I should reconsider. Is the bottleneck the GPU compute or the data loading? The log shows 433 steps in 112s = ~0.26s per step. With batch 64, that's 64*2 views = 128 crops per step at 160px. Hmm.
+
+Actually, data loading with 8 workers and persistent_workers... The crops are computed on the fly (make_crop does PIL resize). This could be a bottleneck. With two views, each sample computes 2 crops. With one view, each sample computes 1 crop. So data loading per sample is halved! If data loading is the bottleneck, then step time could drop significantly.
+
+Let me reconsider. make_crop does:
+- compute side
+- create canvas
+- copy from image
+- PIL resize to 160x160 (or 224x224)
+
+The PIL resize is the expensive part. At 224px it's 1.96x the work of 160px for one crop. Two crops at 160 = 2 * (160^2 work) = 2 * 25600 = 51200. One crop at 224 = 224^2 = 50176. So total crop work is about the same. So data loading per step is about the same.
+
+So whether GPU or data loading is the bottleneck, step time is about the same. Good. So ~433 steps.
+
+OK so my implementation is correct. Let me also double check: the dataset returns a tuple (x, label) now. The DataLoader will collate x (a tensor of shape 3, 224, 224) into a batch of shape (64, 3, 224, 224). Good. The label is an int. Good.
+
+Now, one concern: in the eval dataset, `r.get("cls", -1)` — for eval dets, there's no "cls" key, so it returns -1. That's fine, we ignore it.
+
+Let me also check: the `make_crop` function signature is `make_crop(img, r, context, train)`. In the new getitem, I call `make_crop(img, r, ctx, self.train)`. Good.
+
+Now let me think about whether the random context choice during training is a good idea and matches the plan. The plan says "build only one view using ctx = random choice between TIGHT_CONTEXT and CONTEXT during training (data augmentation via context jitter), and at inference use CONTEXT." Yes, that's what I have.
+
+Wait, but there's a subtlety. TIGHT_CONTEXT = 1.5 and CONTEXT = 3.0. During training we randomly pick either 1.5 or 3.0. At inference we use 3.0 (the wide one). This is a form of multi-scale training where we train on both scales but test on the wide one. That's reasonable — it's like the "multiple views at different scales" idea but as augmentation rather than averaging.
+
+Actually, let me reconsider. The original used both 1.5 and 2.5 and averaged. The new plan uses 1.5 or 3.0 randomly during training, and 3.0 at test. So the test crop is 3.0. The model sees 1.5x and 3.0x during training. This should help the model be robust to scale, and the 3.0x crop keeps the defect filling a reasonable portion of the 224px frame while adding context.
+
+Let me sanity check the crop size. A defect box, say 30x30 px. At context 3.0, side = 3.0 * 30 = 90 px, resized to 224. At context 1.5, side = 45 px, resized to 224. So the tight crop (1.5) zooms in more. At 224px, the defect fills more of the frame in the tight crop. Hmm, actually the plan says "A single tighter crop at 3x context resized to a larger IMG_SIZE (224) keeps the defect filling more of the frame while adding context." Wait, that's a bit confusing. Let me re-read.
+
+"A single tighter crop at 3x context resized to a larger IMG_SIZE (224) keeps the defect filling more of the frame while adding context"
+
+Hmm, 3x context is wider than 1.5x, so the defect fills LESS of the frame, not more. But the point is that at 224px (vs 160px), the absolute resolution is higher, so even though the defect fills a similar fraction, there are more pixels on the defect. So the fine texture is better preserved.
+
+Actually wait. Let me reconsider. Original: two crops at 1.5x and 2.5x, both resized to 160px. The 1.5x crop of a 30px box = 45px → 160px (3.55x upscale). The 2.5x crop = 75px → 160px (2.13x upscale). 
+
+New: one crop at 1.5x or 3.0x, resized to 224px. The 1.5x crop = 45px → 224px (4.98x upscale). The 3.0x crop = 90px → 224px (2.49x upscale).
+
+So the 3.0x crop at 224px: the defect (30px) is 30/90 = 33% of the crop side, and the crop is 224px, so the defect is ~75px in the final image. In the original 2.5x at 160: defect is 30/75 = 40% of crop, crop is 160px, defect is ~64px. So the new 3.0x at 224 gives the defect 75px vs 64px — more pixels on the defect. And the 1.5x at 224: defect is 30/45 = 67% of crop, 224px, defect is ~150px. So the tight crop gives even more pixels on the defect (150px). That's a lot of fine texture.
+
+So the idea is: by going to 224px and using a tighter crop (1.5x), the defect fills more of the frame and has more pixels, preserving fine texture. And the 3.0x adds context. Training on both scales (random) makes it robust. This targets the pore/deposit/stain confusion which depends on fine texture.
+
+OK the hypothesis makes sense. Let me now write the SEARCH/REPLACE blocks.
+
+Let me be very careful to copy the exact text.
+
+Block 1: Change IMG_SIZE and CONTEXT.
+
+Current:
+```python
+IMG_SIZE = 160
+CONTEXT = 2.5           # wide crop: side = CONTEXT * long side of the box
+TIGHT_CONTEXT = 1.5     # tight crop
+```
+
+New:
+```python
+IMG_SIZE = 224
+CONTEXT = 3.0           # wide crop: side = CONTEXT * long side of the box
+TIGHT_CONTEXT = 1.5     # tight crop
+```
+
+Let me check this appears exactly once. Yes.
+
+Block 2: BoxDataset.__getitem__.
+
+Current:
+```python
+    def __getitem__(self, i):Thinking budget reached. Stop thinking now and write the reply in the required format.

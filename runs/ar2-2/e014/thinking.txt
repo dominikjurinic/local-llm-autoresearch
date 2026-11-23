@@ -1,0 +1,327 @@
+===== attempt 1 =====
+Let me analyze the current state and think about what to try next.
+
+Current best: e009, 5-seed val mAP@0.5 = 0.6387
+- Per-class AP: pore 0.528, deposit 0.637, discontinuity 0.779, stain 0.611
+- Baseline (one-step 4-class): 0.638
+- Ceiling (stage-1 boxes with perfect classes): 0.758
+- Single class 'defect': 0.755
+
+So we're at 0.6387, very close to the one-step baseline. The ceiling is 0.758. There's a lot of room to improve.
+
+Let me think about what's been tried:
+- e001: background class → rejected (0.5691)
+- e002: detector boxes with IoU≥0.5 → new best (0.6293)
+- e003: low-res crops → new best (0.6317)
+- e004: prob² scoring → rejected (0.6211)
+- e005: background class with (1-p_bg) → rejected (0.6039)
+- e006: focal loss → rejected (0.6123)
+- e007: mixup → rejected (0.6233)
+- e008: single wide-crop (halved cost, more epochs) → new best (0.6386)
+- e009: H-flip TTA → new best (0.6387)
+- e010: batch 32 → rejected (0.6229)
+- e011: oversampling pore/stain → rejected (0.6305)
+- e012: V-flip + 180° TTA → rejected (0.6370)
+- e013: EfficientNet-B2 → rejected (0.6340)
+
+What hasn't been tried yet:
+1. **Scoring**: The current score is `conf * prob[c]`. We've tried prob² (rejected). What about using the detector confidence differently? The detector confidence is class-agnostic. Maybe we should weight by the max probability or use a different combination.
+
+2. **Architecture**: We've tried B0 and B2. What about other models? convnext, regnety, resnet? The brief mentions convnext_atto, convnext_nano, convnext_pico, efficientnet_b0, efficientnet_b2, mobilenetv3_large_100, regnety_016, resnet18, resnet26d, resnet34, resnet50, tf_efficientnetv2_b0.
+
+3. **Training strategy**: We train for ~2 epochs. The model might benefit from different training approaches.
+
+4. **Image size**: Currently 160. What about different sizes?
+
+5. **Two-crop vs single crop**: We went from two-crop to single wide-crop (2.5×). What about trying different context sizes?
+
+6. **Scoring with background suppression**: We tried adding a background class (rejected). But what about a simpler approach?
+
+7. **Ensemble**: The brief mentions "ensembling within the time budget." We could train two models and average their predictions.
+
+8. **Learning rate schedule**: Currently cosine with 5% warmup.
+
+9. **Data augmentation**: We have H-flip, V-flip (50% each), brightness jitter, and geometric jitter in make_crop. What about color jitter, random erasing, or other augmentations?
+
+10. **Training on detector boxes with lower IoU threshold**: Currently IoU≥0.5. What about IoU≥0.3 or 0.25?
+
+Let me think about what's most likely to help:
+
+The key insight from the brief: "When all types are merged into one class, the same detector reaches 0.77, so many errors are wrong types, not missed defects." This means the detector is finding the right boxes but the classifier is getting the type wrong. The ceiling is 0.758 (perfect classes on stage-1 boxes), so the classifier is the bottleneck.
+
+Current per-class AP: pore 0.528, deposit 0.637, discontinuity 0.779, stain 0.611. Pore and stain are the weakest.
+
+The classifier was trained on: GT crops (high + low res) + detector boxes with IoU≥0.5. It's a single EfficientNet-B0 with 2.5× context crop, trained for ~2 epochs.
+
+Let me think about what could help most:
+
+1. **Ensemble of two models**: Train two different models (e.g., EfficientNet-B0 + ResNet18, or two EfficientNet-B0 with different seeds/augmentations) and average their probabilities. This is a classic technique that often gives 1-3% improvement. The time budget allows for it if each model trains for ~1 epoch instead of 2.
+
+Actually, looking at the time budget: 180s total, 55s reserve, so 125s for training. Currently it does ~2 epochs in 125s. If we train two models, each gets ~60s, which is about 1 epoch each. That might be enough for a decent ensemble.
+
+2. **Different image size**: 160 might not be optimal. 128 would be faster (allowing more epochs), 192 would give more detail.
+
+3. **Training longer with a smaller model**: convnext_pico or convnext_atto are smaller than EfficientNet-B0, so they'd train faster, allowing more epochs.
+
+4. **Scoring changes**: The current score is `conf * prob[c]`. What if we use `conf * prob[c] / max_prob` or `conf * (prob[c] - 0.25)` (subtracting uniform prior)? Or what about using the detector confidence as a ranker rather than a multiplier?
+
+Actually, let me think more carefully about the scoring. The mAP@0.5 rewards:
+(a) right class on boxes that overlap a true defect
+(b) good ranking: true detections should score higher than false ones
+
+The score `conf * prob[c]` combines the detector's confidence (class-agnostic) with the classifier's probability. The issue is:
+- For a true defect with correct class: conf is high, prob[c] is high → high score ✓
+- For a true defect with wrong class: conf is high, prob[wrong] is low → low score ✓ (but the box is still detected, just wrong class)
+- For a false alarm: conf varies, prob for any class might be moderate → could be high or low
+
+The problem with false alarms: if the classifier gives a moderate probability to some class for a background crop, and the detector confidence is high, the score could be high. This hurts the ranking.
+
+One idea: use `conf * (prob[c] - 0.25)` where 0.25 is the uniform prior (1/4 classes). This would make background crops (where prob is roughly uniform) have near-zero scores. But this might be too aggressive.
+
+Another idea: use the max probability as a "defect confidence" and multiply by conf: `score = conf * prob[c] * max_prob`. This would suppress all predictions for background crops where max_prob is low.
+
+Wait, actually the issue is more subtle. For a background crop, the classifier might still give prob = [0.3, 0.25, 0.25, 0.2] (not perfectly uniform). The max_prob would be 0.3, which isn't that low. So multiplying by max_prob wouldn't suppress it much.
+
+What about using the detector confidence more aggressively? The detector confidence is a measure of "how much this looks like a defect." If we use `conf^2 * prob[c]` or `conf^3 * prob[c]`, we'd suppress low-confidence detections more. But the detector confidence distribution might not be well-calibrated.
+
+Let me think about what's most likely to give a meaningful improvement:
+
+**Ensemble** is probably the most reliable improvement. Training two models with different architectures or different augmentations and averaging their probabilities is a well-known technique. The time budget is tight but we can make it work.
+
+Let me think about the ensemble approach:
+- Train Model A (EfficientNet-B0) for ~60s
+- Train Model B (ResNet18 or another model) for ~60s
+- Average their probabilities
+- Score = conf * (pA[c] + pB[c]) / 2
+
+This should give a modest improvement of 0.005-0.015 mAP.
+
+Actually, wait. Let me reconsider. The current training does ~2 epochs in 125s. If we split the time for two models, each gets ~60s, which is about 1 epoch. A model trained for only 1 epoch might be significantly worse than one trained for 2 epochs. The ensemble gain might not offset the per-model quality loss.
+
+Alternative: Train two models with the same architecture but different data augmentation (e.g., one with stronger augmentation, one with weaker). Or train one model for 1.5 epochs and another for 0.5 epochs (using a different subset of data).
+
+Actually, a simpler approach: train two models with the same architecture but different random seeds (the harness already uses different seeds, but within a single run we could train two models with different internal seeds). The key is that they see different augmentation patterns.
+
+Hmm, but the time budget is really tight. Let me think about other approaches.
+
+**What about increasing the image size?** Currently 160. The images are high-res weld bead images. The defects (pores, stains) might be small features that benefit from higher resolution. Let me try 192 or 224.
+
+At 160, the model sees the crop at 160×160. At 224, it sees more detail but each forward pass is slower. EfficientNet-B0 at 224 vs 160: the spatial dimensions are 224/160 = 1.4×, so the compute is about 1.4² = 1.96× per sample. This would reduce the number of epochs from ~2 to ~1. That's a tradeoff.
+
+Actually, let me look at this differently. The model is trained on crops that are 2.5× the box size. If the box is, say, 50×50 pixels, the crop is 125×125, which is then resized to 160×160. So the model is actually seeing an upscaled version of the crop. If we use 224, we're upscaling even more, which doesn't add information. If the crop is 200×200, resizing to 160 loses some detail, but resizing to 224 preserves more.
+
+Hmm, this is getting complicated. Let me think about what's most likely to help.
+
+**What about the context size?** Currently 2.5×. What about 3× or 4×? A larger context gives the model more surrounding information, which might help distinguish stain from deposit (stain is often confused with deposit and background). But a larger context also means the defect is a smaller fraction of the image, making it harder to detect.
+
+**What about training with a longer schedule?** The current schedule is 5% warmup + cosine decay. What about a different schedule?
+
+Let me focus on what I think is most likely to help:
+
+1. **Ensemble of two models** - reliable but time-constrained
+2. **Different architecture** - we've tried B0 and B2, what about convnext or regnety?
+3. **Scoring changes** - low risk, might help with ranking
+4. **Larger context** - might help with stain/deposit confusion
+
+Actually, let me reconsider the scoring. The current score is `conf * prob[c]`. The detector confidence `conf` is class-agnostic. For a true defect, conf is typically high (the detector found it). For a false alarm, conf can be anything.
+
+The key insight: mAP@0.5 is computed per class. For each class, we rank all predictions by score and compute AP. A prediction is a TP if it matches a GT box of that class with IoU≥0.5.
+
+The problem with false alarms: if a false alarm gets a high score for class c, it hurts the AP for class c (it's a FP that ranks high). The current scoring `conf * prob[c]` gives false alarms a score proportional to conf * prob[c]. If the classifier gives a moderate probability to some class for a background crop, and the detector confidence is high, the score could be high.
+
+One approach: use the classifier's max probability as a "defect confidence" and require it to be above a threshold. But this is essentially what the background class approach tried (and failed).
+
+Another approach: use `conf * prob[c] * (prob[c] / max_prob)`. This would give a boost to the top class and suppress others. But this is similar to prob² which was rejected.
+
+What about `conf * prob[c] * max_prob`? For a true defect with correct class, prob[c] is high and max_prob is high → high score. For a false alarm, max_prob is moderate → moderate score. This might help.
+
+Actually, I think the most impactful thing to try is an **ensemble**. Let me think about how to fit it in the time budget.
+
+Current: 17s loading + 125s training + 17s prediction ≈ 159s (within 180s)
+With ensemble: 17s loading + 60s train A + 60s train B + 17s prediction ≈ 154s
+
+Each model would get ~60s of training, which is about 1 epoch. The current model does 2 epochs in 125s, so 1 epoch takes about 62s. So each model in the ensemble would get about 1 epoch.
+
+A model trained for 1 epoch vs 2 epochs: the loss goes from 0.5353 (epoch 0) to 0.2784 (epoch 1). So 1 epoch gives a model with loss ~0.5, 2 epochs gives loss ~0.28. The 1-epoch model is worse but not terrible.
+
+The ensemble of two 1-epoch models might be comparable to one 2-epoch model, or slightly better. The diversity of the ensemble (different augmentation patterns) could help.
+
+But I'm not confident this will beat the current best. Let me think of something else.
+
+**What about using a different backbone that's faster?** convnext_pico has 1.8M params vs EfficientNet-B0's 4M. It would train about 2× faster, allowing ~4 epochs instead of 2. More training might help more than the capacity difference.
+
+Actually, let me look at the per-step cost. The current model does 411 steps in 87s for epoch 0, so about 0.21s per step. With batch size 64, that's 0.21/64 = 0.0033s per sample. For convnext_pico, the per-sample cost would be roughly half, so 0.0016s per sample, and 411 steps would take about 44s. So we could do about 4 epochs in 125s.
+
+But convnext_pico is a much smaller model. Would 4 epochs of a small model beat 2 epochs of a larger model? It's hard to say. The small model might not have enough capacity to learn the fine-grained distinctions.
+
+Let me think about **tf_efficientnetv2_b0**. It has 5.8M params (vs B0's 4M). It's a V2 variant with different architecture. It might be slightly slower per step but have better accuracy. The time cost would be about 1.4× per step, so we'd get about 1.4 epochs instead of 2. That's a tradeoff.
+
+Actually, I think the most promising direction is to try a **different scoring function**. The current `conf * prob[c]` is a simple product. Let me think about what would improve the ranking.
+
+The mAP@0.5 per class rewards:
+1. Correct class on true detections
+2. True detections ranked above false detections
+
+For (1), the classifier probability is what matters. For (2), the score should be high for true detections and low for false ones.
+
+The detector confidence `conf` is a measure of "how defect-like this box is." It's class-agnostic. For true defects, conf is typically high. For false alarms, conf can be anything (the detector made a mistake).
+
+The classifier probability `prob[c]` is a measure of "how likely this crop is class c." For true defects of class c, prob[c] is high. For false alarms, prob[c] is moderate (the classifier doesn't know it's background).
+
+The product `conf * prob[c]` combines these. The issue is that for false alarms with high conf and moderate prob[c], the score can be high, hurting the ranking.
+
+One idea: use `conf * prob[c] * (1 - prob_bg)` where prob_bg is the probability of "background." But we don't have a background class.
+
+Another idea: use the classifier's uncertainty. For a true defect, the classifier is confident (high max_prob). For a false alarm, the classifier is less confident (lower max_prob, more uniform distribution). So we could use `conf * prob[c] * max_prob` or `conf * prob[c] * (max_prob - 0.25) / 0.75`.
+
+Let me try `conf * prob[c] * max_prob`. This would:
+- Boost true detections (high conf, high prob[c], high max_prob)
+- Suppress false alarms (moderate conf, moderate prob[c], low max_prob)
+
+The effect is similar to `conf * prob[c]²` for the top class, but different for other classes. For non-top classes, `prob[c] * max_prob` is smaller than `prob[c]²` (since max_prob > prob[c] for non-top classes... wait, no. max_prob is the max over all classes, so for the top class, prob[c] = max_prob, and prob[c] * max_prob = prob[c]². For non-top classes, prob[c] < max_prob, so prob[c] * max_prob > prob[c]². So this actually boosts non-top classes relative to prob².)
+
+Hmm, that's not quite what I want. Let me think again.
+
+Actually, for the purpose of ranking within a class, what matters is the relative scores of predictions for that class. If I have two predictions for class c: one is a true detection (score s1) and one is a false alarm (score s2). I want s1 > s2.
+
+For the true detection: conf is high, prob[c] is high.
+For the false alarm: conf is moderate, prob[c] is moderate.
+
+The ratio s1/s2 = (conf1 * prob1[c]) / (conf2 * prob2[c]).
+
+If I multiply by max_prob: s1' = conf1 * prob1[c] * max_prob1, s2' = conf2 * prob2[c] * max_prob2.
+
+For the true detection, max_prob1 is high (the classifier is confident). For the false alarm, max_prob2 is lower (the classifier is less confident). So the ratio s1'/s2' = (conf1 * prob1[c] * max_prob1) / (conf2 * prob2[c] * max_prob2) > s1/s2. This helps!
+
+So `conf * prob[c] * max_prob` should improve the ranking. Let me try this.
+
+Wait, but I need to be careful. The max_prob is the same for all classes of a given box. So for a single box, the scores for the 4 classes are:
+- score[c] = conf * prob[c] * max_prob
+
+Since max_prob is the same for all c, this is equivalent to `conf * max_prob * prob[c]`, which is just a scaling of the original score by `max_prob`. The relative ranking within a box is the same as before. But the absolute scores change: boxes with high max_prob (confident predictions) get boosted, boxes with low max_prob (uncertain predictions) get suppressed.
+
+This should help with the ranking across boxes: true detections (high max_prob) get higher scores than false alarms (low max_prob).
+
+Let me try this. It's a simple change to the scoring.
+
+Actually, let me think about this more carefully. The current score is `conf * prob[c]`. The new score would be `conf * prob[c] * max_prob`. Since `max_prob = max(prob)`, this is equivalent to `conf * prob[c] * max(prob)`.
+
+For a box where the classifier is confident (max_prob = 0.8), the scores are boosted by 0.8×.
+For a box where the classifier is uncertain (max_prob = 0.3), the scores are suppressed by 0.3×.
+
+This should help separate true detections from false alarms, since true detections tend to have higher max_prob.
+
+Let me implement this. The change is in the prediction loop:
+
+```python
+for d, p in zip(ev, probs):
+    max_p = float(np.max(p))
+    for c in range(4):
+        s = d["conf"] * float(p[c]) * max_p
+        if s > MIN_SCORE:
+            w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+
+This is a minimal change. Let me go with this.
+
+Wait, actually I realize I should think about whether this is really different from what we've tried. e004 tried `conf * prob²` which was rejected. `conf * prob[c] * max_prob` is different from `conf * prob[c]²` because for non-top classes, `prob[c] * max_prob > prob[c]²`. So it's not the same.
+
+But the key question is: does multiplying by max_prob help the ranking? I believe it does, because it amplifies the difference between confident and uncertain predictions.
+
+Let me go with this. It's a low-risk change that directly addresses the ranking component of mAP.
+
+Actually, let me reconsider. The per-class AP is what matters. For a specific class c, the AP is computed by ranking all predictions for class c by score. A prediction is TP if it matches a GT box of class c with IoU≥0.5.
+
+The score for class c is `conf * prob[c] * max_prob`. The max_prob is the same for all classes of a box, so it acts as a per-box multiplier. This means:
+- Boxes where the classifier is confident (regardless of which class) get boosted
+- Boxes where the classifier is uncertain get suppressed
+
+For class c specifically, a true detection of class c would have high prob[c] and high max_prob (since prob[c] is the max or close to it). A false alarm would have moderate prob[c] and lower max_prob. So the ratio of true to false scores increases. Good.
+
+But what about a true detection of class c where the classifier predicts class d instead? Then prob[c] is low, max_prob is high (for class d). The score for class c is low, which is correct (it's a wrong-class prediction). The score for class d is high, which is also correct (the classifier thinks it's class d).
+
+I think this is a good change. Let me go with it.
+
+Hmm, but actually I want to think about whether there's a better scoring function. What about `conf * (prob[c] - 0.25) * 4`? This subtracts the uniform prior (0.25 = 1/4) and scales by 4 to keep the range [0, 1]. For a confident prediction (prob[c] = 0.8), the score is conf * 0.55 * 4 = conf * 2.2. For an uncertain prediction (prob[c] = 0.3), the score is conf * 0.05 * 4 = conf * 0.2. This is a stronger suppression of uncertain predictions.
+
+But this could be too aggressive. If prob[c] < 0.25, the score would be negative, which we'd clip to 0. This might remove too many predictions.
+
+I think `conf * prob[c] * max_prob` is a safer choice. Let me go with that.
+
+Let me write the code change:
+
+In the prediction loop, change:
+```python
+for d, p in zip(ev, probs):
+    for c in range(4):
+        s = d["conf"] * float(p[c])
+        if s > MIN_SCORE:
+            w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+
+to:
+```python
+for d, p in zip(ev, probs):
+    max_p = float(np.max(p))
+    for c in range(4):
+        s = d["conf"] * float(p[c]) * max_p
+        if s > MIN_SCORE:
+            w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+
+This is a clean, minimal change. Let me finalize this.
+
+Category: scoring
+Hypothesis: Multiplying the score by the classifier's max probability (max over 4 classes) will improve mAP by amplifying the score difference between confident true detections and uncertain false alarms, improving the ranking component of mAP@0.5.
+
+Let me double-check the SEARCH text matches exactly. Looking at the current file:
+
+```python
+    for d, p in zip(ev, probs):
+        for c in range(4):
+            s = d["conf"] * float(p[c])
+            if s > MIN_SCORE:
+                w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+
+Yes, that's the exact text. Let me write the response.
+===== attempt 2 =====
+The user is saying that my SEARCH text wasn't found. Let me look at the current best train.py more carefully to find the exact lines.
+
+Looking at the current best train.py:
+
+```python
+    for d, p in zip(ev, probs):
+        for c in range(4):
+            s = d["conf"] * float(p[c])
+            if s > MIN_SCORE:
+                w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+
+Wait, let me re-read the file. The indentation might be different. Let me look at the exact code:
+
+```python
+    os.makedirs(args.out, exist_ok=True)
+    n = 0
+    with open(os.path.join(args.out, "preds.csv"), "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["det_id", "cls", "score"])
+        for d, p in zip(ev, probs):
+            for c in range(4):
+                s = d["conf"] * float(p[c])
+                if s > MIN_SCORE:
+                    w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+
+I see - the indentation is 8 spaces for `for d, p`, 12 spaces for `for c in range(4)`, 16 spaces for `s = ...`, etc. My SEARCH had 4 spaces for `for d, p` which is wrong. Let me fix the indentation.
+
+The correct lines are:
+```
+        for d, p in zip(ev, probs):
+            for c in range(4):
+                s = d["conf"] * float(p[c])
+                if s > MIN_SCORE:
+                    w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+
+Let me use the correct indentation (8 spaces for the outer for loop, 12 for inner, 16 for the body).

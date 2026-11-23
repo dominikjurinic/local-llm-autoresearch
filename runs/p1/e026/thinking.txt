@@ -1,0 +1,174 @@
+===== attempt 1 =====
+Let me carefully analyze the situation.
+
+## Current state
+- Current best: e009, 5-seed average 0.6359
+- Architecture: MultiScaleClassifier with 4-scale crop pyramid (1.25, 1.75, 2.5, 3.5) on EfficientNet-B0 at 160px, per-scale 1x1 projection, concat, MLP head
+- Per-class AP: pore 0.531, deposit 0.625, discontinuity 0.778, stain 0.610
+- Main errors: pore→stain (19 out of 76), deposit→stain (55 out of 269)
+- If all boxes had correct classes but kept the same scores: 0.7366 vs current 0.6359 → class confusion costs ~0.10
+
+## What the lead has decided
+The lead has already decided on the next experiment:
+- BASE: best (e009)
+- CATEGORY: architecture
+- HYPOTHESIS: Add a second high-resolution branch (ResNet-26d or ResNet-34) that reads the tight crop at 320px, combined with the existing 4-scale pyramid branch.
+
+Wait, but I need to think about whether this is a good idea and whether it fits in the time budget. Let me do the time calculation.
+
+## Time calculation
+
+Current run:
+- Image load: 13s
+- Training: 157 steps in ~82s (from 13s to 95s) → ~0.52s/step
+- Prediction: 41879 boxes, 55620 rows, total 168s. Prediction time ≈ 168 - 95 = 73s. This includes DataLoader overhead for 4 crops per box at 160px.
+
+RESERVE_S = 85s. Training ends at deadline - 85 = 180 - 85 = 95s. Indeed the log shows training ended at 95s.
+
+Now, if I add a second branch:
+- Training: Each step now needs:
+  - Main branch: 4 crops at 160px through EfficientNet-B0
+  - Second branch: 1 crop at 320px through ResNet-26d/34
+  
+  EfficientNet-B0 at 160px: forward+backward. Let me estimate. 157 steps in 82s with 4 crops at 160px = 0.52s/step. This is 4 crops through one backbone. So per-crop cost ≈ 0.13s/step (batch 64).
+  
+  ResNet-26d at 320px: ResNet-26d is a small model (0.02 GFLOPs? no wait). Let me think. ResNet-26d has 4.7M parameters, 0.14 GFLOPs at 224px. At 320px it's (320/224)^2 = 2.04x → ~0.29 GFLOPs forward. With batch 64, that's ~18.5 GFLOP forward. On a typical GPU (say 10-30 TFLOPS for bf16), forward is ~1-2ms... wait no, 18.5 GFLOP / 20 TFLOPS = ~0.9ms. Plus backward ~2x. So ~3ms per batch of 64 → 0.003s/step. That's negligible compared to the 0.52s/step.
+
+  Actually wait, let me reconsider. The training step includes data loading too. With 8 workers and persistent workers, data loading might be a factor. But the crop generation is CPU-side: 4 crops per box, each involving PIL resize to 160px. That's probably the bottleneck.
+
+  Adding 1 more crop at 320px: PIL resize to 320px is ~4x the pixels of 160px, so ~4x the resize time. If 4 crops at 160px take, say, 0.2s of CPU time per batch (spread over 8 workers), then 1 crop at 320px adds ~0.2s of CPU time. But with 8 workers this is pipelined.
+
+  Actually, the key question is: does the training step time increase significantly? If data loading is the bottleneck (CPU crop generation), adding a 5th view (320px) could slow things down. But the GPU compute for the extra branch is small.
+
+  Let me estimate: current step time 0.52s. If I add 1 more crop at 320px, the CPU crop time increases by ~4x one 160px crop. If 4×160px crops take T_cpu per batch, then adding 1×320px adds ~T_cpu (since 320px ≈ 4×160px in pixels). So total CPU time per batch becomes ~5×(T_cpu/4) = 1.25×T_cpu. If CPU was the bottleneck at 0.52s, new step time ≈ 0.65s. That's a 25% reduction in steps: 157 → ~126 steps.
+
+  Hmm, that's a significant reduction in training steps. But the second branch is a new ResNet that needs to train from scratch (well, pretrained, but the classification head is new). With fewer steps, it might be undertrained.
+
+  Actually, wait. Let me reconsider. The second branch only needs the tight crop at 320px. But I could also consider: instead of a separate branch with a separate backbone, just increase the resolution of the existing tight crop? No, the lead specifically wants a second high-res branch with a separate backbone.
+
+  Actually, let me reconsider the whole approach. The lead's plan is:
+  1) Keep e009's 4-scale pyramid for the main branch.
+  2) Add a second branch: ResNet-26d/34 reading only the tight crop at 320px.
+  3) Combine logits.
+  4) Check prediction time fits in ~85s reserve.
+  5) Train end-to-end.
+
+Let me think about prediction time. Currently prediction is 73s for 41879 boxes with 4 crops at 160px. That's ~1.74ms/box for 4 crops → ~0.44ms/crop. Adding 1 crop at 320px through ResNet-26d: the crop generation (PIL resize to 320) is ~4x the 160px cost, and the ResNet forward at 320px is small. So per box, add ~0.44ms (crop) + ~0.5ms (ResNet fwd) ≈ ~1ms/box. For 41879 boxes that's ~42s. So total prediction ≈ 73 + 42 = 115s. But the reserve is only 85s!
+
+Wait, that's a problem. The prediction time would exceed the reserve. Let me recompute.
+
+Actually, the reserve is meant to be enough for prediction + writing. Currently prediction takes 73s with reserve 85s, so there's 12s slack. If I add a second branch and prediction becomes 115s, that exceeds the 85s reserve. But the reserve is just a target — the actual constraint is the total time budget of 180s.
+
+Let me recompute the total. Training ends at deadline - RESERVE_S = 180 - 85 = 95s. Then prediction needs to finish before 180s. So prediction has 180 - 95 = 85s. If prediction now takes 115s, the run would be killed at 180s (timeout).
+
+So I need to either:
+- Reduce RESERVE_S so training ends earlier, giving more time for prediction. But training is already limited.
+- Make the second branch cheaper.
+- Reduce the number of crops or resolution.
+
+Hmm. Let me reconsider. Actually, the issue is that adding a 320px crop is expensive on the CPU (PIL resize) side, which is the bottleneck for prediction.
+
+Let me reconsider the approach. Maybe instead of 320px, use a smaller resolution like 224px for the high-res branch. Or maybe the high-res branch should reuse one of the existing crops but at higher resolution.
+
+Actually, wait. Let me reconsider what "high-res" means here. The point is to give the model more texture detail. The tight crop is currently 1.25x the box, rendered at 160px. If I render the same tight crop at 320px, I get 2x the linear resolution, i.e., 4x the detail. That's the idea.
+
+But the cost is significant. Let me think about whether there's a cheaper way to get the same benefit.
+
+Alternative: What if I increase IMG_SIZE from 160 to 224 for ALL crops? That would be 1.96x the pixels per crop. But the lead said prior resolution attempts (single low-res stream) didn't work. Actually, the "Resolution and small-box handling" family (224px, etc.) had no gain. So just bumping resolution of the existing stream didn't help. The lead's insight is that a SEPARATE high-res branch with a different backbone might help, because... hmm, actually I'm not sure why a separate branch would be better than just higher res on the existing one.
+
+Wait, let me re-read the lead's hypothesis: "a texture-resolution limit of EfficientNet-B0 at 160px, not model capacity in general. Give the classifier a second high-resolution branch (ResNet-26d or ResNet-34, ~3x faster than ResNet-50) so per-box forward pass time stays within budget while the tight crop runs at 320px on it; this directly targets the weak classes where every prior resolution attempt used a single low-res stream."
+
+So the lead's reasoning is that prior resolution attempts changed the single stream's resolution (which had a cost in steps or didn't help), but a separate high-res branch keeps the main stream fast (preserving steps) while adding a high-res stream. The idea is that the high-res branch can focus on texture (pore/deposit) while the main branch handles the multi-scale context.
+
+OK here's my concern: the time budget. Let me be very careful.
+
+Let me reconsider. The real bottleneck. Let me look at the numbers again:
+- 157 steps in 82s = 0.52s/step
+- 41879 boxes in 73s = 1.74ms/box (4 crops 160px)
+
+For prediction, batch size 256. So 41879/256 = 164 batches. 73s/164 = 0.44s/batch. Per box 1.74ms.
+
+The prediction is dominated by... let me think. 4 crops at 160px through EfficientNet-B0. EfficientNet-B0 at 160px forward is ~0.02 GFLOP. Batch 256 → 5.1 GFLOP forward. At ~20 TFLOPS that's 0.26ms. Plus CPU crop generation: 4 crops × PIL resize. PIL resize to 160px from a variable-size canvas... the canvas is s×s where s is up to the box size × scale. For a large box, s could be large, then resized down to 160. For small boxes, s is small (MIN_CROP=16), resized up to 160.
+
+Actually the CPU crop generation is probably the bottleneck, especially since it's single-threaded per worker but 8 workers. Hmm.
+
+Let me just estimate: if I add 1 crop at 320px, the CPU cost is ~4x one 160px crop (since 320px = 4x pixels). If one 160px crop takes ~0.4ms (1.74ms/4), then 320px crop takes ~1.6ms. Plus ResNet-26d forward at 320px ~0.5ms. So per box add ~2ms. For 41879 boxes, that's ~84s. Total prediction ~73 + 84 = 157s. That's way over the 85s reserve.
+
+This is a serious problem. The plan as written will likely time out.
+
+So I need to make a fix. The lead said: "If a detail of the plan cannot work as written (time budget, tensor shapes, missing names), make the smallest fix that keeps the idea and say so at the end of the HYPOTHESIS."
+
+So I need to make the time budget work. Options:
+1. Use a smaller resolution for the high-res branch, e.g., 224px instead of 320px. 224px = 1.96x pixels of 160px, so ~2x the cost of one 160px crop. Per box add ~0.8ms (crop) + 0.3ms (ResNet) ≈ 1.1ms. For 41879 boxes ~46s. Total prediction ~73+46 = 119s. Still over 85s.
+
+Hmm, still over.
+
+2. Reduce the number of main-branch crops. But that changes the main architecture.
+
+3. Reduce RESERVE_S and accept fewer training steps, but the total is still capped at 180s. The problem is total prediction time.
+
+Wait, I think I'm overcomplicating. Let me reconsider. The total budget is 180s. Load 13s. So I have 167s for train + predict + write. Currently: train 82s, predict 73s, write ~2s = 157s, total 168s (with 13s load = 181s... wait that's over 180? Let me recheck).
+
+Log: "train 6052 boxes, eval 41879 detections, 1022 images (13s)" — so after 13s, loading done. "epoch 0: ... 72s" — 72s total. "epoch 1: ... 95s" — 95s total. "done: 2 epochs, 157 steps, 55620 prediction rows, 168s total". So total 168s. That's within 180s. Reserve 85s means training ends at 95s, and 168-95 = 73s for prediction+write. OK.
+
+So currently I'm using 168s of 180s. I have 12s of slack.
+
+If I add a second branch and prediction becomes, say, 119s, then total = 95 (train, but train might be shorter) + 119 = 214s. Way over.
+
+So I MUST reduce something. The key realization: adding a 5th view (even at 160px) costs ~0.4ms/box in prediction and ~0.13s/step in training. Adding it at 320px costs ~2ms/box in prediction.
+
+Let me think differently. What if the high-res branch reuses the SAME tight crop but the dataset generates it once at high res and downsamples for the low-res main branch? No, that doesn't save much.
+
+Actually, here's a cleaner idea: What if I make the high-res branch the ONLY thing that changes, and I make it cheap by using a lower resolution like 192 or 224, AND I reduce the main branch to be cheaper? No, the lead wants to keep the main branch.
+
+Let me reconsider. Maybe the real issue is that I'm overestimating the CPU cost. Let me reconsider whether prediction is CPU or GPU bound.
+
+Actually, you know what, I don't have visibility into the actual GPU. Let me think about what's reasonable. The safest approach is to:
+1. Make the high-res branch cheap (lower resolution, small backbone).
+2. Reduce RESERVE_S to give more room, but that reduces training.
+3. Actually, the cleanest fix: reduce the high-res resolution to something modest and verify with a timing probe.
+
+But the lead specifically wants 320px. Hmm.
+
+Wait, let me reconsider the whole thing. Maybe I'm wrong about the bottleneck. Let me reconsider: maybe the prediction is GPU-bound, not CPU-bound. If GPU-bound, then adding a ResNet-26d at 320px (0.29 GFLOP forward) to the EfficientNet-B0 4×160px (4×0.02 = 0.08 GFLOP) — the ResNet at 320px would actually be 3.6x the FLOPs of the entire main branch! So it would be the dominant GPU cost.
+
+ResNet-26d at 320px: 0.14 GFLOP at 224px × (320/224)^2 = 0.14 × 2.04 = 0.286 GFLOP. Main branch: EfficientNet-B0 at 160px is ~0.02 GFLOP × 4 = 0.08 GFLOP. So the high-res branch is 3.6x the FLOPs of the main branch. That's a lot.
+
+So per box, if main branch is 1.74ms (4 crops), the high-res branch (3.6x FLOPs) would be ~6ms. Total ~7.7ms/box. For 41879 boxes = 322s. Way over budget.
+
+This confirms: 320px ResNet is too expensive. The plan as written will time out.
+
+So I need a fix. The smallest fix that keeps the idea (a separate high-res branch with a different backbone) while fitting the budget:
+- Use a much lower resolution for the high-res branch, OR
+- Use a smaller backbone, OR
+- Apply the high-res branch to fewer boxes.
+
+Hmm, but even at 224px with ResNet-26d: 0.14 GFLOP. Main branch 0.08 GFLOP. So high-res is 1.75x main. Per box ~1.74 + 1.74×1.75 = 4.8ms. For 41879 = 201s. Still over.
+
+At 160px with ResNet-26d: 0.14×(160/224)^2 = 0.07 GFLOP. Similar to main branch. Per box ~1.74 + 1.74×0.875 = 3.3ms. For 41879 = 137s. Still over the 85s reserve, but total = 95 + 137 = 232s. Over.
+
+Hmm. Even adding a single extra branch at 160px with a comparable backbone adds ~1.7ms/box = ~70s of prediction. That's too much.
+
+Wait, this suggests that ANY second branch that runs on all 41879 boxes at a reasonable resolution will blow the budget. Unless... the second branch is very cheap.
+
+Let me reconsider. What's the cheapest meaningful high-res branch?
+- A very small backbone at a modest resolution.
+- Or, apply it only to a subset of boxes (e.g., only boxes where the main branch is uncertain, or only boxes of certain sizes).
+
+Actually, here's a thought: what if the high-res branch is applied only at inference to a subset? No, that's complicated.
+
+Alternatively, what if I reduce the main branch cost to make room? E.g., drop one scale from the pyramid (3 scales instead of 4) to free up ~0.4ms/box in prediction and ~0.13s/step in training, then add the high-res branch. But the lead wants to keep the 4-scale pyramid.
+
+Hmm, let me step back and reconsider the lead's plan and whether I should push back or make a minimal fix.
+
+The instruction says: "Implement exactly this experiment in the current train.py, nothing more... If a detail of the plan cannot work as written (time budget, tensor shapes, missing names), make the smallest fix that keeps the idea and say so at the end of the HYPOTHESIS."
+
+So the time budget is a detail that cannot work as written (320px ResNet on all boxes will time out). I need to make the smallest fix that keeps the idea (a separate high-res branch with a different backbone, targeting texture) while fitting the budget.
+
+The smallest fix: reduce the high-res resolution from 320px to something that fits. But I showed even 160px adds ~70s. So resolution alone isn't enough if the backbone runs on all boxes.
+
+Wait, let me recompute more carefully. I think I'm overestimating. Let me reconsider the per-box cost.
+
+Actually, the prediction batch size is 256. Let me reconsider: 73s for 41879 boxes with 4 crops at 160px through EfficientNet-B0. Let me compute the FLOPs: 41879 boxes × 4 crops × 0.02 GFLOP = 3350 GFLOP forward. At 73s, that's 46 TFLOPS. That's a very fast GPU (A100/H100 class). OK so the GPU is fast.
+
+Now, if the GPUThinking budget reached. Stop thinking now and write the reply in the required format.

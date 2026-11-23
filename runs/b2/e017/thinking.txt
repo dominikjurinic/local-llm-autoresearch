@@ -1,0 +1,752 @@
+===== attempt 1 =====
+Let me carefully analyze the situation.
+
+## Current state
+- Best: e000, 5-seed mean 0.6288
+- 16 experiments, none confirmed better
+- Per-class AP: pore 0.496, deposit 0.629, discontinuity 0.780, stain 0.609
+- Ceiling: 0.758 (perfect classes on stage-1 boxes)
+- Class-agnostic: 0.755
+
+## Error analysis
+Gap to ceiling: 0.758 - 0.6288 = 0.129. This gap is class misassignment.
+
+Per-class AP gaps vs ceiling... the ceiling is 0.758 overall. Let me think about what the per-class ceiling would be. Actually I don't have per-class ceiling numbers. But the class-agnostic is 0.755, so boxes are fine.
+
+The classifier macro-F1 is ~0.87. That's decent but not great. Pore and stain are weak.
+
+## What's been tried (grouped)
+1. **Data changes**: low-res boxes (e001, rejected), higher res 224 (e003, rejected), train on detector boxes to fix mismatch (e004, rejected), change inputs (e009, rejected), background class (e015 crashed, e016 bug)
+2. **Architecture**: bigger backbone (e002, rejected), ensemble (e012 timeout, e013 rejected)
+3. **Scoring**: re-weight conf*p (e005 rejected), emit all classes (e006 rejected), soft re-scoring (e011 not confirmed)
+4. **Inference**: TTA (e007 rejected)
+5. **Augmentation**: mixup (e008 rejected)
+6. **Optimisation**: train longer (e010 bug)
+7. **Sampling**: class reweighting (e014 rejected)
+
+So essentially almost everything has been tried and failed. The macro-F1 of 0.87 seems to be a hard ceiling for this two-crop classifier.
+
+Wait, let me reconsider. What has NOT been tried?
+
+Let me think about the fundamental problem. The two-stage system:
+- Stage 1 gives boxes with conf
+- Stage 2 classifies each box
+
+The key insight from the reference numbers:
+- one-step 4-class: 0.638
+- stage-1 + perfect classes: 0.758
+- stage-1 class-agnostic: 0.755
+
+So the stage-1 boxes are EXCELLENT (0.755 class-agnostic). The problem is purely classification.
+
+The classifier gets macro-F1 0.87. But mAP is 0.6288. Why is mAP so much lower than F1?
+
+Key insight: mAP depends on RANKING. Even if the classifier is 87% accurate, the RANKING of predictions within each class matters. A misclassified box that gets a high score in the wrong class will pollute that class's ranking.
+
+Let me think about the scoring more carefully. Currently: score = conf * p_c, and we emit ALL 4 classes per box.
+
+Wait, e006 tried "emit all classes" and got 0.5994. But the current best e000 ALSO emits all 4 classes per box! Let me re-read.
+
+e000: "each eval box becomes one prediction per class with score = detector conf x class probability." So e000 emits all 4 classes.
+
+e006: "Every box is emitted in all 4 classes, so a box the cl..." — this was a scoring change on top of e000. Got 0.5994.
+
+So the current best already emits all 4 classes per box.
+
+Hmm. Let me reconsider. The problem is the ranking.
+
+Let me think about what happens with the "emit all 4 classes" approach:
+- For a true pore box that the classifier correctly calls pore (p_pore=0.8), we emit:
+  - pore: conf * 0.8 (correct, high)
+  - deposit: conf * 0.1
+  - discontinuity: conf * 0.05
+  - stain: conf * 0.05
+- The pore prediction is a hit.
+- The other 3 are false positives in their respective classes.
+
+For mAP, within the pore class, we have many predictions. The true pore boxes should rank high. But there are also:
+- Misclassified deposit boxes that got high p_pore (false positives in pore class)
+- False alarms that got high p_pore
+
+The issue: a true deposit box with p_pore = 0.3 (misclassified) will score conf*0.3 in the pore class. If conf is high, this could rank above true pore boxes with lower conf.
+
+So the "emit all classes" approach creates a lot of cross-class false positives that pollute rankings.
+
+Alternative: emit only the top-1 class per box. Then:
+- A true pore box correctly classified → pore: conf * p_pore (or just conf)
+- A true deposit box misclassified as pore → pore: conf * p_pore (false positive in pore)
+- A true deposit box correctly classified → deposit: conf * p_deposit
+
+With top-1 only, each box contributes exactly one prediction. This is cleaner.
+
+Wait, but has top-1 been tried? Let me check the history... I don't see an explicit "top-1 only" experiment. e006 was about emitting all classes but with a scoring change. Let me re-read e006.
+
+e006 hypothesis: "The class-agnostic ceiling (0.755) is nearly equal to the perfect-class ceiling (0.758), so the ~0.13 gap to our 0.6288 is class-confusion damage, not box detection. Every box is emitted in all 4 classes, so a box the cl..."
+
+So e006 was trying to fix the "emit all classes" issue. It got 0.5994, rejected. But I don't know exactly what it did. It might have been top-1 or it might have been something else.
+
+Actually, the hypothesis is cut off. Let me think about what a good scoring change would be.
+
+Actually, let me reconsider the whole thing. Let me think about the OPTIMAL scoring strategy.
+
+For mAP@0.5, per class:
+- Sort all predictions of that class by score
+- A prediction is a TP if it matches an unmatched GT box of that class with IoU>0.5
+- AP = average precision
+
+The key: we want true boxes of class c to rank high in class c, and false positives (wrong-class boxes, false alarms) to rank low in class c.
+
+Currently we emit all 4 classes per box with score = conf * p_c. 
+
+Consider a box that is truly a pore. The detector gives conf=0.9. The classifier gives p = [0.8, 0.1, 0.05, 0.05] (pore, deposit, disc, stain).
+Emissions:
+- pore: 0.72
+- deposit: 0.09
+- disc: 0.045
+- stain: 0.045
+
+The pore emission is a TP. Good. The other 3 are FPs in their classes.
+
+Now consider a false alarm (no GT). conf=0.5. Classifier p=[0.3, 0.3, 0.2, 0.2].
+Emissions:
+- pore: 0.15
+- deposit: 0.15
+- disc: 0.10
+- stain: 0.10
+
+These are all FPs. They pollute all 4 classes.
+
+The problem with emitting all classes: a false alarm with moderate conf pollutes ALL 4 classes. With 41879 eval boxes, and many being false alarms, that's a lot of FP pollution.
+
+Now, the class-agnostic score is 0.755. That means if we just used conf as the score for a single "defect" class, we'd get 0.755. So the boxes and confs are well-calibrated for detection.
+
+The question is: how do we split the single class into 4 classes while preserving the good ranking?
+
+Idea: The best approach might be to emit only the top-1 class per box, with score = conf (or conf * p_top1). This way:
+- Each box contributes exactly one prediction to one class.
+- A correctly classified box → TP in the right class.
+- A misclassified box → FP in the wrong class (but only ONE FP, not 4).
+- A false alarm → FP in one class (the top-1 predicted class).
+
+This reduces FP pollution from 4 per box to 1 per box.
+
+But wait, there's a subtlety. If we emit only top-1, then for a true pore box that's correctly classified, we get pore: conf*p_pore. But if p_pore is low (say 0.6), the score is 0.6*conf. Meanwhile a true pore box misclassified as deposit gets deposit: 0.7*conf. Hmm.
+
+Actually, let me reconsider. What score to use?
+
+Option A: top-1 class, score = conf. Then the ranking within each class is purely by detector conf. This is like the class-agnostic case but split by class. The issue: within the pore class, we have true pore boxes (correctly classified) ranked by conf, plus misclassified boxes (deposit/disc/stain boxes that the classifier called pore) ranked by conf, plus false alarms called pore ranked by conf. The misclassified boxes and false alarms are FPs in the pore class.
+
+Option B: top-1 class, score = conf * p_top1. Then the score incorporates classifier confidence. A true pore box with high p_pore ranks high. A misclassified box (true deposit called pore) has p_pore that's the top-1, so it also ranks by conf*p_pore.
+
+Hmm, the difference between A and B is subtle.
+
+Let me think about which is better. Actually, I think the cleanest is:
+
+For each box, emit the top-1 class c* = argmax p_c, with score = conf * p_{c*}.
+
+This way:
+- The score reflects both detection confidence and classification confidence.
+- Each box is assigned to exactly one class.
+- Within class c, the ranking is by conf * p_c (where p_c is the top-1 probability for boxes assigned to c).
+
+Wait, but this has a problem. Consider two true pore boxes:
+- Box 1: conf=0.9, p_pore=0.9 → score 0.81
+- Box 2: conf=0.9, p_pore=0.4 (borderline, but top-1) → score 0.36
+
+Box 1 ranks above Box 2. Good.
+
+Now a misclassified deposit box called pore:
+- Box 3: conf=0.9, p_pore=0.5 (top-1) → score 0.45
+
+Box 3 ranks between Box 1 and Box 2. But Box 3 is a FP in the pore class. So it demotes Box 2 (a true pore) in the ranking. That's bad.
+
+Hmm. So even top-1 has issues.
+
+Let me think differently. The real question is: what's the optimal way to assign boxes to classes and score them?
+
+Actually, I realize the fundamental issue. Let me reconsider whether emitting all 4 classes is really the problem, or whether it's the classifier accuracy.
+
+Let me estimate. If the classifier had macro-F1 0.87, that means ~87% of boxes are correctly classified (roughly). So ~13% are misclassified. Each misclassified box, when we emit all 4 classes, creates 3 FPs (in the wrong classes) plus 1 TP (in the right class, if we emit all). Wait no.
+
+Let me recount. If we emit all 4 classes per box:
+- A correctly classified true box: 1 TP (right class) + 3 FPs (wrong classes).
+- A misclassified true box: 1 FP (right class, since the box IS that class but we're emitting it... wait no).
+
+Hmm, let me be careful. A "true box" means the box overlaps a GT defect. The GT defect has a class. If the box overlaps a GT pore, then in the pore class, this box is a candidate TP (if IoU>0.5). In other classes, it's a FP.
+
+So for a box overlapping a GT pore:
+- In pore class: it's a TP candidate (if it's the best match).
+- In deposit/disc/stain: it's a FP.
+
+If we emit all 4 classes, we emit this box in all 4 classes. In the pore class it might be a TP; in the others it's a FP.
+
+The number of FPs per box is 3 (in the non-GT classes), regardless of classification correctness. The classification only affects the SCORES.
+
+So emitting all 4 classes means every box is a FP in 3 classes. That's a LOT of FPs. With 41879 boxes, that's ~125k FPs across all classes (minus the TPs).
+
+This is the core problem! Emitting all 4 classes per box floods each class with FPs.
+
+The fix: emit fewer classes per box. Ideally top-1 only.
+
+Let me reconsider. If we emit only top-1:
+- Each box is a FP in at most 1 class (if misclassified or false alarm), or a TP in 1 class (if correctly classified).
+- Actually, a box overlapping a GT pore, if top-1 = pore: TP in pore, no FP elsewhere.
+- A box overlapping a GT pore, if top-1 = deposit: FP in deposit, and it's NOT emitted in pore (so we miss the TP!).
+
+Wait, that's a problem. If a true pore box gets top-1 = deposit (misclassified), and we only emit top-1, then we emit it as deposit (FP in deposit) and we DON'T emit it as pore. So we miss the TP in pore. That's bad — we lose a TP.
+
+Whereas with emit-all, we'd emit it in pore (TP) AND deposit (FP). So emit-all captures the TP but adds 3 FPs.
+
+So there's a tradeoff:
+- Emit-all: capture all TPs, but 3 FPs per box.
+- Top-1: fewer FPs (1 per box), but miss TPs for misclassified boxes.
+
+Hmm. Which is better depends on the balance.
+
+Actually, let me reconsider. The number of boxes is 41879. How many are true (overlap GT) vs false alarms? The class-agnostic mAP is 0.755, which means most boxes are TPs (high precision at the detection level). Let's say ~70-80% are TPs. So ~30-40% are false alarms.
+
+For emit-all:
+- TPs: ~30k boxes, each gives 1 TP + 3 FPs = 30k TPs + 90k FPs.
+- FAs: ~12k boxes, each gives 4 FPs = 48k FPs.
+- Total: 30k TPs, 138k FPs.
+
+For top-1:
+- Correctly classified TPs: ~0.87 * 30k = 26k, each gives 1 TP = 26k TPs, 0 FPs.
+- Misclassified TPs: ~0.13 * 30k = 4k, each gives 1 FP (in wrong class) = 4k FPs, and 0 TPs (missed).
+- FAs: ~12k, each gives 1 FP = 12k FPs.
+- Total: 26k TPs, 16k FPs.
+
+So top-1 has far fewer FPs (16k vs 138k) but also fewer TPs (26k vs 30k).
+
+For mAP, fewer FPs is generally good (higher precision). But we also need enough TPs. 26k TPs is still plenty.
+
+Actually, I think top-1 could be significantly better because the FP reduction is huge (138k → 16k, ~8.6x fewer FPs).
+
+But wait, I need to check: has top-1 been tried? Let me look at the history again.
+
+e006: "Every box is emitted in all 4 classes, so a box the cl..." — this seems to be ABOUT the emit-all problem. It got 0.5994 (worse than 0.6288). So whatever e006 did, it made things worse. Maybe e006 was top-1 and it failed? Or maybe e006 was a different scoring change.
+
+Hmm, I can't be sure what e006 did. The hypothesis is cut off. Let me think about what's most likely.
+
+Actually, the category for e006 is "scoring". And the hypothesis mentions "Every box is emitted in all 4 classes, so a box the cl[assifier is uncertain about]...". This suggests e006 was trying to change how boxes are emitted/scored. It's plausible e006 was top-1 or a threshold-based emission.
+
+But it got 0.5994, worse. So if e006 was top-1, then top-1 is bad. But I'm not sure.
+
+Let me reconsider. Actually, maybe the issue is more subtle. Let me think about the SCORING within a class.
+
+Actually, you know what, let me step back and think about the biggest lever.
+
+The gap is 0.129 mAP. The classifier macro-F1 is 0.87. To close the gap, we need either:
+1. Better classification (higher F1) — but many attempts failed.
+2. Better scoring/ranking — some attempts failed, but maybe not the right one.
+
+Let me reconsider the scoring. The current score is conf * p_c, emit all 4 classes.
+
+Actually, here's a thought. What if the problem is that p_c is NOT a good ranking signal? The classifier is closed-set (softmax over 4 classes), so it's always confident about SOMETHING. On a false alarm, it might say p = [0.4, 0.3, 0.2, 0.1], and the top is 0.4. So conf * 0.4 could be a decent score. But on a true box, it might say p = [0.9, 0.05, 0.03, 0.02], top 0.9. So conf * 0.9.
+
+The issue: the classifier's confidence (max p_c) doesn't cleanly separate true boxes from false alarms, because it's closed-set. A false alarm always gets some class with high p_c.
+
+This is exactly why e015/e016 tried adding a "background" class — to let the classifier say "this is not a defect". That's a good idea in principle, but it crashed/bugged.
+
+Hmm, but e016's bug was a code error (bg referenced before defined). The IDEA (background class) might still be good. But the "data" category is marked EXHAUSTED.
+
+Wait, let me re-read the lessons:
+- data: 6 ideas, 5 ran, 0 new best, 2 crashed → EXHAUSTED?
+- architecture: 3 ideas, 2 ran, 0 new best, 1 timeout → EXHAUSTED?
+- scoring: 3 ideas, 3 ran, 0 new best, 1 close → EXHAUSTED?
+- inference: 1
+- augmentation: 1
+- optimisation: 1 (bug)
+- sampling: 1
+
+So data, architecture, scoring are all "exhausted". But the background class idea (e015/e016) was never actually tested due to crashes/bugs. The idea is fundamentally about adding a 5th class to the classifier, which is... a data change (adding background boxes to training) or an architecture change (5 classes instead of 4).
+
+Hmm. The background class idea is promising but has been "exhausted" in the sense that it crashed twice. But the crashes were bugs, not the idea failing.
+
+Let me reconsider. The rule says: "A direction where three or more attempts gave no confirmed gain is exhausted: do not propose another variant of it unless you can say what is fundamentally different."
+
+For data, there were 6 ideas. The background class is one of them (e015, e016). It crashed both times. So it's not that the idea failed; it's that the code was buggy.
+
+But I should be careful. Let me think about whether the background class idea would actually help.
+
+The background class idea: add a 5th class "background" for detector boxes that overlap no GT. Then at test time, multiply each class score by (1 - p_bg). This way, false alarms (high p_bg) get low scores in all classes, reducing FP pollution.
+
+This is a good idea. It directly addresses the FP pollution problem. And it's different from the other scoring attempts (e005, e006, e011) which didn't add a background class.
+
+But it crashed twice. The first crash (e015) — I don't have the details. The second (e016) was a clear bug (bg referenced before defined).
+
+Actually, wait. Let me re-read e016's log:
+```
+epoch 100: loss 0.0000, 414 steps, 123s
+...
+done: 111 epochs, 427 steps, 2 prediction rows, 161s total
+```
+
+111 epochs, 427 steps, loss 0.0000, 2 prediction rows. So the model trained for 111 epochs (way more than e000's 5), loss went to 0, and only 2 prediction rows were written. That means the model overfit massively (loss 0) and then at test time, almost all predictions had score < MIN_SCORE.
+
+Wait, why would only 2 rows be written? If the model overfit to the background class, then p_bg ≈ 1 for everything, so (1-p_bg) ≈ 0, so all scores ≈ 0, below MIN_SCORE. That would explain 2 rows.
+
+So the bug in e016 might be that the background class dominated training, causing the model to predict background for everything. OR the code had a bug where bg was referenced before defined (as stated).
+
+Actually, the stated bug is "`bg` was referenced in the DataLoader before it was defined". So the code was structurally wrong. The 111 epochs and loss 0 suggest the training loop ran way too long (maybe the reserve was miscalculated or the background dataset was tiny causing many epochs).
+
+Hmm, this is getting complicated. Let me think about whether to retry the background class idea with a clean implementation.
+
+Actually, let me reconsider the whole strategy. I've spent 16 experiments and nothing worked. The "exhausted" categories suggest I should be very careful.
+
+Let me think about what's fundamentally different and untried.
+
+Key observations:
+1. The stage-1 boxes are excellent (0.755 class-agnostic).
+2. The classifier is 0.87 macro-F1.
+3. The gap is 0.129 mAP.
+4. Emitting all 4 classes per box floods each class with FPs.
+
+The most impactful untried idea: **change the emission strategy from all-4-classes to a smarter one**.
+
+But e006 (scoring) might have been this. Let me think... Actually, I'll assume e006 was NOT a clean top-1 test, because the hypothesis text suggests it was about a different aspect.
+
+Actually, let me reconsider. Let me re-read e006's hypothesis more carefully: "The class-agnostic ceiling (0.755) is nearly equal to the perfect-class ceiling (0.758), so the ~0.13 gap to our 0.6288 is class-confusion damage, not box detection. Every box is emitted in all 4 classes, so a box the cl[assifier...]"
+
+This is cut off, but the setup is: "Every box is emitted in all 4 classes, so a box the classifier [is uncertain about / misclassifies] [creates FPs in multiple classes]". So e006 was definitely about the emit-all problem. It's very likely e006 was a top-1 or threshold-based emission. And it got 0.5994 (worse).
+
+Hmm, so if e006 was top-1 and it failed, then top-1 is not the answer. But maybe e006 was a different variant.
+
+Wait, 0.5994 is only slightly worse than 0.6288. And the seed noise is ±0.005. So 0.5994 could be within noise of a small negative effect. But it was "rejected" (not confirmed better), which is expected since it's worse.
+
+Actually, if e006 was top-1 and got 0.5994, that's a ~0.03 drop, which is beyond noise. So top-1 (as implemented in e006) would be bad. But I don't know the exact implementation.
+
+Let me think about this differently. What if the issue with top-1 is that it misses TPs for misclassified boxes? That could hurt.
+
+Alternative: emit top-1 AND top-2? Or emit all classes but with a threshold (only emit class c if p_c > threshold)?
+
+Hmm, this is getting into fine-tuning territory.
+
+Let me step back and think about the BIGGEST lever.
+
+Actually, wait. Let me reconsider the classifier itself. The macro-F1 is 0.87. Pore is the weakest (AP 0.496). Let me think about WHY pore is weak.
+
+Pore is a fine-grained texture (small holes). The crop is 160px. Pores are small, so the detail might be lost in the resize. e003 tried 224px and it failed (0.6197). So higher res didn't help.
+
+Hmm. What about the input to the classifier? Currently it's two crops (tight 1.5x + wide 2.5x). What if the wide crop is hurting? Or what if we need a different context?
+
+Actually, let me reconsider. The "two-crop" approach averages logits from tight and wide crops. This is a form of multi-scale. It works (0.87 F1). But maybe the tight crop is too tight for some classes, or the wide crop is too wide.
+
+Let me think about pore specifically. Pores are small. A tight crop (1.5x the box) might capture the pore detail. A wide crop (2.5x) might dilute it. For pore, the tight crop is probably more informative. For stain (large area), the wide crop is more informative.
+
+So maybe the two-crop averaging is suboptimal. But changing this is an "architecture" or "data" change, both exhausted.
+
+Hmm. Let me think about what's truly untried and could give 0.01+.
+
+Actually, let me reconsider the scoring. I keep coming back to it. Let me think very carefully about the optimal scoring.
+
+The metric: mAP@0.5 per class, averaged.
+
+For class c, we have a set of predictions (box, score). We sort by score. A prediction is a TP if it matches an unmatched GT box of class c with IoU>0.5.
+
+The AP for class c depends on the ORDER of predictions. Specifically, we want:
+- True boxes of class c (that overlap GT c) to be ranked high.
+- False positives (wrong-class boxes, false alarms) to be ranked low.
+
+Now, the detector conf is a good signal for "is this a real defect" (since class-agnostic mAP is 0.755). So conf should be a strong component of the score.
+
+The classifier p_c is a signal for "is this class c". 
+
+The optimal score for a box in class c should be high if:
+- The box is a real defect (high conf).
+- The box is class c (high p_c).
+
+So score = f(conf, p_c). The current score is conf * p_c. That's reasonable.
+
+The issue is the EMISSION: which classes do we emit each box in?
+
+If we emit all 4 classes, then a false alarm with conf=0.5, p=[0.3,0.3,0.2,0.2] emits:
+- pore: 0.15, deposit: 0.15, disc: 0.10, stain: 0.10
+
+These are 4 FPs. But they're all low-ish scores (0.10-0.15). Meanwhile a true pore box with conf=0.9, p_pore=0.8 emits pore: 0.72. So the true box ranks above the FPs. Good.
+
+But there are MANY false alarms (12k), each emitting 4 FPs = 48k FPs. Even if they're low-scored, they accumulate. In the tail of the ranking, they don't matter much (precision is already low). But in the middle, they could hurt.
+
+Hmm, actually, for mAP, what matters is the precision at each recall level. If the FPs are all low-scored (below the true boxes), they don't hurt precision at high recall. So maybe emit-all is fine IF the scores are well-calibrated.
+
+The problem is if some FPs get HIGH scores. E.g., a false alarm with conf=0.9 (detector is confident) and p=[0.5, 0.2, 0.2, 0.1] emits pore: 0.45. That's a high-scoring FP in the pore class. It would rank above true pore boxes with conf=0.8, p_pore=0.5 (score 0.40). So this FP demotes a true box.
+
+So the issue is: false alarms with high conf and high p_c create high-scoring FPs.
+
+The background class idea addresses this: if the classifier can say "this is background" (p_bg high), then we multiply by (1-p_bg), reducing the score. A false alarm would have high p_bg, so its scores drop.
+
+But the background class crashed twice. Let me think about whether there's a cleaner way to do it.
+
+Alternative: use the detector conf more aggressively. Actually, the detector conf already capturesThinking budget reached. Stop thinking now and write the reply in the required format.
+===== attempt 2 =====
+The harness said the SEARCH text was not found. Let me look at the current file (e016, since I said BASE: last). The file is e015's file with e016's changes applied. Let me reconstruct what e016's train.py looks like.
+
+e015 was based on e000 (best). e015 crashed. e016 was based on e015 and made the changes shown in the diff.
+
+Let me reconstruct e016's train.py from the diff.
+
+The diff shows:
+```
+@@ -141,4 +141,23 @@
+         random.seed(s); np.random.seed(s)
+ 
++    # Background training boxes: detector boxes on training images that overlap no GT defect.
++    by_img = {}
++    for r in crops:
++        by_img.setdefault(r["image"], []).append(r)
++    bg = []
++    for d in dets:
++        if d["split"] != "train":
++            continue
++        for gg in by_img.get(d["image"], ()):
++            ix1, iy1 = max(d["x1"], gg["x1"]), max(d["y1"], gg["y1"])
++            ix2, iy2 = min(d["x2"], gg["x2"]), min(d["y2"], gg["y2"])
++            inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
++            uni = (d["x2"] - d["x1"]) * (d["y2"] - d["y1"]) + (gg["x2"] - gg["x1"]) * (gg["y2"] - gg["y1"]) - inter
++            if uni > 0 and inter / uni > BG_IOU:
++                break
++        else:
++            bg.append(dict(d, cls=N_CLASSES - 1))
++    print(f"background boxes: {len(bg)}", flush=True)
++
+     g = torch.Generator().manual_seed(args.seed)
+     dl_def = torch.utils.data.DataLoader(BoxDataset(crops, images, True), batch_size=BATCH_SIZE, shuffle=True,
+@@ -151,23 +170,4 @@
+                                         num_workers=workers, pin_memory=True)
+ 
+-    # Background training boxes: detector boxes on training images that overlap no GT defect.
+-    gt = {(r["image"], r): r for r in crops}
+-    by_img = {}
+-    for r in crops:
+-        by_img.setdefault(r["image"], []).append(r)
+-    bg = []
+-    for d in dets:
+-        if d["split"] != "train":
+-            continue
+-        for g in by_img.get(d["image"], ()):
+-            ix1, iy1 = max(d["x1"], g["x1"]), max(d["y1"], g["y1"])
+-            ix2, iy2 = min(d["x2"], g["x2"]), min(d["y2"], g["y2"])
+-            inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+-            uni = (d["x2"] - d["x1"]) * (d["y2"] - d["y1"]) + (g["x2"] - g["x1"]) * (g["y2"] - g["y1"]) - inter
+-            if uni > 0 and inter / uni > BG_IOU:
+-                break
+-        else:
+-            bg.append(dict(d, cls=N_CLASSES - 1))
+-    print(f"background boxes: {len(bg)}", flush=True)
+     model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=N_CLASSES)
+```
+
+Wait, this is confusing. The diff shows e015 -> e016. Let me parse it.
+
+The diff header says `--- e015/train.py` and `+++ e016/train.py`.
+
+So the `-` lines are in e015, the `+` lines are in e016.
+
+First hunk: `@@ -141,4 +141,23 @@`
+Context lines (no prefix):
+```
+        random.seed(s); np.random.seed(s)
+ 
+```
+Added lines (in e016, +):
+```
+    # Background training boxes: detector boxes on training images that overlap no GT defect.
+    by_img = {}
+    for r in crops:
+        by_img.setdefault(r["image"], []).append(r)
+    bg = []
+    for d in dets:
+        if d["split"] != "train":
+            continue
+        for gg in by_img.get(d["image"], ()):
+            ix1, iy1 = max(d["x1"], gg["x1"]), max(d["y1"], gg["y1"])
+            ix2, iy2 = min(d["x2"], gg["x2"]), min(d["y2"], gg["y2"])
+            inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+            uni = (d["x2"] - d["x1"]) * (d["y2"] - d["y1"]) + (gg["x2"] - gg["x1"]) * (gg["y2"] - gg["y1"]) - inter
+            if uni > 0 and inter / uni > BG_IOU:
+                break
+        else:
+            bg.append(dict(d, cls=N_CLASSES - 1))
+    print(f"background boxes: {len(bg)}", flush=True)
+
+```
+Context lines:
+```
+    g = torch.Generator().manual_seed(args.seed)
+    dl_def = torch.utils.data.DataLoader(BoxDataset(crops, images, True), batch_size=BATCH_SIZE, shuffle=True,
+```
+
+So in e016, after `worker_init`, before `g = torch.Generator()`, there's the bg computation block.
+
+Second hunk: `@@ -151,23 +170,4 @@`
+Context line:
+```
+                                        num_workers=workers, pin_memory=True)
+ 
+```
+Removed lines (in e015, -):
+```
+    # Background training boxes: detector boxes on training images that overlap no GT defect.
+    gt = {(r["image"], r): r for r in crops}
+    by_img = {}
+    for r in crops:
+        by_img.setdefault(r["image"], []).append(r)
+    bg = []
+    for d in dets:
+        if d["split"] != "train":
+            continue
+        for g in by_img.get(d["image"], ()):
+            ix1, iy1 = max(d["x1"], g["x1"]), max(d["y1"], g["y1"])
+            ix2, iy2 = min(d["x2"], g["x2"]), min(d["y2"], g["y2"])
+            inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+            uni = (d["x2"] - d["x1"]) * (d["y2"] - d["y1"]) + (g["x2"] - g["x1"]) * (g["y2"] - g["y1"]) - inter
+            if uni > 0 and inter / uni > BG_IOU:
+                break
+        else:
+            bg.append(dict(d, cls=N_CLASSES - 1))
+    print(f"background boxes: {len(bg)}", flush=True)
+```
+Context line:
+```
+    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=N_CLASSES)
+```
+
+So e015 had the bg block AFTER the dataloader (between `num_workers=workers, pin_memory=True)` and `model = timm.create_model(...)`). e016 moved it to before `g = torch.Generator()`.
+
+Wait, but the diff shows the bg block was MOVED from after the dataloader to before `g = torch.Generator()`. But actually, looking more carefully, e015's bg block used `for g in by_img...` and e016's uses `for gg in by_img...`. And e015 had `gt = {(r["image"], r): r for r in crops}` which e016 removed.
+
+Hmm, but this is getting complicated. The key issue: I need to reconstruct the ACTUAL current file (e016) to make correct SEARCH/REPLACE.
+
+Let me think about what e015 was. e015 was based on e000. Let me reconstruct e015 first, then apply e016's diff.
+
+Actually, I don't have e015's full file. But I can reconstruct it from e000 + e015's changes. But I don't have e015's diff either.
+
+Hmm. This is a problem. Let me think about what I actually know.
+
+Wait, actually the harness only showed me e016's diff relative to e015. And it says "Its full train.py differs from the best only by the change above." Wait, no — that line says "If you want to build on (or fix) this most recent version instead of the best, write BASE: last. Its full train.py differs from the best only by the change above."
+
+Hmm wait, that's saying e016's full train.py differs from the best (e000) only by the change above (the e015->e016 diff)? That doesn't make sense because e015 was a separate experiment with its own changes.
+
+Actually, re-reading: "Its full train.py differs from the best only by the change above." I think this is a generic statement that's slightly wrong, OR it means e016 differs from e015 by the change above. Let me re-read.
+
+"If you want to build on (or fix) this most recent version instead of the best, write BASE: last. Its full train.py differs from the best only by the change above."
+
+Hmm, this is ambiguous but I think the harness is telling me that e016's file = e000 (best) + (e015's changes) + (e016's changes). But it says "differs from the best only by the change above" — the "change above" being the e015->e016 diff. That's contradictory unless e015's changes are somehow subsumed.
+
+Wait, actually maybe e015 and e016 are the SAME idea (background class), and e015's file already had most of the background machinery, and e016 just fixed the bug by moving code around. So the "change above" (e015->e016) is what's needed on top of e015, but the full e016 file differs from the best by e015's changes + e016's changes.
+
+I think the safest interpretation: I need the ACTUAL content of e016's train.py. But I don't have it fully. I only have the diff.
+
+Let me reconstruct as best I can.
+
+Actually, wait. Let me reconsider. The statement "Its full train.py differs from the best only by the change above" — maybe the harness is being imprecise and actually means "differs from e015 only by the change above." Given the diff header is `--- e015/train.py +++ e016/train.py`, the change above is e015->e016.
+
+So e016 = e015 + (the diff). And e015 = e000 + (e015's own changes, which I don't have).
+
+This means I can't reliably reconstruct e016's full file. But I need to make SEARCH/REPLACE blocks that match e016 exactly.
+
+Hmm, but the first error was that my SEARCH text `workers = min(8, os.cpu_count() or 2)` was not found. Let me look at what e016's file actually contains around that area.
+
+From the diff, the context around the bg block in e016:
+```
+        random.seed(s); np.random.seed(s)
+
+    # Background training boxes: detector boxes on training images that overlap no GT defect.
+    by_img = {}
+    ...
+    print(f"background boxes: {len(bg)}", flush=True)
+
+    g = torch.Generator().manual_seed(args.seed)
+    dl_def = torch.utils.data.DataLoader(BoxDataset(crops, images, True), batch_size=BATCH_SIZE, shuffle=True,
+```
+
+Wait, in e016 the dataloader is called `dl_def`? Let me check. The context line in the first hunk says:
+```
+    dl_def = torch.utils.data.DataLoader(BoxDataset(crops, images, True), batch_size=BATCH_SIZE, shuffle=True,
+```
+
+Hmm, so in e016, the training dataloader is named `dl_def`, not `dl_tr`. That's interesting. So e015 must have renamed `dl_tr` to `dl_def`. 
+
+Wait, but the second hunk context:
+```
+                                        num_workers=workers, pin_memory=True)
+```
+This is the end of the dataloader (could be either dl_def or dl_ev).
+
+So e016's structure around the dataloaders:
+```
+    def worker_init(_):
+        s = torch.initial_seed() % 2**32
+        random.seed(s); np.random.seed(s)
+
+    # Background training boxes: detector boxes on training images that overlap no GT defect.
+    by_img = {}
+    for r in crops:
+        by_img.setdefault(r["image"], []).append(r)
+    bg = []
+    for d in dets:
+        if d["split"] != "train":
+            continue
+        for gg in by_img.get(d["image"], ()):
+            ix1, iy1 = max(d["x1"], gg["x1"]), max(d["y1"], gg["y1"])
+            ix2, iy2 = min(d["x2"], gg["x2"]), min(d["y2"], gg["y2"])
+            inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+            uni = (d["x2"] - d["x1"]) * (d["y2"] - d["y1"]) + (gg["x2"] - gg["x1"]) * (gg["y2"] - gg["y1"]) - inter
+            if uni > 0 and inter / uni > BG_IOU:
+                break
+        else:
+            bg.append(dict(d, cls=N_CLASSES - 1))
+    print(f"background boxes: {len(bg)}", flush=True)
+
+    g = torch.Generator().manual_seed(args.seed)
+    dl_def = torch.utils.data.DataLoader(BoxDataset(crops, images, True), batch_size=BATCH_SIZE, shuffle=True,
+                                        num_workers=workers, pin_memory=True, drop_last=True,
+                                        persistent_workers=True, generator=g, worker_init_fn=worker_init)
+    dl_ev = torch.utils.data.DataLoader(BoxDataset(ev, images, False), batch_size=256, shuffle=False,
+                                        num_workers=workers, pin_memory=True)
+
+    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=N_CLASSES)
+```
+
+Wait, but I'm guessing at the lines between `dl_def = ...shuffle=True,` and `num_workers=workers, pin_memory=True)`. In e000, the dl_tr line was:
+```
+    dl_tr = torch.utils.data.DataLoader(BoxDataset(crops, images, True), batch_size=BATCH_SIZE, shuffle=True,
+                                        num_workers=workers, pin_memory=True, drop_last=True,
+                                        persistent_workers=True, generator=g, worker_init_fn=worker_init)
+```
+
+So in e016, if it's `dl_def`, the lines would be:
+```
+    dl_def = torch.utils.data.DataLoader(BoxDataset(crops, images, True), batch_size=BATCH_SIZE, shuffle=True,
+                                        num_workers=workers, pin_memory=True, drop_last=True,
+                                        persistent_workers=True, generator=g, worker_init_fn=worker_init)
+```
+
+But wait, the second hunk context shows only ONE line `num_workers=workers, pin_memory=True)` after the removed bg block. That's the end of the dl_ev dataloader (which in e000 was `num_workers=workers, pin_memory=True)`). So the removed bg block was between dl_ev's end and `model = ...`.
+
+Hold on. Let me re-examine. In e000:
+```
+    g = torch.Generator().manual_seed(args.seed)
+    dl_tr = torch.utils.data.DataLoader(BoxDataset(crops, images, True), batch_size=BATCH_SIZE, shuffle=True,
+                                        num_workers=workers, pin_memory=True, drop_last=True,
+                                        persistent_workers=True, generator=g, worker_init_fn=worker_init)
+    dl_ev = torch.utils.data.DataLoader(BoxDataset(ev, images, False), batch_size=256, shuffle=False,
+                                        num_workers=workers, pin_memory=True)
+
+    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
+```
+
+In e015, the bg block was added between dl_ev's `num_workers=workers, pin_memory=True)` and `model = ...`. And e015 renamed `dl_tr` to `dl_def`? Or maybe not. Let me check the diff again.
+
+The first hunk context (e016, which is e015's context since it's unchanged there):
+```
+    g = torch.Generator().manual_seed(args.seed)
+    dl_def = torch.utils.data.DataLoader(BoxDataset(crops, images, True), batch_size=BATCH_SIZE, shuffle=True,
+```
+
+So yes, in e015 (and thus e016), the training dataloader is `dl_def`. So e015 renamed `dl_tr` → `dl_def`.
+
+OK here's my problem: I don't have e015's full file, so I don't know all the changes e015 made. The bg block references `BG_IOU` and `N_CLASSES`, which must be defined somewhere in e015/e016. In e000, there's no `BG_IOU` or `N_CLASSES` — e000 uses `num_classes=4` and `for c in range(4)`.
+
+So e015 added `BG_IOU` and `N_CLASSES` settings, and changed `num_classes=4` to `num_classes=N_CLASSES`, and `for c in range(4)` to `for c in range(N_CLASSES)` probably, and the scoring.
+
+This is getting really complicated. The e016 log showed "2 prediction rows" which means the scoring produced almost nothing — consistent with a bug where p_bg ≈ 1 for everything (model trained to ~0 loss, predicting bg for everything, so keep = 1-p_bg ≈ 0, all scores below MIN_SCORE).
+
+Actually wait, the log shows loss going to ~0.0000 over 111 epochs. That's overfitting to the training set completely. And "2 prediction rows" means almost all eval scores were below MIN_SCORE. This strongly suggests the model learned to predict bg (class 4) for everything, OR there's a bug.
+
+Hmm, actually if the model is trained with bg boxes and the bg class dominates or the model overfits, at eval time p[4] could be high, making keep = 1-p[4] small. But 2 rows out of ~167k possible (41879 * 4) is extreme.
+
+Actually, let me reconsider. The overfitting to loss 0.0000 is suspicious. With 6052 crops + ~1500 bg = ~7500 boxes, 111 epochs, 427 steps... wait, 427 steps / 111 epochs ≈ 3.8 steps per epoch. That's weird. In e000, it was 94 steps per epoch (6052/64 ≈ 94). 
+
+Oh! 427 steps total over 111 epochs = ~3.8 steps/epoch. That means the training set is only ~250 boxes (3.8 * 64 ≈ 243). That's way less than 6052. So something is very wrong with the training set size in e016.
+
+Wait, unless... the `bg` list replaced `crops`? Let me think. In e015, maybe the code did `crops = bg` or something buggy. Or maybe the DataLoader uses a tiny subset.
+
+Actually, 427 steps / 111 epochs. Let me compute: if drop_last=True and batch=64, steps per epoch = floor(N/64). 427/111 = 3.84. So N ≈ 3.84*64 ≈ 246. Hmm.
+
+Actually, maybe the issue is that `train_rows` or whatever is tiny. Or maybe the DataLoader is being iterated but the dataset is small.
+
+Actually, you know what, I'm overanalyzing the bug. The harness said e016 is "suspicious (likely bug)" and I should either fix it or pick a different experiment.
+
+Given the complexity of reconstructing e016's exact file, and that e016 is buggy, maybe I should NOT build on e016. Instead, I should base on the best (e000) and do a clean, fresh experiment.
+
+But wait — the background class idea is genuinely untested (both e015 and e016 crashed/bugged). It's a promising idea. But reconstructing e016's file is error-prone.
+
+Let me reconsider the strategy. The instruction says: "If a run crashed or timed out, read the log and fix the cause." And "Every change is applied on top of the current best train.py (or the most recent version with BASE: last)."
+
+I have two options:
+1. BASE: last (e016) and fix the bug. But I don't have e016's full file, so I can't reliably make SEARCH/REPLACE blocks.
+2. BASE: best (e000) and implement the background class idea cleanly from scratch.
+
+Option 2 is much safer because I have e000's full file (shown at the top). I can implement the background class idea cleanly on top of e000.
+
+But wait — is the background class idea worth pursuing? Let me think about the error analysis.
+
+Current best: 0.6288 mAP@0.5.
+- one-step 4-class baseline: 0.638
+- stage-1 boxes perfect classes: 0.758 (ceiling)
+- stage-1 boxes single class 'defect': 0.755
+
+So the class-agnostic score is 0.755, and we're at 0.6288. The gap is 0.126. This is class mis-assignment + false alarms polluting rankings.
+
+Per-class AP: pore 0.496, deposit 0.629, discontinuity 0.780, stain 0.609.
+
+The idea: add a 5th "background" class. Train the classifier to also recognize "not a defect" (detector boxes that overlap no GT). At test time, multiply each class score by (1 - p_bg), so false alarms (which look like background) get down-weighted in all class rankings.
+
+This directly targets false alarms polluting the rankings. And it could also help with misassigned boxes (a box that's actually a different defect might get high p_bg if it doesn't look like the assigned class... no, that's not quite right).
+
+Actually, the main benefit: false alarms. In the 0.755 class-agnostic score, the boxes are scored by detector conf, which already ranks true detections above false alarms reasonably well (that's why it's 0.755). But when we add class probabilities, a false alarm that the classifier is "confident" is about (e.g., calls it pore with p=0.9) gets score conf * 0.9, which might rank above a true pore detection that the classifier is unsure about (p=0.5). So false alarms pollute the pore ranking.
+
+By adding p_bg and multiplying, a false alarm (high p_bg) gets down-weighted. This should help.
+
+The risk: if the model overfits and predicts high p_bg for everything, all scores collapse (which is what happened in e016 — 2 prediction rows). So I need to be careful about training.
+
+Why did e016 overfit so badly (loss → 0)? Let me think. 111 epochs, 427 steps. If the training set were 6052 + 1500 = 7552 boxes, that'd be ~118 steps/epoch, so 427 steps = ~3.6 epochs, not 111. So the training set in e016 was tiny (~250 boxes). That's the bug — the training set got shrunk to ~250 boxes somehow.
+
+Hmm, how? Maybe e015's code did something like `crops = bg` or the bg computation filtered crops down. Or maybe `train_rows` was defined wrong.
+
+Actually, I bet the bug in e015/e016 is that the bg computation or some line accidentally reassigned `crops` to a small list. Or the DataLoader got the wrong dataset.
+
+Given I can't see e015's file, I'll implement cleanly on e000.
+
+Actually, wait. Let me reconsider whether to pursue the background idea at all, given it's been attempted twice (both bugged). The "Lessons so far" says data is "EXHAUSTED? (3+ ideas, no new best)". But the background idea specifically never RAN successfully. The category is marked exhausted because of other data experiments (e001, e003, e009, e014, e015, e016). But e015/e016 (background) never produced a valid score. So the background idea is genuinely untested.
+
+However, there's a meta-consideration: the harness might be skeptical of the background idea. But it's a legitimate, well-motivated idea that targets false alarms. And it's the only idea in the "data" category that never actually ran.
+
+Let me also consider: is there a cleaner way to handle false alarms without a 5th class? 
+
+Alternative: use the detector conf more cleverly. But e005 (scoring) tried re-weighting and failed. e006, e011 also tried scoring changes and failed.
+
+The 5th-class background approach is fundamentally different: it gives the model an explicit "this isn't a defect" output, learned from actual false alarms. This is a real methodological change, not just re-scoring.
+
+I think it's worth trying, implemented cleanly. Let me do BASE: best and implement it carefully.
+
+Let me design the implementation on top of e000:
+
+1. Add settings: `BG_IOU = 0.3` (threshold for "overlaps a GT"), `N_CLASSES = 5`.
+
+Actually, e000 hardcodes `num_classes=4` and `for c in range(4)`. I'll add `N_CLASSES = 5` and use it.
+
+2. Compute bg boxes: detector boxes on training images that overlap no GT crop (IoU < BG_IOU with all GT boxes on that image).
+
+3. Create a combined training dataset: crops (labels 0-3) + bg (label 4).
+
+4. Train model with num_classes=5.
+
+5. At eval: for each box, compute 5 probs. keep = 1 - p[4]. For c in 0..3: score = conf * p[c] * keep. Write if > MIN_SCORE.
+
+Now, the overfitting concern. In e000, training runs until the budget is used (5 epochs in ~150s). If I add bg boxes, the training set is bigger, so fewer epochs fit. That's fine. But the overfitting to loss 0 in e016 was due to a tiny training set, not the bg idea per se.
+
+Actually, wait. Let me reconsider the overfitting. If the training set is 6052 + 1500 = 7552, and we train for 5 epochs (as in e000's timing), loss would be ~0.22 (like e000). That's not overfitting to 0. The e016 overfitting to 0.0000 over 111 epochs was because the training set was tiny AND it trained for 111 epochs (way more than e000's 5). 
+
+Why did e016 train for 111 epochs? Because each epoch was only ~3.8 steps (tiny dataset), so it could fit many epochs in the time budget. With a proper 7552-box dataset, each epoch is ~118 steps, so only ~5 epochs fit. Good, that matches e000's timing.
+
+So if I implement it correctly with the full crops + bg dataset, I'll get ~5 epochs and loss ~0.22, not overfitting. 
+
+But there's a subtlety: the bg class. If bg boxes are ~1500 out of 7552 (20%), the model learns a reasonable p_bg. At eval, true defects should have low p_bg, false alarms high p_bg. The keep factor down-weights false alarms. This should help.
+
+But there's a risk: if bg boxes are too few or the model doesn't learn bg well, keep ≈ 1 for everything and no change. Or if bg dominates, keep ≈ 0 for everything and collapse. I'll balance bg to be ~1/4 of the training set (like I did in my previous attempt: k_bg = len(crops)//4 = 1513). That's 1513/(6052+1513) = 20% bg. Reasonable.
+
+Hmm, but actually, how many bg boxes are there available? Detector boxes on training images that overlap no GT. Let me think — dets.csv has train and eval boxes. The train boxes are on training images. Some overlap GT (true detections), some don't (false alarms). The false alarms are the bg boxes. There could be thousands. So k_bg = 1513 is fine (we can sample).
+
+Wait, but actually I should double check: are there enough false alarms? The detector is class-agnostic and finds candidate boxes. On training images, many boxes will overlap GT (since GT defects exist), and some won't. The number of non-overlapping boxes dependsThinking budget reached. Stop thinking now and write the reply in the required format.

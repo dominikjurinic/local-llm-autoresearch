@@ -1,0 +1,345 @@
+===== attempt 1 =====
+Let me analyze the situation carefully.
+
+Current best: e016 with 5-seed val mAP@0.5 = 0.6411
+
+Key observations:
+1. The model is undertrained - only ~660 steps (2.5 epochs) in the time budget
+2. Per-class AP: pore 0.537, deposit 0.635, discontinuity 0.780, stain 0.612
+3. Pore and stain are the weak classes
+4. The ceiling is 0.758, so there's significant room for improvement
+5. Stage-1 boxes scored as single class 'defect' get 0.755, meaning the detector boxes are good but classification is the bottleneck
+
+What's been tried and failed:
+- Background class (e001, e005) - rejected
+- Low-res crops (e003) - helped slightly
+- Squaring probability (e004) - rejected
+- Focal loss (e006) - rejected
+- Mixup (e007) - rejected
+- Single wide crop (e008) - helped
+- TTA horizontal flip (e009) - helped
+- Batch size 32 (e010) - rejected
+- Weighted sampler (e011) - rejected
+- Vertical flip TTA (e012) - rejected
+- EfficientNet-B2 (e013) - rejected
+- Max prob scoring (e014) - rejected
+- ConvNeXt-Nano (e015) - rejected
+- IMG_SIZE 224 (e016) - current best
+- Doubling LR (e017) - rejected
+- IMG_SIZE 192 (e018) - rejected
+- Margin scoring (e019) - rejected
+- Raising min LR (e020) - rejected
+- tf_efficientnetv2_b0 (e021) - seed-0 looked good (0.6447) but 5-seed mean was 0.6352, not confirmed
+- MobileNetV3 (e022) - rejected
+
+What hasn't been tried yet:
+- Training on detector boxes with background (e001 failed, but that was a different setup)
+- Different scoring: the current score is conf × prob[c]. What about conf^α × prob[c]^β?
+- More aggressive data augmentation (color jitter, random erasing)
+- Using the detector confidence more cleverly
+- Training with a longer effective schedule (e.g., linear warmup then constant LR instead of cosine)
+- Using both high and low res crops differently
+- Ensemble of two models (but time budget is tight)
+- Using a different optimizer (SGD with momentum vs AdamW)
+- Label smoothing
+- Training for more epochs by reducing per-step cost
+
+Let me think about what's most promising:
+
+1. **SGD with momentum instead of AdamW**: AdamW with LR=1e-3 and weight_decay=0.05 is a reasonable setup, but for fine-tuning pretrained models, SGD with momentum (lr=0.1, momentum=0.9, weight_decay=1e-4) is often better. The cosine schedule with SGD might work differently. However, this is a big change.
+
+2. **Label smoothing**: Adding label smoothing (e.g., 0.1) to cross-entropy can help with calibration and generalization. This is a small, focused change.
+
+3. **Training on detector boxes with background class**: e001 tried this but it was on the old two-crop setup. The current setup is single wide crop at 224. Maybe the issue was different. But e005 also tried background and failed.
+
+4. **Score calibration**: The current score is conf × prob[c]. What if we use conf^0.5 × prob[c]? Or what about using the detector confidence as a gate?
+
+5. **More training steps**: The model only gets ~660 steps. If we can reduce per-step cost, we get more steps. Options:
+   - Reduce batch size (tried, failed)
+   - Use a smaller model (tried MobileNetV3, failed)
+   - Use a smaller image (tried 192, failed)
+   - Use fewer workers / less overhead
+   - Use a simpler augmentation pipeline
+
+6. **Two-model ensemble**: Train two different models and average their probabilities. But this would halve the training time per model.
+
+7. **Training with detector boxes (matched) only, no GT crops**: The current setup uses both GT crops and matched detector boxes. What if we train only on detector boxes (with IoU≥0.5 matching)? This would make the model see exactly the distribution it needs to handle. But e001 tried training on detector boxes and it failed badly (0.5691). However, that was with the old two-crop setup and included background.
+
+8. **Using a different loss: cross-entropy with temperature scaling or label smoothing**
+
+9. **Training with a longer warmup**: Currently 5% warmup. What about 10%?
+
+10. **Using the detector confidence in training**: Weight training samples by detector confidence.
+
+Let me think about what's most likely to help given the constraints:
+
+The model is undertrained (loss still dropping fast: 0.52 → 0.29). The key issue is getting more effective training steps. But many attempts to get more steps have failed (smaller model, smaller image, smaller batch).
+
+Wait - what about **SGD with momentum**? For fine-tuning pretrained models, SGD with momentum at lr=0.1 (or 0.01) with weight_decay=1e-4 is the standard. AdamW at 1e-3 might not be optimal. SGD is also slightly faster per step (no second moment computation), giving a small speedup. More importantly, SGD often generalizes better for fine-tuning.
+
+Actually, let me reconsider. The per-step cost difference between AdamW and SGD is minimal. The main benefit would be better optimization.
+
+Another idea: **Remove the cosine decay and use a constant LR after warmup**. The cosine schedule decays to near-zero in the last 20% of training. With only 660 steps, this means the last ~130 steps are at very low LR. Using a constant LR (or a much gentler decay) would keep the model learning at a useful rate for longer.
+
+Wait, e020 tried raising the min LR from 1e-3 to something higher and it was rejected (0.6363). So the cosine decay isn't the main issue.
+
+Let me think about **label smoothing**. This is a simple, well-motivated change:
+- Cross-entropy with label smoothing (e.g., 0.1) prevents the model from becoming overconfident
+- This can improve calibration, which directly affects the ranking component of mAP
+- It's a one-line change
+- It's unlikely to hurt much
+
+Actually, let me think about what would have the most impact:
+
+The per-class APs are: pore 0.537, deposit 0.635, discontinuity 0.780, stain 0.612
+
+The gap between the current score (0.6411) and the ceiling (0.758) is 0.117. That's a lot. The main issues are:
+1. Wrong class assignments (pore/stain confusion)
+2. False alarms not being suppressed
+3. Undertraining
+
+For #2, the scoring function matters. Currently: score = conf × prob[c]. 
+
+What if we use a **softmax temperature** at inference? Instead of raw softmax probabilities, use a temperature-scaled version. A temperature > 1 makes probabilities more uniform (less confident), temperature < 1 makes them more peaked. 
+
+Actually, the issue is that false alarms (background boxes) will get some probability for each class. If the model isn't confident about any class, all probabilities are ~0.25. Then score = conf × 0.25 for all classes. True defects should have higher prob for the correct class.
+
+What about using **log-probability** instead of probability in the score? score = conf × log(prob[c] + eps)? No, that would make negative scores.
+
+What about **score = conf × prob[c] / (1 - prob[c])**? This is the odds, which amplifies the difference between high and low probabilities.
+
+Actually, let me reconsider the scoring. The current score is conf × prob[c]. For a true detection with prob[c]=0.8 and conf=0.9, score = 0.72. For a false alarm with prob[c]=0.3 and conf=0.5, score = 0.15. The ratio is 4.8.
+
+If we use prob[c]^2: true = 0.9 × 0.64 = 0.576, false = 0.5 × 0.09 = 0.045. Ratio = 12.8. But e004 tried squaring and it was rejected (0.6211).
+
+What about **score = conf × prob[c] × (prob[c] - 0.25)**? This subtracts the uniform prior. For true: 0.9 × 0.8 × 0.55 = 0.396. For false: 0.5 × 0.3 × 0.05 = 0.0075. Ratio = 52.8. But this could go negative for prob < 0.25.
+
+Hmm, let me think differently. What about **using the detector confidence as a training signal**? During training, we could weight the loss by the detector confidence of the matched box. High-conf matches are more reliable.
+
+Actually, I think the most promising untried direction is:
+
+**Train with SGD momentum instead of AdamW.** 
+
+Reasoning:
+- For fine-tuning pretrained models, SGD with momentum is the standard and often outperforms Adam
+- AdamW at lr=1e-3 with cosine decay is a "safe" choice but may not be optimal for this specific task
+- SGD with momentum=0.9, lr=0.05-0.1, weight_decay=1e-4 is the standard for fine-tuning
+- The per-step cost is slightly lower (no second moment), giving a small speedup
+- The optimization landscape for fine-tuning is different from training from scratch; SGD's implicit regularization helps
+
+But wait, changing the optimizer is a big change. Let me think of something more focused.
+
+**Label smoothing (0.1)**: This is a one-parameter change. It:
+- Prevents overconfidence (which helps ranking)
+- Acts as a regularizer (helps with undertraining)
+- Is well-studied and rarely hurts
+- Is a one-line change in the loss function
+
+Let me go with label smoothing. It's focused, testable, and well-motivated.
+
+Actually wait, let me reconsider. The loss goes from 0.52 to 0.29 in 2 epochs. With label smoothing 0.1, the minimum loss would be -log(0.9) ≈ 0.105 instead of 0. So the loss would plateau higher. But the key benefit is better calibration.
+
+Hmm, but with only 660 steps, the model is far from converging. Label smoothing might not help much when the model is undertrained.
+
+Let me think about what else to try...
+
+**Two-model ensemble**: Train two models (e.g., EfficientNet-B0 and ResNet18) and average their probabilities. This would:
+- Provide diversity in the ensemble
+- Each model gets ~half the training time, so each is undertrained
+- But the ensemble might be better than either individual model
+- The scoring would use averaged probabilities
+
+But this is a complex change and each model would be even more undertrained.
+
+**Use both high and low-res crops with different weights**: Currently both are used equally. What if we weight high-res crops higher (they're cleaner)?
+
+**Remove the matched detector boxes from training and use only GT crops**: The matched detector boxes have IoU≥0.5 with GT, so they're slightly misplaced. Training on them might add noise. But e002 showed that adding them helped (0.6368 vs e000 which was probably lower).
+
+**Increase the wide crop context from 2.5 to 3.0**: More context might help distinguish stain from deposit (stain is often confused with deposit and background). More context gives the model more surrounding information.
+
+Actually, this is interesting. The brief says "stain is often confused with deposit and background." More context could help the model see the surrounding area and distinguish stain (which might have a different spatial relationship to the weld bead) from deposit.
+
+Let me think about this more carefully. The current CONTEXT is 2.5 (wide crop side = 2.5 × long side of box). If we increase to 3.0 or 3.5, the model sees more surrounding context. This could help with:
+- Distinguishing stain from deposit (different spatial patterns)
+- Distinguishing defects from background (more context to see the weld bead structure)
+
+This is a focused, testable change. One parameter: CONTEXT from 2.5 to 3.0.
+
+But wait, the crop is then resized to 224×224. So a larger context means the defect occupies a smaller fraction of the image. This could hurt for small defects like pores.
+
+Hmm, trade-off. Let me think...
+
+For pore (small, round holes): the defect is small, so more context means it's even smaller in the 224×224 image. This could hurt.
+For stain (spread out): more context helps see the spatial extent.
+For deposit (extra material): more context helps see the shape.
+For discontinuity (gap in weld): more context helps see the weld structure.
+
+It's a mixed bag. Maybe 3.0 is too aggressive. What about 3.0 only for some classes? No, that's too complex.
+
+Let me go back to **label smoothing**. It's the simplest, most focused change.
+
+Actually, I just realized something. Let me re-examine the training setup:
+
+```python
+train_rows = crops + matched_dets
+```
+
+Where `crops` are GT crops (both high and low res) and `matched_dets` are detector boxes that match GT with IoU≥0.5.
+
+The training set is 26347 boxes (14128 GT + 12219 det). That's a lot of data. With batch size 64, that's ~412 steps per epoch. In the time budget, we get ~660 steps, so about 1.6 epochs.
+
+Wait, the log says "411 steps" for epoch 0 and "660 steps" total. So epoch 0 has 411 steps (26347/64 ≈ 412), and the remaining 249 steps are from epoch 1 (which gets cut off by the time limit).
+
+So we're doing about 1.6 epochs. The model sees most of the data once and a bit more.
+
+Given this, **label smoothing** seems reasonable. It's a regularizer that helps when you have limited training.
+
+Let me also consider: **what about using a different learning rate schedule?** Instead of cosine, use a step schedule or constant LR. But e020 tried raising min LR and it was rejected.
+
+OK here's another idea I haven't tried: **using the detector confidence as a sample weight during training**. Matched detector boxes with high conf are more reliable than those with low conf. Weighting the loss by conf could help the model focus on reliable examples.
+
+But this is a more complex change. Let me stick with label smoothing.
+
+Wait, actually, let me reconsider the problem from scratch. The key insight from the brief:
+
+"mAP@0.5 rewards, per class: (a) the right class on boxes that overlap a true defect, and (b) good ranking: true detections should score higher than false ones."
+
+So we need both:
+1. Correct classification (accuracy on true defects)
+2. Good ranking (true defects score higher than false alarms)
+
+For #2, the scoring function matters a lot. Currently: score = conf × prob[c].
+
+The detector confidence `conf` is the same for all 4 class rows of a given box. So it doesn't help distinguish between classes. The class probability is what distinguishes them.
+
+For false alarms (background boxes), the model will output some probability distribution over 4 classes. If the model is well-calibrated, false alarms should have low max probability (close to uniform 0.25 each). True defects should have high max probability.
+
+The issue is: the model was trained only on true defects (GT crops + matched detector boxes). It has never seen a background example. So it doesn't know what "not a defect" looks like. When given a background crop, it will still output probabilities that sum to 1, and the max might be 0.4 or 0.5 (not as low as 0.25).
+
+This is why e001 and e005 (background class) were tried. But they failed. Why?
+
+e001: Trained on detector boxes with background class. Score 0.5691. This was on the old two-crop setup.
+e005: Added 5th background class, capped at 1.5× matched count. Score 0.6039. Also on old setup.
+
+Both failed. Maybe the background class is too noisy or the cap is wrong.
+
+What if instead of a full background class, we use a **soft background penalty**? For example, during training, add a small amount of "background" examples (unmatched detector boxes) with a very low weight, or use a virtual background class in the loss.
+
+Actually, this is getting too complex. Let me focus on a simple, testable change.
+
+**My choice: Label smoothing (0.1) in the cross-entropy loss.**
+
+Hypothesis: Label smoothing will improve mAP by preventing the model from becoming overconfident on training examples, leading to better-calibrated probabilities that improve the ranking component of mAP (true defects get higher scores relative to false alarms).
+
+This is a one-line change: `nn.CrossEntropyLoss()` → `nn.CrossEntropyLoss(label_smoothing=0.1)`.
+
+Let me write the SEARCH/REPLACE block.
+
+The line to change:
+```python
+    crit = nn.CrossEntropyLoss()
+```
+
+Replace with:
+```python
+    crit = nn.CrossEntropyLoss(label_smoothing=0.1)
+```
+
+This is clean, focused, and testable. Let me go with this.
+
+Wait, actually I want to double-check: does PyTorch's CrossEntropyLoss support label_smoothing? Yes, since PyTorch 1.10, `nn.CrossEntropyLoss` has a `label_smoothing` parameter.
+
+OK, let me finalize this.
+
+Actually, let me reconsider one more time. Is there a better change?
+
+Looking at the experiment history, many changes have been tried. The ones that helped:
+- e002: Adding matched detector boxes (0.6293)
+- e003: Adding low-res crops (0.6317)
+- e008: Single wide crop (0.6386)
+- e009: TTA horizontal flip (0.6387)
+- e016: IMG_SIZE 224 (0.6411)
+
+The trend shows incremental improvements. Each step helped a little.
+
+What about **increasing the CONTEXT from 2.5 to 3.0**? This gives more surrounding context, which could help with:
+- Distinguishing stain from deposit (spatial context)
+- Distinguishing defects from background (more weld structure visible)
+
+The risk is that small defects (pores) become even smaller in the 224×224 image.
+
+Let me estimate: if a pore box is 10×10 pixels, the current crop is 25×25 (2.5×10), resized to 224×224. The pore occupies 10/25 = 40% of the width. With CONTEXT=3.0, the crop is 30×30, and the pore occupies 10/30 = 33% of the width. That's a noticeable reduction.
+
+For a stain box of 50×30 pixels, the current crop is 125×125 (2.5×50), resized to 224×224. The stain occupies 50/125 = 40% of the width. With CONTEXT=3.0, the crop is 150×150, and the stain occupies 50/150 = 33%.
+
+So the relative size drops from 40% to 33% for all defects. That's a 17% reduction in relative size. For small defects, this could be significant.
+
+I think CONTEXT=3.0 is risky. Let me stick with label smoothing.
+
+Actually, you know what, let me think about this differently. What's the single most impactful thing I can do?
+
+The model is undertrained. The loss goes from 0.52 to 0.29. If I could get 2× more training steps, the loss might go to ~0.15, which would significantly improve accuracy.
+
+How to get 2× more steps?
+- Smaller model: tried MobileNetV3 (failed)
+- Smaller image: tried 192 (failed)
+- Smaller batch: tried 32 (failed)
+- Faster per-step: use a simpler model architecture
+
+Wait, what about **convnext_pico** or **regnety_016**? These are smaller models that might be faster per step.
+
+convnext_pico: ~2M params (vs EfficientNet-B0's 4M). Should be ~2× faster per step.
+regnety_016: ~4M params. Similar to EfficientNet-B0.
+
+If convnext_pico is 2× faster, we'd get ~1320 steps instead of 660. That's 3.2 epochs instead of 1.6.
+
+But convnext_nano (5M params) was tried and failed (0.5833). convnext_pico is smaller (2M) and might be even worse.
+
+Hmm, but convnext_nano failed possibly because of the architecture, not the size. Let me not go down this path.
+
+What about **using a smaller batch size with gradient accumulation**? No, that doesn't help with the number of steps.
+
+What about **reducing the number of workers**? The data loading might be a bottleneck. Currently 8 workers. If the GPU is the bottleneck, reducing workers wouldn't help. If the CPU is the bottleneck, reducing workers would make it worse.
+
+Actually, let me look at the timing:
+- Loading: 17s
+- Epoch 0: 94s - 17s = 77s for 411 steps → 0.187s/step
+- Epoch 1: 125s - 94s = 31s for 249 steps → 0.125s/step
+
+Wait, that's odd. Epoch 1 is faster per step? Maybe the data loading was faster because the images were cached.
+
+Total training time: 125s - 17s = 108s for 660 steps → 0.164s/step
+Reserve: 55s
+Prediction: 164s - 125s = 39s
+
+So the prediction takes 39s. That's a lot. With 41879 eval boxes and batch size 256, that's 164 batches. 39s / 164 = 0.238s/batch. With TTA (2 forward passes), that's 0.119s per forward pass per batch of 256.
+
+If I could reduce the prediction time, I'd have more time for training. But the prediction time is fixed by the number of eval boxes.
+
+Unless... I reduce the number of eval boxes by filtering out low-confidence ones. But that would change the output format.
+
+OK, I think label smoothing is the safest, most focused change. Let me go with it.
+
+Actually, one more thought: **what about using a different weight decay?** Currently 0.05 with AdamW. What about 0.01 or 0.1? 
+
+With only 660 steps, weight decay of 0.05 might be too aggressive (over-regularizing) or too weak (under-regularizing). But this is hard to reason about.
+
+Let me just go with label smoothing. It's well-motivated, one-line change, and testable.
+
+Final answer: Label smoothing 0.1.
+
+Let me write the SEARCH/REPLACE block:
+
+SEARCH:
+```
+    crit = nn.CrossEntropyLoss()
+```
+
+REPLACE:
+```
+    crit = nn.CrossEntropyLoss(label_smoothing=0.1)
+```
+
+This should appear exactly once in the file. Let me verify... Yes, there's only one `crit = nn.CrossEntropyLoss()` in the file.
+
+OK, I'm confident in this change. Let me write the response.

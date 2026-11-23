@@ -1,0 +1,451 @@
+===== attempt 1 =====
+Let me review the situation.
+
+Current best: e005, 5-seed mean 0.6345. Architecture change: an MLP head over the concatenated features of the two views (rather than averaging the logits).
+
+History:
+- e001/e002/e009: adding detector boxes from the train split → e002 got 0.6307 on 5 seeds (not confirmed), e009 got 0.6325 on seed 0 (rejected). So this idea has been tried 3 times (e001 crashed, e002 not confirmed, e009 rejected). Per the guide: "if it fails twice, drop it." e002 not confirmed, e009 rejected → drop.
+- e003/e010: stage-1 error simulation jitter → e003 0.6294 (5 seeds), e010 0.6335 (5 seeds). Both not confirmed. Two failed attempts → per the guide, move on to the next direction.
+- e004/e012: pre-computing crops → both crashed/buggy. e004 scored 0.0531 (bug). e012 crashed.
+- e013: num_workers=0 → timeout. Interesting: epoch 0 took 87s vs 57s with workers. So in-process crop generation is much slower per step (PIL ops on the main thread, no overlap with GPU). So worker-based loading is actually faster. The reason the first epoch is slow with workers is pickling the images dict to the workers, but persistent_workers keeps them. In fact, with persistent_workers=True the workers are created once and the dict is pickled once. Epoch 0: 57s (94 steps) vs later ~18s (94 steps) → the ~39s overhead is worker creation + pickling 1022 images. This is a one-time cost of ~26–39s.
+
+Hmm, wait, e013 with workers=0: epoch 0 = 87s (94 steps) = 0.92s/step, vs 57s with workers. So in-process is ~0.4s/step slower. That's a lot. So the DataLoader workers are doing useful parallelism.
+
+- e006: wider MLP head → 0.6338 rejected.
+- e007: box size/aspect ratio inputs → 0.6337/0.6317 not confirmed.
+- e008: random zoom per sample → crashed.
+- e011: TTA flips → timeout.
+- e013: workers=0 → timeout.
+
+Per the guide's plan:
+1. Consolidate: detector boxes from the train split — tried, failed twice (e002 not confirmed, e009 rejected). Drop.
+2. Close the box-quality gap:
+   - Stage-1 error simulation jitter: e003, e010 — two attempts, both not confirmed. Per the guide, "two failed variants of a direction: move to the next direction."
+   - Weight/sample training boxes by box quality.
+   - Combine the two views better than averaging logits — done in e005 (MLP head over concatenated features). e006 (wider head) failed.
+3. Buy training steps: e004/e012 (pre-compute crops) crashed, e013 (workers=0) timed out. Hmm.
+
+Wait — what's the actual bottleneck? Let me compute. Log:
+- Load: 13s
+- Epoch 0: 94 steps in 57s → 0.61s/step (including ~26s of worker startup overhead, so ~0.31s/step steady state)
+- Epochs 1–4: ~94 steps in ~18s → 0.19s/step
+- Total 436 steps in 162s. Training budget: 180 - 55 = 125s, starting from ~13s → t_end = 125s, so training runs 13s→125s = 112s? But the log shows 436 steps done at 125s, total 162s. Prediction is ~37s (162-125).
+
+RESERVE_S=55 but prediction only takes ~37s. So I could shrink the reserve to ~45–48 and get ~10–15 extra seconds of training = ~50–80 extra steps. e012 tried RESERVE_S 55→45 but crashed (need to check why; it was a pre-compute + reserve change).
+
+Actually, wait, why did e004 and e012 crash? e004 scored 0.0531 (buggy result, not a crash). e012 crashed. I don't have the crash logs. e004's bug: pre-computing crops... possible bug: pre-computing crops with train=True jitter? Or a normalization issue? I don't know exactly. The harness says "likely bug."
+
+Let me think about what the most promising next experiment is.
+
+Key diagnostics:
+- mAP if all boxes had the correct class but kept my scores: 0.7464. My score: 0.6345. So the cost of wrong classes = 0.112. The remaining gap to the perfect-classes ceiling 0.758 is 0.012 (cost of scores).
+- Confusion: pore is the weak class (62% correct; 21 of the 64 true pores are predicted as stain, 5 as deposit). Stain: 41 of 607 true stains predicted as deposit. Deposit: 48 of 270 predicted as stain.
+- Per-class AP: pore 0.505, deposit 0.639, discontinuity 0.781, stain 0.613.
+
+So the biggest error is the class decision, especially pore↔stain and stain→deposit. The guide says "fine-grained classes (only after 2 and 3)."
+
+Hmm, but wait. Let me reconsider. The guide's plan is:
+1. Consolidate (detector boxes) — done, failed, drop.
+2. Box-quality gap: jitter simulation (failed twice), box-quality weighting, better view combination (done in e005, wider head failed).
+3. Buy training steps.
+4. Fine-grained classes.
+5. Final 1.5 hours: no big swings.
+
+We're now at experiment 14 of ~30. Time: each experiment is one 180s run. 16 experiments remaining.
+
+What's the highest-value untried idea?
+
+Options:
+
+A. Buy training steps: shrink RESERVE_S from 55 to ~42 (prediction measured ~37s; need a safety margin; 42 gives 5s margin). This is a small, safe change that gives ~13s more training ≈ 60–70 steps. But the effect of more steps: the loss is still dropping (0.49 → 0.17 over 5 epochs; not converged). More steps should help. But how much? The earlier "longer training" family in past runs: "no gain: best 5-seed 0.6355 (not confirmed)." Hmm, that was in past runs from a different base (the original train.py, not e005). The 0.6355 was not confirmed. So longer training has been tried and was not confirmed. But that was with the old base (logit averaging, 0.629–0.630). On the e005 base it's untried. Hmm, but the effect is probably small: ~13s more training. The loss drops from 0.169 at the cut; more steps would bring it to ~0.14. The mAP gain is probably <0.005. Risky in terms of acceptance but cheap. Actually wait — is it really? Let me reconsider: the earlier family "longer training (smaller reserve, measured prediction time): 6 attempts, no gain: best 5-seed 0.6355 (not confirmed); 2 bugs." So this family is effectively exhausted (3+ attempts, no confirmed gain). Per the rules I shouldn't repeat it... but the base is different. Hmm. The rule says "do not repeat a family marked 'no gain' unless you can say what's fundamentally different." The fundamental difference: e005's base has a different head and the loss trajectory is different, but the mechanism (more steps) is the same. I think it's weak.
+
+B. Pre-compute crops but done right. e004 (0.0531, bug) and e012 (crash) both tried this. Two failures → per the guide, "bug: fix once; second failure: drop." So drop pre-computing.
+
+C. Fix the first-epoch overhead another way: the first-epoch overhead is worker creation + pickling the images dict. Alternative: pre-convert images to a more compact format before creating the workers? The images dict holds 1022 full-res RGB numpy arrays. Pickling that to 8 workers is the cost. Alternative: pass only the image paths and have workers open the images themselves (each worker opens the images it needs, with an LRU cache). But then per-step PIL open+decode on workers... with persistent workers and an in-worker cache, each worker decodes each image once. Total decode cost is distributed. Actually, the current approach pickles the whole dict once (13s to load on main + pickling). With workers opening on demand: each worker decodes its subset of images on demand; decode cost is ~? The main-process load was 13s for 1022 images (PIL open + convert). Distributed across 8 workers in parallel, the first epoch overlaps decoding with GPU compute. That could eliminate the 26s first-epoch overhead.
+
+But is this "buying training steps"? Yes. And it's a different mechanism from e013 (workers=0) and e004/e012 (pre-compute crops). Hmm, but the category "optimisation" is marked EXHAUSTED? (3 ideas, 1 ran, 0 new best, 3 crashed/timeout). The harness marks it exhausted, but the guide says "buy training steps (whenever the log shows the GPU is waiting or the loss is still dropping at the cut)." The loss is still dropping at the cut (0.169). And the log shows epoch 0 is 39s slower than later epochs — that's worker startup, GPU probably waiting.
+
+Actually, let me reconsider what's really limiting things. Steady state: 0.19s/step with 8 workers, batch 64, two 160x160 views through EfficientNet-B0 in bf16. That's ~335 steps/min... 436 steps in 112s of training. If I could get to 0.15s/step I'd get ~50 more steps.
+
+D. A fundamentally different angle on the class confusion: the pore↔stain confusion. The guide says fine-grained classes come after 2 and 3. We're at experiment 14; the guide's plan has ~30 experiments, so fine-grained work can start now or soon.
+
+What could help pore vs stain? Ideas:
+- Higher input resolution for the classifier (e.g., 224 instead of 160). The earlier "resolution" family from past runs: 9 attempts, no gain (best 5-seed 0.634 not confirmed) — but that was on the old base with the 224px/larger MIN_CROP/enlarged tight crop for small boxes. Hmm, "224px" was tried in past runs and got no gain. But that was on the original base (0.629). On e005 (MLP head) it's untried. Still, 9 attempts across 5 past runs is a lot. The family is "resolution and small-box handling (224 px, larger MIN_CROP, enlarged tight crop for small boxes): 9 attempts, no gain." I should be cautious.
+
+Wait, but those past runs were from the original train.py with IMG_SIZE=160 and logit averaging. The "224px" attempt would have been IMG_SIZE=224. It got no gain on that base. On the e005 base... the mechanism is the same (more pixels → more texture). If it didn't help before, it probably won't help now. And it costs 2x compute (224/160)^2 = 1.96x → fewer steps. Marginal.
+
+E. A different backbone. Past runs: "bigger or different backbone (EfficientNet-B2, ResNet-50, 2–3 model ensembles): 8 attempts, no gain." Exhausted.
+
+F. A third view (wide 4x). Past runs: "third, very wide view (4x the box) next to the 1.5x and 2.5x crops, average the logits: 3 attempts, accepted twice (5-seed 0.6342 both, +0.005), gain mostly from the pore class; one rejected (0.633). Adds ~20s per run, close to the time limit." Hmm, accepted twice on the old base (+0.005). On the e005 base it's untried. But +0.005 is at the noise threshold, and it's "close to the time limit." And it was mostly a pore-class gain — small-class gains aren't accepted tonight. Probably skip.
+
+G. Box-quality weighting/sampling (guide's direction 2b): "weight or sample training boxes by box quality so the model sees enough poorly-placed boxes." But wait — the training boxes are the true boxes (perfect). "Box quality" here means simulating detector imperfection. e003/e010 did jitter simulation (failed twice). Weighting by box quality... but all training boxes are perfect true boxes; there's no quality signal unless I use the overlap with detector boxes. Hmm, actually I could weight true boxes by how well the detector boxes on the same image overlap them (using dets.csv train split). Boxes the detector places poorly get higher weight? That's a variant of "train on detector boxes" (failed) + jitter (failed). I think this direction is effectively exhausted.
+
+H. Better view combination: e005 did the concatenated-feature MLP. e006 (wider MLP) failed. What about cross-attention or a difference feature? E.g., concatenate [ft, fw, ft-fw, ft*fw]? That's a small change to the head input. Hmm, that's an "architecture" variant. e005 +0057, e006 rejected. One more architecture variant... the guide says after two failed follow-ups, switch. e006 is one failed follow-up. A second failed follow-up → switch. So one more is allowed. But what's the hypothesis? The interaction between views is probably already captured by the MLP on concatenation. Weak.
+
+I. Training on detector boxes — drop (failed twice).
+
+J. TTA — e011 timed out; past runs: 8 attempts, no gain. Drop.
+
+K. Score/ranking changes — 16 attempts in past runs, no gain. Drop.
+
+L. Background class — 9 attempts, no gain. Drop.
+
+M. Class-balanced sampling/weighted loss — no gain; and "class-weighted loss hurt classification every time." Drop.
+
+N. Augmentation — 5 attempts, no gain. Focal loss — no gain. Drop.
+
+So most of the "easy" families are exhausted. What's left per the guide:
+- Buy training steps (direction 3) — "each step gained is worth more than a bigger model."
+- Fine-grained classes (direction 4) — "look for one change that helps the whole pore/deposit/stain confusion, not one class."
+
+Let me think more carefully about buying steps. Where is the time going?
+
+Steady-state step time: 0.19s. Components: data loading (workers generate crops: PIL crop + resize to 160 + normalize + transpose + to tensor, for 2 views, batch 64), GPU forward+backward (EfficientNet-B0, 2 views, batch 64, 160x160, bf16), optimizer step, H2D transfer.
+
+Epoch 0 with 8 workers: 57s for 94 steps. Epochs 1+: 18s. So steady state is 0.19s/step. If the GPU is the bottleneck at 0.19s/step, then reducing per-step compute is the way:
+- Smaller/faster backbone: but "bigger or different backbone" family = no gain (8 attempts). That included bigger models; did it include smaller/faster ones? The available pretrained timm models: convnext_atto, convnext_nano, convnext_pico, efficientnet_b0, efficientnet_b2, mobilenetv3_large_100, regnety_016, resnet18, resnet26d, resnet34, resnet50, tf_efficientnetv2_b0. The past family says "bigger or different backbone (EfficientNet-B2, ResNet-50, 2–3 model ensembles): 8 attempts, no gain: best 5-seed 0.636 (not confirmed), others 0.600–0.631." Hmm, "different backbone" — convnext/mobilenet/resnet18 might have been included in "others 0.600–0.631." A smaller backbone (convnext_pico/atto, regnety_016, resnet18) would be faster → more steps. But if the smaller model is less accurate, the net effect is unclear, and the family is marked no gain. I think backbones are exhausted.
+
+- Fewer views: one view instead of two? The two-crop design is the starting point; the tight+wide context matters (the "context around the object can help separate classes"). Dropping a view halves the forward cost → ~2x steps. But the wide view probably helps stain/deposit context. Risky, and it's a "what the model sees" change. Hmm. Actually, this is an interesting trade: 436 steps of 2-view vs ~800 steps of 1-view. Which wins? The two-view design was the starting recipe that got macro-F1 ~0.87 on perfect boxes. The wide view adds context. I'd guess 2-view at 436 steps beats 1-view at 800 steps, but it's really uncertain. And it's a big swing mid-run.
+
+- Lower resolution: 128 instead of 160 → (128/160)^2 = 0.64x compute → ~1.56x steps. But the "resolution" family: 9 attempts, no gain. Though those were 224 (higher) and MIN_CROP changes. 128 (lower) — was that tried? "Resolution and small-box handling (224 px, larger MIN_CROP, enlarged tight crop for small boxes): 9 attempts, no gain: best 5-seed 0.634 (not confirmed); 2 crashes." It says 224px, not 128. But the family is marked no gain with 9 attempts; I shouldn't poke it again.
+
+- Reduce the number of eval predictions? Prediction is ~37s for 41879 detections. That's fixed by the task (I have to predict all eval boxes). Can I speed up prediction? Batch 256, 2 views each. I could increase the eval batch size (512) — memory permitting. Or... the prediction cost is what it is.
+
+- The first-epoch overhead (~39s): this is the biggest single chunk of "wasted" time. 39s out of 162s! If I can eliminate it, I get ~39s more training ≈ 200 steps at steady state. That's huge — 45% more training.
+
+How to eliminate the first-epoch overhead? The overhead is: DataLoader with num_workers=8 creates 8 worker processes, each pickling the entire images dict (1022 full-res images). The images dict is probably ~1022 * (avg maybe 1000x1000x3 = 3MB) = ~3GB? Pickling 3GB to 8 workers = 24GB of pickling total. That's the 39s.
+
+Options:
+1. num_workers=0: tried (e013), in-process crop generation is too slow (0.92s/step on epoch 0... wait, actually epoch 0 was 87s for 94 steps = 0.93s/step, and epoch 1 was 125-87=38s for 74 steps = 0.51s/step. Still much slower than 0.19s with workers). So in-process crop generation is ~2.7x slower than worker-based. So workers=0 is out.
+
+2. Pre-compute crops: e004 (bug, 0.0531), e012 (crash). Two failures → drop per the guide. But wait — what was the bug? e004 scored 0.0531, which is "far below baseline → bug." Common bugs in pre-computing: forgetting normalization, wrong dtype, or... actually, a subtle one: if you pre-compute crops with train=True jitter, you get one fixed jittered crop per box (jitter applied once), losing per-step augmentation diversity and the per-view-pair shared flip/brightness. But that wouldn't drop the score to 0.053. 0.053 means the model barely learned or the labels are broken. Hmm, maybe a label issue: if the pre-compute loop reindexed rows... I don't know. Two failures → the guide says drop.
+
+3. Have workers open images on demand (paths instead of arrays). Each worker decodes images it needs, with an in-worker LRU/complete cache. With persistent_workers, each worker keeps its cache. Total decode work = 1022 decodes distributed across 8 workers, overlapping with GPU compute during epoch 0. The main-process load (13s) is also avoided (no need to load all images upfront... but I need image sizes for crops? make_crop uses img.shape; I could get sizes from PIL's open without full decode, or store (w,h) in the rows). Actually, crops.csv has img_w, img_h! So workers don't even need to decode to know sizes... but they do need pixels for the crop.
+
+   Implementation: BoxDataset holds image paths; __getitem__ opens the image (cached in a per-worker dict), crops, resizes, normalizes. With 8 persistent workers, each worker decodes ~128 images (6052 boxes / 48 distinct images per worker on average... wait, 1022 images total, 6052 boxes; each worker sees ~756 boxes spanning maybe ~300 distinct images). Decoding 300 images per worker ~ 300 * 3ms = 1s? Actually PIL decoding of a ~1000x1000 JPEG is ~5–15ms. 300 images * 10ms = 3s per worker, in parallel → ~3s total, overlapping with GPU. That's much better than 39s of pickling.
+
+   But: is this "fundamentally different" from the exhausted attempts? e013 was workers=0 (in-process). e004/e012 were pre-computing crops. This is "workers decode on demand" — a different mechanism. The optimisation category is marked "EXHAUSTED?" by the harness, but the guide explicitly says to buy steps whenever the log shows GPU waiting, and the first-epoch overhead is clearly GPU waiting (or at least wasted time). I think this is justified: the guide's direction 3 is "prepare crops once instead of per step, fewer or cheaper data-loader operations, a reserve that matches the measured prediction time." The on-demand decode is "cheaper data-loader operations."
+
+   Hmm wait, but there's a risk: per-step PIL open from cache is cheap (dict lookup), but the crop+resize+normalize is the same work as now. Steady-state step time should be comparable to now (0.19s), since the crop work is the same, just decoded once per image per worker instead of pickling the whole dict.
+
+   Actually, hold on. Let me reconsider: is the 39s first-epoch overhead really pickling? With persistent_workers=True, workers are spawned at DataLoader creation (first iteration). Each worker pickles the dataset (which holds the images dict) via fork... wait! On Linux, torch's DataLoader workers use fork by default (multiprocessing context 'fork' is the default on Linux). With fork, the images dict is inherited via copy-on-write — no pickling! Hmm. So why is epoch 0 slow?
+
+   Actually, torch's DataLoader default multiprocessing context on Linux is 'fork'. With fork, the worker inherits the parent's memory (the images dict) without pickling. So the overhead is: forking 8 processes (each ~COW, cheap), worker initialization, and... the first batch: all 8 workers start generating samples simultaneously, and the GPU waits for the first batch. Also, the first-epoch slowness might be because... hmm, 57s for 94 steps = 0.61s/step vs 0.19s steady. That's 3.2x. Fork should be fast. What else?
+
+   Wait — maybe the images dict is huge and fork's COW page faults... no, COW is lazy.
+
+   Hmm, maybe it's not fork. PyTorch's default start method on Linux is 'fork', yes. But the dataset object contains numpy arrays; with fork they're shared. So worker startup should be ~1–2s total.
+
+   Then what's the 39s? Maybe: pin_memory + first batch H2D; CUDA lazy initialization (cubin loading, ~5–10s); the first forward pass compiles/allocates; bf16 autocast initialization. Actually, CUDA context init + cuDNN plan selection for the first few forwards can take 10–20s. And the first epoch's DataLoader: workers produce batches as fast as the GPU consumes; if the GPU is slow on the first batches (cudnn autotune), the workers fill the queue (prefetch_factor=2 * 8 workers = 16 batches queued).
+
+   Hmm, actually, let me look at the numbers again: epoch 0: 94 steps in 57s (from 13s to 70s? the log says "epoch 0: loss 0.4932, 94 steps, 57s" — that's T0-relative 57s; load was 13s; so epoch 0 took 44s for 94 steps = 0.47s/step). Epoch 1: 75s - 57s = 18s for 94 steps = 0.19s/step. So epoch 0 = 0.47s/step, 2.5x steady.
+
+   And e013 (workers=0): epoch 0 87-13=74s for 94 steps = 0.79s/step; epoch 1: 125-87=38s for 74 steps = 0.51s/step. So in-process steady = 0.51s/step vs worker steady 0.19s/step. The crop generation in-process is ~0.32s/step slower. So crop generation (PIL crop+resize+normalize for 128 views of 160x160) takes ~0.32s on one core. With 8 workers it's parallelized → negligible.
+
+   So the worker steady state is GPU-bound at 0.19s/step. Epoch 0's extra 28s (44 vs 18) is startup: fork + CUDA init + cudnn + worker ramp-up.
+
+   Can I warm up CUDA before the training loop? E.g., run a dummy forward+backward pass with random tensors before the loop, and even pre-create the DataLoader workers (iterate one batch and discard it? no — that consumes training data... I could create the workers with a dummy dataset first). Actually, the simplest: do a small dummy training step (random batch) before the timed loop to trigger CUDA/cuDNN init. That should shave maybe 5–15s off epoch 0.
+
+   Hmm, but wait: does the harness's T0 start before my code runs? T0 = time.time() at import. So CUDA init is counted. A dummy forward of a batch of 64 through EfficientNet-B0 (2 views) + backward: ~1–2s after context init; context init itself ~5–10s. Doing it explicitly doesn't save time — it just moves it earlier. The total is the same. Unless the first-epoch overhead is worker-related (workers ramping up while the GPU idles).
+
+   Let me think about the worker ramp: at t=13s, the training loop starts. The DataLoader spawns 8 workers (fork ~0.5s). The GPU needs batch 1; workers produce it; each worker generates samples one at a time (collate 64 samples per batch... actually the batch is split across workers: ~8 samples per worker per batch). Each sample: dict lookup + 2x (PIL crop, resize, normalize, transpose, from_numpy). ~5–10ms per sample? 8 samples per worker → 40–80ms per batch per worker, in parallel. So data should keep up easily. The first batch arrives ~1s after the loop starts. So the GPU shouldn't wait long.
+
+   So what's the 28s? Honestly, I'm not sure. Maybe CUDA lazy init happens on the first .to(device) / first forward (cubins, ~10–20s on some systems). That's unavoidable except... it's unavoidable, it has to happen somewhere.
+
+   Hmm wait, actually — maybe it's the eval DataLoader? No, that's after training.
+
+   OK, another thought: maybe the epoch-0 slowness is the LR warmup? No, LR doesn't affect speed.
+
+   Let me not overthink the cause. The practical question: what change reliably buys training time?
+
+   Option: shrink RESERVE_S from 55 to 45. Prediction is measured ~37s (162-125). 45 gives 8s marginThinking budget reached. Stop thinking now and write the reply in the required format.
+===== attempt 2 =====
+I made a mistake in the previous reply. I included a second SEARCH/REPLACE block that was a no-op (the make_crop line) where I accidentally left a `=======` line in the replacement text. Let me re-check.
+
+Actually looking at my reply, I had:
+```
+<<<<<<< SEARCH
+def make_crop(img, r, context, train):
+    h, w = img.shape[:2]
+=======
+def make_crop(img, r, context, train):
+    h, w = img.shape[:2]  # kept for clarity; sizes come from the array
+=======
+>>>>>>> REPLACE
+```
+
+That block has TWO `=======` lines, which is invalid. That's the syntax error the harness is reporting. I need to remove that block entirely (it was a no-op anyway) and keep the other three blocks.
+
+Let me rewrite the reply with only the valid blocks:
+1. The `needed`/`images` -> `img_dir`/`sizes` block
+2. The BoxDataset block
+3. The dl_tr block
+4. The dl_ev block
+
+Let me make sure each SEARCH text appears exactly once in the file and is copied character-for-character.
+
+Block 1 SEARCH:
+```
+    needed = {r["image"] for r in crops} | {d["image"] for d in ev}
+    images = {p: np.asarray(Image.open(os.path.join(args.data, "images", p)).convert("RGB")) for p in needed}
+    print(f"train {len(crops)} boxes, eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
+```
+This appears once. Good.
+
+Block 2 SEARCH:
+```
+class BoxDataset(torch.utils.data.Dataset):
+    def __init__(self, rows, images, train):
+        self.rows, self.images, self.train = rows, images, train
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __getitem__(self, i):
+        r = self.rows[i]
+        img = self.images[r["image"]]
+```
+This appears once. Good.
+
+Block 3 SEARCH:
+```
+    dl_tr = torch.utils.data.DataLoader(BoxDataset(crops, images, True), batch_size=BATCH_SIZE, shuffle=True,
+```
+Appears once. Good.
+
+Block 4 SEARCH:
+```
+    dl_ev = torch.utils.data.DataLoader(BoxDataset(ev, images, False), batch_size=256, shuffle=False,
+```
+Appears once. Good.
+
+Now let me double check the REPLACE for block 2. The `__getitem__` after `img = self._img(r["image"])` continues with the rest of the original method body which I don't touch. Let me make sure my SEARCH ends at `img = self.images[r["image"]]` and my REPLACE ends at `img = self._img(r["image"])`. The next line in the file is `        fh = fv = False` which I don't include, so it stays. Good.
+
+Let me verify the full BoxDataset method to ensure my replacement is consistent. Original:
+```
+class BoxDataset(torch.utils.data.Dataset):
+    def __init__(self, rows, images, train):
+        self.rows, self.images, self.train = rows, images, train
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __getitem__(self, i):
+        r = self.rows[i]
+        img = self.images[r["image"]]
+        fh = fv = False
+        ...
+```
+
+My replacement:
+```
+class BoxDataset(torch.utils.data.Dataset):
+    def __init__(self, rows, img_dir, train):
+        self.rows, self.img_dir, self.train = rows, img_dir, train
+        self._cache = {}
+
+    def __len__(self):
+        return len(self.rows)
+
+    def _img(self, name):
+        a = self._cache.get(name)
+        if a is None:
+            a = np.asarray(Image.open(os.path.join(self.img_dir, name)).convert("RGB"))
+            if len(self._cache) >= 400:
+                self._cache.clear()
+            self._cache[name] = a
+        return a
+
+    def __getitem__(self, i):
+        r = self.rows[i]
+        img = self._img(r["image"])
+```
+
+Good. This is valid Python.
+
+Now let me reconsider whether this is actually the right experiment and whether it will work. The concern: with persistent_workers=True and 8 workers, each worker has its own copy of the dataset object. When I add `self._cache = {}` in `__init__`, each worker process will have its own cache (since the dataset is pickled to each worker). That's fine. The cache is per-worker, bounded to 400 images. With 1022 images and 8 workers, each worker sees roughly 128 images on average per epoch but shuffled. Actually the caching with clear at 400 might cause thrashing if a worker touches >400 distinct images. But with 8 workers and 1022 images, each worker touches a random subset. Over an epoch, each worker processes ~6052/8 ≈ 756 items, touching many images. The cache of 400 might thrash. But decoding a full-res image is the cost. Hmm.
+
+Actually, wait. The key question: is on-demand decoding faster or slower than having the dict in memory? The original approach loads all 1022 images into memory at start (13s), then workers pick the dict. The problem identified: epoch 0 costs 44s vs 18s later — that's 26s of one-time overhead. The hypothesis is that this overhead is from pickling the big dict to workers.
+
+But actually, if the dict is already loaded into the main process before the DataLoader is created, and workers are persistent, then the dict is pickled ONCE to each worker at startup (during the first epoch's worker spawn). That's the 26s. With persistent_workers=True, subsequent epochs reuse the workers so no re-pickling.
+
+With my change, each worker decodes images on demand from disk. The first time a worker needs an image, it decodes it (from disk, PIL open). This spreads the decode cost across steps. But the total decode work is the same ~13s worth, just spread out and possibly repeated if cache misses.
+
+Actually the real question is whether the 26s overhead is really the pickling. Let me think. 1022 images, full res. Each image maybe 500-1500 px. As uint8 arrays, total maybe 1022 * ~1M pixels * 3 bytes ≈ 3GB? That's a lot to pickle 8 times = 24GB of pickling. That could indeed take ~26s. Actually pickling numpy arrays is fast (memory copy), 3GB * 8 = 24GB at ~1GB/s = 24s. Yes, plausible.
+
+So my change avoids pickling the dict. Instead each worker decodes from disk. Disk decode: 1022 images, if each takes ~5ms, that's ~5s total but spread across workers (8 in parallel) so ~1s wall. Plus the cache helps repeated access within an image.
+
+But there's a risk: the per-step crop work now includes occasional disk decode. If a batch has many new images, the worker stalls on disk. With batch_size 64 and images being weld bead photos (each image has multiple boxes), consecutive items in a batch often share images. With shuffle, not necessarily.
+
+Hmm, this is getting uncertain. But the hypothesis is reasonable and it's a targeted fix for the measured 26s overhead. Let me also consider: is there a simpler, safer fix? 
+
+Alternative: keep the dict in memory but avoid pickling by NOT using persistent_workers and NOT... no, that's e013 which timed out (workers=0).
+
+Another alternative: reduce the number of workers so less pickling. E.g., workers=2. Pickling 3GB*2 = 6GB ≈ 6s overhead instead of 26s. But then crop work is slower with only 2 workers. Trade-off.
+
+Actually, the cleanest: the dict is loaded in main process. If I could get workers to share it without pickling... In PyTorch, worker processes get a copy of the dataset via fork or spawn. On Linux, the default start method is fork, so the dict is COPIED (copy-on-write) not pickled! Wait, is it fork or spawn?
+
+On Linux, torch default is "fork". With fork, the child gets a copy-on-write view of the parent's memory, so no pickling of the dict — it's shared via COW. So the 26s overhead is NOT pickling the dict if using fork.
+
+Hmm, so what IS the 26s overhead then? Let me reconsider. With fork and persistent_workers, workers are spawned once at the first epoch. The overhead could be:
+- Worker process startup (import torch, etc.) — but that's the same each... no, only once.
+- Actually with persistent_workers=True, workers are created when iteration starts. The first iteration spawns 8 workers (fork + import). That's the one-time cost.
+
+If it's fork, the dict is COW-shared, cheap. So the 26s is worker spawn + import overhead + maybe the first-batch crop work being slow due to cold caches.
+
+Wait, but if workers=0 (e013), there's no worker spawn, yet epoch 0 was 87s (vs 57s for e005 seed-0... wait e005 seed-0 epoch 0 was 57s, e013 epoch 0 was 87s). With workers=0, all crop work is in the main process serially, so it's slower. With 8 workers, the crop work is parallelized but there's spawn overhead.
+
+Actually let me recompute. e005 seed-0: epoch 0 = 57s for 94 steps = 0.61s/step. epoch 1 = 18s for 94 steps = 0.19s/step. So epoch 0 has 39s extra over epoch 1 for the same 94 steps. That 39s is the one-time overhead (worker spawn + first-batch effects).
+
+e013 (workers=0): epoch 0 = 87s for 94 steps = 0.93s/step. epoch 1 = 38s for 74 steps = 0.51s/step. So with workers=0, steady state is 0.51s/step vs 0.19s/step with 8 workers. So 8 workers is 2.7x faster in steady state. The one-time overhead with 8 workers is 39s.
+
+So the question: can I reduce the 39s one-time overhead while keeping 8 workers' steady-state speed?
+
+If it's fork+COW, the dict isn't pickled. So my change to on-demand decoding would ADD disk decode work (worse) without removing the spawn overhead. That would be a net loss.
+
+Hmm. So my hypothesis about "pickling the dict" may be wrong if it's fork.
+
+Let me reconsider what the 39s is. With persistent_workers=True and fork:
+- 8 worker processes forked from main. Fork is cheap.
+- Each worker imports torch, numpy, PIL, timm? No — the worker runs __getitem__ which needs the dataset class and functions. With fork, the worker inherits all loaded modules, so no re-import. Actually with fork, the child inherits the parent's memory including imported modules. So worker startup is fast.
+
+Wait, but actually the DataLoader with num_workers>0 uses a worker loop. On the first batch, it forks workers, then each worker processes items. The 39s could be the actual crop work for the first 94 batches being slow because... no, steady state is 0.19s/step and that INCLUDES crop work in workers.
+
+Let me think differently. 94 steps * 0.19s = 18s steady. Epoch 0 = 57s. Extra 39s. If workers are forked at start and the first ~39s is spent forking + initial data loading into workers, then... 
+
+Actually, you know what, I'm overanalyzing. The measured fact: epoch 0 is 2x slower than later epochs with 8 workers. The cause is one-time worker setup. Whether it's pickling (spawn) or fork overhead, the fix of on-demand decode doesn't clearly help and might hurt.
+
+Let me reconsider. Is there a cleaner win here? 
+
+The steady state is 0.19s/step with 8 workers. That's already fast. The one-time 39s overhead — if I could avoid it, I'd gain ~39s ≈ 200 steps. That's huge.
+
+What causes 39s one-time with persistent workers? Let me think about fork vs spawn. If torch is using spawn (e.g., on some systems or if CUDA is involved), then each worker re-imports everything and re-pickles the dataset. Re-pickling a 3GB dict 8 times = 24GB = ~24s. Plus re-import. That matches ~39s!
+
+Actually, when CUDA is available and the DataLoader is created, does it use fork or spawn? On Linux with CUDA, PyTorch still uses fork by default for DataLoader (the "spawn" warning is for CUDA in the main process, not DataLoader). So it's fork. With fork, COW, no pickling.
+
+Hmm, but the 39s is real. Let me consider: maybe it's not the dict at all. Maybe it's that the FIRST epoch's data loading is slow because the images dict is being accessed for the first time and... no, it's in memory.
+
+Actually, maybe the 39s is the worker fork itself being slow because the main process has a large heap (3GB dict + model + etc.), and fork on a large heap is slow (fork copies the page table, and with COW, if the memory is dirty it's fine, but fork of a 3-4GB process can take a few seconds). 8 forks of a 4GB process = maybe 8 * 2s = 16s? Plus CUDA context in workers? No, workers don't use CUDA.
+
+This is too speculative. Let me step back and think about what's the SAFEST high-value experiment.
+
+Given the uncertainty about the 26-39s overhead cause, and that my on-demand decode change might not help (if fork) or might hurt (adds disk I/O), maybe I should reconsider.
+
+Alternative safe win: The steady state is 0.19s/step. The loss is still falling (0.169 at cut). More steps = better. The reserve is 55s. Measured prediction time: the run finished at 162s total, training ended at... let me see. t_end = deadline - 55 = 180 - 55 = 125s. The log shows "epoch 4: ... 125s" then "done: ... 162s total". So prediction took 162 - 125 = 37s. So the reserve of 55s is 18s too generous! I could drop RESERVE_S from 55 to 45 (as e012 tried) to gain 10s of training. That's ~50 steps. Safe, no model change.
+
+Wait, e012 tried RESERVE_S 55->45 and it crashed. But e012 also did pre-computing crops (the buggy part). The reserve change alone is safe.
+
+Actually, let me reconsider. The prediction takes 37s. If I set RESERVE_S = 45, that leaves 45s for prediction, which is 8s margin over the 37s measured. That's a bit tight but probably OK. Prediction time could vary. 37s measured for 41879 detections / 256 batch = 164 batches. At ~0.22s/batch. With a safety margin, 45s gives 8s buffer. Reasonable but the harness killed e011 (TTA) at timeout and e013 at timeout. I want to be safe.
+
+Hmm, but actually the bigger prize is the 39s epoch-0 overhead. Let me reconsider the on-demand decode idea more carefully, because if it works it's worth ~200 steps.
+
+Actually, wait. Let me reconsider whether the 39s is pickling. Let me look: the print says "1022 images (13s)". So loading all images took 13s. That's the disk decode of all 1022 images in the main process. So decode is ~13s total (1022 images, ~13ms each).
+
+If workers use fork+COW, the dict is shared, and steady-state crop work is 0.19s/step. The 39s one-time is fork overhead.
+
+If I switch to on-demand decode in workers, each worker decodes from disk. With a per-worker cache, and 8 workers each touching a shuffled subset of images, the cache (400) will thrash because each worker touches ~128 images per epoch on average but the shuffle means over multiple epochs it touches all. Within one epoch, each worker touches ~128 distinct images (6052 items / 8 workers = 756 items, but items cluster by image; hard to say). If each worker touches < 400 distinct images per epoch, the cache holds them and decode happens once per image per epoch. Total decode per epoch = 1022 images * 13ms = 13s, spread across 8 workers = ~1.6s wall per epoch. That's fine, comparable to the 39s one-time being replaced by ~1.6s per epoch.
+
+But wait — if it's fork+COW and the dict is already shared for free, then on-demand decode is strictly WORSE (adds 1.6s/epoch of disk I/O that wasn't there). So the change only helps if the 39s is pickling (spawn).
+
+I'm genuinely uncertain. Let me look for a way to determine fork vs spawn... I can't run experiments to check. 
+
+Let me think about the risk/reward:
+- If fork: on-demand decode is a small loss (~1.6s/epoch added, but removes nothing). Net maybe -2 to -5s over the run. Small loss.
+- If spawn: on-demand decode removes ~24s pickling, adds ~1.6s/epoch. Net gain ~20s.
+
+Expected value is positive but the downside is small. Actually the downside: if fork, I added disk I/O that could cause occasional stalls. But 1.6s/epoch is small.
+
+Hmm, but there's another risk: with on-demand decode and a cache that clears at 400, if a worker's working set exceeds 400, it thrashes (decode every access). With shuffle and 1022 images, a worker could touch many images. Let me increase the cache or not clear it. If I never clear it, a worker could cache up to 1022 images = 3GB per worker * 8 = 24GB. Too much. If I clear at 400, and working set is >400, thrashing.
+
+Actually, the images are weld photos. How big? Let me estimate. If they're ~1000x1000, that's 3MB each, 1022 = 3GB. 8 workers * 400 cache * 3MB = 9.6GB. That might be OK if the machine has enough RAM, but risky.
+
+This is getting complicated. Let me reconsider.
+
+Given the uncertainty, maybe the SAFER high-value move is different. Let me reconsider the whole situation.
+
+Current best e005: 0.6345. The diagnostic: mAP if every box had correct class = 0.7464. So wrong classes cost 0.112. The remaining gap to 0.758 ceiling is scores.
+
+The confusion matrix: pore is the weak class (62% right, 21 of 65 true pores → stain). pore AP 0.505.
+
+The guide says: the dominant error is the class decision on detector boxes. Aim for changes that move every class.
+
+Now, what's the highest-value, lowest-risk experiment?
+
+Option A: Fix the epoch-0 overhead (on-demand decode). Risky due to fork/spawn uncertainty.
+
+Option B: Reduce RESERVE_S 55->45 to gain 10s training. Safe, small gain (~50 steps). But 10s * (improvement per step). At 0.19s/step, 10s = 52 steps. The loss is falling; 52 more steps might give +0.002-0.004. Borderline for acceptance (need >0.005). Might not be enough alone.
+
+Option C: A method change that targets the pore/stain confusion. E.g., the pore class is weak because pores are small and confused with stain. 
+
+Actually, let me reconsider. The guide's plan:
+1. Consolidate: detector boxes from train split. This was tried (e001 crashed, e002 not confirmed 0.6307, e009 rejected 0.6325). So 3 attempts, no confirmed gain. The guide says "if it fails twice, drop it." It's been tried 3 times now (e001, e002, e009). Drop it.
+
+Wait, but e002 was "not confirmed" at 0.6307 (5-seed) which is BELOW the current best 0.6345. And e009 was 0.6325 seed-0 rejected. So detector-boxes-as-training-data does NOT beat the current best. Drop it.
+
+2. Close the box-quality gap: simulate detector errors. Tried e003 (0.6294, not confirmed) and e010 (0.6335, not confirmed). Both below best. So that direction has 2 failed attempts. Per the guide: "Two failed variants of a direction: move to the next direction." Move on.
+
+Also e008 (random zoom per sample) crashed. So the "make classifier robust to imperfect boxes" direction has: e003, e008 (crash), e010. That's 3 attempts, no gain. Exhausted.
+
+3. Buy training steps: e004 (precompute, bug), e012 (precompute+reserve, crash), e013 (workers=0, timeout). 3 attempts, no gain, all crashed/timeout. But these all had bugs or bad approaches. The "buy steps" direction hasn't had a clean successful attempt yet. The on-demand decode is a NEW approach to buying steps (different from precompute and workers=0).
+
+Hmm, so actually the on-demand decode IS a fundamentally different approach to the "buy training steps" direction, and it's the most promising clean one. The precompute approaches failed due to bugs; workers=0 failed due to slow crop work. On-demand decode keeps workers but avoids the big dict.
+
+But my fork/spawn uncertainty bothers me. Let me think about whether I can make the on-demand decode robust regardless.
+
+Actually, here's a cleaner idea: Instead of on-demand decode with a fragile cache, I can keep the images in memory BUT avoid the one-time overhead by... hmm.
+
+Wait. Let me reconsider the 39s overhead. What if it's NOT worker setup but something else? Let me look at the numbers again:
+- e005 seed-0: epoch 0 = 57s (94 steps), epoch 1 = 18s (94 steps, wait it says 188 steps total at 75s, so epoch 1 is 75-57 = 18s for 94 steps).
+
+Actually wait, the log:
+```
+epoch 0: loss 0.4932, 94 steps, 57s
+epoch 1: loss 0.3288, 188 steps, 75s
+```
+188 steps at 75s means epoch 1 (steps 95-188, i.e., 94 steps) took 75-57 = 18s. So 0.19s/step. Epoch 0 = 57s for 94 steps = 0.61s/step. Extra = 39s.
+
+Now, is 39s really one-time worker setup? Or is it that the FIRST epoch processes data differently? With shuffle=True and a generator, the first epoch shuffles. The shuffle itself is cheap.
+
+Actually, I bet the 39s is the DataLoader worker startup: forking 8 workers, and each worker's first batch requires setting up. With persistent_workers, this happens once.
+
+But here's the thing: if I set num_workers to a smaller number, say 4, the fork overhead is halved (~20s) but steady-state is slower (4 workers vs 8). Steady state with 8 = 0.19s/step. With 4, maybe 0.30s/step. Over the run: 8 workers: 39 + N*0.19. 4 workers: 20 + N*0.30. Break-even at N = (39-20)/(0.30-0.19) = 19/0.11 = 172 steps. We run ~436 steps. So 4 workers: 20 + 436*0.30 = 20 + 131 = 151s. 8 workers: 39 + 436*0.19 = 39 + 83 = 122s. So 8 workers is better. Not the fix.
+
+OK here's another thought. What if I just accept the 39s and instead focus on making the steady-state faster or the model better?
+
+Actually, let me reconsider the reserve. Prediction takes 37s. Reserve is 55s. That's 18s wasted. If I reduce reserve to 42s (giving 5s margin over 37s), I gain 13s of training = ~68 steps. That's a safe, clean win. Combined with nothing else. 68 steps at the tail where loss is ~0.15 and falling... might give +0.003-0.005. Borderline.
+
+But actually, I realize the reserve reduction is the SAFEST experiment and it's a clean "buy steps" that doesn't risk a crash. But it might be too small to be accepted (need >0.005 gain).
+
+Let me combine: the guide says one idea per turn. So I can't combine reserve + decode.
+
+Hmm. Let me reconsider. Which single experiment has the best expected value?
+
+Let me reconsider the on-demand decode more carefully, because it targets the 39s which is the biggest single inefficiency.
+
+Actually, you know what — let me reconsider whether the dict is even the issue. The print shows 13s to load images. If I DON'T load them up front (on-demand), I save that 13s too! Because the 13s is spent decoding all 1022 images before training starts. With on-demand, that 13s is spread into the training (and only for images actually used, which is all of them, but spread out and parallelized across workers).
+
+So on-demand decode:
+- Saves 13s of up-front load (moved into training, parallelized).
+- If spawn: saves ~24s of pickling.
+- If fork: the dict was COW-shared (free), so I only save the 13s up-front load, but I ADD disk decode during training (13s worth, parallelized = ~1.6s/epoch).
+
+Wait, but the 13s up-front load is counted in the 13s print, which is BEFORE training. So total time = 13s (load) + training + prediction. If I remove the up-front load, I free 13s. But I add disk decode during training. If fork, the dict was free during training, so I add 13s of decode (parallelized, ~1.6s/epoch * 5 epochs = 8s). Net: -13s (up-front) + 8s (decode during training) = -5s. Small gain.
+
+If spawn, net: -13s (up-front) - 24s (pickling) + 8s (decode) = -29s. Big gain.
+
+So even in the worst case (fork), on-demand decode gives a small net gain (~5s) and in the best case (spawn) a big gain (~29s). The downside risk is low. And it's a clean implementation.
+
+But wait, there's the cache thrashing risk. Let me make the cache robust. Actually, let me reconsider: with fork+COW, if I keep the dict, it's free. The only reason to go on-demand is to save the 13s up-front and (if spawn) the pickling. 
+
+Alternatively — a much simpler and safer approach: keep the dict in memory (loaded up front, 13s), but that's the current best. The 39s overhead is the issue.
+
+Ugh, I keep going back and forth. Let me just commit to the on-demand decode because:
+1. It's a fundamentally different "buy steps" approach (not precompute, not workers=0).
+2. Net gain is positive in both fork and spawn scenarios.
+3. It's clean to implement.
+
+But let me make the cache robust to avoid thrashing and memory blowup. Let me use a bounded LRU-ish cache. Actually, simpler: since images are accessed via shuffle, and each image appears in multiple boxes, let me just cache without a hard clear but cap by number. If I cap at 400 and clear, thrashing possible. Let me cap at a higher number but bound memory.
+
+Actually, the simplest robust approach: don't cache at all, just decode each time. Decode cost = 13s per epoch (all images) parallelized across 8 workers = ~1.6s/epoch. Over 5 epochs = 8s. That's acceptable and avoids all cache complexity. But wait, each item is a box, and each box needs its image decoded. 6052 boxes per epoch, but many boxes share images. If I decode per box (no cache), that's 6052 decodes * 13ms = 79s per epoch! Way too slow. So I MUST cache.
+
+So caching is essential. With a per-worker cache. The working set per worker per epoch: 6052 boxes / 8 workers = Thinking budget reached. Stop thinking now and write the reply in the required format.

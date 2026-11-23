@@ -1,0 +1,244 @@
+===== attempt 1 =====
+Let me think carefully about what happened and what to do next.
+
+Current best: e002, 5-seed mean 0.6337. Per-class: pore 0.515, deposit 0.627, discontinuity 0.781, stain 0.611.
+
+Reference numbers:
+- one-step 4-class baseline to beat: 0.638 (we're at 0.6337, just below it)
+- ceiling (stage-1 boxes with perfect classes): 0.758
+- class-agnostic: 0.755
+
+So the gap to the ceiling is 0.124, all class-decision error.
+
+History:
+- e001: crashed (numpy broadcast bug)
+- e002: current best — train on detector boxes (overlapping GT) in addition to GT crops. 0.6337.
+- e003: crashed (NameError)
+- e004: fixed e003 — tight crop at 224px. 0.6325, rejected. So higher-res tight crop didn't help.
+- e005: data — some change about context/texture (probably larger context crops?). 0.6366 on seed 0, 5-seed 0.6315, not confirmed. So slightly worse on average.
+- e006: augmentation — color jitter etc. 0.6241, rejected.
+- e007: scoring — timeout.
+- e008: scoring — drop detector conf, use only softmax probability. 0.1692, suspicious (likely bug).
+
+Wait, e008's change: score = p[c] instead of conf * p[c]. That dropped the score to 0.1692. Hmm, why would that be a bug? Let me think.
+
+Actually wait — the change itself looks trivially correct: for each class, the rank order is conf * p[c] vs p[c]. conf is a per-box constant (same for all 4 classes of that box). Multiplying all 4 rows of a box by the same constant does NOT change the within-class rank order! Because for a given class c, the scores are conf_i * p_i[c] vs p_i[c]. The rank order within class c changes because conf_i differs across boxes! conf is per-box, so different boxes have different conf values. So within class c, box i has score conf_i * p_i[c], and dropping conf changes the order.
+
+So e008 tested: rank by p[c] alone vs conf*p[c]. Result: 0.1692, catastrophic. That's a huge drop — from 0.6337 to 0.1692. That seems too large to be just a reordering effect... or is it?
+
+Hmm, actually it could be. If the detector conf is a strong signal for "is this a real defect" (true positive vs false alarm), then ranking by p[c] alone would put false alarms with high class probability above true detections. The detector is class-agnostic but its conf correlates with whether the box is a true defect. The ceiling experiment (0.758) keeps false alarms as class 0 with detector conf as score — and gets 0.758. That means when false alarms are ranked by conf, they end up mostly below true positives...
+
+Wait, actually let me reconsider. In the ceiling, false alarms get class 0 (pore) with score = conf. And the result is 0.758. So conf-based ranking of false alarms works reasonably well.
+
+But e008's result of 0.1692 is suspicious. The harness says "likely bug". Let me look at the log: "117781 prediction rows" vs e002's "54447 prediction rows". Because with score = p[c], more rows pass MIN_SCORE = 0.001 (since conf < 1, conf * p[c] < p[c]). 117781 rows = 41879 * ~2.8. So many rows. Per image at most 300 rows count. Hmm, that's a lot of rows per image. 41879 detections / 1022 images ≈ 41 detections per image, 4 classes each = 164 rows per image, under 300. OK.
+
+Why would score = p[c] give 0.1692? Let me think about what p[c] looks like. The model is trained with cross-entropy; softmax probabilities for the correct class are often high (0.9+). For false alarms (non-defect regions), the model might still output some class with high probability, or be uncertain. If the model is confident on false alarms too (e.g., says "pore" with 0.8), then ranking by p alone puts false alarms at the top, destroying AP.
+
+With conf * p, the detector conf acts as a gate: false alarms tend to have lower conf (though not always). Actually, the stage-1 detector is class-agnostic and finds "defect-like" regions; its conf is higher for real defects. So conf * p ranks true defects higher.
+
+So e008 actually tells us something real: the detector conf is a very important signal for ranking, and dropping it is catastrophic. It's not necessarily a bug — it's a real finding: conf carries the "is this a defect" signal, and the classifier's probability alone doesn't.
+
+But the harness flags it as "likely bug". Hmm. The drop from 0.6337 to 0.1692 is 0.46 — that's enormous. Could a reordering cause that? If false alarms get ranked above true positives for all classes, AP could collapse to near the fraction of true positives... Actually, if all false alarms are ranked above all true positives, then AP for each class ≈ recall at best... no wait. If false alarms are all above true positives, then as we sweep the threshold, we get all false alarms first (precision → 0), then true positives. AP would be roughly the area under a curve that starts at 0 and jumps up at the end. If there are F false alarms and T true positives per class, and all F are above all T, then the precision at the point where we've consumed all F and 1 TP is 1/(F+1)... AP would be small. With 41879 detections and maybe ~10-15k true ones (IoU>0.5), the ratio could give AP ~0.1-0.2 per class. So 0.1692 is consistent with "false alarms mostly ranked above true positives". So e008 might not be a bug — it's a real result showing conf is essential.
+
+Hmm wait, but is that right? The model was trained on detector boxes (12219 of them) that overlap GT, plus GT crops. It was NOT trained on false alarms. So at test time, on false alarms, the model's output is out-of-distribution. The model might be fairly confident on them (e.g., they look like some defect). So p[c] alone doesn't separate false alarms from true defects well, while conf does (the detector was trained to detect defects, so its conf is higher on real defects).
+
+OK so the lesson from e008: keep conf in the score; it's the main "true vs false" signal. The classifier's job is mainly to assign the right class among boxes that are real defects, and to refine ranking.
+
+Now, what's the biggest lever? Let me think about the error decomposition.
+
+Per-class AP: pore 0.515, deposit 0.627, discontinuity 0.781, stain 0.611. Mean 0.6337.
+
+The ceiling is 0.758 (perfect classes, conf scores). So if we had perfect classes, with conf-based ranking, we'd get 0.758. Our 0.6337 means class errors cost 0.124.
+
+Where do class errors hurt? Two ways:
+1. A true defect box gets the wrong class → it's a false positive for the predicted class and a miss for the true class. This hurts both classes.
+2. A false alarm gets some class → it's a false positive for that class, hurting that class's precision.
+
+Also, the ranking within a class matters: among true defects of class c, the order by conf*p[c] vs conf. And false alarms of class c ranked by conf*p[c].
+
+The crop classifier reaches macro-F1 ~0.87 on perfect boxes. So ~13% of boxes are misclassified. That's consistent with the 0.124 gap (roughly: each misclassified true box costs ~2 AP points across two classes, plus false-alarm class assignment effects).
+
+So the main lever is improving classification accuracy, especially for pore (weakest) and stain/deposit confusion.
+
+What's been tried:
+- Higher-res tight crop (224): rejected (0.6325).
+- e005: data change about context/texture — 0.6315, not confirmed (slightly worse).
+- e006: augmentation (color jitter): rejected (0.6241).
+- Class-weighted loss: "hurt every time" (from "What is already known").
+- Scoring changes: conf is essential (e008); e007 timed out.
+
+What hasn't been tried?
+- Better model (e.g., efficientnet_b2, regnety_016, resnet50, tf_efficientnetv2_b0). Model capacity could help classification. But time budget: currently 2 epochs, 424 steps in ~110s of training. A bigger model would be slower per step. IMG_SIZE 160. efficientnet_b2 at 160px... probably 2-3x slower per step. Might still fit in budget with fewer steps. Risky but plausible.
+- Test-time augmentation (TTA): average over flips. Currently training uses random flips; at test time no TTA. TTA with 4 flips would average predictions. This is a scoring/inference change. Cost: 4x prediction time. Currently prediction is fast (162s total, training ~110s, so prediction ~30s for 41879 boxes at batch 256). 4x = ~120s, might exceed budget. Actually let me compute: total 162s, load 14s, training to 125s (t_end = deadline - 55 = 180-55 = 125s). So prediction + write = 162-125 = 37s. With 4-flip TTA, prediction would be ~148s, total ~273s > 180s. Too slow unless we reduce training time. Hmm, but we could reduce RESERVE or train fewer steps. Actually the training loop runs until t_end = deadline - RESERVE_S = 125s. So prediction must fit in 55s. 37s * 4 = 148s > 55s. Doesn't fit. 2 flips (horizontal only) = 74s > 55s. Still too slow. So TTA doesn't fit without cutting training. Could cut training to say 60s and do 2-flip TTA in ~90s... but cutting training hurts. Marginal.
+
+- Better use of the two views: currently logits averaged. Could train with both views as separate samples, or use a wider context.
+
+- The weak classes: pore and stain. Pore is tiny dark holes. Stain confused with deposit.
+
+- Idea: use the detector conf more cleverly in the score? e008 showed conf is essential. What about score = conf * p[c] but with calibration? E.g., use p[c] / sum or temperature? Monotone transformations per class don't change order... wait, within a class, the score is conf_i * p_i[c]. A monotone transform of the whole score changes nothing. But changing the exponent: conf_i^a * p_i[c] — that changes the relative weight of conf vs p within a class. E.g., conf^0.5 * p[c] would down-weight conf differences. Or conf * p[c]^2 to up-weight classifier confidence. These are real re-orderings within each class.
+
+Hmm, which direction? The ceiling uses conf alone (with perfect classes) and gets 0.758. So conf alone ranks true vs false well. The classifier p[c] adds class info but might add noise to the ranking. If p[c] is noisy (e.g., 0.8 for a wrong class), then conf * p[c] for the wrong class is high and it becomes a false positive in that class.
+
+Actually, let me think about what would most help. The per-class AP gap: pore 0.515 vs ceiling contribution... I don't have per-class ceiling numbers. But pore is weakest.
+
+Let me think about the biggest structural issue. The classifier is trained on GT crops + overlapping detector boxes. It's a crop classifier. Its macro-F1 is ~0.87 on perfect boxes. The remaining 13% error is class confusion, mostly pore/deposit/stain.
+
+To improve classification:
+1. Better features (bigger/better model).
+2. More/better data (we're already using all train crops + detector boxes).
+3. Better input representation (resolution, context). Higher-res tight crop failed. Larger context (e005) failed.
+4. Multi-crop / ensemble.
+5. Training for longer / better optimization.
+
+Wait — training duration. Currently only 2 epochs (424 steps) because of the time budget. The loss went 0.4582 → 0.2468. That's still decreasing! The model is undertrained. 18271 boxes / 64 = 285 steps/epoch. In ~110s we got 424 steps. If we could train longer, loss would keep dropping. But the budget is fixed at 180s total. Load 14s, reserve 55s for prediction. So ~110s for training.
+
+Could we speed up training to get more steps? E.g., larger batch size (64 → 128) halves steps per epoch but each step is ~2x longer, so steps/sec is similar. Actually with data parallel... no, single GPU. Larger batch = fewer, longer steps; total throughput similar or slightly better. Not a big win.
+
+Could we use a faster model with more steps? E.g., mobilenetv3 or regnety_016 (smaller) at higher resolution? regnety_016 is small and fast. But is it more accurate? Probably similar to efficientnet_b0.
+
+Hmm, what about the input: currently 2 views (1.5x tight, 2.5x wide), both at 160px, through the same model, logits averaged. What if we render the tight crop at higher resolution AND use a model that benefits? e004 tried 224 tight and failed (0.6325). But that was with the same training budget.
+
+Let me reconsider. What change could plausibly gain ≥0.01?
+
+Option A: Bigger model (efficientnet_b2 or tf_efficientnetv2_b0). More capacity → better class separation, especially pore/stain. Risk: slower steps, fewer total steps. Let me estimate. efficientnet_b0 at 160px: 424 steps in 110s → ~3.85 steps/s, ~258ms/step (including data loading with 8 workers). efficientnet_b2 is ~3x the FLOPs of b0. At 160px, maybe 2-2.5x slower per step → ~1.5-1.9 steps/s → ~170-200 steps in 110s. That's less than 1 epoch. Hmm, that's a big reduction in steps. The model might not train as well with fewer steps. Risky.
+
+Actually wait, the per-step time includes data loading. With 8 workers and persistent_workers, data loading might be partially hidden. The compute is the bottleneck for b2. Let me be careful. This is risky — fewer steps could hurt more than the extra capacity helps.
+
+Option B: Use a faster, more efficient model to train longer. E.g., keep efficientnet_b0 but... it's already fast.
+
+Option C: Improve the ranking/score to better separate true vs false and refine class order. But e008 showed conf is essential; the scoring space seems explored (e007 timeout, e008 catastrophic).
+
+Option D: Reduce false alarms' impact. False alarms are kept and assigned a class. If we could detect false alarms better and suppress them (lower their score), that would help precision. But the score must be conf * something. If we multiply by a "defect-likeness" from the classifier... but the classifier doesn't have a "background" class. We could add a 5th class "background/none" during training (using non-overlapping detector boxes as negative examples) and then use the background probability to down-weight false alarms. That's a real idea!
+
+Let me think about Option D more. Currently, the classifier is trained only on positive boxes (GT crops + overlapping detector boxes). It never sees false alarms. At test time, false alarms get a class from the softmax. If we train the classifier to also recognize "not a defect" (background), we could:
+- Assign class = argmax over 4 defect classes, but
+- Scale the score by (1 - p_background), so false alarms (high p_background) get low scores and rank below true defects.
+
+This directly targets the "ranking of false alarms against true detections" part of the error. And it uses detector conf differently: instead of conf being the sole true/false signal, the classifier also votes on it.
+
+But wait — e008 showed that dropping conf and using p[c] alone is catastrophic. That's because p[c] (over 4 classes, no background) is high even for false alarms. If we add a background class, then for false alarms p_background would be high and p[defect] low, so the score = conf * p[c] * (1 - p_bg) or conf * p[c] (with p normalized over 5 classes) would be low for false alarms. This is fundamentally different from e008: e008 used p over 4 classes (no background), which is high for false alarms. With a background class, the defect probabilities are suppressed for false alarms.
+
+This is a promising, novel idea. Let me check it's not in the history. History: e001/e002 (train on detector boxes), e003/e004 (resolution), e005 (context/texture data), e006 (augmentation), e007/e008 (scoring). No background class. Good.
+
+How to implement:
+- Collect non-overlapping detector boxes on training images as "background" examples (class 4, or -1 → map to 4). These are detector boxes that don't overlap any GT crop (IoU ≤ 0.5). They're false alarms from stage 1.
+- Train the model with 5 classes (0-3 defects + 4 background).
+- At test time, for each eval box, compute p over 5 classes. For each defect class c in 0-3, score = conf * p[c]. (Since p is now over 5 classes, p[c] is lower for false alarms because probability mass goes to background.) Write rows for classes 0-3 only (not background).
+
+Wait, but does writing only 4 classes and using p over 5 classes work? The score for a true defect of class c would be conf * p[c] where p[c] is now smaller (because some mass is in background). But the rank order within class c: for true defects, p[c] is high and p_bg low; for false alarms, p[c] low and p_bg high. So conf * p[c] would rank true defects above false alarms better than before. 
+
+Actually, this is cleaner: the 5-class softmax naturally down-weights false alarms in every defect class's score. And it's still "conf * p[c]" form, consistent with e008's lesson that conf matters.
+
+Let me reconsider the number of background examples. How many non-overlapping detector boxes are there on training images? Total train detector boxes: we have det_by_img. det_boxes = 12219 (overlapping). How many total train detector boxes? The log says "train 18271 boxes (12219 detector boxes)". So 18271 = GT crops (high-res) + 12219 detector boxes. So GT crops (high) = 18271 - 12219 = 6052. And total train detector boxes = 12219 + (non-overlapping). We don't know the non-overlapping count directly. Let me estimate: the detector has some false alarm rate. If 12219 overlap and there are, say, 40% false alarms, then non-overlapping ≈ 12219 * (0.4/0.6) ≈ 8146. So background examples could be ~8000, comparable to the 12219 positives. That's a reasonable negative set. But we might want to balance — maybe subsample background to avoid overwhelming. Actually, having ~equal positives and negatives is fine for a 5-class problem (it's not binary; 4 defect classes share the positive mass). Let me not subsample initially, or maybe cap it.
+
+Hmm, but there's a subtlety: the background boxes are detector false alarms — they're "defect-like" regions that the stage-1 detector fired on. They're a good negative set because they're exactly the hard negatives we see at test time. 
+
+Another subtlety: at test time, we need p over 5 classes. The model outputs 5 logits. We take softmax over 5. For scoring, use p[0:4]. Good.
+
+Let me also reconsider: does adding a background class hurt the defect classification? It adds a 5th class that's somewhat "everything else". The defect classes still compete. The background class might pull probability away from defects, but that's exactly what we want for false alarms. For true defects, p_bg should be low. I think this is net positive.
+
+Let me also think: the ceiling (0.758) keeps false alarms as class 0 with conf. So false alarms DO hurt the ceiling too (0.758 < 0.77 single-class... wait, single-class is 0.77, ceiling 4-class is 0.758). Hmm, actually the single-class 'defect' is 0.755, and the 4-class ceiling is 0.758. So false alarms cost about the same in both. The point is: if we could suppress false alarms, we'd beat 0.758 potentially. The background-class idea could push us above the ceiling! That's a big potential gain.
+
+Actually wait, let me re-read: "d2_boxes_perfect_classes_val_map50: a ceiling. Every detector box that overlaps a true defect (IoU > 0.5) gets the correct class; every other box (false alarms) is KEPT, as class 0, with its detector conf." So the ceiling keeps false alarms. If our method suppresses false alarms (via background class), we could exceed 0.758. That's the key insight — the ceiling isn't a true ceiling if we can remove false alarms.
+
+So the background-class idea targets BOTH: better class assignment (5-class softmax) AND false-alarm suppression (which could exceed the 0.758 ceiling). This is the most promising idea I've found.
+
+Let me estimate the gain. Currently 0.6337. If false-alarm suppression works well, we could gain a lot. Even partial improvement could give +0.02 to +0.05. This is worth trying.
+
+Now let me think about implementation details and risks.
+
+Implementation:
+1. In the labeling loop, currently we add overlapping detector boxes with their class. We need to ALSO add non-overlapping detector boxes as background (class 4). Currently the code only adds boxes with "cls" set (overlapping). Let me modify: for each train detector box, if it overlaps, set cls to the GT class; else set cls = 4 (background). Then add all of them.
+
+Let me look at the current code:
+```python
+    det_boxes = 0
+    for img_name, gs in crop_by_img.items():
+        ds = det_by_img.get(img_name)
+        if not ds:
+            continue
+        g = np.array([[r["x1"], r["y1"], r["x2"], r["y2"]] for r in gs])
+        c = np.array([r["cls"] for r in gs])
+        d = np.array([[x["x1"], x["y1"], x["x2"], x["y2"]] for x in ds])
+        inter_w = ...
+        ...
+        iou = inter / np.maximum(uni, 1e-9)
+        best = iou.argmax(0)
+        for j in range(len(ds)):
+            if iou[best[j], j] > 0.5:
+                ds[j]["cls"] = int(c[best[j]])
+                det_boxes += 1
+    crops = crops + [d for d in det_by_img.values() for d in d if "cls" in d]
+```
+
+So currently only overlapping boxes get "cls" and are added. I need to change the inner loop to also handle non-overlapping:
+```python
+        for j in range(len(ds)):
+            if iou[best[j], j] > 0.5:
+                ds[j]["cls"] = int(c[best[j]])
+                det_boxes += 1
+            else:
+                ds[j]["cls"] = 4  # background / false alarm
+```
+And the add line stays the same (all now have "cls").
+
+Wait, but there's an issue: `best = iou.argmax(0)` gives the best GT for each detector box. If iou[best[j], j] ≤ 0.5, it's a false alarm. Good.
+
+But hold on — what about detector boxes on images that have NO GT crops? Those images aren't in crop_by_img, so they're skipped (the `if not ds: continue` — no wait, `ds = det_by_img.get(img_name)` and we iterate over crop_by_img keys). If an image has detector boxes but no GT crops, it's not in crop_by_img, so those detector boxes are never processed. They'd be false alarms (no defect on that image) but we skip them. That's fine — we just have fewer background examples. But actually, we could add those as background too. Let me handle: iterate over det_by_img, and for images not in crop_by_img, all boxes are background. Let me add that.
+
+Actually, to keep the edit focused and reduce risk, let me handle both cases cleanly. Let me restructure the labeling loop to iterate over det_by_img (all train detector boxes) and for each, find the best overlapping GT.
+
+Let me rewrite:
+```python
+    det_boxes = 0
+    bg_boxes = 0
+    for img_name, ds in det_by_img.items():
+        gs = crop_by_img.get(img_name)
+        if gs:
+            g = np.array([[r["x1"], r["y1"], r["x2"], r["y2"]] for r in gs])
+            c = np.array([r["cls"] for r in gs])
+            d = np.array([[x["x1"], x["y1"], x["x2"], x["y2"]] for x in ds])
+            inter_w = np.maximum(0.0, np.minimum(g[:, None, 2], d[None, :, 2]) - np.maximum(g[:, None, 0], d[None, :, 0]))
+            inter_h = np.maximum(0.0, np.minimum(g[:, None, 3], d[None, :, 3]) - np.maximum(g[:, None, 1], d[None, :, 1]))
+            inter = inter_w * inter_h
+            area_g = (g[:, None, 2] - g[:, None, 0]) * (g[:, None, 3] - g[:, None, 1])
+            area_d = (d[None, :, 2] - d[None, :, 0]) * (d[None, :, 3] - d[None, :, 1])
+            uni = area_g + area_d - inter
+            iou = inter / np.maximum(uni, 1e-9)
+            best = iou.argmax(0)
+            for j in range(len(ds)):
+                if iou[best[j], j] > 0.5:
+                    ds[j]["cls"] = int(c[best[j]])
+                    det_boxes += 1
+                else:
+                    ds[j]["cls"] = 4
+                    bg_boxes += 1
+        else:
+            for j in range(len(ds)):
+                ds[j]["cls"] = 4
+                bg_boxes += 1
+    crops = crops + [d for d in det_by_img.values() for d in d if "cls" in d]
+```
+
+This is a larger edit but correct. Let me keep it.
+
+2. Change num_classes from 4 to 5:
+```python
+    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
+```
+→
+```python
+    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=5)
+```
+
+3. At test time, the softmax is over 5 classes. We write rows for classes 0-3 only:
+```python
+        for d, p in zip(ev, probs):
+            for c in range(4):
+                s = d["conf"] * float(p[c])
+```
+This already loops c in range(4), so it uses p[0:4] which are the defect classes. Good, no change needed there! The p array is now 5-wide but we only use the first 4. 
+
+Wait, but the score = conf * p[c] where p is over 5 classes. For a true defect, p[c] is high (defect class), p_bg low. For a false alarm, p[c] low, p_bg high. So conf * p[c] is naturally lower for false alarms. 
+
+But there's a subtlety: the magnitude of p[c] changes (now sums to 1 over 5 classes instead of 4). Does that matter? Within a class, the rank order is what matters, and conf * p[c] with p over 5 classes still ranks true defects above false alarms. The absolute magnitude doesn't matter for mAP (only order within class). And MIN_SCORE = 0.001 — with p over 5 classes, p[c] could be smaller, so more rows might drop below MIN_SCORE. But that's fine, it just drops very-low-confidence rows.Thinking budget reached. Stop thinking now and write the reply in the required format.

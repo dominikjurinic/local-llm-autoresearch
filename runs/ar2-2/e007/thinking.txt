@@ -1,0 +1,510 @@
+===== attempt 1 =====
+Let me analyze the current situation:
+
+**Current best (e003):** 0.6317 mAP@0.5 (5-seed mean)
+- Per-class AP: pore 0.517, deposit 0.622, discontinuity 0.780, stain 0.608
+- Trains on GT crops (high + low res) + matched detector boxes
+- Two-crop input (tight 1.5x + wide 2.5x) through EfficientNet-B0
+- Score = detector conf × class probability
+- ~2 epochs in ~160s budget
+
+**What's been tried and rejected:**
+- e001: Training on detector boxes with background class → 0.5691 (bad)
+- e004: conf × prob² → 0.6211 (bad)
+- e005: Adding background class + (1-p_bg) multiplier → 0.6039 (bad)
+- e006: Focal loss → 0.6123 (bad)
+
+**Key observations:**
+1. The ceiling is 0.758 (perfect classes on stage-1 boxes). Current is 0.6317.
+2. Pore (0.517) and stain (0.608) are the weakest classes.
+3. The classifier was trained on both GT crops AND matched detector boxes.
+4. The score is simply conf × prob. The ranking matters a lot for mAP.
+5. Previous attempts at adding background class hurt. Focal loss hurt. Squaring prob hurt.
+
+**What ideas remain?**
+
+Let me think about what could help:
+
+1. **Architecture change**: The current model uses EfficientNet-B0. Maybe a different backbone would help. But the brief says "changes of method helped more" than hyperparameter tuning. Architecture is in scope.
+
+2. **Test-time augmentation (TTA)**: At inference, use multiple crops or augmentations to get more robust predictions. This could help with the ranking.
+
+3. **Different scoring**: We tried prob² (worse) and background multiplier (worse). What about using the margin (max_prob - second_max_prob) as a confidence signal? Or normalizing scores differently?
+
+4. **Training strategy**: 
+   - More epochs? The model only gets ~2 epochs. Maybe we can train faster (smaller image size, different batch size) to get more epochs.
+   - Different optimizer?
+   - Learning rate schedule?
+
+5. **Data**: 
+   - The training set has 26347 boxes. Maybe we can oversample the weak classes (pore, stain)?
+   - But class-weighted loss was tried and hurt. Oversampling is different from weighted loss though.
+
+6. **Inference**: 
+   - TTA with multiple crops at inference
+   - Using both tight and wide crops differently (e.g., separate classifiers)
+   - Ensemble of models
+
+7. **Scoring**: 
+   - The key insight: mAP rewards ranking. True detections should score higher than false ones.
+   - Currently score = conf × prob. The detector conf is the same for all classes of a box.
+   - What if we use a different combination? Like conf^0.5 × prob? Or conf × prob^0.5?
+   - Actually, prob² was worse (0.6211 vs 0.6317). So making prob matter more hurts.
+   - What about using the log of prob? Or 1 - entropy?
+
+8. **The two-crop approach**: Currently both crops go through the same network and logits are averaged. What if we use them differently?
+
+Let me think about what's most likely to help:
+
+**Idea: Test-time augmentation (TTA)**
+At inference, instead of one crop per view, use multiple augmented versions (horizontal flip, vertical flip, slight rotation) and average the probabilities. This should make the predictions more robust and improve ranking.
+
+But wait - this doubles or quadruples inference time. With 41879 eval detections, this could be expensive. Let me check: currently inference takes about 39s (162-123). With 4x TTA it would be ~156s, which is too much. Maybe 2x TTA (horizontal flip) would be ~78s, leaving ~82s for training. That might work but is tight.
+
+Actually, looking more carefully: the training takes about 106s (123-17), and inference takes about 39s (162-123). Total is 162s. The budget is presumably 180s (default). So we have about 18s of slack.
+
+2x TTA would add ~39s to inference, making it ~101s for inference, total ~207s. That's over budget.
+
+Unless we reduce training time. We could:
+- Reduce RESERVE_S (but that's risky)
+- Train for fewer steps
+- Use a smaller model
+- Increase batch size
+
+Actually, let me reconsider. The budget is `--seconds` which defaults to 180 but could be different. The log shows 162s total. So we have 18s of slack.
+
+**Idea: Oversample weak classes (pore, stain)**
+Instead of class-weighted loss (which hurt), we can oversample pore and stain examples in the training data. This is a data/sampling approach. The DataLoader shuffles, so we can just repeat those rows.
+
+Actually, this is a "sampling" category change. Let me think about whether this would help. The weak classes are pore (0.517) and stain (0.608). If we oversample them, the model will see more of them and potentially learn better features. But it might hurt the strong classes.
+
+**Idea: Use a different/more powerful backbone**
+The available models include convnext_nano, resnet50, tf_efficientnetv2_b0, etc. A larger model might help but would be slower. convnext_nano is slightly larger than efficientnet_b0. tf_efficientnetv2_b0 is similar size.
+
+Actually, for a 160x160 input, the difference between these small models might be minimal. And training time would increase.
+
+**Idea: Increase IMG_SIZE**
+Currently 160. Going to 192 or 224 might help the model see more detail, especially for distinguishing pore from stain. But it would slow down training.
+
+**Idea: Different scoring - use conf^alpha * prob^beta**
+We tried prob^2 (worse). What about conf^0.5 * prob? This would reduce the importance of the detector confidence and rely more on the classifier. Or conf * sqrt(prob)?
+
+Actually, let me think about this more carefully. The mAP@0.5 scoring:
+- For each class, boxes are sorted by score
+- A box is a TP if it matches a GT box of that class with IoU ≥ 0.5
+- AP = area under precision-recall curve
+
+The ranking within a class matters. If we have a true pore detection and a false alarm, the true one should score higher. The detector conf gives some signal about whether it's a real defect. The classifier prob gives signal about the class.
+
+Currently: score = conf * prob_c for class c.
+
+For a true pore detection: conf might be 0.7, prob_pore might be 0.6 → score 0.42
+For a false alarm: conf might be 0.3, prob_pore might be 0.2 → score 0.06
+For a true deposit misclassified as pore: conf 0.8, prob_pore 0.3 → score 0.24
+
+The issue is that for a given class, we need true detections to rank above false ones. The conf helps distinguish real from false. The prob helps with class assignment.
+
+What if we use a different formula? Like score = conf * prob_c * (prob_c - max_{c≠c} prob_c)? This would penalize uncertain predictions. But this is getting complex.
+
+**Idea: Training on more data / different data mix**
+Currently: 14128 GT crops + 12219 matched det boxes = 26347.
+What about using ALL detector boxes (including unmatched ones) but with a soft label or just the matched ones with higher weight?
+
+Actually, e001 tried training on detector boxes with background and it was bad (0.5691). e005 tried adding background class and it was bad (0.6039). So background seems to hurt.
+
+**Idea: Increase training time by reducing inference cost**
+What if we use a simpler/faster inference? Like only using the tight crop instead of both? That would halve inference time, giving more time for training.
+
+Or: what if we train for more epochs? Currently ~2 epochs. If we can get to 4-5 epochs, the model might learn better.
+
+To get more training time:
+- Reduce inference: use only tight crop (halve inference from ~39s to ~20s)
+- Or: reduce RESERVE_S from 55 to 30 (risky)
+- Or: increase batch size to train faster per epoch
+
+Actually, let me look at the numbers more carefully:
+- Loading: 17s
+- Training: 106s (2 epochs, 421 steps)
+- Inference: 39s
+- Total: 162s
+- Budget: presumably 180s (or maybe more?)
+
+Wait, the default is 180 but the actual budget passed might be different. Let me assume 180s.
+
+If we reduce inference to ~20s (single crop), we save ~19s. That gives us ~125s for training, which is about 2.4 epochs. Not a huge improvement.
+
+**Idea: Use a learning rate that allows more effective training in fewer epochs**
+Current: LR=1e-3 with cosine decay. What about a higher initial LR with warmup? Or a different optimizer?
+
+**Idea: Data augmentation improvements**
+Current augmentation: geometric jitter (±10% center, 0.85-1.2 scale), horizontal/vertical flip, brightness (0.8-1.2).
+What about:
+- Color jitter (saturation, contrast)
+- Random erasing
+- Mixup or cutmix
+
+These could help the model generalize better, especially for the weak classes.
+
+**Idea: Mixup**
+Mixup is a simple and effective augmentation. It creates virtual training examples by blending two samples. This can improve generalization. It's a data/augmentation change.
+
+Let me think about what's most likely to give a measurable improvement:
+
+1. The per-class scores show pore (0.517) and stain (0.608) are weak. These are the classes that are confused with each other and with background/deposit.
+
+2. The classifier reaches ~0.87 macro-F1 with perfect boxes. The gap to the ceiling (0.758 vs 0.632) suggests both classification errors AND ranking issues.
+
+3. Previous experiments showed that:
+   - Adding background class: hurt (e001, e005)
+   - Focal loss: hurt (e006)
+   - prob²: hurt (e004)
+   - Adding low-res crops: helped slightly (e003)
+   - Adding matched det boxes: helped (e002)
+
+Let me think about what hasn't been tried:
+- Different backbone
+- TTA
+- Mixup/cutmix
+- Oversampling weak classes
+- Different image size
+- Training longer (faster inference)
+- Different scoring formula (e.g., conf^0.5 * prob)
+- Using the two crops with separate heads and combining differently
+- Label smoothing
+
+**My pick: Mixup augmentation**
+
+Rationale:
+- It's a well-known technique that improves generalization
+- It's simple to implement
+- It doesn't change the architecture or scoring
+- It should help the model learn smoother decision boundaries, which could help with the confusing pore/stain/deposit distinctions
+- It's in the "augmentation" category
+- Previous augmentation changes (jitter) were part of the base; adding mixup is a focused change
+
+Actually wait, let me reconsider. The model only trains for ~2 epochs. Mixup might not have enough time to show its benefit. But it could still help by providing more diverse training signals per step.
+
+Alternatively, **oversampling weak classes** is simpler and more directly targets the problem. If pore and stain are underrepresented or harder to learn, seeing them more often could help.
+
+Let me check: what's the class distribution? We don't have exact numbers, but from the AP scores, pore and stain are weak. If they're also less frequent, oversampling would help. If they're frequent but hard, oversampling might help less.
+
+Actually, I think a more impactful change might be **using a slightly larger/different backbone**. The EfficientNet-B0 is quite small. For 160x160 inputs, maybe a ResNet-18 or ConvNeXt-Pico/Nano would extract better features. But this is a bigger change and might not help if the bottleneck is data quality rather than model capacity.
+
+Let me go with **mixup** as it's a clean, testable hypothesis with a focused change. If the model is underfitting (loss still decreasing at epoch 1: 0.4479 → 0.2744), then mixup could help by providing more diverse examples and preventing overfitting to specific examples.
+
+Actually, wait. Let me reconsider the scoring angle. 
+
+The key insight from the brief: "mAP@0.5 rewards, per class: (a) the right class on boxes that overlap a true defect, and (b) good ranking: true detections should score higher than false ones."
+
+Currently score = conf * prob. The detector conf is a fixed value per box. For a given box, all 4 class scores differ only by prob. So the ranking within a box is purely by classifier probability.
+
+But across boxes, the conf provides the "is this a real defect?" signal. 
+
+What if the issue is that the detector conf is noisy? Some false alarms have high conf, and some true detections have low conf. In that case, the classifier probability should be the primary signal.
+
+What about score = prob_c (without conf)? This would make the ranking purely by classifier confidence. But then false alarms that the classifier is uncertain about would still get moderate scores.
+
+Actually, the brief says "stage-1 boxes scored as a single class 'defect': 0.755 mAP@0.5". This means the detector conf alone (as a single class) gives 0.755. The 4-class baseline is 0.638. So the classifier is actually HURTING the ranking compared to just using conf!
+
+Wait, that's interesting. If we score all boxes as a single class with just conf, we get 0.755. But with 4 classes and conf*prob, we get 0.632. The classifier is adding noise to the ranking.
+
+This suggests that the classifier's probabilities are not well-calibrated relative to the detector's confidence. The detector conf is a better "is this a defect" signal than the classifier's max probability.
+
+So maybe the scoring should weight conf more heavily. Like score = conf^2 * prob? Or conf * prob^0.5?
+
+Wait, we tried prob^2 (which makes prob matter more) and it was worse. What about making conf matter more?
+
+score = conf^2 * prob: This would amplify the detector confidence. True defects with high conf would score much higher. False alarms with low conf would be suppressed more.
+
+But wait, conf^2 * prob makes the dynamic range of conf larger. If conf ranges from 0.1 to 0.9, then conf^2 ranges from 0.01 to 0.81. This might help separate true from false.
+
+Actually, let me think about this differently. The issue is:
+- Single class with conf: 0.755
+- 4-class with conf*prob: 0.632
+
+The gap is 0.123. This is partly because:
+1. Wrong class assignments (a box that's actually pore gets scored as deposit)
+2. Ranking issues (a true pore with prob 0.4 scores lower than a false alarm with prob 0.6)
+
+For issue 1, the classifier is doing its job (assigning classes). For issue 2, the ranking is off.
+
+What if we use: score = conf * (prob_c / sum(prob)) = conf * prob_c (which is what we have). The normalization doesn't change anything since we're already using softmax.
+
+What about: score = conf * prob_c^0.5? This reduces the impact of the classifier's confidence while keeping the class assignment. A box with prob 0.6 for pore would get score = conf * 0.775 instead of conf * 0.6. A false alarm with prob 0.3 for pore would get conf * 0.548 instead of conf * 0.3. The ratio between true and false goes from 2:1 to 1.4:1, which is worse.
+
+Hmm, that's the opposite of what we want. We want true > false, so we want the ratio to be larger, not smaller.
+
+What about: score = conf^1.5 * prob? This amplifies conf. A true detection with conf 0.8: 0.716 * prob. A false alarm with conf 0.3: 0.164 * prob. Ratio: 4.4:1 (vs 2.7:1 for conf^1). This should help ranking.
+
+But we need to be careful: if the detector conf is noisy (some true detections have low conf), amplifying it could hurt.
+
+Let me go with a different approach. Let me think about what's most likely to give a clear, measurable improvement.
+
+**Revised idea: Increase training duration by using a single crop at inference**
+
+Currently we use two crops (tight + wide) at inference, which doubles inference time. If we use only the wide crop (or only the tight crop) at inference, we save ~20s. We could use that extra time for training.
+
+But this changes the inference, not the training. And the two-crop approach was part of the "starting recipe" that reached 0.87 F1. Removing one crop might hurt.
+
+**Another idea: Use label smoothing**
+Label smoothing (e.g., 0.1) makes the targets softer. Instead of [0,0,1,0], it becomes [0.033, 0.033, 0.9, 0.033]. This can improve generalization and calibration. It's a simple change to the loss function.
+
+But focal loss (which also modifies the loss) was tried and hurt. Label smoothing is different though - it doesn't change the weighting of hard vs easy examples, it just makes the targets softer.
+
+**My final pick: Mixup augmentation**
+
+Hypothesis: Mixup augmentation will improve mAP by creating virtual training examples that blend defect crops, leading to smoother decision boundaries and better generalization, particularly for the confusing pore/stain/deposit distinctions. This should improve both classification accuracy and the calibration of probabilities (which affects ranking).
+
+Implementation:
+- With probability 0.5 (or 1.0), mix two samples: x = λ*x1 + (1-λ)*x2, y = λ*y1 + (1-λ)*y2
+- Use cross-entropy with soft labels
+- λ ~ Beta(α, α) with α=2.0
+
+This is a focused change to the training loop. Let me write it.
+
+Actually, I need to be careful. The current training uses two views per sample (tight + wide). With mixup, I need to mix both views. Let me think about how to implement this.
+
+Current batch: xt (tight crops), xw (wide crops), y (labels)
+After mixup: xt = λ*xt_a + (1-λ)*xt_b, xw = λ*xw_a + (1-λ)*xw_b, y = λ*onehot_a + (1-λ)*onehot_b
+
+The loss would need to handle soft labels. I can use:
+loss = -(y_soft * log_softmax(logits)).sum(1).mean()
+
+Let me implement this.
+
+Actually, wait. Let me reconsider. The model trains for only ~2 epochs (421 steps). Mixup might not have enough time to show benefit. Also, with only 421 steps, the model might be underfitting rather than overfitting. In that case, mixup (which is primarily an anti-overfitting technique) might not help.
+
+Let me check: loss goes from 0.4479 to 0.2744. That's a significant decrease, suggesting the model is still learning. With more data (via mixup), it might learn faster or reach a better optimum.
+
+But I'm not fully convinced mixup is the best choice. Let me think about alternatives.
+
+**Alternative: Increase IMG_SIZE from 160 to 192**
+This gives the model more spatial detail to work with. Pores and stains might be easier to distinguish with more pixels. The trade-off is slower training (larger images = more computation per step).
+
+At 160x160, a 1.5x crop of a small defect might only be ~24x24 pixels of actual defect. At 192x192, it would be ~29x29. Not a huge difference.
+
+But for larger defects, the difference is more significant. And the wide crop (2.5x) would have more context.
+
+Training time would increase by (192/160)² = 1.44x. So ~153s for training instead of 106s. Total would be ~17s + 153s + 39s = 209s. That's over budget!
+
+Unless we reduce inference. With single crop: 17 + 153 + 20 = 190s. Still tight.
+
+This might not fit in the budget. Let me abandon this.
+
+**Alternative: Use a faster backbone to train longer**
+If I use convnext_pico (smaller than efficientnet_b0), each step would be faster, allowing more steps in the same time. More steps = more training = better model.
+
+But convnext_pico is smaller and might not extract as good features. The trade-off is unclear.
+
+**Alternative: Increase batch size**
+Currently BATCH_SIZE=64. If I increase to 128, each epoch has fewer steps but each step is more stable. With the same time budget, we'd get fewer steps but each step is more effective.
+
+Actually, with more data per step, the gradient is more accurate, which can help convergence. But we'd have fewer total steps.
+
+Hmm, this is getting complicated. Let me go back to mixup.
+
+Actually, you know what, let me think about this from a different angle. What's the biggest source of error?
+
+Per-class AP: pore 0.517, deposit 0.622, discontinuity 0.780, stain 0.608
+
+Pore is the weakest. What makes pore hard?
+- Pores are small, round holes in the weld
+- They might be confused with stains (dark spots)
+- They might be confused with discontinuities (gaps)
+- At low resolution, they might look like noise
+
+Stain is the second weakest:
+- Stains are dark marks on the weld surface
+- Confused with deposit (extra material)
+- Confused with background (dark areas)
+
+The classifier needs to distinguish these subtle visual differences. More training data or better features would help.
+
+**New idea: Use the low-res crops more heavily**
+In e003, low-res GT crops were added. What if we increase the weight of low-res crops? Or use only low-res crops?
+
+Actually, the detector operates on low-res images. So the crops from low-res images are more representative of what the detector sees. If we weight low-res crops more heavily, the classifier might be better calibrated for the actual input distribution.
+
+But this is a data change, and we already added low-res crops in e003. Making them more prominent is a further data change.
+
+**Let me go with mixup. It's a clean, testable hypothesis.**
+
+Here's my implementation plan:
+1. Add a MIXUP parameter (probability and alpha)
+2. In the training loop, with probability MIXUP_P, mix two samples
+3. Use soft-label cross-entropy for mixed batches
+
+Let me write the code:
+
+```python
+MIXUP_P = 0.5
+MIXUP_ALPHA = 2.0
+```
+
+In the training loop:
+```python
+# Mixup
+if random.random() < MIXUP_P:
+    lam = np.random.beta(MIXUP_ALPHA, MIXUP_ALPHA)
+    idx = torch.randperm(len(xt))
+    xt = lam * xt + (1 - lam) * xt[idx]
+    xw = lam * xw + (1 - lam) * xw[idx]
+    # Soft labels
+    y_a = torch.zeros(len(y), 4).scatter_(1, y.unsqueeze(1), 1)
+    y_b = torch.zeros(len(y), 4).scatter_(1, y[idx].unsqueeze(1), 1)
+    y_soft = lam * y_a + (1 - lam) * y_b
+    y_soft = y_soft.to(device)
+    logits = (model(xt) + model(xw)) / 2
+    loss = -(y_soft * torch.log_softmax(logits, 1)).sum(1).mean()
+else:
+    loss = crit((model(xt) + model(xw)) / 2, y)
+```
+
+Wait, I need to be careful with the device. The xt, xw are on CPU (from DataLoader) and moved to device in the loop. Let me restructure.
+
+Actually, looking at the current code:
+```python
+xt = xt.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+xw = xw.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+y = y.to(device, non_blocking=True)
+with torch.autocast(**amp):
+    loss = crit((model(xt) + model(xw)) / 2, y)
+```
+
+So xt, xw, y are moved to device before the loss computation. I need to do mixup before moving to device, or after. Let me do it after moving to device (mixing tensors on GPU is fine).
+
+Actually, it's easier to do it before:
+```python
+# Before moving to device
+if random.random() < MIXUP_P:
+    lam = np.random.beta(MIXUP_ALPHA, MIXUP_ALPHA)
+    idx = np.random.permutation(len(xt))
+    xt = (lam * xt + (1 - lam) * xt[idx]).numpy()  # or keep as tensor
+    ...
+```
+
+Hmm, but xt is already a tensor from the DataLoader. Let me do the mixup on CPU tensors before moving to GPU:
+
+```python
+if random.random() < MIXUP_P:
+    lam = float(np.random.beta(MIXUP_ALPHA, MIXUP_ALPHA))
+    idx = torch.randperm(len(xt))
+    xt = lam * xt + (1 - lam) * xt[idx]
+    xw = lam * xw + (1 - lam) * xw[idx]
+    y_a = torch.zeros(len(y), 4).scatter_(1, y.unsqueeze(1), 1.0)
+    y_b = torch.zeros(len(y), 4).scatter_(1, y[idx].unsqueeze(1), 1.0)
+    y_soft = (lam * y_a + (1 - lam) * y_b)
+    xt = xt.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+    xw = xw.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+    y_soft = y_soft.to(device, non_blocking=True)
+    with torch.autocast(**amp):
+        logits = (model(xt) + model(xw)) / 2
+        loss = -(y_soft * torch.log_softmax(logits.float(), 1)).sum(1).mean()
+else:
+    xt = xt.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+    xw = xw.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+    y = y.to(device, non_blocking=True)
+    with torch.autocast(**amp):
+        loss = crit((model(xt) + model(xw)) / 2, y)
+```
+
+This is a bit verbose. Let me clean it up.
+
+Actually, I realize there's a potential issue with mixup and the two-crop setup. When we mix two samples, we're mixing their tight crops and wide crops independently. But the tight and wide crops of the same sample come from the same box (same center, different scale). After mixing, the tight crop of sample A is combined with the wide crop of sample B, which doesn't correspond to any real box. This might confuse the model.
+
+To avoid this, I should mix the tight crops together and the wide crops together, but keep them paired. That is:
+- xt_mixed = lam * xt_a + (1-lam) * xt_b
+- xw_mixed = lam * xw_a + (1-lam) * xw_b
+
+This is what I had above. The tight crop of the mixed sample is a blend of tight crops, and the wide crop is a blend of wide crops. They're not perfectly aligned (the tight crop is from a different box than the wide crop), but both are blends of the same two samples. This should be fine.
+
+Let me finalize the implementation. I'll make the changes minimal:
+
+1. Add MIXUP_P and MIXUP_ALPHA constants
+2. Modify the training loop to apply mixup
+
+Let me write the SEARCH/REPLACE blocks.
+
+First, add the constants:
+```
+SEARCH:
+MIN_SCORE = 0.001       # rows below this score are not written
+REPLACE:
+MIN_SCORE = 0.001       # rows below this score are not written
+MIXUP_P = 0.5
+MIXUP_ALPHA = 2.0
+```
+
+Second, modify the training loop. The current code is:
+```python
+            xt = xt.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            xw = xw.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            y = y.to(device, non_blocking=True)
+            with torch.autocast(**amp):
+                loss = crit((model(xt) + model(xw)) / 2, y)
+```
+
+Replace with:
+```python
+            if random.random() < MIXUP_P:
+                lam = float(np.random.beta(MIXUP_ALPHA, MIXUP_ALPHA))
+                idx = torch.randperm(len(xt))
+                xt = lam * xt + (1 - lam) * xt[idx]
+                xw = lam * xw + (1 - lam) * xw[idx]
+                y_a = torch.zeros(len(y), 4).scatter_(1, y.unsqueeze(1), 1.0)
+                y_b = torch.zeros(len(y), 4).scatter_(1, y[idx].unsqueeze(1), 1.0)
+                y_soft = (lam * y_a + (1 - lam) * y_b)
+                xt = xt.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+                xw = xw.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+                y_soft = y_soft.to(device, non_blocking=True)
+                with torch.autocast(**amp):
+                    logits = (model(xt) + model(xw)) / 2
+                    loss = -(y_soft * torch.log_softmax(logits.float(), 1)).sum(1).mean()
+            else:
+                xt = xt.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+                xw = xw.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+                y = y.to(device, non_blocking=True)
+                with torch.autocast(**amp):
+                    loss = crit((model(xt) + model(xw)) / 2, y)
+```
+
+This looks good. Let me verify the SEARCH text matches exactly.
+
+Looking at the current file:
+```
+            xt = xt.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            xw = xw.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            y = y.to(device, non_blocking=True)
+            with torch.autocast(**amp):
+                loss = crit((model(xt) + model(xw)) / 2, y)
+```
+
+Yes, that's the exact text from the file.
+
+Let me also double-check the constants line:
+```
+MIN_SCORE = 0.001       # rows below this score are not written
+```
+
+Yes, that's in the file.
+
+One concern: the mixup operation on CPU tensors might be slow for large batches. But with BATCH_SIZE=64 and 160x160x3 images, the tensors are 64x3x160x160 = 4.9M floats. The mixup operation is just element-wise multiplication and addition, which should be fast even on CPU.
+
+Another concern: `torch.randperm(len(xt))` creates a random permutation. This is fine.
+
+Let me also make sure the soft labels are correct. For a batch of size B:
+- y is a tensor of shape (B,) with integer class labels
+- y_a is (B, 4) one-hot
+- y_b is (B, 4) one-hot for the permuted labels
+- y_soft = lam * y_a + (1-lam) * y_b, shape (B, 4)
+
+The loss: -(y_soft * log_softmax(logits)).sum(1).mean()
+This is the standard mixup loss. Looks correct.
+
+I think this is a good experiment. Let me finalize.
+
+Wait, one more thought: should I use `random.random()` or `np.random.random()` for the mixup decision? The current code uses `random.random()` for augmentation decisions (in make_crop and BoxDataset). I'll use `random.random()` for consistency.
+
+Actually, I just realized: the `random` module is seeded with `args.seed`, and `np.random` is also seeded. But in the DataLoader workers, `worker_init_fn` re-seeds both. So the mixup decision in the main process (training loop) uses the main process's random state, which is fine.
+
+Let me finalize the response.

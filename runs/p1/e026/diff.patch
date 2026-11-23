@@ -1,0 +1,123 @@
+--- e009/train.py
++++ e026/train.py
+@@ -39,4 +39,5 @@
+ import torch
+ import torch.nn as nn
++import torch.nn.functional as F
+ from PIL import Image
+ 
+@@ -47,9 +48,12 @@
+ SCALES = (1.25, 1.75, 2.5, 3.5)  # multi-scale crop pyramid
+ MIN_CROP = 16
++MODEL_HR = "resnet26d"       # separate high-resolution branch backbone
++IMG_SIZE_HR = 224            # high-res crop resolution (kept <=224 to fit the wall-clock budget)
++HR_TIGHT = SCALES[0]         # the tight crop the high-res branch reads
+ TRAIN_ON = ("high",)    # resolutions of crops.csv used for training
+ BATCH_SIZE = 64
+ LR = 1e-3
+ WEIGHT_DECAY = 0.05
+-RESERVE_S = 85          # seconds kept free for prediction and writing (4 crops ≈ 2x pred time)
++RESERVE_S = 115         # seconds kept free for prediction and writing (4-crop + high-res pass)
+ MIN_SCORE = 0.001       # rows below this score are not written
+ MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+@@ -68,5 +72,5 @@
+ 
+ 
+-def make_crop(img, r, context, train):
++def make_crop(img, r, context, train, size=IMG_SIZE):
+     h, w = img.shape[:2]
+     cx, cy = (r["x1"] + r["x2"]) / 2, (r["y1"] + r["y2"]) / 2
+@@ -82,22 +86,26 @@
+     if sx1 > sx0 and sy1 > sy0:
+         canvas[sy0 - y0:sy1 - y0, sx0 - x0:sx1 - x0] = img[sy0:sy1, sx0:sx1]
+-    return np.asarray(Image.fromarray(canvas).resize((IMG_SIZE, IMG_SIZE), Image.BILINEAR), dtype=np.float32) / 255.0
++    return np.asarray(Image.fromarray(canvas).resize((size, size), Image.BILINEAR), dtype=np.float32) / 255.0
+ 
+ 
+ class MultiScaleClassifier(nn.Module):
+-    """Shared backbone over 4 scale crops, per-scale 1x1 projection, concat, MLP head."""
+-
+-    def __init__(self, backbone, num_scales=4, proj_dim=256, hidden=512, num_classes=4):
++    """Shared backbone over 4 scale crops, per-scale 1x1 projection, concat, MLP head,
++    plus a separate high-resolution branch (its own backbone + 1x1 projection) on the
++    tight crop; the two streams are concatenated before the head."""
++
++    def __init__(self, backbone, hr_backbone, num_scales=4, proj_dim=256, hidden=512, num_classes=4):
+         super().__init__()
+         self.backbone = backbone
+         C = backbone.num_features
+         self.scale_projs = nn.ModuleList([nn.Conv2d(C, proj_dim, 1) for _ in range(num_scales)])
++        Ch = hr_backbone.num_features
++        self.hr_proj = nn.Conv2d(Ch, proj_dim, 1)
+         self.head = nn.Sequential(
+-            nn.Linear(num_scales * proj_dim, hidden),
++            nn.Linear((num_scales + 1) * proj_dim, hidden),
+             nn.GELU(),
+             nn.Linear(hidden, num_classes),
+         )
+ 
+-    def forward(self, views):
++    def forward(self, views, hr_view):
+         feats = []
+         for i, x in enumerate(views):
+@@ -107,4 +115,7 @@
+             feats.append(f)
+         f = torch.cat(feats, dim=1)                 # [B, num_scales * proj_dim]
++        fh = self.hr_proj(hr_view)                  # [B, proj_dim, H, W]
++        fh = fh.mean(dim=[2, 3])                    # [B, proj_dim]
++        f = torch.cat([f, fh], dim=1)               # [B, (num_scales + 1) * proj_dim]
+         return self.head(f)
+ 
+@@ -135,5 +146,15 @@
+             x = (x - MEAN) / STD
+             views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))
+-        return views, r.get("cls", -1)
++        # high-resolution view: the tight crop rendered at IMG_SIZE_HR, same flips/brightness
++        xh = make_crop(img, r, HR_TIGHT, self.train, size=IMG_SIZE_HR)
++        if fh:
++            xh = xh[:, ::-1]
++        if fv:
++            xh = xh[::-1, :]
++        if self.train:
++            xh = np.clip(xh * bright, 0, 1)
++        xh = (xh - MEAN) / STD
++        hr_view = torch.from_numpy(np.ascontiguousarray(xh.transpose(2, 0, 1)))
++        return views, hr_view, r.get("cls", -1)
+ 
+ 
+@@ -170,5 +191,6 @@
+ 
+     backbone = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=None)
+-    model = MultiScaleClassifier(backbone, num_scales=len(SCALES))
++    hr_backbone = timm.create_model(MODEL_HR, pretrained=PRETRAINED, num_classes=None)
++    model = MultiScaleClassifier(backbone, hr_backbone, num_scales=len(SCALES))
+     model = model.to(device).to(memory_format=torch.channels_last)
+     crit = nn.CrossEntropyLoss()
+@@ -184,5 +206,5 @@
+     while not done:
+         tot, nb = 0.0, 0
+-        for views, y in dl_tr:
++        for views, hr_view, y in dl_tr:
+             frac = min(1.0, (time.time() - t_start) / budget)
+             f = frac / 0.05 if frac < 0.05 else 0.5 * (1 + math.cos(math.pi * (frac - 0.05) / 0.95))
+@@ -190,7 +212,8 @@
+                 pg["lr"] = LR * max(f, 1e-3)
+             views = [v.to(device, non_blocking=True).to(memory_format=torch.channels_last) for v in views]
++            hr_view = hr_view.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+             y = y.to(device, non_blocking=True)
+             with torch.autocast(**amp):
+-                loss = crit(model(views), y)
++                loss = crit(model(views, hr_view), y)
+             opt.zero_grad(set_to_none=True)
+             loss.backward()
+@@ -207,7 +230,8 @@
+     probs = []
+     with torch.no_grad(), torch.autocast(**amp):
+-        for views, _ in dl_ev:
++        for views, hr_view, _ in dl_ev:
+             views = [v.to(device).to(memory_format=torch.channels_last) for v in views]
+-            probs.append(torch.softmax(model(views).float(), 1).cpu())
++            hr_view = hr_view.to(device).to(memory_format=torch.channels_last)
++            probs.append(torch.softmax(model(views, hr_view).float(), 1).cpu())
+     probs = torch.cat(probs).numpy()
+     os.makedirs(args.out, exist_ok=True)

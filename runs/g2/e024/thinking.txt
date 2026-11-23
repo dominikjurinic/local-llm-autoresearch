@@ -1,0 +1,181 @@
+===== attempt 1 =====
+Let me carefully think about where we are and what to do next.
+
+Current state:
+- Best: e012, 5-seed mean 0.6363 (3-view logit average: 1.5x, 2.5x, 4x crops, EfficientNet-B0, 160px).
+- Baseline to beat: 0.638 (one-step 4-class detector). We're at 0.6363, just below it.
+- Ceiling: 0.758 (stage-1 boxes with perfect classes).
+- Diagnostics: wrong-class cost is 0.7400 - 0.6363 = 0.1037. The remaining gap to the ceiling (0.758) is 0.018, which is the cost of scores vs detector conf.
+
+Per class: pore 0.546, deposit 0.615, discontinuity 0.778, stain 0.606.
+
+Confusion matrix (on boxes overlapping a true defect):
+- pore: 51 correct out of 76 (67%); 18 → stain, 5 → deposit
+- deposit: 203 correct out of 269 (75%); 63 → stain, 2 → pore
+- discontinuity: 431/438 (94%)
+- stain: 548/574 (89%); 45 → deposit, 9 → pore
+
+So the big confusion: deposit→stain (63), stain→deposit (45), pore→stain (18).
+
+Research guide plan:
+1. Consolidate: train on detector boxes from the train split. Earlier runs accepted this twice (5-seed 0.6337, 0.6342, about +0.004). But in this run, e001 crashed, e002 was rejected (0.6282), e020 was rejected (0.6229). Hmm, wait — e002 was based on e000 (the starting file with 2 crops), and scored 0.6282. e020 was based on e012 (3 views) and scored 0.6229. Both rejected. The guide says "if it fails twice, drop it and move on." It has now failed twice in this run (e002, e020). So per the guide, drop it.
+
+2. Box quality gap: simulate detector error (tried in e003, e005 — both rejected). Weight/sample boxes by box quality — not tried yet. Combine views better (shared backbone concat) — tried in e004 (0.6329, not confirmed), e007 crashed, e021/e022/e023 crashed 3 times. So the shared-backbone direction has had 5 attempts (4 ran: e004, e007 crash, e021, e022, e023 crashes). Actually e004 ran and was not confirmed (0.6329 vs 0.6363 — worse). e007 crashed. e021, e022, e023 crashed. So the shared-backbone concat direction: 1 real result (worse), 4 crashes. That direction is essentially exhausted (two failed variants → move on).
+
+3. Buy training steps: precompute crops (e010 timeout, e011 rejected 0.6254), reduce reserve (e006 rejected 0.6253), drop view at inference (e016 timeout, e017 timeout, e018 crash, e019 rejected 0.6176). Hmm, the inference category is marked EXHAUSTED (3+ ideas, no new best). But wait — e016/e017 timed out trying to precompute eval crops. e019 (drop 4x view at inference) scored 0.6176, which is much lower — that's suspicious. Dropping the 4x view at inference shouldn't drop the score by 0.02 unless the 4x view is important. Actually wait, e019 was based on e018, which was based on e017... the chain is messy. 0.6176 is "much lower than best" which usually means a bug. But it was rejected.
+
+Hmm, let me think about what's actually still untried and promising.
+
+Key observations from the log:
+- Total 185s: 14s load, ~111s train (285 steps), ~60s prediction.
+- Loss still dropping at cutoff: 0.2421 at step 285 (epoch 3). Epoch losses: 0.6973, 0.3390, 0.2684, 0.2421. Still dropping.
+- Step time: 111s / 285 steps ≈ 0.39s/step. That's slow for a B0 at 160px with 3 views... wait, 3 forward passes per sample (3 views through the full model). 64 batch, 3 passes. Hmm.
+
+Actually wait — the model does 3 full forward passes per batch (model(xt), model(xw), model(xw2)). That's 3x the compute. If we could do 1 forward pass with 64 samples... but the views are different images.
+
+Ideas to buy steps:
+a) Reduce prediction cost: prediction is 41879 boxes × 3 crops = 125,637 crops at 160px through B0. ~60s. If we drop the 4x view at inference only, save ~20s. But e019 did that (sort of) and got 0.6176 — rejected. But wait, e019's base chain was broken (e018 crashed, e019 built on e018). The 0.6176 might be a bug in that chain. Hmm, but the harness said "rejected" not "bug." Actually the brief says "scores much lower than the current best usually mean a bug... the harness will say so." It didn't say it was a bug. Hmm.
+
+Actually, let me reconsider: e019 = "e018 intended to drop the 4x view at inference... but it crashed because the dataset returned None for the third view at eval time." e019 fixed that and got 0.6176. So dropping the 4x view at inference (trained on 3 views) gave 0.6176, which is 0.019 below best. That's a real drop — the 4x view matters at inference. OK.
+
+b) Precompute training crops: e011 rejected at 0.6254. Hmm, that's also lower than best (0.6363). Wait, e011 was based on e010 (which timed out). e011: "precomputing only the training crops costs ~16s but removes per-step PIL..." scored 0.6254, rejected. So precomputing training crops (exact box positions, no jitter precomputed, jitter applied on the fly?) actually hurt? Or the 16s precompute cost ate training time. 16s of 180s is 9% of the budget — that could cost ~25 steps, which might explain 0.6254 vs 0.6363? Plausible.
+
+Hmm wait, but actually the per-step crop computation: make_crop does PIL resize per view per box per epoch. 6052 boxes × 3 views × 4 epochs = ~72k crop operations over 111s. With 8 workers, ~14ms/crop... that's a lot. Actually PIL resize of a small region to 160px should be <1ms. The crop region can be large (4x context on high-res images — weld images are "high-res"; 4x the box could be big, e.g., 1000px, and resizing a 1000px crop to 160px takes ~1-2ms). Plus 3-arg... whatever.
+
+c) Reduce per-step compute: the model does 3 full B0 forward passes. What if we use a smaller/faster model? ConvNeXt-Nano timed out (e015). Hmm, why would convnext_nano time out? It's smaller than B0 (5M vs 4M params? actually convnext_nano is ~5M, B0 is ~4M). Similar speed. The timeout might have been from something else in that edit.
+
+d) Reduce views from 3 to 2 at both train and inference: that halves... no, cuts 1/3 of compute. 2 views (1.5x, 2.5x) at 160px. The 4x view was added in e012 and gave +0.005 (0.6329→0.6363, confirmed). Dropping it would lose that. But if dropping it buys ~37% more training steps... the loss is still dropping at cutoff. Trade-off. Hmm, but e019 (drop 4x at inference only) lost 0.019. That's a big loss for just dropping a view at inference — suggests the 4x view's logits are heavily weighted in the average. Dropping it at train+inference would be a bigger change. Risky, and it directly contradicts e012's confirmed gain. I don't love it.
+
+e) Batch size / AMP: already using bfloat16 AMP. channels_last already set.
+
+f) Actually, the big one: prediction phase is 60s for 41879 boxes. RESERVE_S = 55. The run ends at 185s, 5s under the kill point. Wait, 185s total with 180s budget? "At the limit the run is killed" — but the log says 185s total and it completed? The harness must allow a small grace, or the kill is at exactly 180 and the run was killed... but it says "done: 4 epochs... 185s total" so it finished. Probably the kill is slightly after, or T0 counts from before argparse. Anyway, we're right at the limit.
+
+Let me reconsider the problem. What's the biggest error?
+
+Diagnostics:
+- mAP if every box had the correct class but kept your scores: 0.7400. Yours: 0.6363. So wrong classes cost 0.1037.
+- Ceiling (perfect classes AND detector conf scores): 0.758. So scores cost another 0.018.
+
+The class-decision error is dominant. On boxes overlapping a true defect:
+- 67% pore correct (25 wrong out of 76: 18→stain, 5→deposit, 1→discont, 1→no row)
+- 75% deposit correct (66 wrong out of 269: 63→stain, 2→pore, 1→discont, 2→no row)
+- 94% discont correct
+- 89% stain correct (26 wrong out of 574: 45→deposit, 9→pore, 8→discont, 4→no row)
+
+Total boxes overlapping: 76+269+438+574 = 1357. Wrong: 25+66+5+26 = 122.
+
+The deposit↔stain confusion is the biggest (63+45=108 of 122). Pore→stain is 18.
+
+What distinguishes deposit from stain? In weld images, deposit is extra material (bright, raised), stain is discoloration (dark patch). Pore is a small dark hole.
+
+What changes could help the whole deposit/stain/pore confusion? Ideas:
+
+1. Higher input resolution for the tight crop: e014 (320px tight crop) timed out. Resolution family was "no gain" in earlier runs (224px etc.), but that was in the 2-view era. Hmm, the earlier-runs table says "resolution and small-box handling (224 px, larger MIN_CROP, enlarged tight crops for small boxes): 9 attempts, no gain." And in this run e014 timed out. So resolution is somewhat exhausted.
+
+2. More training steps: loss still dropping. If we can buy steps, every class benefits. This is the "buy training steps" direction. What's the cheapest way?
+
+Let me compute: 185s total = 14s load + 111s train + 60s predict. To buy training time:
+- Cut prediction: precompute eval crops? e016 timed out (tried to precompute all eval crops — 41879×3 crops ≈ 125k crops ≈ 129s, too much).
+- Cut prediction by dropping a view: e019 lost 0.019.
+- Cut load time: 14s to load 1022 images. Could be a bottleneck; images are high-res. Not much to do.
+- Speed up training: 0.39s/step for 64×3 views of B0@160. Hmm, that's ~130ms per view per 64 batch. Reasonable on a modest GPU.
+
+What about reducing the number of views in training but keeping them at inference? No, that breaks train/test match.
+
+What about a faster backbone? B0 is already small. resnet18 is faster but weaker. The earlier-runs table says "bigger or other backbone: no gain." Smaller backbone untried? "Bigger or other backbone (EfficientNet-B2, ResNet-50, 2-3 model ensembles): 8 attempts, no gain" — that was bigger. Smaller (resnet18, convnext_pico) untried in this family? convnext_nano timed out in e015 (but the timeout might have been an edit bug, not the model).
+
+Hmm wait, why did e015 (convnext_nano) time out? The diff isn't shown. Maybe the edit changed something else. Can't tell.
+
+3. Different angle: the confusion is deposit↔stain. What if we train on the detector boxes from the train split (the "consolidate" step)? Failed twice in this run (e002: 0.6282 on 2-view base; e020: 0.6229 on 3-view base). The guide says drop after two failures. In earlier runs it was accepted twice with +0.004. In this run it's consistently negative. Drop it.
+
+4. What about the score side? "The remaining gap to the perfect-classes ceiling is what your scores cost compared to detector conf" = 0.018. Score = conf × p(class). The earlier-runs table says score-row manipulation was exhausted (16 attempts, no gain). The 5th background class: 9 attempts, no gain. So scoring is exhausted.
+
+5. What about training data: "low-resolution crops added to training: no gain." Class-balanced sampling: no gain. Augmentation: no gain. Focal loss: no gain.
+
+6. What's untried?
+- Box-quality weighting/sampling (guide phase 2 item 2): untried in this run and in earlier runs (not in the table).
+- Shared backbone with feature concat: tried, 1 real result worse + 4 crashes. Effectively exhausted.
+- Detector-error simulation: e003, e005 rejected. Exhausted.
+- Box size/aspect as input: earlier runs "never properly tested" (2 crashes, 1 edit fail, 1 run at 0.629). In this run e008: 0.6251 seed 0, 5-seed 0.6279, not confirmed. So that's now tested and not confirmed. Exhausted.
+- SWA / weight averaging: untried! The background reading mentions SWA as a cheap variance/accuracy technique. Under a fixed budget, SWA averages weights over the last part of training — nearly free (just store/average weights). Could help calibration and accuracy. Hmm, but the metric only cares about order within class; SWA typically improves accuracy a bit.
+- EMA of weights: same family.
+- Mixup/CutMix: "training augmentation (rotation, mixup, stronger color or geometry): 5 attempts, no gain" — mixup was included there. Exhausted.
+- Label smoothing: untried? Not in the table. But "class-weighted loss hurt every time" and focal no gain. Label smoothing reduces probability information — probably neutral for ranking. Low priority.
+- Longer training via cheaper prediction: prediction is 60s. What if we write fewer rows? MIN_SCORE already filters. 55313 rows written. Writing is fast.
+- What if we speed up prediction by using a smaller batch... no.
+- What about reducing the number of eval boxes classified? All 41879 need predictions. But per image at most the 300 highest-scoring rows count. 41879 boxes / 1022 images ≈ 41 boxes/image. So all rows count (41×4=164 < 300). Can't skip any.
+
+Hmm wait, actually — per image at most 300 rows count. 41 boxes × 4 classes = 164 rows/image. So all count. OK.
+
+7. Bigger idea: the 3-view logit average is doing 3 full forward passes. What if we do 1 forward pass on a horizontally-stacked 3-image input? No — the model expects 3×160×160.
+
+What about a multi-crop input where the 3 crops are stacked as channels? 9×160×160 input with a modified stem. That's 1 forward pass at 3x input channels — the first conv is 3→32; making it 9→32 costs 3x on that layer only. Total compute ≈ 1x a single B0 forward + a bit. That would cut training step time to ~1/3! And prediction to ~1/3 (60s → ~25s). That buys a lot of training steps.
+
+But: is that "fundamentally different" from the shared-backbone concat (e004, e007, e021-23)? Yes: e004/e021 concat pooled features from separate forward passes (2 or 3 passes, then concat 2560-dim). The 9-channel input is a single forward pass where the network sees all 3 scales simultaneously with cross-scale interactions from layer 1. Different mechanism. And it's much cheaper.
+
+But there's a catch: pretrained weights. The stem (first conv) expects 3 channels. If we change to 9 channels, we must reinitialize the stem conv (e.g., repeat the pretrained 3-channel weights 3 times). timm has `features_only`... actually for EfficientNet, the stem is `conv_stem` (3→32, 3x3). We can create the model with in_chans=9? timm's efficientnet doesn't support in_chans directly... actually many timm models support `in_chans` via `features_only`? Let me think. timm's efficientnet has a `num_classes` param; in_chans support: EfficientNet's `__init__` has `in_chans=3`? I believe timm's efficientnet_b0 accepts `in_chans` — yes, timm's EfficientNetModel has an `in_chans` parameter, and the stem handles it: if in_chans != 3, it repeats the pretrained stem weights (timm has this logic: "if in_chans != 3: ... repeat weights"). Actually I recall timm's efficientnet stem: `self.conv_stem = nn.Conv2d(in_chans, ...)` and in `pretrained` loading it handles in_chans mismatch? Not sure it auto-handles. Safer: build the model normally (in_chans=3), then replace conv_stem with a new Conv2d(9, 32, 3, ...) and initialize by repeating the pretrained kernel 3 times along the channel dimension. That's easy and safe.
+
+Then forward: input (B, 9, 160, 160) → single pass → 4 logits. One pass instead of three.
+
+Cost estimate: B0@160 with 3 channels: ~130ms per 64-batch forward+backward? Actually 0.39s/step for 3 views includes 3 forwards + 1 backward. Let me estimate: forward ~100ms, backward ~130ms per view batch? 3 views: 3×100 + 3×130 (each view has its own backward through its own graph) ≈ 720ms? But measured is 390ms/step. Hmm, with AMP bfloat16 it's faster. Whatever — single 9-channel pass: forward ≈ 1.1x single (extra stem cost is negligible), backward ≈ 1.1x. Total step ≈ (1.1f + 1.1b) vs (3f + 3b) → ~1/3. So ~130ms/step instead of 390ms. Training time 111s → ~370 steps instead of 285. Plus prediction: 41879 boxes × 1 pass (9ch) ≈ 1/3 of 60s ≈ 20s. Total: 14 + 111 + 20 ≈ 145s, or with more steps: train until 180-45=135s → ~120s training at 130ms/step ≈ 900 steps. That's a big jump in training.
+
+Wait, but is a 9-channel input with 3 stacked crops actually better or worse than averaging 3 separate passes? The separate passes share weights (same model), so each view is classified independently and averaged. The 9-channel version lets the network fuse scales at every layer. It's a different inductive bias. Risk: with only 6052 boxes, the 9-channel model has a reinitialized stem (loses pretrained stem weights for 2/3 of the channels... well, it repeats them, so it's a valid init). The backbone is pretrained and the stem is a mild reinit. Should be fine.
+
+But wait — there's a subtlety with the crops: the 3 views are the same box at 1.5x, 2.5x, 4x context. Stacked as 9 channels (each 3-channel crop). The network sees all 3 at 160px. This is like a multi-scale input. Reasonable.
+
+Alternatively, simpler: keep 3 separate passes but that's the current best. The 9-channel idea is a real architectural change with a big compute payoff. The guide says "changes to what the model sees or learns from usually matter more than turning one more knob" and "every second of training you gain is a free improvement."
+
+But the architecture category has had 9 attempts, 1 new best, 2 close, 5 crashes. It's not marked exhausted but it's crash-prone. The 9-channel edit is small and low-risk:
+1. Create model normally.
+2. Replace stem: `stem = model.conv_stem` (in timm's efficientnet, the stem is `conv_stem`). New conv: nn.Conv2d(9, stem.out_channels, 3, padding=1, bias=False), weight = repeat stem.weight 3 times along dim 1. Copy bias.
+3. Dataset returns a single (B, 9, 160, 160) tensor: stack the 3 normalized views along channel dim.
+4. Forward: model(x) once.
+
+Let me double-check timm's efficientnet_b0 structure: `timm.create_model('efficientnet_b0')` → EfficientNet with `self.conv_stem = nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1, bias=False)`. Yes, in timm's efficientnet the first layer is `conv_stem`. Then `self.blocks` (MBBlocks), `self.head` (global pool + classifier). `model.num_features` = 1280. Good.
+
+So the edit:
+- In dataset `__getitem__`: build the 3 views as before, but return a single tensor: `torch.cat(views, dim=0)` → (9, 160, 160).
+- Training loop: `x, y in dl_tr`, `loss = crit(model(x), y)`.
+- Prediction: same, single pass.
+- After model creation: replace the stem.
+
+Stem replacement code:
+```python
+model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
+stem = model.conv_stem
+new_stem = nn.Conv2d(9, stem.out_channels, stem.kernel_size, stride=stem.stride, padding=stem.padding, bias=stem.bias is not None)
+with torch.no_grad():
+    new_stem.weight.copy_(stem.weight.repeat(1, 3, 1, 1))
+    if stem.bias is not None:
+        new_stem.bias.copy_(stem.bias)
+model.conv_stem = new_stem
+model = model.to(device).to(memory_format=torch.channels_last)
+```
+Wait — repeat along dim 1: stem.weight is (32, 3, 3, 3). repeat(1, 3, 1, 1) → (32, 9, 3, 3). Channels 0-2 = original, 3-5 = original, 6-8 = original. So the 9-channel input [tight(3), wide(3), wide2(3)] — each triple of channels gets the same pretrained kernel. Good init.
+
+Then `.to(device)` after replacement so the new stem is on device and channels_last.
+
+Also the optimizer: create the opt after the stem replacement so the new stem params are included. Order matters: create model, replace stem, move to device, then AdamW(model.parameters()).
+
+Dataset change: currently returns views[0], views[1], views[2], cls. Change to return x9, cls where x9 = torch.cat(views, dim=0).
+
+Training loop change: `for x, y in dl_tr:` ... `xt = x.to(device, non_blocking=True).to(memory_format=torch.channels_last)` ... `loss = crit(model(xt), y)`.
+
+Prediction: `for x, _ in dl_ev:` ... single pass.
+
+Time estimate:
+- Load: 14s (same).
+- Training: step time should drop to ~1/3 (one 9ch forward+backward instead of three 3ch). 9ch forward is ~1.05x a 3ch forward (stem extra cost is trivial; the rest of the net is identical since after the stem it's 32 channels). Backward similar. So step ≈ 390/3 × 1.05 ≈ 137ms. Training budget: 180 - 55 (reserve) - 14 (load, already elapsed at t_start... actually t_start is after load) = deadline - RESERVE - t_start. t_start ≈ 14s. Reserve 55. So training until 125s → ~111s of training → ~800 steps.
+- Prediction: 41879 boxes × 1 pass (9ch) at batch 256 → 164 batches. Per-batch time ≈ (60s/3) / (41879/3/256) ... currently 3 passes: 41879×3/256 = 489 batches in 60s → 122ms/batch. New: 164 batches × ~130ms ≈ 21s.
+- Total ≈ 14 + 111 + 21 + writing ≈ 150s. Comfortably under 180. Could even lower the reserve to 45 later.
+
+Risk check:
+- channels_last on the 9ch input: fine.
+- AMP bfloat16: fine.
+- The 3 crops are computed per sample as before (PIL work unchanged) — data loading cost is the same per step (3 crops per box). Hmm wait — is data loading the bottleneck? 0.39s/step with 8 workers prefetching; if GPU compute is ~130ms/step for 3 views, then per step the workers must produce 64 boxes × 3 crops. If crop production is ~14ms/box (3 crops), 64 boxes = 900ms per batch to produce... that would be the bottleneck! Hmm.
+
+Wait, let me reconsider. If data loading is the bottleneck, then cutting GPU compute doesn't buy steps. Let me estimate crop cost: make_crop does: compute region, fill canvas, copy, PIL resize to 160×160, normalize. For a 4x context crop on a high-res image: box long side could be, say, 200px → 4x = 800px region → resize 800→160. PIL bilinear resize of 800×800×3 to 160×160: ~1-2ms. Plus numpy ops ~0.5ms. So ~3ms per crop, ~9ms per box. 64 boxes = ~600ms per batch with 1 worker; with 8 workers, ~75ms per batch in wall time (pipelined). So data is ~75ms/batch, GPU 3 views ≈ 250ms/batch (390ms step minus overhead). So GPU-bound currently. After change: GPU ~130ms, data ~75ms → still GPU-bound, step ≈ 130-150ms. Good, we gain ~2.5x steps.
+
+Actually wait, I should double-check the current step time breakdown. 285 steps in 111s = 389ms/step. That includes data wait. If data is 75ms and GPU is 315ms... plausible.
+
+So the 9-channel single-pass should give ~800 steps instead of 285. Loss at 285 steps was 0.242 and dropping; at 800 steps it should be much lower (Thinking budget reached. Stop thinking now and write the reply in the required format.

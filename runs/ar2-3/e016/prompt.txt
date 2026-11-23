@@ -1,0 +1,363 @@
+### system
+# Research brief: two-stage weld defect detection (LoHi-WELD)
+
+## Background
+LoHi-WELD contains images of real robotic weld beads with four defect types:
+0 pore, 1 deposit, 2 discontinuity, 3 stain. The original paper uses a one-step detector
+(YOLOv7-tiny) that finds and names defects at once: 0.69 mAP@0.5 on high-res images. When all
+types are merged into one class, the same detector reaches 0.77, so many errors are wrong types,
+not missed defects.
+
+We test a two-stage system: a class-agnostic detector (stage 1, fixed, already run) finds defect
+boxes; your code (stage 2) decides the type of each box and how confident each prediction is.
+
+## Reference numbers on validation (same images your score is computed on)
+- one-step 4-class detector (the baseline to beat): 0.638 mAP@0.5
+- stage-1 boxes with perfect classes (ceiling for stage 2): 0.758 mAP@0.5
+- stage-1 boxes scored as a single class 'defect': 0.755 mAP@0.5
+
+## What is already known
+- A crop classifier given perfect boxes reaches macro-F1 ~0.87 with the starting recipe (two-crop
+  input). Pore and deposit are the weak classes; stain is often confused with deposit and background.
+- Tuning hyperparameters alone helped little in earlier experiments; changes of method helped more.
+- Class-weighted loss hurt classification every time it was tried.
+
+## What determines the score
+mAP@0.5 rewards, per class: (a) the right class on boxes that overlap a true defect, and (b) good
+ranking: true detections should score higher than false ones. Detector boxes include false alarms
+(background) and slightly misplaced boxes; the starting classifier was trained only on perfect boxes
+and has no notion of "not a defect". Several rows per box (one per class) are allowed and often help.
+
+Ideas that are in scope (not a to-do list):
+- train the classifier on detector boxes from the training images (dets.csv split "train"), labelled
+  by overlap with the true boxes in crops.csv, including a "background" class for false alarms
+- combine detector conf and classifier probabilities differently (powers, background probability, ...)
+- robustness to box misplacement (jitter matching the detector's errors)
+- use of low-res training crops, test-time augmentation, ensembling within the time budget
+- architecture changes using the pretrained backbones listed below
+
+## How your code is run
+- `python train.py --data /work/data --out /work/out --seed S --seconds T`, offline, in a sandbox.
+- `T` is the total wall-clock budget (loading, training, prediction). At the limit the run is killed
+  and counts as failed. Keep a safety margin.
+- Inputs and output format: see the docstring at the top of train.py.
+- The harness scores the eval boxes on validation images and shows you the score. The rest are hidden
+  test images, scored only after the research is finished. You cannot tell them apart.
+- No internet. Packages: the standard library, numpy, torch, torchvision, timm, PIL.
+- Pretrained weights are available only for these timm models: convnext_atto, convnext_nano, convnext_pico, efficientnet_b0, efficientnet_b2, mobilenetv3_large_100, regnety_016, resnet18, resnet26d, resnet34, resnet50, tf_efficientnetv2_b0
+
+## How results are judged
+- Each new version runs with seed 0. If it beats the current best mean, it is re-run with more seeds;
+  only if the multi-seed mean still beats the best does it become the new best.
+- Seed-to-seed noise is about +-0.005 to 0.01 mAP. A single-seed gain smaller than that is probably noise.
+- A score far below the current best usually means a bug (wrong class order, wrong box format,
+  untrained model), not a bad idea; the harness will say so.
+- Every change is applied on top of the current best `train.py` (or the most recent version with BASE: last).
+
+## Rules
+1. One idea per turn, with a short testable hypothesis. Keep the edit focused on that idea.
+2. Keep the contract. Use the seed. Respect the time budget.
+3. Do not try to find the labels of eval images by any route; only training labels may be used.
+4. If a run crashed or timed out, read the log and fix the cause.
+
+## Reply format (exactly this; no other text outside these fields)
+BASE: best            (or: last   -- to edit the most recent version instead of the best)
+CATEGORY: one of data, augmentation, architecture, loss, sampling, optimisation, inference, scoring, other
+HYPOTHESIS: one or two sentences
+<<<<<<< SEARCH
+lines copied exactly from the current file
+=======
+the new lines
+>>>>>>> REPLACE
+
+You may give several SEARCH/REPLACE blocks. Each SEARCH text must appear exactly once in the
+file (copy it character for character, including indentation). To insert code, put a nearby
+line in SEARCH and repeat it in REPLACE together with the new lines.
+
+
+### user
+## Current best train.py (e013, 5-seed val mAP@0.5 0.6314, seed std 0.0041)
+```python
+#!/usr/bin/env python3
+"""
+Two-stage weld defect detection, stage 2: the file the research agent edits.
+
+Stage 1 (fixed, already done): a class-agnostic detector (YOLOv7-tiny) found candidate defect boxes,
+each with a confidence ("conf"). Stage 2 (this file): decide the defect type of each box and give
+each prediction a score: 0 pore, 1 deposit, 2 discontinuity, 3 stain.
+The result is scored like a normal detector: mAP at IoU 0.5 over the 4 classes.
+
+Contract with the harness (do not break it):
+  - inputs in <data>:
+      crops.csv  labelled training boxes: id, res ("high"/"low"), image, x1, y1, x2, y2, img_w, img_h, cls
+      dets.csv   detector boxes: det_id, split ("train" or "eval"), image, x1, y1, x2, y2, img_w, img_h, conf
+                 "train" boxes are on training images (their true class can be found by overlap with crops.csv);
+                 "eval" boxes are on hidden evaluation images: make predictions for these
+      images/    the images
+  - write <out>/preds.csv with columns det_id, cls, score: one or more rows per eval box
+    (several rows with different classes for the same box are allowed; leaving a box out drops it).
+    Higher score = more confident. Per image at most the 300 highest-scoring rows count.
+  - use --seed for all randomness
+  - finish within --seconds of wall time (loading, training, prediction); the harness kills it at the limit.
+
+Starting point: the "two-crop" classifier (tight crop 1.5x + wide crop 2.5x of the box through the same
+EfficientNet-B0, logits averaged), trained on the true training boxes; each eval box becomes one
+prediction per class with score = detector conf x class probability.
+"""
+import time
+
+T0 = time.time()  # the time budget counts from here
+
+import argparse
+import csv
+import math
+import os
+import random
+
+import numpy as np
+import timm
+import torch
+import torch.nn as nn
+from PIL import Image
+
+# ---------------------------------------------------------------- settings
+MODEL = "efficientnet_b0"
+PRETRAINED = True
+IMG_SIZE = 160
+CONTEXT = 2.5           # wide crop: side = CONTEXT * long side of the box
+TIGHT_CONTEXT = 1.5     # tight crop
+MIN_CROP = 16
+TRAIN_ON = ("high",)    # resolutions of crops.csv used for training
+BATCH_SIZE = 64
+LR = 1e-3
+WEIGHT_DECAY = 0.05
+RESERVE_S = 65          # seconds kept free for prediction and writing
+MIN_SCORE = 0.001       # rows below this score are not written
+MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+
+def read_csv(path):
+    rows = list(csv.DictReader(open(path)))
+    for r in rows:
+        for k in ("x1", "y1", "x2", "y2", "conf"):
+            if k in r:
+                r[k] = float(r[k])
+        if "cls" in r:
+            r["cls"] = int(r["cls"])
+    return rows
+
+
+def make_crop(img, r, context, train):
+    h, w = img.shape[:2]
+    cx, cy = (r["x1"] + r["x2"]) / 2, (r["y1"] + r["y2"]) / 2
+    side = max(max(r["x2"] - r["x1"], r["y2"] - r["y1"]) * context, MIN_CROP)
+    if train:  # light geometric jitter
+        cx += random.uniform(-0.1, 0.1) * side
+        cy += random.uniform(-0.1, 0.1) * side
+        side *= random.uniform(0.85, 1.2)
+    s = max(2, int(round(side)))
+    x0, y0 = int(round(cx - s / 2)), int(round(cy - s / 2))
+    canvas = np.full((s, s, 3), 114, dtype=np.uint8)  # gray padding outside the image
+    sx0, sy0, sx1, sy1 = max(0, x0), max(0, y0), min(w, x0 + s), min(h, y0 + s)
+    if sx1 > sx0 and sy1 > sy0:
+        canvas[sy0 - y0:sy1 - y0, sx0 - x0:sx1 - x0] = img[sy0:sy1, sx0:sx1]
+    return np.asarray(Image.fromarray(canvas).resize((IMG_SIZE, IMG_SIZE), Image.BILINEAR), dtype=np.float32) / 255.0
+
+
+class BoxDataset(torch.utils.data.Dataset):
+    def __init__(self, rows, images, train):
+        self.rows, self.images, self.train = rows, images, train
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __getitem__(self, i):
+        r = self.rows[i]
+        img = self.images[r["image"]]
+        fh = fv = False
+        bright = 1.0
+        if self.train:  # same flips and brightness for both views
+            fh, fv, bright = random.random() < 0.5, random.random() < 0.5, random.uniform(0.8, 1.2)
+        views = []
+        for ctx in (TIGHT_CONTEXT, CONTEXT):
+            x = make_crop(img, r, ctx, self.train)
+            if fh:
+                x = x[:, ::-1]
+            if fv:
+                x = x[::-1, :]
+            if self.train:
+                x = np.clip(x * bright, 0, 1)
+            x = (x - MEAN) / STD
+            views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))
+        return views[0], views[1], r.get("cls", -1)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data", default="/work/data")
+    ap.add_argument("--out", default="/work/out")
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--seconds", type=float, default=180)
+    args = ap.parse_args()
+    deadline = T0 + args.seconds
+    random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    crops = [r for r in read_csv(os.path.join(args.data, "crops.csv")) if r["res"] in TRAIN_ON]
+    dets = read_csv(os.path.join(args.data, "dets.csv"))
+    ev = [d for d in dets if d["split"] == "eval"]
+    needed = {r["image"] for r in crops} | {d["image"] for d in ev}
+    images = {p: np.asarray(Image.open(os.path.join(args.data, "images", p)).convert("RGB")) for p in needed}
+    print(f"train {len(crops)} boxes, eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
+
+    workers = min(8, os.cpu_count() or 2)
+
+    def worker_init(_):
+        s = torch.initial_seed() % 2**32
+        random.seed(s); np.random.seed(s)
+
+    g = torch.Generator().manual_seed(args.seed)
+    dl_tr = torch.utils.data.DataLoader(BoxDataset(crops, images, True), batch_size=BATCH_SIZE, shuffle=True,
+                                        num_workers=workers, pin_memory=True, drop_last=True,
+                                        persistent_workers=True, generator=g, worker_init_fn=worker_init)
+    dl_ev = torch.utils.data.DataLoader(BoxDataset(ev, images, False), batch_size=256, shuffle=False,
+                                        num_workers=workers, pin_memory=True)
+
+    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
+    model = model.to(device).to(memory_format=torch.channels_last)
+    crit = nn.CrossEntropyLoss()
+    opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    amp = dict(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda")
+
+    # Train until the budget minus the reserve is used up: 5% warm-up, then cosine decay.
+    t_start = time.time()
+    t_end = deadline - RESERVE_S
+    budget = max(1.0, t_end - t_start)
+    steps, epoch, done = 0, 0, False
+    model.train()
+    while not done:
+        tot, nb = 0.0, 0
+        for xt, xw, y in dl_tr:
+            frac = min(1.0, (time.time() - t_start) / budget)
+            f = frac / 0.05 if frac < 0.05 else 0.5 * (1 + math.cos(math.pi * (frac - 0.05) / 0.95))
+            for pg in opt.param_groups:
+                pg["lr"] = LR * max(f, 1e-3)
+            xt = xt.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            xw = xw.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            y = y.to(device, non_blocking=True)
+            with torch.autocast(**amp):
+                loss = crit((model(xt) + model(xw)) / 2, y)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+            tot += loss.item(); nb += 1; steps += 1
+            if time.time() >= t_end:
+                done = True
+                break
+        print(f"epoch {epoch}: loss {tot / max(nb, 1):.4f}, {steps} steps, {time.time() - T0:.0f}s", flush=True)
+        epoch += 1
+
+    # Classify every eval detection; one prediction per class with score = detector conf x class probability.
+    model.eval()
+    probs = []
+    with torch.no_grad(), torch.autocast(**amp):
+        for xt, xw, _ in dl_ev:
+            xt = xt.to(device).to(memory_format=torch.channels_last)
+            xw = xw.to(device).to(memory_format=torch.channels_last)
+            logits = (model(xt) + model(xt.flip(3)) + model(xw) + model(xw.flip(3))) / 4
+            probs.append(torch.softmax(logits.float(), 1).cpu())
+    probs = torch.cat(probs).numpy()
+    os.makedirs(args.out, exist_ok=True)
+    n = 0
+    with open(os.path.join(args.out, "preds.csv"), "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["det_id", "cls", "score"])
+        for d, p in zip(ev, probs):
+            for c in range(4):
+                s = d["conf"] * float(p[c])
+                if s > MIN_SCORE:
+                    w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+    print(f"done: {epoch} epochs, {steps} steps, {n} prediction rows, {time.time() - T0:.0f}s total", flush=True)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+Per-class val AP@0.5 (mean of 5 seeds): pore 0.507, deposit 0.629, discontinuity 0.781, stain 0.609
+
+Log of its seed-0 run (last lines):
+train 6052 boxes, eval 41879 detections, 1022 images (13s)
+epoch 0: loss 0.7219, 94 steps, 59s
+epoch 1: loss 0.3642, 188 steps, 77s
+epoch 2: loss 0.2872, 282 steps, 95s
+epoch 3: loss 0.2566, 376 steps, 113s
+epoch 4: loss 0.2766, 381 steps, 115s
+done: 5 epochs, 381 steps, 54378 prediction rows, 157s total
+
+## Experiment history (15 experiments so far)
+id | base | category | hypothesis | seed-0 score | 5-seed mean | outcome
+e001 | e000 | data | Training the classifier on detector boxes (dets.csv train) labelled by IoU>0.5 overlap with GT crops, with an explicit background class for false alarms, will improve mAP by teaching the model to suppress false positives | - | - | crashed
+e002 | e001 | data | The e001 crash was a trivial type bug (`img_w`/`img_h` left as strings by `read_csv`); fixing it lets us test the core idea—training on detector boxes with an explicit background class—whose hypothesis is that teaching t | 0.5172 | - | rejected
+e003 | e000 | data | Including low-resolution training crops alongside high-resolution ones roughly increases the training set size, giving the classifier more examples of each defect type (especially the weak pore and stain classes) and sho | 0.6251 | - | rejected
+e004 | e000 | scoring | Squaring the class probability in the score (conf × p² instead of conf × p) will improve mAP by more aggressively suppressing predictions where the classifier is uncertain (likely background boxes), thereby improving the | 0.6161 | - | rejected
+e005 | e000 | data | Training the classifier on detector boxes (from dets.csv train split) that overlap true crops (IoU>0.5) instead of the true box coordinates will close the train/test distribution gap: the classifier will see the same sli | 0.6248 | - | rejected
+e006 | e000 | architecture | Replacing EfficientNet-B0 with ConvNeXt-Nano, a modern backbone using depthwise-separable convolutions and layer normalisation, will generalise better to the weak pore and stain classes because its different inductive bi | 0.2901 | - | suspicious (likely bug)
+e007 | e000 | augmentation | Adding MixUp (α=0.2) to the training loop will regularize the classifier and improve generalization, especially for the weak pore and stain classes, by creating virtual training examples that smooth the decision boundary | 0.6326 | 0.6292 | not confirmed
+e008 | e000 | scoring | Multiplying the score by the classifier's max probability (conf × p[c] × max(p)) will improve mAP by suppressing background boxes more than true detections, since background crops tend to produce more uniform (lower-conf | 0.6265 | - | rejected
+e009 | e000 | data | Increasing the wide-crop context from 2.5× to 3.5× will improve the weak stain and pore classes by giving the classifier more surrounding weld-pattern context, helping it distinguish stain from deposit/background and sma | 0.6342 | 0.6309 | not confirmed
+e010 | e000 | loss | Label smoothing (0.1) will improve mAP by preventing the classifier from becoming overconfident, which improves the ranking of true detections above false alarms (critical for mAP@0.5) and acts as a regularizer for the w | 0.6328 | 0.6254 | not confirmed
+e011 | e000 | augmentation | The detector boxes are "slightly misplaced" relative to GT, but the current training jitter (±10% center, 0.85–1.2× size) may be too conservative to cover the actual misplacement distribution. Increasing the jitter to ±1 | 0.6356 | 0.6294 | not confirmed
+e012 | e000 | loss | Focal loss (γ=2) will improve mAP by down-weighting easy-to-classify examples and concentrating gradient updates on hard examples (the weak pore/stain classes and confusing stain-vs-deposit cases), improving both class a | 0.6209 | - | rejected
+e013 | e000 | inference | Test-time augmentation with horizontal flip (averaging logits over original and h-flipped crops) will reduce prediction variance and improve classification accuracy, especially on the weak pore and stain classes, by givi | 0.6392 | 0.6314 | new best
+e014 | e013 | scoring | Outputting only the top-1 class per detector box (instead of all 4 class rows) will improve mAP by eliminating wrong-class false positives: each non-top-1 row is an unconditional FP for its class (a box overlapping one G | 0.5916 | - | rejected
+e015 | e013 | data | Adding detector boxes (dets.csv train) that overlap GT crops (IoU>0.5) to the GT training set will improve mAP by exposing the classifier to the detector's actual box placement distribution (slightly misplaced, different | 0.6285 | - | rejected
+
+## Most recent experiment: e015 (rejected)
+Its change, relative to its base e013:
+--- e013/train.py
++++ e015/train.py
+@@ -128,7 +128,29 @@
+     dets = read_csv(os.path.join(args.data, "dets.csv"))
+     ev = [d for d in dets if d["split"] == "eval"]
+-    needed = {r["image"] for r in crops} | {d["image"] for d in ev}
++    # Label train detector boxes by IoU>0.5 overlap with GT crops, add to training set
++    gt_by_image = {}
++    for c in crops:
++        gt_by_image.setdefault(c["image"], []).append(c)
++    det_labeled = []
++    for d in [x for x in dets if x["split"] == "train"]:
++        img = d["image"]
++        if img not in gt_by_image:
++            continue
++        dx1, dy1, dx2, dy2 = d["x1"], d["y1"], d["x2"], d["y2"]
++        best_iou, best_cls = 0.0, -1
++        for c in gt_by_image[img]:
++            ix1, iy1 = max(dx1, c["x1"]), max(dy1, c["y1"])
++            ix2, iy2 = min(dx2, c["x2"]), min(dy2, c["y2"])
++            inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
++            union = (dx2 - dx1) * (dy2 - dy1) + (c["x2"] - c["x1"]) * (c["y2"] - c["y1"]) - inter
++            iou = inter / max(union, 1e-6)
++            if iou > best_iou:
++                best_iou, best_cls = iou, c["cls"]
++        if best_iou > 0.5:
++            det_labeled.append({"image": img, "x1": dx1, "y1": dy1, "x2": dx2, "y2": dy2, "cls": best_cls})
++    train_rows = list(crops) + det_labeled
++    needed = {r["image"] for r in train_rows} | {d["image"] for d in ev}
+     images = {p: np.asarray(Image.open(os.path.join(args.data, "images", p)).convert("RGB")) for p in needed}
+-    print(f"train {len(crops)} boxes, eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
++    print(f"train {len(train_rows)} boxes ({len(crops)} GT + {len(det_labeled)} det), eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
+ 
+     workers = min(8, os.cpu_count() or 2)
+@@ -139,5 +161,5 @@
+ 
+     g = torch.Generator().manual_seed(args.seed)
+-    dl_tr = torch.utils.data.DataLoader(BoxDataset(crops, images, True), batch_size=BATCH_SIZE, shuffle=True,
++    dl_tr = torch.utils.data.DataLoader(BoxDataset(train_rows, images, True), batch_size=BATCH_SIZE, shuffle=True,
+                                         num_workers=workers, pin_memory=True, drop_last=True,
+                                         persistent_workers=True, generator=g, worker_init_fn=worker_init)
+
+If you want to build on (or fix) this most recent version instead of the best, write BASE: last. Its full train.py differs from the best only by the change above.
+
+Propose the next experiment, in the reply format.

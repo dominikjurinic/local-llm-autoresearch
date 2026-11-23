@@ -1,0 +1,986 @@
+===== attempt 1 =====
+Let me analyze the situation carefully.
+
+## Current state
+- Best so far: e000 (the two-crop classifier with EfficientNet-B0 at 160px) with 5-seed val mAP@0.5 of 0.6288.
+- The dominant error is wrong-class assignment: the classification loss is 0.117 mAP (from 0.7461 if every box had its correct class, vs 0.6288 current).
+- Class-wise accuracy on overlapping boxes: pore 63%, deposit 78%, discontinuity 96%, stain 88%.
+- Pore and deposit are the weak classes; stain is often confused with deposit (and vice versa).
+- The "perfect classes" ceiling is 0.7461 for the current scoring, and 0.758 for the perfect-class ceiling described in the brief.
+- Wait, there's a discrepancy: the brief says the perfect-classes ceiling is 0.758, but diagnostics say "mAP@0.5 if every box had its correct class but kept your scores: 0.7461". The difference between these is what the scoring (conf × p) costs vs raw detector conf. Actually, hmm — actually the brief's ceiling (0.758) is described as "stage-1 boxes with perfect classes": every box that overlaps a true defect gets the correct class, every other box (false alarm) is kept as class 0 with its detector conf. Wait, that would change things for false alarms.
+
+Actually let me re-read:
+- `d2_boxes_perfect_classes_val_map50`: a ceiling. Every detector box that overlaps a true defect (IoU > 0.5) gets the correct class; every other box (false alarms) is KEPT, as class 0, with its detector conf. The score of each box is its detector conf.
+
+So this includes false alarms being kept as class 0 (pore). Our current system scores false alarms for all classes via conf × p(c), so false alarms could be assigned to any class. Hmm, interesting. But the key question: what's the remaining error we can fix?
+
+From diagnostics:
+- mAP@0.5 if every box had its correct class but kept your scores: 0.7461 (current: 0.6288). So wrong classes cost ~0.117 mAP.
+- The perfect-classes ceiling is 0.758. The gap between 0.7461 and 0.758 is 0.012 — that's the scoring part (how we rank boxes, including false alarms).
+
+Wait, actually if "every box had its correct class" includes all detector boxes (even false alarms) — no, re-read: "mAP@0.5 if every box had its correct class but kept your scores". This means for boxes overlapping a true defect, assign the true class; what about false alarms? The text says "if every box had its correct class" — probably meaning all detector boxes that overlap are assigned their true class, and the false alarm handling stays as is. Hmm, but actually maybe it means: for each detector box, if it overlaps a true defect, use that class; otherwise (false alarm), it's already effectively class 0 in our scoring (p(c) low for all). 
+
+Actually the key insight: wrong classes cost 0.117 mAP. That's huge. If we fix the classifier to be nearly perfect on overlapping boxes, we'd get ~0.746. And then the remaining gap (0.758 - 0.746 = 0.012) is about scoring/ranking of false alarms.
+
+So the main target: fix the classifier's wrong-class assignment. The dominant confusions: pore↔deposit and deposit↔stain. Specifically, the confusion matrix shows:
+- true pore: 63% right, 6→deposit, 20→stain, 1→discontinuity
+- true deposit: 78% right, 2→pore, 55→stain, 2→discontinuity
+- true discontinuity: 96% right
+- true stain: 88% right, 15→pore, 46→deposit, 9→discontinuity
+
+So the big confusions: deposit→stain (55) and stain→deposit (46). Also pore→stain (20) and stain→pore (15). These are texture/size-dependent. Note also that small boxes have 80% accuracy vs medium/large 91-93%.
+
+What's the current model? EfficientNet-B0 at 160px, two crops: tight (1.5x) and wide (2.5x), logit averaging.
+
+Now, what has been tried in this run:
+1. Scoring changes (conf × p variants): no gain.
+2. Architecture: 224px (timeout), efficientnetv2_b0 (crashed), convnext_nano/pico (suspicious/bug), matching backbone native resolution (rejected), bigger models (no gain).
+3. Data: training on detector boxes (e009, +0.0017, not confirmed), e010/e011 (crashes), third 4x view (+0.005, accepted twice but only pore class; close to time limit).
+4. Optimisation: SWA (not confirmed).
+
+The history says "architecture" and "data" are EXHAUSTED? with 3+ ideas no new best. But let me think about what's fundamentally different.
+
+Wait — there's a very important detail I should consider. The current model is EfficientNet-B0 at IMG_SIZE=160. But EfficientNet's optimal input resolution is 224px (the standard EfficientNet-B0 uses 224×224 as the "native" resolution for its base). Actually, efficientnet_b0 in timm has default resolution 224. Training at 160 may be suboptimal — but e012/e013 tried matching native resolution and got rejected (not confirmed) or no gain. Hmm wait, e012 tried 224 with halved batch size? Let me check: "e013: ...used 224px with a halved batch size and timed..." — no, e013's outcome was "rejected" (score 0.6202 at seed 0). e002 tried 224 and timed out. So higher resolution has been attempted but hasn't worked well.
+
+Wait, actually let me think about what the most promising direction is. The problem:
+1. The classification error is the dominant loss (0.117 mAP).
+2. It's concentrated in pore↔deposit and deposit↔stain confusions.
+3. Pore boxes are small (80% accuracy on small boxes). Actually let me think: is it that they're small, or that pore/deposit/stain look similar?
+
+Let me consider the hypothesis space. What hasn't been tried in this run?
+
+The e014 crash was interesting: an MLP fusion of features from the two views. The idea was "naive logit-averaging weights fine texture and context equally for every box". That crashed because EfficientNet doesn't expose `.features` in timm as expected (well, actually timm's efficientnet does have a `features` module... hmm, maybe it doesn't with the way it's created? Actually `timm.create_model('efficientnet_b0', pretrained=True)` returns an EfficientNet model which has `features`, `avg_pool`, `fc`. But e014 crashed with AttributeError: 'EfficientNet' object has no attribute 'features'. That's odd. Maybe the timm version here wraps it differently, or `model.features` was replaced? Actually looking at the traceback, it says EfficientNet object has no attribute 'features'. Let me think... In some timm versions, the model returned is a `EfficientNet` with modules `features`, `avg_pool`, `head`. But maybe when pretrained and num_classes=4, the head is replaced... Actually, hmm. In timm 0.9+, `efficientnet_b0` has `self.features = Sequential(...)`, `self.avg_pool = nn.AdaptiveAvgPool2d((1,1))`, `self.head = Dropout+Linear`. So `features` should exist. Unless the crash happened because in that version the attribute was something else... The error is clear though: no attribute 'features'. So the available timm version has a different structure. Actually, wait — maybe `model` after create_model with num_classes=4 still has features. Hmm, but the error is definitive for this environment.
+
+Anyway, e014 crashed. So I can't just retry it. But could I fix e014? It's "BASE: last" territory. But the history shows architecture family as exhausted (3+ ideas, no new best). However, those were different ideas (bigger models, resolution, other backbones) — a learned view fusion is genuinely different from all of them. But wait — e014's idea was specifically about fusing the two views with a learned MLP rather than logit averaging. And it crashed due to an attribute error.
+
+Hmm, but I should think more carefully about what direction has the most potential and hasn't been tried. Let me consider:
+
+**Idea 1: Train on detector boxes (matching training/test distribution)** — Already tried (e009/e010) with marginal gain (+0.0017 not confirmed). The idea is sound but didn't show clear gain. But wait, actually e009 got +0.004 at 5-seed? No: "accepted twice (5-seed 0.6337 and 0.6342, about +0.004)". So the history shows it was accepted twice in the earlier 5 runs with +0.004. But e009's 5-seed mean is 0.6305 (not confirmed). Hmm, so this family has been tried multiple times and didn't pan out strongly here.
+
+**Idea 2: Multi-scale / more views at training** — third view tried (+0.005 on pore only, close to time limit). Could add more views? e014's idea of learned fusion instead of averaging. 
+
+**Idea 3: Better use of the two crops** — e.g., not just logit averaging but a proper feature fusion or attention. Or training the classifier to handle the detector boxes better (they're noisier than GT boxes).
+
+Actually, wait. Let me re-examine the confusion matrix more carefully. The real issue seems to be texture confusions between pore, deposit, and stain. Pore and deposit are small objects; discontinuity is easy. Stain vs deposit is a classic "looks similar" problem.
+
+What about: **focus on making the classifier see the right things** — e.g., training with only the tight crop vs wide crop for different classes? Or using per-class crops? Actually, one thing that stands out: for small boxes (which are mostly pore), the tight crop at 1.5x might be very small after resizing to 160px. A box of area ~50px would get cropped to a 1.5x side ≈ maybe 20-30px, then resized to 160 — that's a huge upscale with interpolation, effectively blurring. Meanwhile, for large boxes the wide 2.5x crop is plenty.
+
+Hmm, but e013/e014 in this run tried resolution and got nothing.
+
+Actually, let me reconsider. What about the **false alarm handling**? The diagnostic says wrong classes cost 0.117 mAP, and then there's a 0.012 gap between keeping our scores vs the perfect-classes ceiling with detector conf. But actually wait — is that right? Let me re-read: "mAP@0.5 if every box had its correct class but kept your scores: 0.7461 (yours: 0.6288). The difference is what wrong classes cost; the remaining gap to the perfect-classes ceiling in the brief is what your scores cost compared with the detector's conf."
+
+Hmm, so if we could assign every box its correct class, we'd get 0.7461. And the perfect-class ceiling (with detector conf for everything) is 0.758. The gap 0.758 - 0.7461 = 0.012 is about scoring. So fixing classification gives +0.117, fixing scoring gives +0.012. Total ~0.763 vs ceiling 0.758? That doesn't add up (would exceed ceiling). Well, the ceiling has false alarms as class-0 "pore" with detector conf, so it's a different setup. Whatever.
+
+OK so the main target is clearly classification accuracy on overlapping boxes. Specifically:
+- pore (63%): biggest improvement possible. 
+- deposit (78%): big too, mainly to stain.
+- stain (88%): to deposit/pore.
+
+Now what's the actual cause of these confusions? The classes are visually similar (pore vs deposit vs stain). Let me think about what changes could fix this:
+
+**Option A: Learn view fusion instead of logit averaging** (fix e014's crash). This is a natural next step and genuinely different from everything tried. Logit averaging treats the two views equally; a learned MLP might weight them per-box or learn that fine texture (tight) vs context (wide) matters differently per class. Expected gain: maybe 0.01-0.03 on top of the classification fix.
+
+**Option B: Better training data for the confused classes.** E.g., more augmented examples, or specifically hard examples. Or using different crops for different classes. 
+
+**Option C: The "detector boxes as training data" idea refined.** e009/e010 tried this with marginal gains. Could be a solid +0.004 but already tried.
+
+**Option D: Change the input representation to emphasize texture.** E.g., convert crops to some edge/texture transform, or use a different normalization. Or use multi-scale feature extraction within the model (e.g., using a wider version of EfficientNet that retains more resolution). Hmm.
+
+**Option E: Test-time ensemble of multiple seeds/models.** But this increases compute time significantly. With 180s budget and ~160s for training, there's little room. But wait — could we train faster? If the model is small and training takes 162s including data loading... 
+
+Let me think about the most promising path. The dominant error is classification. Let me think about WHY the classifier confuses pore and deposit/stain:
+
+Actually — here's an important observation from the confusion matrix. Let's compute what happens per class in terms of mAP. Actually, let's think about the sizes:
+- Share of boxes with right class by defect size (area thirds): small 80%, medium 91%, large 93%.
+
+Small boxes are much worse. Pore is probably a small object (a pore). Deposit might be medium. Discontinuity is large (a crack/line). Stain is large-ish.
+
+For small boxes, the tight crop at 1.5x would be tiny after the resize to 160px — effectively low resolution of the actual defect. The wide crop at 2.5x helps context but makes the object smaller in the frame. So for small pore defects, the classifier sees a very small, possibly blurry object at 160px.
+
+Hmm — but wait, the box is cropped at 1.5x the box side and then resized to 160×160. For a small box of, say, 20px side: crop side = 30px, resized to 160 → each original pixel spans ~8px. The defect fills maybe 50% of the crop. So it's like seeing a 10px object on a 160px image at low quality. But actually for a 20px box with a pore inside that's, say, 10px across — after cropping to 30px and upscaling to 160, the pore is 50px in the final image. That's actually quite big! Hmm wait: if the box is 20px × 20px (area 400), the crop side is 30px, then resized to 160×160. A defect of 10px within the box would be 50px in the final image. That's actually a lot of pixels. So small boxes aren't necessarily low resolution for the actual defect... unless the box is much smaller.
+
+Hmm wait, "area thirds" — area of 3rd? So small = bottom third of areas. Let's say total area distribution: small < maybe 300px? Medium 300-1000, large >1000. A small box with side ~20px, crop at 1.5x → 30px → resized to 160. The defect fills a decent fraction of the crop but after resize it's actually fine.
+
+OK, so maybe resolution isn't the main issue. What about the fact that for small boxes, the tight and wide crops both include a lot of background? Actually no — for small boxes, the box is tight around the defect (the detector presumably found it), and 1.5x adds margin.
+
+Let me think about the actual semantics:
+- pore: small hole/void in the weld bead. Appears as a dark spot or light spot inside the bead.
+- deposit: extra material / unevenness at the start or end of a bead.
+- stain: discoloration, probably around the bead, not necessarily the defect itself.
+
+The confusion between deposit and stain (55/210 = 26% of deposit boxes misclassified as stain, and 46/540 = 8.5% of stain misclassified as deposit) is the biggest absolute error count. And pore↔stain (20/63 = 32% of pores as stain).
+
+What could distinguish deposit from stain? Context: deposit is within the bead (extra material), stain is discoloration usually at the edge/boundary. The wide crop (2.5x) gives context. But the classifier might be using texture: deposit looks like a bump (rough texture), stain looks like a flat discoloration.
+
+Hmm, what about this: **the tight crop vs wide crop provides different info**. For classification, maybe we should think about which crop matters for which class. The e014 idea (learned MLP fusion) was exactly this.
+
+Alternatively — here's another thought. What if the issue is that the classifier is essentially being asked to classify at the box level but with noisy boxes from the detector? The bounding boxes from YOLO might be slightly off, or include partial defects. But we can't change stage 1.
+
+Let me think about **what hasn't been tried**:
+1. Learned fusion of views (e014 crashed — this is a fixable crash). This is fundamentally different from "bigger model", "higher resolution", "other backbone", "more views with averaging".
+2. Hard example mining / focused training on the confused classes.
+3. Multi-class consistency: using a graph or prior to enforce relationships (e.g., stain vs deposit).
+4. Training the classifier on **cropped features** directly from a frozen model at multiple scales... hmm.
+
+Actually, wait. Let me look at e014's crash more carefully and reconsider fixing it. The error was `AttributeError: 'EfficientNet' object has no attribute 'features'`. In timm, the standard EfficientNet structure is:
+- `model.features` — exists in most versions
+But the traceback shows it doesn't exist here. Let me think about what the actual structure is in this environment... Actually, maybe the model was wrapped? Or maybe with `timm.create_model` and pretrained=True, the returned object's attribute lookup fails for some reason? No, that's weird.
+
+Actually — hold on. In timm versions after 0.9.x, there's a chance that `model.features` doesn't exist because the model returns a different wrapper. Let me think... Actually in recent timm (1.0+?), `create_model` returns models with `features`, `fc` etc. Hmm, but actually the EfficientNet family in timm has been restructured — some versions return a `EfficientNet` where features is `self.features`. The error says it doesn't have it. 
+
+Hmm, but actually wait — the crash happened at line 178: `ft = model.features(xt); fw = model.features(xw)`. And the traceback shows `torch/nn/modules/module.py __getattr__ raise AttributeError`. This is the standard "attribute not found" path. So in this timm version, EfficientNet indeed doesn't have a `.features` attribute... That's odd for any version. Actually wait — maybe in this environment, the model was created with `timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)` where MODEL = "efficientnet_b0". In timm, `efficientnet_b0` is registered as a function returning an EfficientNet model whose attributes are: `features`, `avg_pool`, `fc`? Hmm, but maybe in the newer versions it's `self.features`... 
+
+Actually let me just think practically. Rather than fight with attribute names, I could use `model.forward_features(x)` which is a standard timm API. In timm ≥ 0.9, models have `forward_features`, `forward_head`, etc. Let me check: for EfficientNet in timm 1.x, the model has `features` as a Sequential... Actually no. Let me recall the actual code:
+
+```python
+class EfficientNet(nn.Module):
+    def __init__(self, cfg, ...):
+        super().__init__()
+        self.features = nn.Sequential(...)
+        self.avg_pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.head = nn.Sequential(...)
+```
+
+Hmm. And `forward_features` is defined. So `model.features(xt)` should work... unless the environment's timm is old or new in a different way.
+
+Wait, maybe the issue is that `timm.create_model` returns an `EfficientNet` where the attribute is `features` but it's not accessible because... hmm no. Actually you know what, there might be a simpler explanation: this is a very recent timm version (1.x) where `create_model` for efficiency-net-like models returns a model where `features` was renamed? Let me think about EfficientNetV2 in timm 1.x:
+```python
+class EfficientNetV2(nn.Module):
+    def __init__(self, ...):
+        super().__init__()
+        self.features = nn.Sequential(...)
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.head = nn.Sequential(...)
+```
+It does have features.
+
+Hmm, actually — wait. Maybe the crash is real and I should just not use `.features` and instead use `model.forward_features` or compute via the model's standard forward with `output_features=True`. In timm ≥ 0.9: `out = model(x, output_dict=True)` returns features? Or `model.forward_features(x)`.
+
+Actually, a simpler robust approach: in this environment, I can access the backbone differently. Let me think... The cleanest way that works across timm versions is:
+- `model.forward_features(x)` — standard API in recent timm.
+- Or `model(x, features_only=True, return_indices=...)`.
+
+Actually, since the model is a pretrained timm model with num_classes=4, `model(x)` returns logits. To get features, I could use:
+```python
+features = model.forward_features(x)  # in recent timm this exists
+```
+Or better: `out = model(x, output_dict=True)` or `return_feat=True`? Hmm.
+
+Actually — let me reconsider. Rather than trying to fix e014 (which requires knowing the exact API), maybe there's a fundamentally better direction.
+
+Let me think about the **core problem again**: classification error of 0.117 mAP, mostly pore-deposit-stain confusions. 
+
+What are the fundamental things that could improve this?
+1. Better features for fine-grained texture discrimination (architecture change) — tried: bigger models, other backbones, higher res. All failed.
+2. Better training setup (data augmentation, loss, sampling) — tried: class-weighted loss, focal loss, mixup, rotation, more views, training on detector boxes. Most gave no gain or marginal.
+3. **Better fusion / combination of the two views** — NOT tried effectively (e014 crashed).
+4. Better handling of false alarms in scoring — minor effect (+0.012 at most).
+
+Given that e014's idea is "learned view fusion" and it crashed only due to an API issue, I think fixing and running e014 is a legitimate next step — it's the one idea from the recent history that was genuinely new and would change what the model learns (not just a knob). But wait — e014's crash means it wasn't actually run. And the "architecture" category is marked EXHAUSTED? in the lessons table. Hmm, but that's because of the specific ideas tried (bigger models, other backbones, resolution), not view fusion.
+
+Hmm, but hold on. Let me think about whether there's something even better that hasn't been tried at all.
+
+Actually — **let me reconsider the scoring problem more carefully**. The diagnostic says wrong classes cost 0.117 mAP. But here's a subtlety: within each class, the *ranking* of predictions matters for AP@0.5. Our current scoring is `conf × p(c)`. Within class c, the ranking is determined by `conf × p(c)` — i.e., detector conf × classifier confidence in class c. The "perfect classes" reference shows that if every overlapping box got its true class, mAP would be 0.7461 with our scores. So the classification error and scoring are partially intertwined: when a box is misclassified, it's not counted as a hit for its true class (and might hurt by being a false positive elsewhere).
+
+Wait, actually I realize there might be a subtle issue worth checking: the diagnostic "mAP@0.5 if every box had its correct class but kept your scores" — this is computed on the *eval boxes*. But some of those eval boxes are false alarms! If we give them the true class of... nothing? Presumably false alarms keep whatever scoring they have (e.g., their conf × p(c) for all classes). So 0.7461 assumes every box that overlaps a true defect gets its right class, with our scores. That's the best achievable with our scoring scheme given perfect classification. The ceiling 0.758 uses detector conf as the score for all boxes (including false alarms as class 0 pore).
+
+So: fixing classification → ~0.746. Then maybe improving scoring → up to 0.758. The scoring gains are smaller (~0.012). So priority #1 is definitely classification.
+
+Now, let's think about what would give the best classification improvement. Let me reconsider the problem: we have a classifier that sees a tight crop and a wide crop. The confusions are between visually similar classes. 
+
+**Key idea I haven't seen tried: train a classifier on features at multiple scales from the same model, or use a single crop with more pixels.** Hmm no, that's been tried (resolution).
+
+**Another idea: what about the fact that the two views' crops have different content?** The tight crop (1.5x) centers on the defect; the wide crop (2.5x) includes more context. Logit averaging treats them equally. What if for some classes, one view is much better? E.g., for stain, the wide view's context matters; for pore, the tight view's texture matters. A learned MLP fusion could learn this per-class weighting. e014 was exactly this but crashed.
+
+Hmm, wait — let me reconsider whether there's something even more fundamental. What about **using the detector's own boxes from stage 1 on train images as training data with better handling**? e009/e010 got +0.004 at most. That family seems marginal.
+
+What about **hard example mining or focusing training on the confused pairs**? Not tried. This could be cheap and effective: create additional training samples that are hard (e.g., crop boxes from images with ambiguous features, or oversample pore/deposit/stain confusions). But the training data comes from crops.csv which has 6052 boxes. The confusion matrix is computed on validation — we don't know the test distribution exactly but it's probably similar.
+
+Hmm, actually here's a cleaner thought. Let me reconsider: **what if the classifier's problem is not the features but that it's being asked to classify with only 160px crops where the defect fills a small fraction?** The "small boxes" accuracy of 80% vs 91-93% for medium/large suggests that box size matters. But I computed above that upscaling a 20px box to 160px gives good pixel count for the defect itself. Unless... the detector boxes are loose (much larger than the defect). For example, if YOLO's box around a pore is 30px but the actual pore is 5px — then even with 1.5x margin and resize to 160, the pore is only ~25px in a 160px image. That's still decent. Hmm.
+
+Alternatively, what if for small boxes, the issue is that the *tight* crop at 1.5x makes the object too large (cropping out context) while the wide crop at 2.5x makes it smaller? Or that both crops are essentially just the defect with no context — and the class distinction requires context? E.g., a pore vs deposit: deposit is extra material *attached* to the bead, so context (the bead boundary) matters. A stain is discoloration at the edge. So maybe for these classes, **context is essential**, and neither 1.5x nor 2.5x provides enough context!
+
+That's an interesting hypothesis: the current crops are too tight for the texture/class discrimination needed for pore/deposit/stain. The third view at 4x (+0.005 on pore) suggests wider context helps. But that was close to the time limit.
+
+Hmm wait, actually e007's "third, very wide view (4x)" got +0.005 accepted twice but only from pore class. So wider context does help, but it costs ~20s.
+
+OK here's another thought — what about a **multi-scale input to the model**: not just two crops of the box, but the model processing boxes at multiple scales... no wait, that's what we have.
+
+What about **a "crop the image region around the box at multiple contexts" with adaptive context**? E.g., use 1.5x and 3x? That's basically e007 with slightly different widths. Hmm.
+
+Let me step back and think about what has genuinely been tried and what hasn't:
+
+**Truly untried ideas:**
+1. Learned view fusion (e014 crashed — could fix).
+2. Multi-scale feature extraction (e.g., use a model that computes features at multiple resolutions and fuse them — like a FPN, or use `timm.create_model` with `features_only=True` and pick levels).
+3. Hard example training / focal-like sampling for the confused pairs.
+4. **Use of spatial information within the crop** (Thinking budget reached. Stop thinking now and write the reply in the required format.
+===== attempt 2 =====
+Let me look at the current best train.py file more carefully. The relevant section:
+
+```python
+    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
+    model = model.to(device).to(memory_format=torch.channels_last)
+    crit = nn.CrossEntropyLoss()
+    opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+```
+
+The issue is that in the current best file, there's no `model.fc` assignment because e014 was just an idea (crashed). Let me write the edit correctly. I need to:
+1. Add the learned fusion MLP after model creation.
+2. Change the loss computation to use features.
+
+Wait, actually — I should reconsider. The user's instructions say "One idea per turn" and "Keep the edit focused on that idea." My previous block was overly complicated because I tried to do both blocks but one failed. Let me fix this by writing the search/replace blocks correctly.
+
+Actually, I think the simplest approach is:
+- Block 1: Add the MLP after model creation (search for the exact lines around `model = timm.create_model...`)
+- Block 2: Change the loss computation.
+
+Let me carefully copy the exact lines from the file.
+
+From the current best train.py:
+```python
+    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
+    model = model.to(device).to(memory_format=torch.channels_last)
+    crit = nn.CrossEntropyLoss()
+```
+
+So the search for block 1 would be:
+```python
+    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
+    model = model.to(device).to(memory_format=torch.channels_last)
+    crit = nn.CrossEntropyLoss()
+```
+Replace with:
+```python
+    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
+    model = model.to(device).to(memory_format=torch.channels_last)
+
+    # Learned fusion of the two views: per-class MLP over [tight feat, wide feat].
+    fc = nn.Sequential(
+        nn.Linear(model.num_features, 256),
+        nn.ReLU(),
+        nn.Linear(256, 4),
+    )
+    model.fc = fc
+    crit = nn.CrossEntropyLoss()
+```
+
+And the loss line:
+```python
+                loss = crit((model(xt) + model(xw)) / 2, y)
+```
+Replace with:
+```python
+                ft = model.forward_features(xt); fw = model.forward_features(xw)
+                loss = crit(fc(torch.cat([ft.mean([1, 2]), fw.mean([1, 2])], dim=1)), y)
+```
+
+Wait, but there's a problem. When I set `model.fc = fc`, the forward pass goes through `fc` anyway. But in e014's code, the intent was to use features instead. Since I'm now using `forward_features` directly, I don't need to reassign model.fc at all — actually, if I reassign model.fc, that doesn't hurt but it's redundant. Actually, wait — `forward_features` returns features without going through fc. So if I want the MLP to be used at inference time too (for eval boxes), I should keep model.fc = fc and just call model(xt) at inference.
+
+Actually let me reconsider: for inference, I currently do `torch.softmax(((model(xt) + model(xw)) / 2).float(), 1)` in the eval loop. If I want the learned fusion to be consistent between train and eval, I should use the same MLP at eval time. So I should keep `model.fc = fc` and change the eval loop too.
+
+Hmm, but that changes more code. Let me think about whether that's better. Yes — consistency matters. The model should do learned fusion at both training and inference.
+
+Let me structure the edit:
+1. Add MLP to model (replace in train setup)
+2. Change loss to use forward_features with fc
+3. Change eval loop to use the same fusion
+
+Actually, simpler approach: keep `model.fc = fc` and just call `model(xt)` at inference (which goes through features then fc). Then at training I can also use `model(xt)` which will apply fc. But the issue is that in the current code, the two views' logits are averaged: `(model(xt) + model(xw)) / 2`. If I assign `model.fc = fc`, then `model(xt)` already includes fc. So the training loss becomes `crit((model(xt) + model(xw)) / 2, y)` — wait, that would average the fused logits of both views, which is still naive fusion of two *fused* outputs.
+
+Hmm, actually e014's approach was:
+```python
+ft = model.features(xt); fw = model.features(xw)
+loss = crit((ft.mean([1, 2]) + fw.mean([1, 2])) / 2, y)
+```
+But that was buggy — it should have been `crit(fc(...), y)` for a single fused prediction, not averaging the feature means. The intent of e014 (learned fusion) is to take [tight_feat, wide_feat] and apply fc once.
+
+Let me be cleaner: at inference, do
+```python
+logits = ((model(xt) + model(xw)) / 2).float()  # if model.fc is fc, this averages fused logits
+```
+vs
+```python
+ft = model.forward_features(xt); fw = model.forward_features(xw)
+logits = fc(torch.cat([ft.mean([1,2]), fw.mean([1,2])], dim=1))
+```
+
+The second one is the "learned fusion" — take the mean-pooled features of each crop and concatenate them into a [tight_feat, wide_feat] vector, then apply the MLP. This is what e014 intended (but its code was missing `fc`). The first one would average two independently-fused outputs — that's also "learned fusion" but a different, less principled variant.
+
+Actually, I think the cleanest interpretation of the learned-fusion idea: at both train and eval, take [tight_feat, wide_feat] and apply fc once. This is what e014 meant to do. So I should:
+- Add `fc` MLP
+- In training: use forward_features + fc
+- In eval: use forward_features + fc
+
+But wait — the model currently has num_classes=4 already assigned to model.fc by timm. Overriding with `model.fc = fc` replaces it. That's valid in timm. And `forward_features` is available in timm for all models (it's the standard API). For EfficientNet, `forward_features` exists in newer timm versions. In older versions it might be `model.features`. The e014 crash was exactly because `.features` didn't exist — meaning this timm version has `forward_features` instead. So using `forward_features` is correct and safe.
+
+Let me write the blocks properly now. First block: add MLP after model creation. Second block: update loss. Third block: update eval loop.
+
+Actually, to keep it focused, let me do two blocks:
+1. Add MLP + update training loss
+2. Update eval prediction loop
+
+Wait, I need to be careful about the exact line copying. Let me look at the file content again from the brief:
+
+```python
+    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
+    model = model.to(device).to(memory_format=torch.channels_last)
+    crit = nn.CrossEntropyLoss()
+    opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    amp = dict(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda")
+```
+
+And the loss line:
+```python
+            with torch.autocast(**amp):
+                loss = crit((model(xt) + model(xw)) / 2, y)
+            opt.zero_grad(set_to_none=True)
+```
+
+And the eval loop:
+```python
+    # Classify every eval detection; one prediction per class with score = detector conf x class probability.
+    model.eval()
+    probs = []
+    with torch.no_grad(), torch.autocast(**amp):
+        for xt, xw, _ in dl_ev:
+            xt = xt.to(device).to(memory_format=torch.channels_last)
+            xw = xw.to(device).to(memory_format=torch.channels_last)
+            probs.append(torch.softmax(((model(xt) + model(xw)) / 2).float(), 1).cpu())
+    probs = torch.cat(probs).numpy()
+```
+
+OK so now let me write the blocks. I'll make them small and precise.
+
+Block 1: Add MLP after model creation.
+Block 2: Change loss to use forward_features + fc.
+Block 3: Change eval loop to use forward_features + fc for consistency.
+
+Actually, since "one idea per turn", let me combine the training changes into one block if possible, and keep the eval change as a separate block (since it's necessary for consistency). Actually, I can do both in one reply with multiple blocks — that's allowed ("You may give several SEARCH/REPLACE blocks").
+
+Let me write them carefully.
+
+Block 1:
+SEARCH:
+```python
+    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
+    model = model.to(device).to(memory_format=torch.channels_last)
+    crit = nn.CrossEntropyLoss()
+```
+REPLACE:
+```python
+    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
+    model = model.to(device).to(memory_format=torch.channels_last)
+
+    # Learned fusion of the two views: per-class MLP over [tight feat, wide feat].
+    fc = nn.Sequential(
+        nn.Linear(model.num_features, 256),
+        nn.ReLU(),
+        nn.Linear(256, 4),
+    )
+    model.fc = fc
+
+    crit = nn.CrossEntropyLoss()
+```
+
+Block 2:
+SEARCH:
+```python
+            with torch.autocast(**amp):
+                loss = crit((model(xt) + model(xw)) / 2, y)
+```
+REPLACE:
+```python
+            with torch.autocast(**amp):
+                ft = model.forward_features(xt); fw = model.forward_features(xw)
+                loss = crit(fc(torch.cat([ft.mean([1, 2]), fw.mean([1, 2])], dim=1)), y)
+```
+
+Block 3:
+SEARCH:
+```python
+            probs.append(torch.softmax(((model(xt) + model(xw)) / 2).float(), 1).cpu())
+```
+REPLACE:
+```python
+            ft = model.forward_features(xt); fw = model.forward_features(xw)
+            logits = fc(torch.cat([ft.mean([1, 2]), fw.mean([1, 2])], dim=1)).float()
+            probs.append(torch.softmax(logits, 1).cpu())
+```
+
+Wait — one important consideration. `model.fc = fc` replaces the existing head. But in timm, `num_classes=4` sets up `model.fc` with a Linear(768, 4) for EfficientNet-B0 (num_features=1280? let me think). Actually for efficientnet_b0, `num_features` is 1280 typically. The pretrained model's fc would be Linear(1280, 4). Replacing it with our MLP is fine.
+
+But there's a subtlety: `model.forward_features` — does EfficientNet in timm have that method? In recent timm versions (>= 0.9), all models have `forward_features`. The e014 error was that `.features` didn't exist, which strongly suggests the version has `forward_features` and dropped the `.features` attribute. So this should work.
+
+Actually, I want to double check one thing: in timm's EfficientNet implementation, is there a `forward_features`? Let me think about what the error message said: `'EfficientNet' object has no attribute 'features'`. In timm 0.9+, `timm.create_model` returns models where the feature extractor is accessible via `model.forward_features` (a public method) and sometimes via properties like `.features`. The older API had `.features` for ConvNeXt but not all models. Given that e014's error was specifically about `.features`, using `forward_features` is the standard solution in modern timm.
+
+I'm fairly confident this is right. Let me also make sure I'm not making a mistake about `model.num_features`. For efficientnet_b0, it's 1280. The MLP input dim would be 1280*2=2560 (concatenated). That's fine.
+
+Wait, one more thought: should I also update the eval loop? If I don't, then during inference the model will use... hmm, if `model.fc` is set to fc but I call `model(xt)` at inference, it goes through features → fc automatically. So calling `model(xt)` at inference already uses the learned fusion! The current eval loop does `torch.softmax(((model(xt) + model(xw)) / 2).float(), 1)` — this averages the fused logits of both views, which is NOT the same as fusing features and applying fc once.
+
+So for consistency with training (which fuses features then applies fc), the eval loop should do the same: take forward_features of both, concat, apply fc once. Otherwise train and eval are doing different things.
+
+So yes, I should update block 3. This keeps the idea coherent: learned fusion = [tight_feat, wide_feat] → MLP applied once, at train and eval.
+
+Actually wait — there's an even simpler option. If `model.fc = fc` is set, then `model(xt)` automatically uses the MLP. I could just keep `torch.softmax(((model(xt) + model(xw)) / 2).float(), 1)` in eval but change train to use the fused approach... no, that's inconsistent.
+
+OK let me just write it as planned. The three blocks are clear.
+
+Actually hold on — one issue with Block 1: `nn.Linear(model.num_features, 256)`. When timm creates a model with num_classes=4, does it set up the head? Yes, `model.fc` exists. But is `model.num_features` a public attribute? For timm models created via `create_model`, `num_features` should be available as an attribute on the model (it's set in `_default_cfg` or during construction). Actually, for EfficientNet, `model.num_features` might not be defined... Let me think.
+
+In timm, many models have a `self.num_features` attribute in their body/neck, and then the `ModelFeatures` wrapper exposes it. For example, in timm's efficientnet:
+```python
+class EfficientNet(nn.Module):
+    def __init__(self, ...):
+        ...
+        self.num_features = 1280  # or similar
+```
+Actually for efficientnet_b0 in timm, the `num_features` is typically exposed as an attribute of the model. The `create_model` function returns a model that has `.num_features`. Let me check: in timm's `timm/modeling/efficientnet.py`, the class defines `self.num_features = 1280` or similar after building. And in `ModelFeatures` (the wrapper), it exposes `model.num_features`.
+
+Hmm, actually to be safe, I should probably hardcode 1280 or use a safer accessor. But `model.num_features` is widely used in timm for this exact purpose (e.g., in examples of adding custom heads). Actually, let me reconsider — for models created with `create_model`, the returned model instance has `.num_features` available as an attribute in most cases.
+
+Actually, I just realized there might be an issue: for efficientnet_b0, when created with `num_classes=4`, timm replaces `model.fc` with a Linear(1280, 4). But does the model expose `num_features`? In timm, `_features` are handled by `ModelFeatures` which wraps and provides `.num_features`. Hmm, actually in newer timm versions (0.9+), models created via `create_model` go through a wrapper where `num_features` is set on the model instance itself when `num_classes != 0`.
+
+To be safer, I could use `model.num_features` — this is what e014 would have used if it had worked (it crashed before reaching that line). The standard pattern in timm for getting features of a pretrained model is:
+```python
+model = timm.create_model('efficientnet_b0', pretrained=True)
+num_features = model.num_features  # works in most timm versions
+```
+
+I'm fairly confident this works. But to be extra safe, I could just hardcode. Actually no — `model.num_features` is fine and it's the standard approach. Let me go with it.
+
+Hmm wait, actually there's another concern: does `fc` need to be registered in the model for the optimizer to pick it up? Yes! If I create `fc = nn.Sequential(...)` as a local variable and set `model.fc = fc`, then `model.parameters()` will include fc's parameters because it's assigned as an attribute of the module. So `opt = torch.optim.AdamW(model.parameters(), ...)` will train fc. 
+
+One more check: in Block 2, `ft.mean([1, 2])` — this is mean pooling over spatial dims [1, 2] (height, width). For EfficientNet features shape (B, C, H, W), so mean over [1,2] gives (B, C). Good.
+
+Let me finalize the blocks and write the reply.
+===== attempt 3 =====
+Let me look at the exact text from the current best train.py (e000). I need to find where `model = timm.create_model` appears.
+
+From the e000 file:
+```python
+    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
+    model = model.to(device).to(memory_format=torch.channels_last)
+    crit = nn.CrossEntropyLoss()
+    opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+```
+
+Hmm, the search block 1 was:
+```python
+    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
+    model = model.to(device).to(memory_format=torch.channels_last)
+    crit = nn.CrossEntropyLoss()
+```
+
+But I added a blank line between `model.to(...)` and `crit` in the replace. The issue is that the first SEARCH text wasn't found — "its first line: 'model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)'". So maybe the current file at /work/train.py (the actual base) differs slightly from e000?
+
+Wait — the instruction says BASE: last means edit the most recent version instead of the best. But I still need to match the file that is actually on disk at /work/train.py.
+
+Let me re-examine. The user's error message says the first line of the SEARCH text is 'model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)'. This means the harness tried to find it and failed. That suggests the file on disk doesn't have exactly that sequence.
+
+The most recent experiment e014's full train.py differs from e000 only by the change above (which added the fc module but broke at runtime). Wait — e014 crashed, so the file at /work/train.py is probably e000 or possibly e014's version? Actually if it crashed during training, the file was saved before running. The base for this round: BASE: last means edit the most recent version (e014's train.py), which differs from e000 only by adding the fc module and the `model.features` usage.
+
+Wait, I need to re-read. e014 crashed with AttributeError on `model.features`. So /work/train.py currently = e014's file (which has the fc block but broken features access). Actually the traceback shows it crashed before producing results — the file is there at /work/train.py.
+
+So I should look at what e014's file looks like:
+```python
+    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
+    model = model.to(device).to(memory_format=torch.channels_last)
+
+    # Learned fusion of the two views: per-class MLP over [tight feat, wide feat].
+    fc = nn.Sequential(
+        nn.Linear(model.num_features, 256),
+        nn.ReLU(),
+        nn.Linear(256, 4),
+    )
+    model.fc = fc
+     crit = nn.CrossEntropyLoss()
+    opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+```
+
+Wait, the error message shows the diff between e014 and e000:
+```diff
+@@ -147,4 +147,12 @@
+     model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
+     model = model.to(device).to(memory_format=torch.channels_last)
++
++    # Learned fusion of the two views: per-class MLP over [tight feat, wide feat].
++    fc = nn.Sequential(
++        nn.Linear(model.num_features, 256),
++        nn.ReLU(),
++        nn.Linear(256, 4),
++    )
++    model.fc = fc
+     crit = nn.CrossEntropyLoss()
+     opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+```
+
+So the current /work/train.py (e014's file) has:
+```python
+    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
+    model = model.to(device).to(memory_format=torch.channels_last)
+
+    # Learned fusion of the two views: per-class MLP over [tight feat, wide feat].
+    fc = nn.Sequential(
+        nn.Linear(model.num_features, 256),
+        nn.ReLU(),
+        nn.Linear(256, 4),
+    )
+    model.fc = fc
+     crit = nn.CrossEntropyLoss()
+```
+
+That's why my search block 1 failed — I searched for the original e000 text, but the file now has the extra fc block. So BASE: last means /work/train.py currently = e014's version which already contains `fc` and `model.fc = fc`.
+
+So my edits should target e014's current state:
+- Fix line 178 area: replace `ft = model.features(xt); fw = model.features(xw)` with `forward_features`.
+- Also fix the eval loop (currently uses `(model(xt) + model(xw)) / 2`).
+
+Let me look at e014's file content in detail. From the diff, I can reconstruct:
+```python
+    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
+    model = model.to(device).to(memory_format=torch.channels_last)
+
+    # Learned fusion of the two views: per-class MLP over [tight feat, wide feat].
+    fc = nn.Sequential(
+        nn.Linear(model.num_features, 256),
+        nn.ReLU(),
+        nn.Linear(256, 4),
+    )
+    model.fc = fc
+     crit = nn.CrossEntropyLoss()
+    opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+```
+
+Wait, there's `crit` with a leading space in the diff: `+    model.fc = fc` then ` - crit = nn.CrossEntropyLoss()` — that minus indicates it was already in the file. Actually looking at the diff more carefully:
+
+```
+@@ -147,4 +147,12 @@
+     model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
+     model = model.to(device).to(memory_format=torch.channels_last)
++
++    # Learned fusion of the two views: per-class MLP over [tight feat, wide feat].
++    fc = nn.Sequential(
++        nn.Linear(model.num_features, 256),
++        nn.ReLU(),
++        nn.Linear(256, 4),
++    )
++    model.fc = fc
+     crit = nn.CrossEntropyLoss()
+     opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+```
+
+So the existing lines `crit = nn.CrossEntropyLoss()` and `opt = ...` are unchanged. The new file has:
+```python
+    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
+    model = model.to(device).to(memory_format=torch.channels_last)
+
+    # Learned fusion of the two views: per-class MLP over [tight feat, wide feat].
+    fc = nn.Sequential(
+        nn.Linear(model.num_features, 256),
+        nn.ReLU(),
+        nn.Linear(256, 4),
+    )
+    model.fc = fc
+     crit = nn.CrossEntropyLoss()
+```
+
+Hmm wait, the diff shows:
+```
+-                loss = crit((model(xt) + model(xw)) / 2, y)
++                ft = model.features(xt); fw = model.features(xw)
++                loss = crit((ft.mean([1, 2]) + fw.mean([1, 2])) / 2, y)
+```
+
+Wait no. The second diff:
+```
+@@ -168,5 +176,6 @@
+             y = y.to(device, non_blocking=True)
+             with torch.autocast(**amp):
+-                loss = crit((model(xt) + model(xw)) / 2, y)
++                ft = model.features(xt); fw = model.features(xw)
++                loss = crit((ft.mean([1, 2]) + fw.mean([1, 2])) / 2, y)
+```
+
+Hmm but the fc block was also added. So in e014's file, `fc` is defined and `model.fc = fc` set, but then the loss uses `(ft.mean([1,2]) + fw.mean([1,2]))/2` — which just averages the mean-pooled features, ignoring `fc` entirely! And `crit((features)/2, y)` with 4 classes... wait no, if the model has num_classes=4 and fc replaced fc with 4 outputs, then calling model(xt) returns logits. But e014 used `ft = model.features(xt)` which failed at AttributeErrors.
+
+Actually let me re-check: in timm's EfficientNet, `model.forward_features` exists. There's no `.features` attribute. Also note the `crit` uses 4 classes and the loss is CrossEntropyLoss — so targets are class indices 0-3. If we pass mean-pooled features (256-dim) to crit directly as "logits", that would fail because logits must be shape (batch, 4). Wait: `crit((ft.mean([1, 2]) + fw.mean([1, 2])) / 2, y)` — this passes a tensor of shape (batch, 256) as logits to CrossEntropyLoss with targets (batch,), which would error "Expected input batch_size 4 but found...". Actually no, it would just fail because the expected last dim is num_classes. Hmm, actually with nn.CrossEntropyLoss, if you pass a tensor of shape (N, C) and target (N), C must be 4. Passing (N, 256) would error "Expected input to have 4 channels".
+
+Wait but it crashed with AttributeError before reaching the loss computation. So e014 is fundamentally broken in multiple ways:
+1. `model.features` doesn't exist
+2. Even if it worked, passing mean-pooled features (256-dim) to CrossEntropyLoss would fail dimension mismatch
+
+So I need to fix this properly. Let me write the correct code for the current file state (e014's version).
+
+Actually wait — maybe I should just go back to e000's structure. The problem is BASE: last points to /work/train.py which contains e014's modifications. But e014's version is buggy beyond the API error. 
+
+Let me think about what to do. The instructions say: "If a run crashed or timed out, read the log and fix the cause." And "BASE: last -- to edit the most recent version instead of the best".
+
+So I'll use BASE: last and fix e014's file properly.
+
+Current /work/train.py content (e014's) — I need to reconstruct it exactly. From e000 plus the diff:
+
+```python
+    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
+    model = model.to(device).to(memory_format=torch.channels_last)
+
+    # Learned fusion of the two views: per-class MLP over [tight feat, wide feat].
+    fc = nn.Sequential(
+        nn.Linear(model.num_features, 256),
+        nn.ReLU(),
+        nn.Linear(256, 4),
+    )
+    model.fc = fc
+     crit = nn.CrossEntropyLoss()
+    opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+```
+
+Hmm wait, I see ` crit = nn.CrossEntropyLoss()` with a leading space in the diff output. That's just how the diff was printed maybe? Actually looking at it: `+    model.fc = fc` then `     crit = nn.CrossEntropyLoss()` — the second line starts with 5 spaces? No wait, that would be weird. Let me look again at the diff text from e014 description:
+
+```
+     model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
+     model = model.to(device).to(memory_format=torch.channels_last)
++
++    # Learned fusion of the two views: per-class MLP over [tight feat, wide feat].
++    fc = nn.Sequential(
++        nn.Linear(model.num_features, 256),
++        nn.ReLU(),
++        nn.Linear(256, 4),
++    )
++    model.fc = fc
+     crit = nn.CrossEntropyLoss()
+```
+
+I think `crit` lines just have the original indentation. So in the file:
+```python
+    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
+    model = model.to(device).to(memory_format=torch.channels_last)
+
+    # Learned fusion of the two views: per-class MLP over [tight feat, wide feat].
+    fc = nn.Sequential(
+        nn.Linear(model.num_features, 256),
+        nn.ReLU(),
+        nn.Linear(256, 4),
+    )
+    model.fc = fc
+    crit = nn.CrossEntropyLoss()
+```
+
+Wait but the diff in the original prompt shows:
+```
++    model.fc = fc
+     crit = nn.CrossEntropyLoss()
+```
+So `crit` follows directly with no blank line.
+
+OK so now let me reconstruct the whole e014 file structure from what I know. The key changes from e000 are in two places:
+1. After model creation (fc head definition + `model.fc = fc`)
+2. In the training loop loss computation (`ft = model.features(xt); ...`)
+
+And probably the eval loop still has `(model(xt) + model(xw)) / 2` because the diff only showed changes in those two regions. Let me check: the second diff block was at `@@ -168,5 +176,6 @@` which covers the loss line. The eval loop is after that (line ~200+), and no diff was shown there, so it should still be `probs.append(torch.softmax(((model(xt) + model(xw)) / 2).float(), 1).cpu())`.
+
+Wait, actually the diff summary said "Its change, relative to its base e000" — and showed two diffs. So yes, only those two regions changed.
+
+Now I'll write my edits against e014's current state:
+
+**Edit 1**: Fix `model.features` → `model.forward_features` in the training loop.
+**Edit 2**: Actually use `fc` to fuse the features (currently it averages mean-pooled features and feeds them to crit, which is broken).
+**Edit 3**: Make sure the eval loop uses the same fused fc path.
+
+Wait — but hold on. There's an issue with using `model.forward_features`. For timm EfficientNet:
+- `model(x)` → calls forward → `x = self.features(x)`, then adaptive pooling, then `self.avg_pool(...)`, then `x = x.flatten(1)`, then `self.fc(x)`.
+
+Actually let me recall the efficientnet implementation in timm. The standard forward:
+```python
+def forward(self, x):
+    x = self.features(x)
+    x = self.global_pool(x)  # or adaptive pool
+    x = self.avg_pool(x)
+    x = self.flatten(x)
+    x = self.fc(x)
+    return x
+```
+
+Hmm, actually in timm's efficientnet:
+```python
+    def forward(self, x):
+        x = self.features(x)
+        x = self.global_pool(x)
+        x = self.avg_pool(x)
+        x = x.flatten(1)
+        x = self.fc(x)
+        return x
+```
+
+Where global_pool is adaptive_avgpool2d or similar. `forward_features` returns `self.features(x)` only — the spatial features (B, C, H, W). Then I need to pool and flatten.
+
+Actually in timm, `model.forward_features(x)` is a documented API: it returns the feature map from `self.features` with shape (B, C, H, W). So my code should be:
+
+```python
+ft = model.forward_features(xt)
+fw = model.forward_features(xw)
+ft = ft.mean([1, 2])  # global average pooling
+fw = fw.mean([1, 2])
+logits = fc(torch.cat([ft, fw], dim=1))
+loss = crit(logits, y)
+```
+
+This is correct — `fc` is a Sequential that takes (B, 512) → (B, 4).
+
+For the eval loop:
+```python
+ft = model.forward_features(xt); fw = model.forward_features(xw)
+logits = fc(torch.cat([ft.mean([1, 2]), fw.mean([1, 2])], dim=1)).float()
+probs.append(torch.softmax(logits, 1).cpu())
+```
+
+Also note: `model.fc = fc` — since fc is a module attribute, `model(xt)` would call the full forward and give the fused output. But we're using features directly so that's fine either way. Actually I should just use `model(xt)` for simplicity? No — `model(xt)` would apply features + pooling + fc in one go. Since model.fc is now replaced with the fused MLP, calling `model(xt)` gives exactly what I want! But wait: does `forward_features` exist as a standard method? In timm >= 0.9, there's `forward_features`. Let me check if this timm version supports it.
+
+Actually, for EfficientNet in timm, the class structure:
+```python
+class EfficientNet(nn.Module):
+    def __init__(self, ...):
+        self.features = nn.Sequential(...)
+        self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.flatten = Flatten()
+        self.fc = nn.Linear(in_features, num_classes)
+```
+
+Hmm, wait. Actually in timm's EfficientNet (from `timm/models/efficientnet.py`):
+```python
+    def forward(self, x):
+        x = self.features(x)
+        x = self.global_pool(x)
+        x = self.avg_pool(x)
+        x = self.flatten(x)
+        x = self.fc(x)
+        return x
+```
+
+Hmm, but I'm not 100% sure about `forward_features`. Let me think... In timm >= 0.5 or so, many models have a `forward_features` method for feature extraction. For instance:
+
+```python
+    def forward_features(self, x):
+        x = self.conv_stem(x)
+        ...
+        return x
+```
+
+Actually the safest approach: use `model.forward_features` if available, but to be safe maybe I should just access the features through the standard API. Let me use a safer approach that definitely works across timm versions:
+
+```python
+    ft = model.features(xt)  # This doesn't exist per the error!
+```
+
+The error says: `'EfficientNet' object has no attribute 'features'`. That's odd because I thought EfficientNet had `self.features`. Wait, let me look more carefully. The error came from:
+```
+File "~/projects/weld-research/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1972, in __getattr__
+    raise AttributeError(...)
+AttributeError: 'EfficientNet' object has no attribute 'features'
+```
+
+Hmm, so EfficientNet really doesn't have `.features`? That's strange for timm. Let me reconsider — maybe the model was created with `timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)` where MODEL = "efficientnet_b0". Hmm.
+
+Wait — maybe the issue is that after replacing `model.fc`, something changed? No...
+
+Actually wait. I think in some timm versions, EfficientNet is defined differently. Let me think about what's available:
+- `model.features` — standard for ResNet-family in timm. For EfficientNet?
+
+Actually, looking at the actual efficientnet.py in timm (e.g. v0.9.x):
+```python
+class EfficientNet(nn.Module):
+    def __init__(self, cfg, ...):
+        super().__init__()
+        self.num_classes = num_classes
+        ...
+        self.features = nn.Sequential(...)
+        self.global_pool = ...
+        self.avg_pool = ...
+        self.flatten = ...
+        self.fc = ...
+```
+
+Hmm, so it should have `.features`. But the error says no attribute. Wait — could the model be created differently? Let me check: `timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)`. MODEL = "efficientnet_b0". 
+
+Hmm wait, maybe there's a version where timm's efficientnet wraps it as `EfficientNet` but the attributes are different. Or maybe... Actually! I recall that in some newer timm versions, `timm.create_model` with `num_classes=4` creates a model where the internal modules might be named differently.
+
+Actually hold on — let me reconsider. In recent timm (e.g., 0.9.x+), EfficientNet models are created via `efficientnet_b0()` and they define:
+```python
+    self.features = nn.Sequential(...)
+```
+
+Hmm, but the error says no attribute 'features'. So maybe this version of timm uses a different structure? 
+
+Let me look at what's available. For safety, I can just use `model.forward_features(xt)` — that's the standard API in timm for feature extraction across model types. But wait, if that also doesn't exist...
+
+Actually, let me reconsider. The most robust approach: keep using `model(xt)` and `model(xw)` (which works), then extract features differently. Actually no — the point is to fuse the features from both crops. 
+
+OK let me think about what definitely works:
+1. `model(xt)` gives logits (B, 4) after full forward pass with `self.fc` = our fused MLP.
+2. `model.forward_features(xt)` — this exists in timm for most models but I need to verify.
+
+Actually, I just realized something important. Let me re-read the efficientnet implementation in timm:
+
+```python
+class EfficientNet(nn.Module):
+    def __init__(self, cfg, img_size=224, num_classes=1000, ...):
+        super().__init__()
+        self.num_classes = num_classes
+        self.cfg = cfg
+        ...
+        # stem and stage 1
+        self.features = nn.Sequential(...)
+```
+
+Actually you know what, let me check the actual timm efficientnet code. In `timm/models/efficientnet.py` (recent versions):
+
+```python
+class EfficientNet(nn.Module):
+    def __init__(self, cfg, img_size=224, num_classes=1000, in_chans=3, pretrained=False, **kwargs):
+        super().__init__()
+        self.num_classes = num_classes
+        self.cfg = copy.deepcopy(cfg)
+        ...
+        self.features = nn.Sequential(...)  # ???
+```
+
+Hmm, I'm not certain. But the error message from e014 clearly states `'EfficientNet' object has no attribute 'features'`. So either:
+(a) This timm version's EfficientNet doesn't have `.features`, or
+(b) There's something else going on.
+
+Actually! I recall now — in some versions of timm, the `efficientnet` implementation was refactored to use `EfficientNetV2`-style architecture where the backbone is named differently. But wait — the model name is "efficientnet_b0" which resolves to a specific class.
+
+Let me look at this from a different angle: what's the safest way to get features that works across timm versions? 
+
+In timm, every model has `model(x)` and you can use `forward_features` if it exists (added in timm 0.5/0.6 for feature extraction). For EfficientNet specifically in recent timm versions:
+
+```python
+class EfficientNet(nn.Module):
+    def __init__(self, cfg, ...):
+        ...
+        self.features = nn.Sequential(...)  # Actually I think this IS the case
+```
+
+Hmm wait. Let me look at the actual error more carefully:
+
+```
+File "/work/train.py", line 213, in <module>
+    main()
+  File "/work/train.py", line 178, in main
+    ft = model.features(xt); fw = model.features(xw)
+         ^^^^^^^^^^^^^^
+  File "~/projects/weld-research/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1972, in __getattr__
+    raise AttributeError(...)
+AttributeError: 'EfficientNet' object has no attribute 'features'
+```
+
+So `model.features` doesn't exist on EfficientNet in this timm version. So I should use a different approach. 
+
+Options that definitely work with any timm model:
+1. Use `model.forward_features(x)` if available (timm >= 0.5 or so)
+2. Construct the feature extraction manually by iterating over the model's modules
+
+The safest cross-version approach in this codebase: since `model(xt)` returns logits and I want to fuse features, I could use `forward_features` which is a documented API in timm (introduced around 0.6 for feature extraction). But is it available on EfficientNet?
+
+Actually, let me think about what's actually in the efficientnet.py file of the latest timm. I recall:
+
+```python
+class EfficientNet(nn.Module):
+    def __init__(self, cfg, img_size=224, num_classes=1000, in_chans=3, pretrained=False, **kwargs):
+        super().__init__()
+        self.num_classes = num_classes
+        self.cfg = cfg
+        ...
+        self.features = nn.Sequential(...)  # No...
+
+        # Actually I think it's:
+        self.conv_stem = ...
+```
+
+Hmm. OK let me try a completely different approach that avoids relying on internal attribute names: use `model.forward_features` which is the documented public API for feature extraction in timm. If that fails, I'll know from the crash and can adjust.
+
+Actually wait — I recall now! In recent timm (0.9.x), EfficientNet models are defined as:
+
+```python
+class EfficientNet(nn.Module):
+    def __init__(self, cfg, img_size=224, num_classes=1000, in_chans=3, pretrained=False, **kwargs):
+        super().__init__()
+        self.num_classes = num_classes
+        self.cfg = copy.deepcopy(cfg)
+        ...
+        # stem and blocks
+        self.features = nn.Sequential(...)  
+```
+
+Hmm I keep going back and forth. Let me just test the API assumption in my code by using a robust method:
+
+Actually, the most robust way: `model.forward_features(x)` exists for timm models since 0.5 or so. For instance:
+- ResNet: `self.conv1`, `self.bn1`, `self.relu`, `self.maxpool`, `self.layer1`... no `.features`? Actually ResNet in timm has `self.forward_features`? 
+
+Hmm wait. Let me recall the actual timm API for feature extraction:
+
+In timm, most models have a method `forward_features(x)` that returns the raw features from the backbone before pooling/classification. This is used by e.g. classification + detection heads. For ResNet:
+```python
+    def forward_features(self, x):
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+        x = self.layer1(x)
+        ...
+        return x
+```
+
+For EfficientNet in timm (let me think about the actual file):
+
+```python
+class EfficientNet(nn.Module):
+    def __init__(self, cfg, img_size=224, num_classes=1000, **kwargs):
+        super().__init__()
+        self.num_classes = num_classes
+        ...
+        # stem and block 0
+        self.features = nn.Sequential(...)
+
+        self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.flatten = Flatten()
+        self.fc = nn.Linear(..., num_classes)
+
+    def forward(self, x):
+        x = self.features(x)
+        x = self.global_pool(x)
+        x = self.avg_pool(x)  # maybe
+        x = self.flatten(x)
+        x = self.fc(x)
+        return x
+```
+
+If that's the case, then `model.features` SHOULD exist. But the error says it doesn't! So either:
+- The version of timm used here is different (maybe an older or newer one where EfficientNet structure changed)
+- OR... wait. Maybe I should check what model was actually created. MODEL = "efficientnet_b0".
+
+Hmm, let me look at this from the angle of: what does `timm.create_model("efficientnet_b0")` return in various timm versions?
+
+Actually — I just realized something. Maybe the issue is that the error trace shows the file path `~/projects/weld-research/.venv/lib/python3.12/site-packages/...`. This looks like the venv used by the harness. But regardless of version, the attribute doesn't exist.
+
+OK here's the thing — I should just write code that works robustly. The safest approach: since I'm modifying `model.fc` to be a fused MLP anyway, I can simply use `model(xt)` and `model(xw)` to get logits with the fused model... but wait, that gives me (B, 4) fused logits, not separate features to fuse!
+
+Hmm. The core idea is: I want to combine features from two crops. The way to do this without relying on attribute names:
+1. `ft = model.forward_features(xt)` — if available
+2. Access the backbone via a different route
+
+Actually, you know what? There IS a much simpler and more robust approach that doesn't rely on internal structure at all. Since we're already replacing `model.fc` with our fused MLP, I can instead:
+- Keep the standard timm API but extract features through the public `forward_features` method if it exists, or use a different public path.
+
+Actually — let me look at this from yet another angle. The safest bet is to check whether `forward_features` exists on EfficientNet in this timm version. Since I can't check without running, and crashing means wasted time... 
+
+Hmm, but actually there's an even better approach. In timm, most models support accessing the backbone features through:
+```python
+features = model.forward_features(x)  # documented API since timm ~0.5
+```
+
+Let me just try `forward_features` — it's a public API in timm (it's how feature extraction is done for detection tasks). For EfficientNet, this should return the spatial features from the backbone.
+
+Actually wait — I want to double check something. Looking at e014's diff again:
+```python
++                ft = model.features(xt); fw = model.featuresThinking budget reached. Stop thinking now and write the reply in the required format.

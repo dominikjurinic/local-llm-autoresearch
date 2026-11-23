@@ -1,0 +1,93 @@
+--- e010/train.py
++++ e011/train.py
+@@ -45,11 +45,13 @@
+ PRETRAINED = True
+ IMG_SIZE = 160
++HR_SIZE = 224           # high-resolution branch crop size
+ SCALES = (1.25, 1.75, 2.5, 3.5)  # multi-scale crop pyramid
+ MIN_CROP = 16
++HR_MIN_CROP = 64        # minimum crop side for the high-res branch
+ TRAIN_ON = ("high",)    # resolutions of crops.csv used for training
+ BATCH_SIZE = 64
+ LR = 1e-3
+ WEIGHT_DECAY = 0.05
+-RESERVE_S = 85          # seconds kept free for prediction and writing (4 crops ≈ 2x pred time)
++RESERVE_S = 115         # seconds kept free for prediction and writing (5 views incl. HR)
+ MIN_SCORE = 0.001       # rows below this score are not written
+ MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+@@ -68,8 +70,10 @@
+ 
+ 
+-def make_crop(img, r, context, train):
++def make_crop(img, r, context, train, min_crop=None, out_size=None):
+     h, w = img.shape[:2]
+     cx, cy = (r["x1"] + r["x2"]) / 2, (r["y1"] + r["y2"]) / 2
+-    side = max(max(r["x2"] - r["x1"], r["y2"] - r["y1"]) * context, MIN_CROP)
++    mc = min_crop if min_crop is not None else MIN_CROP
++    os_ = out_size if out_size is not None else IMG_SIZE
++    side = max(max(r["x2"] - r["x1"], r["y2"] - r["y1"]) * context, mc)
+     if train:  # light geometric jitter
+         cx += random.uniform(-0.1, 0.1) * side
+@@ -82,9 +86,10 @@
+     if sx1 > sx0 and sy1 > sy0:
+         canvas[sy0 - y0:sy1 - y0, sx0 - x0:sx1 - x0] = img[sy0:sy1, sx0:sx1]
+-    return np.asarray(Image.fromarray(canvas).resize((IMG_SIZE, IMG_SIZE), Image.BILINEAR), dtype=np.float32) / 255.0
++    return np.asarray(Image.fromarray(canvas).resize((os_, os_), Image.BILINEAR), dtype=np.float32) / 255.0
+ 
+ 
+ class MultiScaleClassifier(nn.Module):
+-    """Shared backbone over 4 scale crops, per-scale 1x1 projection, spatial feature-pyramid fusion, MLP head."""
++    """Shared backbone over 4 scale crops + 1 high-res crop, per-scale 1x1 projection,
++    spatial pyramid fusion for the scales, separate high-res branch, concat, MLP head."""
+ 
+     def __init__(self, backbone, num_scales=4, proj_dim=256, hidden=512, num_classes=4):
+@@ -99,19 +104,24 @@
+             nn.GELU(),
+         )
++        self.hr_proj = nn.Conv2d(C, proj_dim, 1)
+         self.head = nn.Sequential(
+-            nn.Linear(proj_dim, hidden),
++            nn.Linear(2 * proj_dim, hidden * 2),
+             nn.GELU(),
+-            nn.Linear(hidden, num_classes),
++            nn.Linear(hidden * 2, num_classes),
+         )
+ 
+     def forward(self, views):
+         feats = []
+-        for i, x in enumerate(views):
+-            f = self.backbone.forward_features(x)   # [B, C, H, W]
+-            f = self.scale_projs[i](f)              # [B, proj_dim, H, W]
++        for i in range(len(self.scale_projs)):
++            f = self.backbone.forward_features(views[i])   # [B, C, H, W]
++            f = self.scale_projs[i](f)                     # [B, proj_dim, H, W]
+             feats.append(f)
+-        f = torch.cat(feats, dim=1)                 # [B, num_scales * proj_dim, H, W]
+-        f = self.stem(f)                            # [B, proj_dim, H, W]
+-        f = f.mean(dim=[2, 3])                      # [B, proj_dim]
++        f = torch.cat(feats, dim=1)                        # [B, num_scales * proj_dim, H, W]
++        f = self.stem(f)                                   # [B, proj_dim, H, W]
++        f = f.mean(dim=[2, 3])                             # pyramid vector [B, proj_dim]
++        hr = self.backbone.forward_features(views[-1])     # [B, C, H, W]
++        hr = self.hr_proj(hr)                              # [B, proj_dim, H, W]
++        hr = hr.mean(dim=[2, 3])                           # high-res vector [B, proj_dim]
++        f = torch.cat([f, hr], dim=1)                      # [B, 2 * proj_dim]
+         return self.head(f)
+ 
+@@ -142,4 +152,16 @@
+             x = (x - MEAN) / STD
+             views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))
++        # high-resolution branch: tight crop at original pixel size, min side HR_MIN_CROP, resized to HR_SIZE
++        box_side = max(r["x2"] - r["x1"], r["y2"] - r["y1"])
++        hr_min = max(box_side, HR_MIN_CROP)
++        x = make_crop(img, r, 1.0, self.train, min_crop=hr_min, out_size=HR_SIZE)
++        if fh:
++            x = x[:, ::-1]
++        if fv:
++            x = x[::-1, :]
++        if self.train:
++            x = np.clip(x * bright, 0, 1)
++        x = (x - MEAN) / STD
++        views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))
+         return views, r.get("cls", -1)
+ 

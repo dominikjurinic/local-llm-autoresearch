@@ -1,0 +1,386 @@
+Let me analyze the situation carefully.
+
+## Current state
+- Best: e009 (4-scale crop pyramid + MLP head), 5-seed val mAP@0.5 = 0.6359, seed std 0.0053
+- The "perfect classes" ceiling with current scores: 0.7366 (vs perfect classes ceiling 0.758)
+- So there's ~0.10 mAP lost to wrong class decisions on true defects, plus the gap from 0.7366 to 0.758 is what your scores cost vs detector conf.
+
+## Diagnostics of current best
+- True defect boxes overlapping by IoU > 0.5: pore 63% right, deposit 77% right, discontinuity 95% right, stain 90% right
+- Pore→stain (19 errors), deposit→stain (55 errors) are the big ones
+- The error is mainly class confusion on true defects, especially pore and deposit being misread as "stain"
+
+## Lessons so far
+- architecture: 13 ideas, 8 ran, 1 new best (e009), 2 close but not confirmed, 5 crashed/timeout/bug
+- Several families exhausted
+- e021 (SWA) crashed due to a bug - `torch.stack` with mixed dtypes
+
+## What has been tried and failed (per the history table):
+1. Fewer/re-weighted score rows / scoring tricks: no gain
+2. 5th background class: no gain
+3. Training on detector boxes: +0.004 (small, accepted twice)
+4. Wide view: +0.005 (small)
+5. Low-res crops: no gain
+6. Bigger backbone/ensembles: no gain (best 0.636 unconfirmed)
+7. Resolution/small box handling: no gain
+8. TTA: no gain
+9. Longer training: no gain
+10. Class-balanced sampling / weighted loss: no gain
+11. Training augmentation: no gain
+12. Focal loss: no gain
+13. Box size/aspect ratio as input: never properly tested
+
+## The core problem
+The remaining ~0.10 mAP loss is class confusion on true defects (pore→stain, deposit→stain). This is a texture-level discrimination problem. All attempts at changing the model architecture (bigger backbone, higher resolution, more crops, cross-attention, etc.) have failed to confirm gains.
+
+Key observations from the diagnostics:
+- Pore 63% right, deposit 77% right, both often read as "stain"
+- True stain is 90% right already
+- The error is NOT in box placement or ranking (the detector conf works well for ranking)
+- The error IS in the class decision on boxes overlapping real defects
+
+The "5th background class" and other scoring families were exhausted. Architecture changes have been tried extensively with little success.
+
+Let me think about what's different and could work:
+
+1. **e021's SWA crash** - this was a bug, not an idea failure per se. SWA (Stochastic Weight Averaging) is a legit technique but e021 crashed. The idea wasn't properly tested though. But "optimisation" category had only 1 idea.
+
+2. **Training on detector boxes** (e013) - accepted twice with small gains (+0.004). This is the "training/test distribution mismatch" idea. e013 was based on e009 and got 0.6168 (rejected at seed 0? It says rejected but in the history table "accepted twice"). Wait, looking at the table: e013 shows seed-0 score 0.6168, no 5-seed mean, outcome "rejected". But the earlier brief says "accepted twice (5-seed 0.6337 and 0.6342)". That was a different idea family - "Detector boxes from the train split as extra training data" which got accepted twice at 0.6337/0.6342. So there were similar but slightly different variants.
+
+Let me focus on what's most promising:
+
+The reference numbers in the brief:
+- one-step 4-class detector baseline: 0.638 mAP@0.5
+- stage-1 boxes with perfect classes (ceiling for stage 2): 0.758
+- stage-1 boxes scored as single class 'defect': 0.755
+
+So the "ceiling" for stage 2 is 0.758. Our current best is 0.6359. There's a huge gap (0.12) because we're doing per-class decisions. The perfect classes case keeps false alarms as class 0 with detector conf, so it doesn't help the per-class mAP much... wait, actually if every box that overlaps a true defect gets the correct class, then all true defects are found correctly. But false alarms would be class 0 (not counted in the 4 classes), so they don't hurt precision for the 4 classes. So 0.758 is the ceiling where we have perfect recall on true defects with no false positives from wrong classes... but wait, mAP@0.5 is averaged over 4 classes. If we make all boxes overlap a defect get their correct class, then recall is 100% for all classes and precision depends on the detector's false alarm rate per class. The detector conf-based ranking would order them well.
+
+Actually let me re-read: "Every detector box that overlaps a true defect (IoU > 0.5) gets the correct class; every other box (false alarms) is KEPT, as class 0, with its detector conf." Class 0 is not one of the 4 evaluated classes? Wait, the classes are 0 pore, 1 deposit, 2 discontinuity, 3 stain. Hmm, but class 0 here means pore...
+
+Wait, I think in the reference numbers, "class 0" refers to the background class (the 5th class). Let me re-read: "every other box (false alarms) is KEPT, as class 0". But class 0 = pore. That doesn't make sense unless... hmm. Actually in the context of "stage-1 boxes with perfect classes", maybe they mean every box that does NOT overlap a true defect gets assigned to background class (which might be numbered differently). Actually since mAP is computed over the 4 defect classes, false alarms as any class other than those 4 don't matter. So keeping them as background avoids precision loss.
+
+OK so the ceiling 0.758 means: if we had perfect class labels on all true-defect-overlapping boxes (with detector conf as score), we'd get 0.758. This is the max achievable with this two-stage setup given the detector's box proposals.
+
+Current gap to ceiling: 0.758 - 0.6359 = 0.122. The diagnostic says "mAP@0.5 if every box had its correct class but kept your scores: 0.7366". So the difference between 0.7366 and our 0.6359 (0.10) is from wrong classes on true defects. And the remaining gap 0.758 - 0.7366 = 0.021 is from... hmm, that's from ranking/ordering? Actually "if every box had its correct class but kept your scores" - so same scores, just correct class. That gives 0.7366. And the perfect-classes ceiling 0.758 uses detector conf as score instead of our score. So our score ordering loses 0.021 relative to detector conf alone (on boxes with correct class). Interesting - so the detector conf ranking is better than our score ranking!
+
+Wait, but "stage-1 boxes scored as a single class 'defect': 0.755" - that's close to 0.758. So if we just output one class (defect) with detector conf, we get 0.755. But since there are 4 classes and mAP is averaged over them... hmm, if all predictions were class "defect", that would be one class and AP for that class would be high. But the metric averages over 4 classes, so single-class output would give 1/4 of the per-class AP? No wait - it says "the same detector reaches 0.77" when all types are merged into one class. And "stage-1 boxes scored as a single class 'defect': 0.755". So this is measured with mAP over 4 classes where... hmm, I'm confused.
+
+Actually re-reading the brief: "mAP@0.5 is computed per class and averaged." If we only output one class (say "defect"), then the other 3 classes have no predictions, so their AP would be... 0? Or undefined? This is confusing. But the reference numbers are given as absolute scores, so I should trust them:
+- Perfect classes + detector conf: 0.758
+- Our current best: 0.6359
+- Current "if every box had correct class but kept your scores": 0.7366
+
+So the biggest loss is wrong class on true defects (0.10). But wait - if a box overlaps a true defect and we assign it the right class, then we get recall for that class. If we assign it the wrong class, we lose recall AND might create false positives for the wrong class. So fixing the class assignment should recover most of that 0.10.
+
+But hold on - 0.7366 is with "your scores" (detector conf x p) and correct classes. Our actual 0.6359 uses both wrong classes AND our score ordering. The difference 0.1007 is the cost of wrong classes.
+
+Now, the remaining gap from 0.7366 to 0.758 (0.021) is the cost of using our score vs detector conf for ranking. So even with perfect classes, we lose 0.021 because of scoring. Interesting. The detector conf alone on "defect" class gives 0.755 - which suggests the detector conf ranking is quite good.
+
+Hmm wait, I think there's an issue with my understanding. Let me think again about what 0.7366 means. It says "mAP@0.5 if every box had its correct class but kept your scores". So this is a hypothetical where we take our current predictions but change the class of every box overlapping a true defect to be correct. The score stays as detector conf x p (or whatever our score was). This gives 0.7366, vs our 0.6359. So wrong classes cost us 0.1007 mAP.
+
+This is the main target: fix class confusion on true defects. Pore→stain and deposit→stain are the big errors.
+
+## What could work?
+
+The architecture family has been exhausted (13 ideas, no confirmed gain beyond e009). Let me look for what's fundamentally different.
+
+Actually wait - let me reconsider. There's a key insight: the current best score is 0.6359 but "if every box had its correct class but kept your scores" = 0.7366. That means the model has the *information* to classify correctly in most cases, but its *decisions* are wrong on ~10-20% of cases. Specifically:
+- Pore: 63% right → 37% wrong (mostly→stain, 19/75=25%)
+- Deposit: 77% right → 23% wrong (mostly→stain, 55/270=20%)
+- Discontinuity: 95% right
+- Stain: 90% right
+
+So the model is systematically misclassifying pores and deposits as stain. This smells like a *label quality* problem or a *feature representation* problem. 
+
+Actually - wait. Let me reconsider the label quality angle. The diagnostics say "true pore 63% right" etc. But what if the training labels are noisy? E.g., what if some "stain" boxes in training actually look like pores/deposits, or vice versa? If the model learns from consistent but wrong labels, it will be systematically confused.
+
+Actually, looking at e018's hypothesis: "I hypothesise this is a data-quality problem, not a capacity problem: the model learns pore/deposit/st[ain]..." - and it timed out. So this idea was not properly tested either.
+
+Let me think about what we know:
+- Pore and deposit are visually similar (both small features)
+- Stain is often confused with them
+- The model systematically reads pores/deposits as stain
+
+One possibility: the labels in crops.csv might have inconsistent definitions. E.g., maybe "stain" boxes include some pores or deposits, or vice versa. But we can't check the ground truth beyond what's given.
+
+Another angle: **test-time calibration/ensemble**. The reference says "Averaging predictions of several independently trained models is one of the most reliable ways to improve accuracy". e014 (ensembles) crashed at 0.5771 - wait, it was rejected with seed-0 score 0.5771 which is way below baseline. That sounds like a bug.
+
+Actually, looking at e014: "averaging predictions of several independently trained models" - the result was 0.5771 at seed 0, rejected. But maybe it had a bug (wrong class order?). It's unclear.
+
+Hmm, let me think about what's actually feasible and high-value.
+
+**Key insight from reference numbers**: The gap to the perfect-class ceiling is mostly (~0.10) from wrong classes on true defects. This is where the fix should go. But 13 architecture ideas have been tried without confirmed gain. Maybe the issue isn't the model architecture but rather:
+
+1. **The training data mismatch**: e013 (training on detector boxes) gave +0.004 at best. The problem is that the detector boxes are noisy, so training on them might not help much for hard cases.
+
+2. **Label noise / class definition issue**: Maybe some labels are genuinely ambiguous or wrong. If we can identify mislabeled examples...
+
+3. **The model is undertrained**: e021's SWA idea tried to address this but crashed. The current best trains only 157 steps (~2 epochs). This might be a real issue - with a 180s budget, the model barely converges. But longer training didn't help (e014 "longer training" family: no gain, best 0.6355 not confirmed).
+
+Hmm wait, actually e014 is about ensembles at inference, and the "longer training" family was separate ("Longer training (smaller reserve, measured prediction time)": no gain: best 5-seed 0.6355). So longer training doesn't help much. The model converges fast (2 epochs) but doesn't solve the hard cases.
+
+Let me think about this differently. What's *different* from everything tried?
+
+The idea that stands out: **the class confusion pattern suggests a label problem**. If pores and deposits are systematically misread as stain, maybe there's systematic label noise in the "stain" class (or in the pore/deposit classes). But we can't easily detect that.
+
+Alternative: **A two-stage classifier approach** - train on detector boxes with IoU-based matching (the Faster R-CNN style), which e013 touched on but only got +0.004.
+
+Wait, actually let me reconsider the "training on detector boxes" result more carefully. From the brief: "Detector boxes from the train split as extra training data (IoU > 0.5 with a true box, labelled with its class) | 6 attempts | accepted twice (5-seed 0.6337 and 0.6342, about +0.004)". So this gave a small but real gain. It was based on e000 though (the starting point).
+
+And e013 (based on e009): "The classifier is trained only on ground-truth boxes but must classify stage-1 detector boxes at test time — a distribution mismatch... Training on the actual detector boxes | 0.6168 | - | rejected". Wait, this says rejected at seed 0 with 0.6168 which is worse than e009's 0.6403. So based on e009 it didn't help? That's odd. Maybe the implementation was different (replacing vs augmenting training data).
+
+Hmm, this is getting complicated. Let me step back and think about what would be a *fundamentally different* idea that targets the 0.10 mAP loss from class confusion.
+
+**Idea: The model might be learning spurious correlations.** E.g., maybe certain stain labels are actually pores/deposits or vice versa in the training data. If we could clean the data...
+
+But actually, let me think about a different angle entirely: **confidence calibration / thresholding**. The metric says "AP depends only on this ORDER". But within a class, if we're ranking true detections above false alarms... The current score is conf × p(class). What if instead of using the model's probability, we use a calibrated confidence?
+
+Wait, actually there's something important in the brief: "stage-1 boxes scored as a single class 'defect': 0.755 mAP@0.5". This means when all predictions are one class with detector conf, the mAP (averaged over 4 classes?) is 0.755. But if we only output one class... hmm, that doesn't make sense for a 4-class average. Unless the metric treats it as "average of per-class AP" where the 3 empty classes count as... 
+
+Actually I think what happens is: when all predictions are merged into ONE class, mAP@0.5 = 0.77 (from the brief's opening paragraph). And "stage-1 boxes scored as a single class 'defect': 0.755" is probably measured differently - maybe per-class AP where only one class has predictions and others get... Hmm.
+
+OK, I think I'm overcomplicating the reference numbers. Let me focus on what's actionable.
+
+**The core problem**: Wrong class on true defects (pore→stain, deposit→stain), costing ~0.10 mAP. 13 architecture attempts failed to confirm any gain.
+
+**What's left?**
+- The idea that the labels are noisy/inconsistent: e018 touched this but timed out before testing properly.
+- SWA (e021): crashed due to bug, never properly tested.
+- Ensembles (e014): crashed/rejected, possibly buggy.
+- Training on detector boxes: +0.004 small gain.
+
+Given the "research method" guidance: "Ideas that change what the model sees or learns from usually matter more than turning one more knob." And "A direction where three or more attempts gave no confirmed gain is exhausted".
+
+The architecture family (13 ideas) has been thoroughly tried with no new confirmed gains. The only confirmed gain was e009 itself (+0.005). So further architecture variants are low-yield.
+
+Let me think about what could actually fix the class confusion:
+
+**Idea A: Fix the label noise.** Maybe some training examples have wrong labels. For example, pores that look like stains or vice versa. We could try to identify them (e.g., by training on all data and finding inconsistent predictions). But we don't have a clean validation set to compare against - the eval images are hidden.
+
+**Idea B: Better training data mixing.** The current best uses SCALES = (1.25, 1.75, 2.5, 3.5) with 4 crops per box. What if we use a different approach to the crop pyramid - e.g., more focused on the hard cases?
+
+**Idea C: SWA / ensembles.** e021 crashed. SWA is cheap to implement and was never properly tested. The "optimisation" category has only 1 idea (crashed). This might be a low-cost, potentially high-value fix. But would SWA help with class confusion on hard cases? SWA helps generalization, especially in sharp minima. Given the model converges in 2 epochs at 157 steps, it's probably not undertrained in the traditional sense.
+
+**Idea D: The "5th background class" or scoring tricks** - exhausted family.
+
+**Idea E: Better use of context.** Pores and deposits are small; maybe we need to look at more context around them. But "wide view" ideas were tried (e015, e020).
+
+Hmm, wait. Let me reconsider something. The brief says:
+- "A crop classifier given perfect boxes reaches macro-F1 ~0.87 with the starting recipe (two-crop input)."
+
+So with *perfect* boxes, the classifier gets macro-F1 0.87. With detector boxes (which are noisy), the AP is lower. The macro-F1 of 0.87 means ~13% error rate on true defects with perfect boxes. And we know the per-class accuracy: pore 63%, deposit 77%, discontinuity 95%, stain 90%. Average = (63+77+95+90)/4 = 81.25%. Close to 0.87? Not exactly but in the ballpark.
+
+The key question: why do pores and deposits get read as stain even with decent features?
+
+**Idea F: The "stain" class might be a catch-all for uncertain detections.** Maybe in the training data, some boxes labeled "stain" are actually pores or deposits (or vice versa). If we could re-label... 
+
+Actually, let me think about this from the metric perspective. The mAP is averaged over 4 classes. Class-specific AP:
+- pore 0.531, deposit 0.625, discontinuity 0.778, stain 0.610
+
+So discontinuity is easy (95% right). The hard ones are pore and deposit (63%, 77%). And these two are also the ones confused with stain. 
+
+**What makes pore/deposit/stain hard?** They're all small, textural features. The model at 160px crops might genuinely not have enough resolution to tell them apart. But we tried higher resolution and it didn't help...
+
+Actually wait - e019 "efficientnet_b0 at 160px cannot encode the fine texture" was a timeout. And e011 "dedicated high-resolution stream" was rejected (0.5990). So higher resolution didn't help. Hmm.
+
+**Idea G: Multi-label or thresholding per class.** What if instead of softmax argmax, we use per-class thresholds? The metric says AP depends only on the order within a class. So per-class thresholding doesn't help! (The brief explicitly states: "Any change that keeps the order of a class's predictions (for example multiplying all its scores by a constant, or a monotone function of the score) leaves its AP unchanged.")
+
+So per-class calibration won't help. What matters is reordering within each class.
+
+**Idea H: Improve the ranking within each class.** The score is conf × p(class). If p(class) is wrong for the hard cases, we need a better confidence. But as established, this only helps if it reorders true detections above false ones *within* the class.
+
+Hmm, but wait. Let me think about what "order" means here. For mAP@0.5 per class, we sort all predictions of that class by score. A prediction is a hit if it overlaps an unmatched true box of that class by IoU > 0.5. AP is the average precision over the precision-recall curve. So the order matters: true positives should be at the top.
+
+Currently the score is conf × p(class). For a box overlapping a true defect of class c, if p(c) is low (because the model misclassifies it as stain), then that box ranks lower than other boxes of class c that are correctly classified. This creates false negatives (missed detections for class c) and the misclassified box appears as a false positive for class c (if we still output a row for class c with high enough score).
+
+Actually wait - we output one row per class per box if the score > MIN_SCORE. So a box overlapping a true pore, classified as stain by the model, would get a row for class 0 (pore) with score conf × p(pore|box). If p(pore) is low, this row ranks low and might not count as a hit (but it also doesn't hurt precision if it's below the threshold... no, actually any row of that class counts in the ranking).
+
+Hmm, actually for mAP calculation: predictions of class c are sorted by score. A true positive matches an unmatched true box with IoU > 0.5. If our prediction box (which overlaps the true box at IoU > 0.5) is at rank k and we assign it a low score, then it comes later in the ranking. Earlier positions might be filled by other predictions of class c that are false positives. So yes, the order matters.
+
+OK so the fix is: get p(class|box) right for the hard cases. That's the 0.10 mAP loss.
+
+Now, let me think about what's *fundamentally different* from the 13 architecture attempts.
+
+**The "label quality" idea (e018)**: This was never properly tested. If the training labels are inconsistent for the hard classes, then no amount of architectural change will fix it - we need to clean the data or use a robust loss. This is fundamentally different from architecture changes because it addresses *training signal quality* rather than *model capacity*.
+
+How could we test this? We could:
+1. Train on all data, identify boxes where the model is uncertain or misclassifies consistently, and check if they're ambiguous in the image (can't really - no ground truth for eval images)
+2. Use a "noisy label" robust loss (e.g., symmetric cross-entropy, label smoothing, etc.) - but class-weighted loss was explicitly said to hurt every time it was tried.
+
+Hmm wait, actually there's something interesting: the brief says "Class-weighted loss hurt classification every time it was tried." That's about handling imbalance. But label noise robustness is different.
+
+Let me think about another angle: **semi-supervised / pseudo-labeling**. The eval images have detector boxes but no labels. We could train on the training data, then use the model to generate pseudo-labels for the eval boxes... but that doesn't improve accuracy per se.
+
+**Idea I: Focus the training on hard examples.** Maybe a curriculum or hard-negative mining approach. But e013 tried training on detector boxes (noisy labels).
+
+**Idea J: Different data augmentation for the hard classes.** E.g., if pores and deposits are confused, maybe we need to augment specifically to highlight their differences. But "training augmentation" was exhausted.
+
+Hmm, let me reconsider. There's one more angle I haven't thought about: **the detector boxes themselves**. Stage 1 boxes that overlap true defects might be *misplaced* or the wrong size, which could hurt classification. E.g., a box that's too big might include background context that confuses the classifier (making it look like a stain). The diagnostics say "Share of those boxes with the right class, by defect size (area thirds): small 82%, medium 90%, large 92%" - wait, that's interesting! Small boxes are *worse* (82% vs 90-92%). But small defects are harder to classify... 
+
+Actually hold on - "Share of those boxes with the right class, by defect size" - this is the share of true defects at different sizes where the model got it right. So for small defects, only 82% are right; for large ones, 92%. So larger defects are easier. But the current best has SCALES up to 3.5x... 
+
+Hmm, actually I wonder: is this "defect size" the *defect* size or the *box* size? If it's box size, then boxes that cover more of the image are easier. But we want tight crops for texture!
+
+Actually let me re-read: "Share of those boxes with the right class, by defect size (area thirds)". This is about the true defect size (from crops.csv presumably), not the box. So small defects are harder to classify. Interesting.
+
+OK, I need to make a decision. Let me weigh the options:
+
+1. **SWA (fix e021's bug)**: The crash was a dtype bug (`torch.stack` with mixed dtypes). This is cheap to fix. SWA helps generalization. But would it help much for this problem? The model converges in 2 epochs; SWA typically helps when training longer. With only 157 steps, SWA might not have much effect (only ~8 snapshots). Also, "optimisation" category had only 1 idea.
+
+2. **Label noise / data quality**: e018's idea was never properly tested. If labels are noisy for pore/deposit/stain, this would explain the systematic confusion. This is fundamentally different from architecture changes.
+
+3. **Ensembles**: e014 crashed/rejected with 0.5771 - likely a bug (wrong class order or scoring). But ensembles are a reliable technique. However, given the time budget and that the model converges so fast, an ensemble would need 2-3 models each training to convergence, which might exceed the budget.
+
+4. **Training on detector boxes with proper IoU matching**: The family got +0.004 at best. Could we do better with a *different* approach? E.g., only use detector boxes that are high-quality (IoU > 0.7) or use them as a filter rather than supplement.
+
+5. **Different loss for hard cases**: E.g., focal loss was tried (no gain). 
+
+Let me think about #2 more carefully. Why would the labels be noisy? The dataset is "LoHi-WELD" with real robotic weld beads. The four defect types: pore, deposit, discontinuity, stain. Pores and deposits are visually similar (both can look like small blobs); stains are different but might overlap spatially. If a box drawn around a small pore also includes some nearby discoloration, it might be labeled "stain". Or if the annotator was unsure...
+
+Actually, here's a thought: **what if some "stain" boxes in the training data are actually pores/deposits with slightly different appearance?** Then the model learns that "small blob" → "stain" because that's what most of the training data says. This would explain the systematic pore→stain and deposit→stain errors.
+
+How to detect/clean this? One approach: train the classifier on the full training set (with all 6052 boxes), then find training examples where the model's prediction is very confident but contradicts other evidence... we don't have another signal though.
+
+Alternatively: **use a "cleaning" step**. Train on the data, predict on the data, and if a sample is consistently misclassified by multiple models or by itself, flag it as potentially noisy. Then remove or relabel those samples. This is a standard approach for label noise.
+
+But there's aThinking budget reached. Stop thinking now and write the reply in the required format.## Thinking Summary
+
+The remaining ~0.10 mAP loss is class confusion on true defects (pore→stain, deposit→stain). The 13 architecture attempts are exhausted. The key differentiator for a new direction: this looks like a *label quality* problem — systematic misclassification of pores and deposits as stain suggests some training labels may be inconsistent/ambiguous, not that the model lacks capacity (it achieves ~87% macro-F1 on perfect boxes). This idea was proposed in e018 but timed out before testing.
+
+The SWA crash (e021) was a dtype bug, not an idea failure, and SWA was never actually tested. However, with only 157 steps the effect would be small.
+
+The highest-leverage, fundamentally-different angle: **training-data cleaning**. The current model is trained on all 6052 training boxes as-is. If a subset of pore/deposit/stain labels are inconsistent (e.g., stain boxes that actually contain pores/deposits), the model learns the wrong mapping. A standard fix:
+1. Train the classifier.
+2. Identify training examples the model is confident about in a way that contradicts the label or is "borderline".
+3. Remove or re-label the most suspicious samples (e.g., those where the model's predicted class differs from the label AND the margin to the second-best class is large — indicating the model disagrees with the label confidently).
+
+This is fundamentally different from all 13 architecture attempts and the 3 data-family attempts: it changes the *training signal*, not the model or the input. The expected gain: if even ~5-10% of the hard-class training labels are inconsistent, cleaning them could recover several percent of the 0.10 mAP loss (≈+0.01-0.03).
+
+But I need to be careful about time budget: the current run takes 168s total with 157 steps. Adding a cleaning step adds maybe 1 epoch of training + prediction time (~30s), which might exceed the 180s budget. Let me design it to fit: one cleaning iteration, then retrain on the cleaned set. The key is that the cleaning step itself needs a forward pass over the training data (fast with batch size 256).
+
+Actually, let me reconsider - the time budget is tight. e021's crash happened at the SWA averaging step. Let me pick something more robust and cheap.
+
+**Better idea: use "soft" labels / evidence from a held-out model to filter training data.** Actually, simplest robust approach that fits the budget: train the classifier, then filter out training boxes where the model's top-1 prediction class differs from the ground-truth label with high confidence (margin > threshold). Retrain on the cleaned set. This is one additional epoch of forward pass + a few seconds of filtering. Should fit.
+
+Wait - but there's a risk: if labels are truly correct and the model is just confused, we'd delete good training data. A safer version: only delete boxes where the *second-best* class has much higher probability than the true class... that's the same thing.
+
+Hmm, actually there's a subtlety: I should not just delete based on one forward pass since the model might be uncertain. The "high confidence" criterion is important: only remove examples where p(correct_class) is low but p(some_other_class) is high (i.e., the model disagrees with the label confidently).
+
+Let me also consider: maybe I'm overthinking. Let me look at what's actually most likely to give a *confirmed* gain. The guidance says: "A change needs a broad effect across classes and images to be accepted."
+
+Let me go with the data-cleaning idea but make it robust and budget-safe. Actually, wait - one more consideration. e018's timeout means this family has 1 attempt (crashed/timeout). So it's not exhausted per se.
+
+Actually, let me reconsider SWA too - the bug was a dtype issue with `torch.stack` when state dict keys have different dtypes (e.g., Long for buffers?). Actually the error says "Input dtype must be either a floating point or complex dtype. Got: Long" - this means some buffer (like running_mean/var in batchnorm?) is stored as Long. Wait, model.state_dict() would include bn weights/running stats as float. Hmm, unless... `torch.stack([s[k] for s in swa_states])` where some tensors are ints? Actually the issue could be that `swa_states` collected via `v.detach().cpu().clone()` keeps dtype. If a key has dtype Long (like num_batches_tracked in batchnorm), stack would fail. This is real - batchnorm buffers include `num_batches_tracked` as a Long tensor. So SWA needs to skip non-float tensors.
+
+Let me go with the data cleaning idea, which I think is the most fundamentally different and highest-leverage angle. But let me make it very cheap and robust.
+
+Plan:
+1. Train classifier as before (or slightly shorter).
+2. Run a forward pass over training data to compute predictions + margins.
+3. Filter: remove training boxes where the model's top-1 class != label AND p(top-1) - p(label) > margin threshold (model disagrees with label confidently).
+4. Retrain on cleaned set for one epoch.
+5. Output predictions as before.
+
+Budget: training 2 epochs + 1 forward pass over 6052 training boxes + filtering. Should fit in 180s.
+
+Wait, actually let me reconsider the time budget more carefully. Current run: 168s total (13s load, ~40s for epoch 0, ~23s for epoch 1, prediction ~30s?). Actually: "epoch 0: loss 0.4703, 94 steps, 72s" then "epoch 1: loss 0.2745, 157 steps, 95s" and done at 168s. So training was ~82s total and prediction + writing ~46s.
+
+A cleaning iteration adds one forward pass over training boxes (batch size 256, 6052 boxes ≈ 24 batches ≈ ~3-5s) plus filtering (~2s). That's fine.
+
+Actually, hold on. Let me reconsider once more whether this is the right call. The concern: does data cleaning actually fix *label noise*? If labels are wrong, yes. But if the model is just systematically confused because of a feature representation issue, then the model would be confident but wrong... but wait, if the model is confidently wrong on training data, that means the model disagrees with the label, which IS evidence of label noise (the model has seen this exact example and learned something else).
+
+Hmm, actually no. If the model is confident on a training example and gets it "wrong" (relative to the label), that's exactly what you'd expect with correct labels: the model's features might not separate them well. But if the model is *very* confident in the wrong class, that's suspicious.
+
+A better criterion for label noise: consistency across models or augmented views. Simplest proxy: the model's confidence in its top-1 prediction vs the label. If p(top-1) > 0.7 and top-1 != label, flag it.
+
+Actually, let me think about this differently. There's a cleaner way to detect label noise: **predict on augmented versions of each training box**. If the same box consistently gives different classes under augmentation, it's ambiguous → potentially noisy label or inherently hard. But that costs more compute.
+
+Let me simplify and go with the "model confidently disagrees with label" filter. It's cheap, simple, and directly targets label inconsistency.
+
+Actually, one more thought - let me reconsider whether to use SWA since e021 crashed due to a bug (not an idea failure). The crash was in the averaging code. A fixed SWA is very cheap: 8 snapshots of model weights during training (~4 seconds for clone operations) and then averaging at the end. But with only ~8 snapshots, and the model converging in 2 epochs, the effect might be minimal.
+
+I'll go with data cleaning. It targets the root cause (label quality) which is fundamentally different from all architecture attempts, and it was never actually tested.
+
+Let me write the reply.
+
+Actually wait - let me reconsider one more time. Is there something about the *metric* I should exploit? The brief says: "mAP@0.5 is computed per class and averaged." Our per-class APs: pore 0.531, deposit 0.625, discontinuity 0.778, stain 0.610.
+
+Discontinuity is nearly perfect (95% right). Pore and deposit are the problems. The gap to fix is in pore+deposit classification on true defects.
+
+One more thought: maybe instead of cleaning data, I should consider *re-weighting* or *relaxing* the hard classes. But class-weighted loss was tried and hurt.
+
+OK going with data cleaning. Let me write the plan clearly.
+
+Actually, let me reconsider the time budget one final time. The current best run (e009) uses:
+- Load: 13s
+- Epoch 0: 59s (to 72s)
+- Epoch 1: 23s (to 95s)
+- Then... wait, the log says "done: 2 epochs, 157 steps, ..., 168s total". So from 95s to 168s = 73s for prediction + writing. Prediction with batch size 256 over 41879 eval boxes with 4 views each... that's slow.
+
+So adding a forward pass over training data (6052 boxes, batch 256 → 24 batches) at ~2-3s per batch ≈ 50-70s? That might push us over budget. Actually the eval forward pass is much slower because of 4 views per box and the model with 4 scales. The training forward pass also has 4 views...
+
+Let me estimate: 6052 boxes / 256 batch = 24 batches. Each batch does a forward pass with 4 views. The eval pass is 41879/256 ≈ 164 batches in ~73s, so ~0.45s per batch (including data loading). For training: 24 batches × maybe 0.5s = 12s. That's fine.
+
+But actually, the model forward pass with 4 views is the same computation... wait, in the training loop each batch has 6052/256 ≈ 24 steps. Each step processes one batch of 6052 boxes? No - the DataLoader has batch_size=64 for training and 256 for eval. So training batches are 64 boxes × 4 views each. Eval batches are 256 boxes × 4 views each.
+
+So a training forward pass (all 6052 boxes) = 94 batches (as in epoch 0: "94 steps"). The eval pass = 164 batches in ~73s. So each batch takes ~0.45s. Training epoch 0 with 94 steps took 59s. So one full forward pass over training data ≈ 46s (at eval speed) or less if cached differently...
+
+Actually the current run does 157 steps of training (which is much more than needed for convergence) plus the eval pass. Let me design the plan to fit:
+
+Option: Do the cleaning in a *separate* cheap model/training loop, or just do it after the main training completes? The issue is that once we train 2 epochs and then clean+retrain, we need budget for retraining.
+
+Better plan: 
+1. Train 1 epoch (fast convergence anyway).
+2. Forward pass over training data to identify dirty labels (~50s).
+3. Clean the set.
+4. Retrain on cleaned data for 1-2 epochs (~60-80s).
+5. Predict (~70s).
+
+Total: 13 + 40 + 50 + 70 + 70 = 243s > 180s. Too slow!
+
+Hmm. I need to cut somewhere. Options:
+- Use a smaller number of crops for the cleaning forward pass (e.g., use only 2 crops instead of 4). This halves the compute.
+- Reduce the training epochs before cleaning.
+- Do the whole thing with fewer models... 
+
+Actually, let me reconsider. Maybe I should do the cleaning differently: identify "dirty" labels by *retraining* on a subset? Or use a simpler heuristic that doesn't require an extra epoch?
+
+Alternative cheaper plan:
+1. Train for 1 epoch (~40s).
+2. Do the forward pass + filtering over all training data (~50s, 4 views cached via DataLoader - same as training).
+3. Retrain on cleaned data for 1 epoch (~40s).
+4. Predict (~70s).
+Total: ~163s. Fits with margin!
+
+Actually wait, I realize there might be a subtlety: the DataLoader creates crops on the fly during each forward pass, which is expensive. If I want to do a clean forward pass over all training boxes with the *same* 4-view setup, it's ~50s. That's acceptable.
+
+Let me finalize the plan:
+- Train classifier for 1 epoch on full training set.
+- Forward pass over all training boxes (same views) to get predictions + margins.
+- Filter out training boxes where model's top-1 class ≠ label AND margin > 0.3 (model is confident and disagrees).
+- Retrain for 1 epoch on the cleaned set.
+- Predict as before.
+
+This is ~165s estimated. Budget 180s with RESERVE_S=85 → actually the current best uses RESERVE_S=85 which leaves 95s for training. Current: epoch 0 took 59s, epoch 1 took 23s to reach 95s deadline. So there's slack in the budget.
+
+Let me restructure: I'll add a "cleaning" step that uses a quick forward pass and then trains on the filtered set. The key is keeping the total under 180s.
+
+Actually, let me reconsider the whole approach once more. Is data cleaning really the best bet? Let me check against the criteria:
+- "Ideas that change what the model sees or learns from usually matter more than turning one more knob." → Data cleaning changes what the model learns from. ✓
+- "A change needs a broad effect across classes and images to be accepted." → If labels are noisy for pore/deposit/stain, this affects all hard classes. ✓
+- Expected gain: if 5-10% of labels in hard classes are wrong, cleaning could recover +0.02-0.04 mAP. This is above the ~0.005 acceptance threshold. ✓
+
+But wait - there's a risk this doesn't work at all. The evidence for label noise is *inference*: the model systematically misclassifies pores/deposits as stain. But this could be due to:
+1. Label noise (some stain labels are actually pores/deposits)
+2. Insufficient features (the model genuinely can't tell them apart at 160px)
+
+If it's #2, cleaning won't help. If it's #1, cleaning helps a lot.
+
+Hmm. Given the 13 architecture attempts all failed to confirm gains, and the model achieves decent accuracy on perfect boxes but systematically confuses classes, label noise seems more likely than pure feature insufficiency. Especially since e018 (the "data quality" idea) was proposed by someone who analyzed this data deeply and it timed out rather than being rejected as ineffective.
+
+OK, let me go with this plan. Let me write it up.
+
+Actually, one refinement: instead of just filtering with a margin, I could use a more sophisticated approach: identify boxes where the model is confident in its prediction but that prediction disagrees with the label. This is standard for label noise detection. I'll also consider using augmented views for consistency checking, but that's more expensive. Let me keep it simple and cheap.
+
+Let me write the final reply.

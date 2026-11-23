@@ -1,0 +1,141 @@
+===== attempt 1 =====
+Let me review the situation.
+
+Current best: e005, 5-seed 0.6345. It's a two-crop (1.5x tight + 2.5x wide) EfficientNet-B0 with a shared backbone, an MLP head on concatenated features (2560→128→4), trained on true boxes with light jitter, 55s reserve, AdamW 1e-3.
+
+History:
+- e001/e002: training on detector boxes (IoU>0.5 with true boxes) — crashed, then fixed, 0.6330/0.6307, unconfirmed. Rejected.
+- e003: stage-1 error simulation jitter — 0.6342 seed0, 0.6294 5-seed, unconfirmed.
+- e004: precomputed crops — bug (0.0531).
+- e005: shared head MLP (concat features) — new best 0.6345.
+- e006: larger head — rejected.
+- e007: box size/aspect ratio as extra input — 0.6317 unconfirmed.
+- e008: random zoom per sample — crashed.
+- e009: detector boxes again (on top of e005) — 0.6325 rejected.
+- e010: stage-1 error simulation again (on top of e005) — 0.6380 seed0, 0.6335 5-seed, unconfirmed.
+- e011: TTA flips at inference — timeout (195s).
+
+Diagnostics:
+- Class chosen on boxes overlapping true defects: pore 62% correct (21 pore→stain, 5 pore→deposit), deposit 80% (48 deposit→stain), discontinuity 96%, stain 90% (41 stain→deposit, 9 stain→pore).
+- mAP if all boxes had the correct class but kept my scores: 0.7464 vs my 0.6345. So the error from wrong classes is 0.112! That's huge. Wait, that seems too big. Hmm, "mAP@0.5 if every box had its correct class but kept your scores: 0.7464 (yours: 0.6345). The difference is what wrong classes cost."
+
+Wait, but the confusion matrix shows 62-96% correct class on overlapping boxes. If 90% of boxes get the right class, how does wrong class cost 0.112? Because wrong-class predictions also count as false positives for that class... actually, wrong class on a box that overlaps a true defect: the correct-class row is a TP, the wrong-class row is an FP. But mAP is order-dependent: a wrong-class row with a high score for another class hurts that other class's precision. Also, if the wrong-class row is higher-scoring than the correct-class row... hmm, actually each box outputs 4 rows with score = conf * p_c. The row for the true class is a TP for that class. Other rows are FPs for their respective classes.
+
+Actually wait — the 0.7464 number: "mAP@0.5 if every box had its correct class but kept your scores." So replace the class of each box's argmax... no, "every box had its correct class" — boxes overlapping a true defect get the correct class; boxes that don't overlap are... probably kept as-is (class 0? or kept as-is?). The brief's ceiling d2_boxes_perfect_classes_val_map50 = 0.758 has false alarms kept as class 0. 0.7464 is "kept your scores" — hmm, the scores are... if the box gets the correct class, the score is presumably conf * p_{correct class}? Or the detector's conf? Ambiguous. Anyway, the gap 0.7464 - 0.6345 = 0.112 is attributed to wrong classes.
+
+Hmm wait, that's a lot. Let me think about what actually happens. For a box overlapping a true pore with p = [0.38, 0.05, 0.02, 0.55] (predicted as stain): rows: pore conf*0.38 (TP for pore), stain conf*0.55 (FP for stain). In the perfect-class version: pore conf*0.38? Or conf*1.0? If the score is kept as "your score" = conf * p_trueclass = conf*0.38, then the pore AP is the same... but the stain FP disappears, improving stain's precision. And the stain box that was a TP for stain... wait no, in the perfect-class version the stain box overlapping a true stain gets class stain with score conf * p_stain.
+
+Hmm, actually the 0.112 gap: the wrong-class rows are FPs that hurt the precision of the class they're assigned to. With 41879 eval boxes, many false alarms... actually let me not overthink; the diagnostic says the difference is what wrong classes cost. So the biggest lever: reduce wrong-class predictions, especially pore (62% correct) and deposit (80%).
+
+Pore: 21 of 53 wrong are pore→stain, 5 pore→deposit. Stain: 41 stain→deposit, 9 stain→pore. Deposit: 48 deposit→stain.
+
+So the confusion: stain↔deposit, pore→stain. Stain is confused with deposit (41), deposit is confused with stain (48). Pore is confused with stain (21).
+
+Per-class AP: pore 0.505, deposit 0.639, discontinuity 0.781, stain 0.613.
+
+Now, what's the plan per the research guide:
+1. Consolidation: training on detector boxes from the train split — tried e002 (0.6307) and e009 (0.6325), both rejected/unconfirmed. The guide says "if it fails twice, drop it." So drop it.
+2. Close the box-quality gap: stage-1 error simulation — tried e003 (0.6294) and e010 (0.6335), both unconfirmed. Two failures → per the guide's rule of thumb "two failed variants in a direction: move to the next direction." Hmm, e010 was seed0 0.6380 but 5-seed 0.6335, unconfirmed. So two attempts, no confirmed improvement. Move on.
+- Weight/sample training boxes by box quality — not tried? The "detector boxes" family is about adding detector boxes as training data. "Weighting by box quality" is arguably a different thing but related. Hmm.
+- Combine the two views better — e005 did exactly this (shared backbone, concat features, MLP head) and it was the best. e006 (larger head) rejected. So that direction is partially done.
+
+3. Buy training steps: e004 (precompute crops) crashed with a bug. That's a promising direction: the log shows epoch 0 takes 44s (13→57), later epochs ~18s. First-epoch overhead from DataLoader warmup. Precomputing crops at load time could save ~25-30s → more steps. But e004 had a bug (score 0.0531, "suspicious (likely bug)"). The guide says "bug: fix once; second failure: drop." e004 was based on e000, not e005. Fixing it on top of e005 is a new attempt. Hmm, but what was the bug? "Precompute all training crops (both views) as uint8 tensors at load time" scored 0.0531 — that's a catastrophic bug, like crops not being normalized, or the dataset indexing wrong, or the precomputed crops not being used. I don't know the exact cause. Repeating with "fix" is risky since I don't know the bug.
+
+Alternative for buying steps:
+- Reduce reserve: currently RESERVE_S=55. Prediction took 162-125=37s in the seed0 log (after epoch 4 at 125s, done at 162s). Actually the prediction phase: after training ends at 125s, done at 162s → 37s for prediction + writing. Reserve 55 leaves 18s of slack. Could reduce to 45. That buys ~10s ≈ 55 steps. But the guide warns that previous runs broke this twice by timing during warmup. The reserve here is fixed, not measured. Reducing from 55 to 45 is a modest change; timeout risk: prediction time varies with seed? The prediction time depends on the number of eval boxes (fixed 41879) and DataLoader. Should be stable ~37s. 45 reserve → 8s margin. Hmm, a bit tight but probably OK. But is it worth ~55 steps? The loss is still decreasing: epoch 4 loss 0.1689. More steps probably help a bit. But 55 steps is ~12% more steps; effect probably <0.005. Hmm.
+
+Actually wait — let me reconsider. What's the biggest lever? The diagnostic: 0.7464 vs 0.6345 = 0.112 from wrong classes. The confusion matrix shows the class decision error on overlapping boxes. But wait — is 0.112 all "wrong class"? Let me double-check: "mAP@0.5 if every box had its correct class but kept your scores: 0.7464 (yours: 0.6345). The difference is what wrong classes cost; the remaining gap to the perfect-class ceiling in the brief is what your scores cost relative to the detector's conf."
+
+So yes: wrong classes cost 0.112. That's the dominant error. The confusion matrix: pore 62%, deposit 80%, stain 90%, discontinuity 96%.
+
+Hmm, but wait: how does a wrong class on a box overlapping a true defect cost 0.112? Let me think: a box overlapping a true pore predicted as stain: the stain row (score conf*p_stain, high) is an FP for stain; the pore row (conf*p_pore, low) is a TP for pore but low-ranked. In the perfect-class world, that box contributes a TP for pore at score conf*p_pore (same), and no FP for stain. So stain's precision improves. With ~1000+ boxes per class and many FPs... actually the number of overlapping boxes: from the confusion matrix, total overlapping boxes ≈ 53+272+458+611 ≈ 1394 (sum of rows: 62+1... let me sum: pore row 47+5+1+21+1=75; deposit 2+217+3+48+1=271; discont 1+2+442+14+1=460; stain 9+41+6+555+3=614. Total ≈ 1420 boxes overlapping true defects). And 41879 eval boxes total, so ~40459 false alarms! That's a lot of FPs. Each false alarm outputs 4 rows (scores conf*p_c). The FPs for each class hurt precision.
+
+Hmm wait, but actually, for mAP@0.5 with many FPs, AP is dominated by precision at the ranked TPs. If a class has N TPs and M FPs, and FPs are scattered throughout the score range, AP ≈ (1/N) * sum of precision at TP ranks. With 40459 FPs across 4 classes (each FP box contributes 1 high row for its argmax class + 3 low rows), the argmax rows concentrate FPs in the class the model thinks is most likely.
+
+The 0.112 gap from wrong classes: when a box overlapping a true pore is predicted as stain, the stain row is a high-score FP for stain, and the pore row is a low-score TP for pore. Fixing the class: the pore TP moves up (score conf*p_stain? no wait — "kept your scores"... ambiguous, but presumably the box's score for the correct class = conf * p_correctclass, which is low). Hmm, if the score stays conf*p_pore (low), the TP stays low-ranked, but the high stain FP disappears. So the gain comes mostly from removing high-score FPs of the wrong class.
+
+So: reducing the wrong-class argmax on overlapping boxes helps a lot, because each such box currently injects a high-score FP into another class. Especially pore→stain (21), deposit→stain (48), stain→deposit (41): these inject high-score FPs into stain and deposit.
+
+So the lever is: improve classification, especially the stain/deposit/pore confusion. That's a model quality issue. What hasn't been tried?
+
+Families tried (from the brief):
+- Score rows: exhausted.
+- Background class: exhausted.
+- Detector boxes as training data: 2 failures on top of e005 (e009 rejected, e002 before it). Guide: drop.
+- Third wide view: accepted twice in previous runs (+0.005, mostly pore), "adds ~20s per run, close to time limit." Not tried in this run's history! Wait, the history of this run: e001-e011. The third view isn't in this run's history. It was accepted twice in the previous 5 runs (5-seed 0.6342, +0.005, mostly pore). Hmm, but +0.005 is below the acceptance threshold of ~0.005... "only if the multi-seed mean beats the best by more than the uncertainty." The gain was +0.005 which was accepted under the looser old rule. Under today's rule it might not pass. Also "gain almost entirely from pore class" — a one-class gain, and the guide says small one-class gains aren't accepted. Skip.
+- Low-res crops: exhausted.
+- Larger backbone/ensemble: exhausted (8 attempts, no confirmed gain).
+- Resolution/small boxes: exhausted.
+- TTA: 8 attempts in previous runs, no gain; e011 in this run timed out. Exhausted.
+- Longer training: 6 attempts in previous runs, no confirmed gain (best 0.6355 unconfirmed). Hmm, "longer training (smaller reserve, measured prediction time): no gain, best 5-seed 0.6355 (unconfirmed); 2 bugs." So the longer-training family is exhausted-ish. But note: 0.6355 unconfirmed is close. Still, the family is marked no-gain.
+- Class-balanced sampling/weighted loss: exhausted.
+- Training augmentation: exhausted (5 attempts, best 0.6333 unconfirmed).
+- Focal loss: exhausted.
+- Box size/aspect as input: e007 in this run (0.6317 unconfirmed); previous runs never properly tested (crashes). So ~2 attempts, both no gain. Probably exhausted.
+
+So most of the standard families are exhausted. What's left per the guide:
+- "Weight or sample training boxes by box quality so the model sees enough misplaced boxes" — not explicitly tried. The detector-boxes family is related but distinct: instead of adding detector boxes, weight the true boxes... hmm, but the true boxes are all "perfect" boxes, so weighting by box quality doesn't make sense for true boxes. It would mean: among the training rows (true boxes + detector boxes?), weight by quality. Without detector boxes, all training boxes are perfect. So this direction collapses into the detector-boxes family. Skip.
+
+- "Combine the two views better than logit averaging, e.g. one shared backbone whose pooled features from both crops are concatenated before a small head" — that's exactly e005 (the current best). e006 tried a larger head (rejected). So that's done.
+
+- Buy training steps — e004 crashed (bug). The guide lists this as a direction: "prepare crops once instead of per step, fewer or cheaper data-loader operations, a reserve that matches measured prediction time with a safety margin."
+
+Hmm wait, actually let me look at the log more carefully:
+
+train 6052 boxes, eval 41879 detections, 1022 images (13s)
+epoch 0: loss 0.4932, 94 steps, 57s → epoch 0 took 44s
+epoch 1: 188 steps, 75s → 18s
+epoch 2: 282, 93s → 18s
+epoch 3: 376, 112s → 19s
+epoch 4: 436, 125s → 13s (partial, cut at t_end = 180-55 = 125s)
+done: 5 epochs, 436 steps, 162s total.
+
+So steady state: 94 steps/18s ≈ 5.2 steps/s. 436 steps total. First epoch loses 26s to DataLoader warmup (persistent_workers, but the first epoch still pays for worker startup + image reads... actually images are preloaded in memory; the per-step cost is PIL crop+resize for 2 views).
+
+If I precompute crops once at load time (6052 boxes × 2 views × 160×160×3 uint8 = 6052*2*160*160*3 = 93 MB — fine), the first epoch should be ~18s like the others, saving ~26s → ~135 more steps (26s * 5.2). That's a 31% increase in steps! That's a big deal. But e004 attempted exactly this and scored 0.0531 (bug). I don't know the bug. Risky. The guide says "bug: fix once; second failure: drop." e004 was 1 failure. But I can't see what the bug was... The hypothesis text was cut off: "Precompute all training crops (both views) as uint8 tensors at load time so the DataLoader no longer performs PIL extract+resize per step. This should cut the first-epoch overhead (46 s vs 18 s for later epochs) and sha..." — "and sha..." probably "share memory with workers" or "save X steps."
+
+Possible bug in precomputing crops: the crops are precomputed without jitter? No wait, jitter is random per step — if precomputed, jitter is fixed (computed once). That would reduce augmentation but not cause 0.0531. A catastrophic bug like 0.0531 suggests the model was barely trained, or the crops were wrong (e.g. all gray padding, wrong normalization, wrong indexing). Hmm.
+
+Alternatively, I could buy steps in a different way:
+- Reduce the number of views at training? No, that changes the method.
+- Speed up the DataLoader: the per-step work is 2 PIL resizes per sample × 64 batch = 128 resizes of small images. With 8 workers that should be fast... but 5.2 steps/s = 192ms/step. GPU forward for 2×160×160 EfficientNet-B0 in bf16: probably 30-50ms for a batch of 64. So ~140ms/step is data loading. 8 workers × 128 resizes... PIL resize is slow-ish. Precomputing would mostly fix this.
+
+Actually, wait: is the first-epoch overhead really data loading? Epoch 0: 44s for 94 steps = 468ms/step. Epoch 1: 18s/94 = 191ms/step. The difference is 277ms/step × 94 = 26s. With persistent_workers=True, workers start up before epoch 0; the first epoch pays for worker process startup (~2-4s total, not 26s). Hmm, what else? Image loading: images are preloaded in the main process dict; workers fork (Linux) so they inherit the images via fork COW — fine.
+
+Actually, the first-epoch slowness might be GPU warmup: CUDA context init, cuDNN benchmark/autotune, allocator growth. cuDNN benchmark mode on the first forward can add several seconds per new shape. All batches are the same shape, so autotune happens once. Hmm, 26s is a lot for warmup.
+
+Or: the DataLoader with 8 workers and persistent_workers — the first epoch's prefetch is empty, so the GPU waits for the first batch (worker startup ~few seconds). But 26s?
+
+Let me think about e004's bug differently: maybe it precomputed crops with the train jitter... no. Maybe it stored crops as uint8 and forgot to /255 and normalize in __getitem__? That would give garbage input → loss doesn't decrease → 0.0531. Plausible. Or it precomputed with the wrong context (e.g. both views at 2.5x). Or an indexing bug: dataset returns crops[i] but the shuffle order... whatever.
+
+Given the uncertainty, is it worth retrying precompute? The guide explicitly lists it as a direction ("prepare crops once instead of per step"). And the payoff is large: ~26s + steady-state savings → maybe 150+ more steps. More steps at a still-decreasing loss (0.169 at the end) should help all classes. And it's a "buy steps" change, orthogonal to classification quality.
+
+But the risk: I don't know e004's bug. I'd be writing from scratch on top of e005. If I write it carefully, it should work. The bug was in their implementation, not the idea. The harness says "likely-bug result (don't repeat without fixing the cause)." I can't see the cause... but I can write a careful implementation and verify in the log (loss should decrease like before; if it's ~0.05 again, it's a bug).
+
+Alternatively, a safer way to buy steps: reduce RESERVE_S from 55 to 40. Prediction took 37s (125→162). Writing 51688 rows is fast. 40s reserve leaves a 3s margin — too tight? Prediction time: 41879 boxes / 256 batch = 164 batches × 2 views forward. From the log, 37s total including DataLoader for eval (first eval batch also pays warmup). If prediction is 37s and reserve is 40, margin is 3s — risky if the seed changes timing slightly. Reserve 45 → margin 8s, buys 10s ≈ 52 steps. Modest.
+
+Hmm, what about both? No — one idea per turn.
+
+Let me think about what would give the biggest expected gain:
+
+Option A: Precompute training crops (fix e004's idea on top of e005). Expected: +130-160 steps (30-35% more training). If loss is still decreasing (it is: 0.169 and dropping ~0.05/epoch), more steps → better classification → helps all classes, especially pore/deposit/stain. Expected gain: hard to say; 30% more steps might be +0.005-0.015. Risk: bug (medium), timeout (low — precomputing 6052×2 crops at load: 12104 crops × (extract+resize 160×160) ≈ 12104 × ~1ms = ~12-20s? Hmm, that eats into the budget!).
+
+Wait, that's important. Precomputing crops at load time: currently crop extraction happens in workers during training (amortized). If I do it in the main process at load, it adds ~15-25s to load time (currently 13s). Then the first epoch is fast. Net: I move the cost from epoch 0 (where it overlaps... no, it doesn't overlap, it's serial in the main process) to load time. Hmm, actually no: currently the crop work is done in 8 workers in parallel with GPU training. The GPU is already waiting on data in steady state (192ms/step, GPU ~50ms). So the crop work is on the critical path even in steady state! Precomputing in the main process serially: 12104 crops. Let me estimate: PIL extract+resize of a small region to 160×160: ~0.5-1ms each → 6-12s serially. Then training epochs are GPU-bound: 64 batch, 2 views, EfficientNet-B0 bf16: forward+backward probably 60-80ms/step → 12-16 steps/s vs current 5.2. So steady state might go from 192ms to ~75ms/step.
+
+Total budget for training: 125s (with 55 reserve). Currently: 436 steps. With precompute: load +10s (23s), then 102s of training at 13 steps/s → ~1300 steps. That's 3× the steps! Even if my estimate is off by 2×, it's a big win.
+
+Hmm wait, but is steady state really data-bound? 8 workers, batch 64, each sample = 2 crops (PIL resize). Per worker: 64/8 = 8 samples = 16 crops per batch ≈ 8-16ms per worker per batch. So data should keep up... unless PIL resize is slower than I think, or there's GIL/serialization overhead. 192ms/step with 8 workers suggests each worker takes ~192ms per 8 samples = 24ms/sample = 12ms/crop. That's slow for a PIL resize of a small crop to 160×160 — suggests the bottleneck is something else: maybe the numpy→torch conversion, or the DataLoader's collate/serialization, or the images dict lookup (COW page faults? forked workers accessing the large images dict: 1022 images, total maybe 200-500MB; COW page faults on access could be slow).
+
+Actually, a big factor: `self.images[r["image"]]` — the dict of full-resolution images in the worker's COW memory. Each access touches pages that may have been evicted... 1022 images × maybe 500KB = 500MB. Workers access them randomly. Page faults could dominate. Precomputing crops in the main process (where the images are already hot in memory) avoids per-step worker image access entirely.
+
+Also the eval DataLoader: 41879 boxes, same per-step crop work, batch 256, prediction 37s = ~226ms/batch... 164 batches × 226ms. If I precompute eval crops too, prediction becomes pure GPU: 164 batches × ~60ms = 10s. That frees up reserve time → I can reduce the reserve to ~20s and train even longer!
+
+Hmm, but precomputing eval crops: 41879 × 2 = 83758 crops × 160×160×3 uint8 = 643MB. In RAM, fine. Time: 83758 × ~1ms = ~80s?! That's too slow serially in the main process. Hmm. Wait, if crop extraction is ~1ms, then 12104 training crops = 12s (OK), but 83758 eval crops = 84s (not OK).
+
+But wait — my 1ms estimate might be off. Let me reconsider: in steady state, 8 workers produce 5.2 steps/s × 64 = 333 samples/s = 666 crops/s across 8 workers = 83 crops/s/worker = 12ms/crop. If that's the true per-crop cost, precomputing 83758 eval crops serially = 1000s. Not feasible. But 12ms/crop seems too slow for PIL... unless the bottleneck is the COW page faults on image access, which wouldn't apply if... no, it would apply in the main process too? No — the main process has the images in its own memory (it loaded them), so no COW faults. The workers forked from main; their accesses to the images dict trigger COW page faults only if the pages were modified... actually fork COW: the child shares pages until one writes. Read-only access = no fault (pages are shared). So COW isn't the issue for reads.
+
+Hmm, so why 12ms/crop? PIL's Image.fromarray(canvas).resize((160,160), BILINEAR): fromarray copies (s×s×3, s up to maybe 500px → 750KB copy), resize to 160×160. Plus the canvas creation (np.full s×s×3) and the region copy. For a 2.5x crop of a box with long side ~100px, s=250: np.full 250×250×3 = 187KB fill, region copy, fromarray 187KB, bilinear resize 250→160 (downscale, fast). Probably 1-2ms total. 8 workers should give 8×500 = 4000 crops/s. But we observe 666 crops/s. So the bottleneck isn't crop computation per se...
+
+Maybe it's DataLoader overhead: pin_memory, collate (list of 64 tuples of 2 tensors → default_collate), 8 workers' IPC, GIL in the main process for collate. Or the `drop_last=True` + shuffle overhead. Or the per-sample return: 2 tensors of 3×160×160 float32 = 384KB per sample × 64 = 24MB per batch through the IPC queue. That's a lot of serialization! 24MB/batch × 5.2 batches/s = 125MB/s through shared memory. Plausible bottleneck.
+
+If I precompute crops as uint8 (160×160×3 = 76.8KB/sample, 2 views = 15Thinking budget reached. Stop thinking now and write the reply in the required format.

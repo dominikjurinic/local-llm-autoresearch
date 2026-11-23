@@ -1,0 +1,202 @@
+===== attempt 1 =====
+Let me analyze the current state and think about what to try next.
+
+Current best: e012, 5-seed val mAP@0.5 0.6373
+- Model: tf_efficientnetv2_b0, IMG_SIZE=160, two-crop (1.5x + 2.5x), TTA with horizontal flip
+- Per-class AP: pore 0.517, deposit 0.636, discontinuity 0.781, stain 0.616
+- Training: ~471 steps, 6 epochs, 172s total
+
+Key observations:
+1. Pore is the weakest class (0.517), followed by stain (0.616)
+2. The ceiling with perfect classes is 0.758, so there's ~0.12 room for improvement
+3. Background class (e001) and detector-box training (e004) both hurt
+4. Focal loss, label smoothing, mixup, rotation all didn't help
+5. TTA with horizontal flip helped (e005)
+6. More training time helped (e008)
+7. tf_efficientnetv2_b0 was better than efficientnet_b0 (e012)
+
+What hasn't been tried:
+- Different scoring strategies (e.g., using a temperature-scaled softmax, or different combination of detector conf and class prob)
+- Training on low-res crops (e002 was rejected but that was on e000 base)
+- Different architectures (convnext_nano was buggy, but what about resnet50 or regnety_016?)
+- Ensemble of two different architectures
+- Different learning rate schedules
+- Using the detector confidence differently in scoring
+- Training with more aggressive data augmentation (color jitter)
+- Using both high and low res crops (e002 was on e000, maybe it works better on e012?)
+- Different batch size
+- Cosine annealing with restarts
+- Using the wide crop only (simpler, maybe the tight crop is adding noise?)
+- Different IMG_SIZE (192 instead of 224 which timed out)
+- Using a larger model like resnet50
+
+Let me think about what's most likely to help:
+
+1. The scoring formula is `d["conf"] * float(p[c])`. The detector conf is a single number per box. Maybe we should use it differently - e.g., `d["conf"] ** alpha * p[c]` where alpha < 1 to soften the detector's influence, or use `d["conf"] * p[c] ** beta` where beta > 1 to sharpen class discrimination.
+
+2. Actually, looking at the per-class scores, pore is weak. The issue might be that the model can't distinguish pore from stain/deposit well. What if we try a different architecture that's better at fine-grained texture discrimination?
+
+3. What about using both high AND low resolution crops for training? e002 tried this on e000 (which was efficientnet_b0) and got 0.6209 vs e000's baseline. But e012 with tf_efficientnetv2_b0 got 0.6373. Maybe adding low-res crops on top of e012 would help since the architecture is different.
+
+4. What about changing the scoring to use `max(p) * p[c]` (the e009 idea) but with a different formulation? e009 tried `p[c] * max(p)` and got 0.6355 seed-0 vs 0.6417 for e012. That was worse.
+
+5. What about using a different combination: instead of `conf * p[c]`, use `conf * p[c] / (1 - max(p) + eps)` or something that penalizes uncertain predictions?
+
+6. Actually, let me think about what would most directly help the weak classes. Pore at 0.517 is the weakest. The issue is likely confusion with stain and deposit. 
+
+7. What about trying a different model? regnety_016 or resnet50? These have different inductive biases. ResNet50 is deeper and might capture more hierarchical features. But it's also larger and might be slower.
+
+8. What about increasing IMG_SIZE to 192 (between 160 and 224)? 224 timed out, but 192 might work with the 50s reserve. Let me estimate: 160px inference took about 42s (172-130=42s for prediction). 192/160 = 1.2, so 192px would be about 1.44x the compute, so ~60s. With 50s reserve, that's tight. Maybe 42 * (192/160)^2 = 42 * 1.44 = 60s. That's over 50s. Hmm.
+
+Actually wait, let me recalculate. The log shows:
+- Training ends at 130s
+- Total is 172s
+- So prediction takes 172-130 = 42s
+- With RESERVE_S=50, the deadline is T0+180, so training can go until T0+130. That matches.
+- For 192px: 42 * (192/160)^2 ≈ 60s. That's over 50s.
+
+So 192px would need RESERVE_S=65 or so. That means less training time. Probably not worth it.
+
+9. What about a different approach to scoring? Currently it's `conf * p[c]`. What if we use `conf^0.5 * p[c]`? This would be less aggressive in suppressing low-confidence detections. Or `conf * p[c]^1.5` to sharpen the class distribution?
+
+Actually, let me think about this differently. The mAP@0.5 metric rewards:
+- Correct classification of true defects
+- Good ranking (true defects should score higher than false positives)
+
+The current scoring `conf * p[c]` means:
+- A box with conf=0.9 and p=[0.1, 0.1, 0.1, 0.7] gets scores [0.09, 0.09, 0.09, 0.63]
+- A box with conf=0.3 and p=[0.25, 0.25, 0.25, 0.25] gets scores [0.075, 0.075, 0.075, 0.075]
+
+The second box (likely a false alarm) still gets 0.075 per class. If we could suppress these more, ranking would improve.
+
+What about `conf * p[c] * max(p)`? That was e009 and it was 0.6355 (worse than 0.6417). So that didn't help.
+
+What about using a temperature on the softmax? `softmax(logits / T)` with T < 1 sharpens the distribution. This is equivalent to training with a lower temperature. Let me think... if T=0.7, the max probability goes up and the min goes down more. This would make the `max(p)` suppression stronger AND make the class discrimination sharper.
+
+Actually, a simpler idea: what about using `conf * p[c]` but with a temperature-scaled softmax at inference? `softmax(logits / 0.8)` would sharpen the class probabilities. This is a pure inference change that doesn't require retraining.
+
+Wait, but we're already training the model. The temperature at inference is a free parameter. Let me try T=0.7 or T=0.8.
+
+Actually, let me think about what's most promising given the history:
+
+Things that helped: TTA (e005), more training (e008), better architecture (e012)
+Things that didn't: background class, low-res crops, focal loss, label smoothing, mixup, rotation, max-prob suppression, 224px
+
+What about:
+- Different architecture (regnety_016, resnet50)
+- Temperature scaling at inference
+- Different scoring formula
+- Training with color augmentation (Hue shift, saturation)
+- Using both tight and wide crops but with different weights (e.g., tight crop gets more weight)
+- Using a larger batch size for more stable gradients
+- Using SGD instead of AdamW (sometimes helps with generalization)
+
+I think the most promising untried idea is to try a different architecture. We've tried:
+- efficientnet_b0 (baseline)
+- convnext_nano (buggy)
+- tf_efficientnetv2_b0 (current best)
+
+Let me try regnety_016. RegNet is designed for efficient computation and has a different channel progression. Or resnet50 which is a classic deep architecture.
+
+Actually, wait. Let me reconsider. The per-class scores show pore (0.517) and stain (0.616) are weak. These are the classes that look most similar to each other and to background. 
+
+What if the issue is that the model is not getting enough signal to distinguish these? What about:
+1. Using a larger input (192px) with reduced reserve
+2. Using a deeper/wider model
+3. Using a different loss that specifically helps with the confused classes
+
+Actually, I just realized: what about trying to use the detector confidence more effectively? Currently it's a simple multiplication. What if we do `conf ** 0.5 * p[c]`? This would be less punishing for low-confidence detections. Or what about `conf * (p[c] - 0.25) / 0.75` (rescaling so uniform = 0)?
+
+Hmm, let me think about what's most likely to give a clean improvement.
+
+Actually, I think a good next experiment would be to try a different architecture. Let's try `regnety_016` which is a RegNet-Y variant. It's similar in size to efficientnetv2_b0 but with a different architecture (more uniform channel widths, different block structure). This tests whether the specific architecture matters or if it's more about capacity.
+
+Alternatively, `resnet50` is a well-known architecture that's slightly larger. It has a different inductive bias (residual connections, no SE blocks).
+
+Let me go with `resnet50` since it's a fundamentally different architecture family and is well-optimized. If it works better, it suggests the SE/efficientnet inductive bias isn't ideal for this task. If it works worse, we know efficientnetv2_b0 is a good choice.
+
+Wait, but resnet50 is larger and might be slower. Let me think about the time budget. With 180s total and 50s reserve, we have 130s for training. At 160px, the current model does ~94 steps/epoch. ResNet50 at 160px should be similar speed or slightly slower. It should be fine.
+
+Actually, let me reconsider. The most impactful thing might be to try a different scoring strategy. The current one is `conf * p[c]`. What if we try:
+- `conf * p[c] ** 2` (sharpen class distribution)
+- `conf ** 0.7 * p[c]` (soften detector conf)
+- `conf * p[c] / sum(p) ** 0.5` (normalize)
+
+Actually, `p[c] ** 2` is interesting because it's equivalent to temperature < 1 on the softmax. And it's a pure scoring change that doesn't require retraining.
+
+Let me think about what would most directly help. The issue with pore (0.517) is likely:
+1. Misclassification (calling it stain or deposit)
+2. Low ranking (false positives scoring higher than true pores)
+
+For (1), we need better classification. For (2), we need better scoring.
+
+I think the best next experiment is to try a temperature-scaled scoring: instead of `conf * p[c]`, use `conf * p[c] ** T` where T > 1 (sharpening). This is a pure scoring change, easy to implement, and directly targets the ranking component of mAP.
+
+Wait, but `p[c] ** T` for T > 1 would make the sum of scores less than 1 (since p[c] < 1 for all c). That's fine for ranking purposes.
+
+Let me try T = 1.5. So the score becomes `conf * p[c] ** 1.5`.
+
+For a box with p = [0.1, 0.1, 0.1, 0.7]:
+- Old scores: [0.09, 0.09, 0.09, 0.63]
+- New scores: [0.028, 0.028, 0.028, 0.525]
+
+For a box with p = [0.25, 0.25, 0.25, 0.25]:
+- Old scores: [0.075, 0.075, 0.075, 0.075]
+- New scores: [0.0375, 0.0375, 0.0375, 0.0375]
+
+The ratio of max to min within a box goes from 7:1 to ~19:1. This should help ranking.
+
+But wait, this also reduces the absolute scores. Since mAP is based on ranking, absolute scale doesn't matter (only relative ordering matters). So this should be fine.
+
+Actually, I realize this is essentially the same as what e009 tried (multiplying by max(p)), just in a different form. e009 got 0.6355 vs 0.6417 for e012. So sharpening the class distribution at inference didn't help.
+
+Hmm, let me think of something else.
+
+What about training with a different loss that specifically helps with the confused pairs? For example, a contrastive loss that pushes apart pore and stain embeddings?
+
+Or what about a simpler idea: using a larger batch size? Currently 64. With 6052 training boxes, that's ~94 steps/epoch. With batch size 128, it would be ~47 steps/epoch but each step sees more diverse examples. This might help with gradient noise.
+
+Actually, I think the most promising untried direction is to try a different backbone. We've only successfully tried efficientnet variants. Let me try `resnet50` which has a very different architecture (deep residual connections, global average pooling, no SE blocks). This is a clean test of whether the architecture family matters.
+
+Actually wait - let me reconsider the time budget. The current model (tf_efficientnetv2_b0) at 160px does 94 steps/epoch. ResNet50 at 160px should be similar or slightly faster (fewer parameters in the early layers). Let me check: tf_efficientnetv2_b0 has ~12.6M params, resnet50 has ~25.6M params. So resnet50 is about 2x larger. It might be ~1.5x slower per step. That means ~60 steps/epoch instead of 94. Over 130s, that's maybe 4 epochs instead of 6. Fewer steps but each step is on a larger model. Hard to say which is better.
+
+Let me go with a different approach. What about trying to improve the scoring by using a learned temperature? Or better yet, what about trying to use the two crop views differently at inference?
+
+Currently: `logits = (model(xt) + model(xw) + model(xt.flip(3)) + model(xw.flip(3))) / 4`
+
+What if the tight crop is more informative for classification (since it's closer to the defect) and the wide crop provides context? What if we weight them differently: `logits = (2*model(xt) + model(xw) + 2*model(xt.flip(3)) + model(xw.flip(3))) / 6`?
+
+This is a simple change that tests whether the tight crop is more important for classification. It's a pure inference change.
+
+Actually, I think the most impactful thing to try next is a different model. Let me go with `regnety_016`. It's similar in size to efficientnetv2_b0 but has a different architecture (RegNet blocks with uniform channel widths). If it's better, it suggests the architecture matters. If it's worse, we stick with efficientnetv2_b0.
+
+Wait, actually, let me look at this from a different angle. What are the things that have consistently helped?
+- TTA (e005): +0.01
+- More training time (e008): +0.003
+- Better architecture (e012): +0.006
+
+And things that haven't helped:
+- Different losses (focal, label smoothing)
+- Different augmentations (rotation, mixup)
+- Different scoring (max-prob suppression)
+- Different data (background class, detector boxes, low-res)
+
+The consistent theme is that the model's representational capacity and training quality matter more than the specific loss or augmentation. So maybe the next step is to try a model with more capacity.
+
+Let me try `resnet50`. It's about 2x the parameters of tf_efficientnetv2_b0, which should give more capacity for learning the fine-grained distinctions between defect types. The risk is that it's slower and we get fewer training steps, but the hypothesis is that the extra capacity is worth it.
+
+Actually, I just realized I should check: is resnet50 in the list of available pretrained models? Yes: "resnet50" is listed.
+
+Let me go with this. The change is simple: just change MODEL = "tf_efficientnetv2_b0" to MODEL = "resnet50".
+
+Wait, but I should also consider: will resnet50 work with the same LR and weight decay? AdamW with LR=1e-3 and WD=0.05 should be fine for resnet50. The cosine schedule should also work.
+
+One concern: resnet50 at 160px might be slower. Let me estimate:
+- tf_efficientnetv2_b0: ~12.6M params, 94 steps/epoch
+- resnet50: ~25.6M params, maybe ~60-70 steps/epoch
+
+Over 130s of training, that's maybe 4 epochs (vs 6). But each epoch has a larger model. The total number of forward/backward passes would be less, but each one is more expensive. Net effect on training quality is unclear.
+
+I'll go with this as a clean architecture test. If it works, great. If not, we learn that efficientnetv2_b0 is the right choice.
+
+Let me write the change.

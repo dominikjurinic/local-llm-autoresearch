@@ -1,0 +1,297 @@
+===== attempt 1 =====
+Let me analyze the situation carefully.
+
+**Current best (e000):** 0.6280 mAP@0.5 (5-seed mean)
+- Per-class: pore 0.497, deposit 0.628, discontinuity 0.780, stain 0.607
+- Trains on perfect ground-truth crops (4 classes)
+- Score = detector conf × class probability
+
+**Rejected experiment (e001):** 0.5691 (single seed)
+- Trained on detector boxes with a 5th "background" class
+- This was a big drop (0.569 vs 0.628)
+
+**Key observations:**
+1. The baseline one-step 4-class detector gets 0.638 mAP@0.5
+2. Stage-1 boxes with perfect classes get 0.758 mAP@0.5 (ceiling)
+3. Stage-1 boxes scored as single class get 0.755 mAP@0.5
+4. Current best is 0.628, below the one-step baseline of 0.638
+5. The gap between 0.628 and 0.758 is large — the classifier is the bottleneck
+
+**Why e001 failed:**
+- Training on detector boxes with background class dropped performance significantly
+- The issue might be:
+  - Too many background examples (false alarms)
+  - The classifier was trained on detector boxes which are noisier
+  - The 5-class setup with background may have confused the model
+  - The IoU threshold of 0.5 for matching might be too strict or too loose
+  - The model now has 5 classes but predictions are still 4 classes (or maybe it outputs 5 and the 5th is background?)
+
+Wait, looking at the e001 code more carefully - it creates a 5-class model but the prediction code still writes 4 classes. Let me check... The diff shows the model was changed to 5 classes, but the prediction code wasn't shown in the diff. The original prediction code writes `for c in range(4)` so it would only use the first 4 classes. But the model now outputs 5 logits. This means the softmax would be over 5 classes, and the background probability would dilute the class probabilities. This could be part of why it dropped.
+
+Actually wait - the prediction code in e001 would still do `for c in range(4)` and use `p[c]` where p is the 5-class softmax. So the background class probability would reduce the sum of the 4 class probabilities, effectively lowering all scores. But that alone shouldn't cause a 0.06 drop.
+
+The bigger issue is probably that training on noisy detector boxes (with misplacement, false alarms) made the classifier worse at distinguishing classes. The "perfect boxes" training was better for classification accuracy.
+
+**What should we try next?**
+
+Let me think about what ideas are most promising:
+
+1. **Hybrid training**: Train on both perfect crops AND detector boxes. The perfect crops give clean class signals, while detector boxes teach robustness to misplacement. This is a "data" category change.
+
+2. **Better scoring function**: Instead of `conf × prob`, try something like `conf^α × prob^β` or use the background probability to penalize. This is a "scoring" category.
+
+3. **Test-time augmentation**: Average predictions over multiple crops (different positions/scales) at inference time. This is "inference".
+
+4. **Architecture change**: Try a different backbone. Maybe convnext_nano or efficientnet_b2. "architecture" category.
+
+5. **Training on low-res crops too**: The current code only uses "high" resolution. Adding "low" might help. "data" category.
+
+6. **Ensembling**: Train multiple models and average. "inference" category.
+
+7. **Better handling of the background problem**: Instead of a 5th class, train on detector boxes but only the ones that match (IoU ≥ 0.5), and use the background probability differently in scoring.
+
+Let me think about what's most likely to help:
+
+The per-class APs show pore (0.497) and stain (0.607) are the weakest. The known issues are:
+- Pore and deposit are weak classes
+- Stain is confused with deposit and background
+
+The gap to ceiling (0.758) is 0.13. The classifier with perfect boxes gets macro-F1 ~0.87. So the classification is decent but not great.
+
+**Most promising idea: Hybrid training data**
+
+The key insight is:
+- Training on perfect boxes → good class discrimination but vulnerable to box misplacement
+- Training on detector boxes → robust to misplacement but noisier labels
+- The e001 failure was likely because ALL training data was noisy detector boxes
+
+A hybrid approach: train on perfect crops (for clean class signal) + detector boxes that match (for robustness), without the background class (to avoid diluting the class probabilities). Or include background but weight it differently.
+
+Actually, let me reconsider. The e001 drop was from 0.628 to 0.569, a 0.059 drop. That's significant. The main issues with e001:
+1. All training data was detector boxes (noisy positions)
+2. 5-class model with background
+3. The background class dilutes probabilities
+
+What if we:
+- Keep training on perfect crops (the 6052 boxes)
+- ADD detector boxes that match ground truth (IoU ≥ 0.5) as additional training examples
+- Keep 4 classes (no background)
+- This gives robustness to misplacement without the noise of background
+
+This is a focused "data" change.
+
+Actually, let me think about another angle. The scoring function is `conf × prob`. What if we use a different scoring?
+
+The ceiling is 0.758 with perfect classes. The single-class score is 0.755. This means the ranking (conf) is already very good. The issue is purely classification accuracy.
+
+If the classifier gets macro-F1 ~0.87 with perfect boxes, that means ~13% of boxes get the wrong class. With 4 classes, random would be 25%. So the classifier is decent.
+
+But the mAP is 0.628 vs ceiling 0.758. That's a 0.13 gap. If classification were perfect, we'd get 0.758. With 87% accuracy, we'd expect roughly... well, mAP is more nuanced than just accuracy because of the ranking component.
+
+Let me think about what would give the biggest bang:
+
+**Option A: Hybrid training (data)**
+- Add matched detector boxes to the perfect crops
+- Keep 4 classes
+- This should improve robustness without hurting class discrimination
+- Risk: if the detector boxes are very noisy, it could hurt
+
+**Option B: Better scoring (scoring)**
+- Try `conf^0.5 × prob` or `conf × prob^2` 
+- Or use `conf × prob / (1 + bg_prob)` if we add background
+- This is low-risk and could help with ranking
+
+**Option C: Test-time augmentation (inference)**
+- At inference, average over 2-3 different crop positions/scales
+- This could improve robustness without retraining
+- Risk: time budget
+
+**Option D: Use low-res crops too (data)**
+- Currently only "high" resolution is used
+- Adding "low" could increase training data
+- Risk: low-res might be noisier
+
+Let me go with **Option A: Hybrid training**. It's a natural follow-up to the e001 experiment, it's a focused change, and it addresses the known weakness (robustness to box misplacement) without the pitfalls of e001 (all-noisy data, background class dilution).
+
+The specific change:
+1. Keep the 6052 perfect crops as the base training set
+2. Add detector boxes from train split that match ground truth (IoU ≥ 0.5) as additional training examples
+3. Keep 4 classes (no background)
+4. The matched detector boxes get the class of the matched ground truth box
+
+This should:
+- Maintain clean class signal from perfect crops
+- Add robustness to detector box misplacement
+- Not dilute class probabilities with background
+- Potentially improve the pore and stain classes (which are confused with background)
+
+Let me write the code change.
+
+Looking at the current best code:
+
+```python
+    crops = [r for r in read_csv(os.path.join(args.data, "crops.csv")) if r["res"] in TRAIN_ON]
+    dets = read_csv(os.path.join(args.data, "dets.csv"))
+    ev = [d for d in dets if d["split"] == "eval"]
+    needed = {r["image"] for r in crops} | {d["image"] for d in ev}
+    images = {p: np.asarray(Image.open(os.path.join(args.data, "images", p)).convert("RGB")) for p in needed}
+    print(f"train {len(crops)} boxes, eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
+```
+
+I need to:
+1. Load all crops (not just high-res filter yet)
+2. Load dets, split into train and eval
+3. For train dets, find matching crop (IoU ≥ 0.5) and assign class
+4. Add matched train dets to the training set
+5. Keep the 4-class model
+
+Let me write this carefully:
+
+```python
+    all_crops = read_csv(os.path.join(args.data, "crops.csv"))
+    crops = [r for r in all_crops if r["res"] in TRAIN_ON]
+    dets = read_csv(os.path.join(args.data, "dets.csv"))
+    train_dets = [d for d in dets if d["split"] == "train"]
+    ev = [d for d in dets if d["split"] == "eval"]
+    # Match train detector boxes to ground truth crops (IoU >= 0.5)
+    from collections import defaultdict
+    crops_by_img = defaultdict(list)
+    for r in all_crops:
+        crops_by_img[r["image"]].append(r)
+    matched_dets = []
+    for d in train_dets:
+        best_iou, best_cls = 0.0, -1
+        for c in crops_by_img.get(d["image"], []):
+            x1, y1 = max(d["x1"], c["x1"]), max(d["y1"], c["y1"])
+            x2, y2 = min(d["x2"], c["x2"]), min(d["y2"], c["y2"])
+            inter = max(0, x2 - x1) * max(0, y2 - y1)
+            union = (d["x2"]-d["x1"])*(d["y2"]-d["y1"]) + (c["x2"]-c["x1"])*(c["y2"]-c["y1"]) - inter
+            iou = inter / union if union > 0 else 0.0
+            if iou > best_iou:
+                best_iou, best_cls = iou, c["cls"]
+        if best_iou >= 0.5:
+            d["cls"] = best_cls
+            matched_dets.append(d)
+    train_rows = crops + matched_dets
+    needed = {r["image"] for r in train_rows} | {d["image"] for d in ev}
+    images = {p: np.asarray(Image.open(os.path.join(args.data, "images", p)).convert("RGB")) for p in needed}
+    print(f"train {len(train_rows)} boxes ({len(crops)} gt + {len(matched_dets)} det), eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
+```
+
+Wait, but the `make_crop` function uses `r["x1"]`, `r["y1"]`, `r["x2"]`, `r["y2"]` and `r["image"]`. The detector boxes have the same fields. And `r.get("cls", -1)` is used for the label. So the detector boxes with assigned `cls` should work directly with `BoxDataset`.
+
+Let me check the BoxDataset:
+```python
+class BoxDataset(torch.utils.data.Dataset):
+    def __init__(self, rows, images, train):
+        self.rows, self.images, self.train = rows, images, train
+
+    def __getitem__(self, i):
+        r = self.rows[i]
+        img = self.images[r["image"]]
+        ...
+        return views[0], views[1], r.get("cls", -1)
+```
+
+Yes, it uses `r["image"]`, `r["x1"]`, etc., and `r.get("cls", -1)`. The detector boxes have all these fields. Good.
+
+Now, the DataLoader uses `train_rows` instead of `crops`:
+```python
+    dl_tr = torch.utils.data.DataLoader(BoxDataset(train_rows, images, True), batch_size=BATCH_SIZE, shuffle=True,
+```
+
+And the model stays 4-class.
+
+Let me also think about whether I should add the `from collections import defaultdict` import at the top or inline. The current code doesn't import defaultdict. I'll add it at the top.
+
+Actually, looking at the code structure, the imports are at the top:
+```python
+import argparse
+import csv
+import math
+import os
+import random
+
+import numpy as np
+import timm
+import torch
+import torch.nn as nn
+from PIL import Image
+```
+
+I'll add `from collections import defaultdict` after `import random`.
+
+Let me finalize the changes:
+
+1. Add `from collections import defaultdict` to imports
+2. Replace the data loading section to include matched detector boxes
+3. Change `crops` to `train_rows` in the DataLoader
+
+Let me write the exact SEARCH/REPLACE blocks.
+
+Block 1: Add import
+```
+SEARCH:
+import random
+
+import numpy as np
+REPLACE:
+import random
+from collections import defaultdict
+
+import numpy as np
+```
+
+Block 2: Replace data loading
+```
+SEARCH:
+    crops = [r for r in read_csv(os.path.join(args.data, "crops.csv")) if r["res"] in TRAIN_ON]
+    dets = read_csv(os.path.join(args.data, "dets.csv"))
+    ev = [d for d in dets if d["split"] == "eval"]
+    needed = {r["image"] for r in crops} | {d["image"] for d in ev}
+    images = {p: np.asarray(Image.open(os.path.join(args.data, "images", p)).convert("RGB")) for p in needed}
+    print(f"train {len(crops)} boxes, eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
+REPLACE:
+    all_crops = read_csv(os.path.join(args.data, "crops.csv"))
+    crops = [r for r in all_crops if r["res"] in TRAIN_ON]
+    dets = read_csv(os.path.join(args.data, "dets.csv"))
+    train_dets = [d for d in dets if d["split"] == "train"]
+    ev = [d for d in dets if d["split"] == "eval"]
+    crops_by_img = defaultdict(list)
+    for r in all_crops:
+        crops_by_img[r["image"]].append(r)
+    matched_dets = []
+    for d in train_dets:
+        best_iou, best_cls = 0.0, -1
+        for c in crops_by_img.get(d["image"], []):
+            x1, y1 = max(d["x1"], c["x1"]), max(d["y1"], c["y1"])
+            x2, y2 = min(d["x2"], c["x2"]), min(d["y2"], c["y2"])
+            inter = max(0, x2 - x1) * max(0, y2 - y1)
+            union = (d["x2"]-d["x1"])*(d["y2"]-d["y1"]) + (c["x2"]-c["x1"])*(c["y2"]-c["y1"]) - inter
+            iou = inter / union if union > 0 else 0.0
+            if iou > best_iou:
+                best_iou, best_cls = iou, c["cls"]
+        if best_iou >= 0.5:
+            d["cls"] = best_cls
+            matched_dets.append(d)
+    train_rows = crops + matched_dets
+    needed = {r["image"] for r in train_rows} | {d["image"] for d in ev}
+    images = {p: np.asarray(Image.open(os.path.join(args.data, "images", p)).convert("RGB")) for p in needed}
+    print(f"train {len(train_rows)} boxes ({len(crops)} gt + {len(matched_dets)} det), eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
+```
+
+Block 3: Change DataLoader to use train_rows
+```
+SEARCH:
+    dl_tr = torch.utils.data.DataLoader(BoxDataset(crops, images, True), batch_size=BATCH_SIZE, shuffle=True,
+REPLACE:
+    dl_tr = torch.utils.data.DataLoader(BoxDataset(train_rows, images, True), batch_size=BATCH_SIZE, shuffle=True,
+```
+
+This looks good. Let me verify the hypothesis:
+
+Hypothesis: Adding detector boxes that match ground truth (IoU ≥ 0.5) to the training set alongside perfect crops will improve mAP because the classifier becomes robust to the detector's box misplacement while retaining clean class labels from the ground-truth crops, without the probability dilution from a background class that hurt e001.
+
+Category: data
+
+This is a focused, testable change. Let me finalize.

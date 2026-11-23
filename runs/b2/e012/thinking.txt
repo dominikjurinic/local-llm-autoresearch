@@ -1,0 +1,333 @@
+===== attempt 1 =====
+Let me analyze the situation.
+
+Current best: e000, 5-seed mean 0.6288. Per-class: pore 0.496, deposit 0.629, discontinuity 0.780, stain 0.609.
+
+Reference numbers:
+- One-step 4-class baseline: 0.638 (the number to beat)
+- Stage-1 boxes with perfect classes: 0.758 (ceiling)
+- Stage-1 boxes as single class: 0.755
+
+So we're at 0.6288, below the one-step baseline of 0.638, and far below the 0.758 ceiling. The gap to the ceiling is ~0.129, which is class mis-assignment damage.
+
+Key insight from the problem: "The class-agnostic detector (stage 1, fixed) finds candidate boxes... your code (stage 2) decides the type of each box and gives each prediction a score."
+
+The ceiling with perfect classes is 0.758. The class-agnostic score is 0.755. So the boxes themselves are great — the issue is purely class assignment.
+
+We're at 0.6288. The gap to ceiling (0.758) is 0.129. This is all class-assignment error.
+
+What's been tried:
+- data (4): low-res boxes, higher resolution, train on detector boxes — all rejected
+- architecture (1): bigger backbone — rejected
+- scoring (3): score changes, temperature — e011 (temperature) not confirmed (0.6267, slightly below best 0.6288)
+- inference (1): TTA — rejected
+- augmentation (1): mixup — rejected
+- optimisation (1): bug
+
+So the classifier itself (macro-F1 ~0.87) is the bottleneck. Many attempts to improve the classifier on the same inputs failed.
+
+Let me think about what's fundamentally different and could give a real gain.
+
+The key observation: the crop classifier with perfect boxes reaches macro-F1 ~0.87. Pore and deposit are weak. Stain confused with deposit.
+
+Wait — let me reconsider the whole approach. The problem says "A crop classifier given perfect boxes reaches macro-F1 ~0.87 with the starting recipe (two-crop input)."
+
+But we're getting 0.6288 mAP. The ceiling is 0.758. So even with the current classifier, if it were perfect, we'd be at 0.758.
+
+Actually, let me think about the metric more carefully. mAP@0.5 per class. For each class, predictions sorted by score, a hit if it overlaps an unmatched true box of that class by IoU > 0.5.
+
+The key insight: "AP depends only on this ORDER." So the score only matters for ordering within a class.
+
+Now here's a critical realization. We emit every box in all 4 classes with score = conf * p_c. So a single detector box produces 4 predictions (one per class), each with a different score.
+
+Consider a true deposit box. The classifier gives it p_deposit = 0.5, p_pore = 0.3, p_stain = 0.15, p_disc = 0.05. So it appears in:
+- deposit ranking at score conf*0.5
+- pore ranking at score conf*0.3
+- stain ranking at score conf*0.15
+- disc ranking at score conf*0.05
+
+In the deposit ranking, this is a true positive (hit). Good.
+In the pore ranking, this is a FALSE POSITIVE (it's a deposit, not a pore). It competes against true pore boxes. If conf*0.3 is high, it could rank above true pore boxes and hurt pore AP.
+
+So the damage mechanism: misclassified boxes pollute the wrong class's ranking. A deposit classified as pore (with high pore prob) will rank high in the pore class and count as an FP, pushing down the precision of pore.
+
+This is exactly what e011 tried to address with temperature (soften probabilities so misassigned boxes score lower in the wrong class). It gave 0.6267, not confirmed (below 0.6288).
+
+Hmm, but temperature softens ALL probabilities, including the correct class. Let me think...
+
+Actually with temperature > 1, the softmax becomes flatter. So p_c for the true class goes DOWN, and p_c for wrong classes go... it depends. If the true logit is highest, temperature>1 reduces the gap, so the true class prob decreases and wrong class probs increase (relatively). Wait no.
+
+Let's say logits are [3, 1, 0, 0] for [pore, deposit, disc, stain], and deposit is true.
+softmax([3,1,0,0]) = [0.65, 0.24, 0.055, 0.055]
+softmax([3,1,0,0]/2) = softmax([1.5, 0.5, 0, 0]) = [0.49, 0.19, 0.11, 0.11]
+
+So the true class (deposit) went from 0.24 to 0.19 (down), and the wrong classes went up (pore 0.65->0.49 down, disc 0.055->0.11 up, stain 0.055->0.11 up).
+
+Wait, pore went from 0.65 to 0.49. That's the top logit. Hmm, in this example pore has the highest logit (3) but deposit is true. So the classifier is wrong here.
+
+Let me redo with the true class being highest. Logits [0, 3, 0, 0] (deposit true, highest).
+softmax = [0.055, 0.65, 0.055, 0.055]
+softmax/2 = softmax([0, 1.5, 0, 0]) = [0.11, 0.49, 0.11, 0.11]
+
+So true class deposit: 0.65 -> 0.49 (down). Wrong classes: 0.055 -> 0.11 (up).
+
+So temperature>1 REDUCES the true class score and INCREASES wrong class scores. That's the OPPOSITE of what we want for reducing FP pollution! A misassigned box (where the classifier is wrong) would have its wrong-class score go UP, making it pollute MORE.
+
+Wait, but e011 was testing temperature on the assumption it helps. It gave 0.6267 (slightly below best). So it didn't help.
+
+Hmm. Let me reconsider. Actually the issue is more subtle. Let me think about what actually helps.
+
+The real problem: we want, for each class, the true boxes of that class to rank high, and false boxes (wrong-class true boxes + false alarms) to rank low.
+
+The score is conf * p_c. conf is the detector confidence (fixed). p_c is the classifier's probability for class c.
+
+For a true box of class d, in the class-d ranking, score = conf * p_d. We want p_d high.
+For a true box of class d, in the class-c (c≠d) ranking, score = conf * p_c. We want p_c LOW (so it doesn't pollute).
+
+So we want p_d high and all other p_c low. That's a sharp/confident correct prediction. Temperature>1 makes it LESS sharp, which is bad.
+
+So maybe we want temperature < 1 (sharpen)? But that was... let me check. e011 used TEMP=2.0 (>1). What about <1?
+
+Actually wait. Let me reconsider. The issue is that sharpening (temp<1) would make wrong-class scores even lower, which is good for reducing pollution, but it would also make the true-class score higher for confident-correct predictions and lower for uncertain ones.
+
+Hmm, but there's a subtlety. Consider a box where the classifier is genuinely uncertain between two classes (e.g., stain vs deposit). Logits [0, 2, 0, 1.5] (deposit true). 
+softmax = [0.04, 0.55, 0.04, 0.37]
+This box appears in deposit ranking at conf*0.55 (good, it's a true deposit) and in stain ranking at conf*0.37 (pollution).
+
+If we sharpen (temp<1), say temp=0.5:
+logits/0.5 = [0, 4, 0, 3]
+softmax = [0.0003, 0.82, 0.0003, 0.18]
+Now deposit 0.55->0.82 (up, good), stain 0.37->0.18 (down, less pollution, good).
+
+So sharpening helps here. But what about a box where the classifier is WRONG? Logits [3, 1, 0, 0], deposit true but pore has highest.
+softmax = [0.65, 0.24, 0.055, 0.055]
+temp=0.5: logits/0.5=[6,2,0,0], softmax=[0.98, 0.015, 0.0004, 0.0004]
+Now pore 0.65->0.98 (UP, more pollution in pore!), deposit 0.24->0.015 (DOWN, this true deposit now ranks very low in deposit class — BAD, it becomes a miss in deposit).
+
+So sharpening is bad when the classifier is wrong (it amplifies the error). This is the classic calibration problem.
+
+So temperature is a blunt instrument. e011 tried temp=2 (softening), got 0.6267 (worse). 
+
+Let me think differently. What's the fundamental issue and what would actually help?
+
+The core problem: macro-F1 ~0.87, meaning ~13% of boxes are misclassified. These misclassifications pollute the wrong class rankings. The damage is 0.129 mAP.
+
+Ideas that could fundamentally help:
+1. Better classifier (tried many, failed)
+2. Better scoring that's robust to misclassification
+3. A fundamentally different approach to the two-stage problem
+
+Let me think about the scoring more. The key realization from the metric: "AP depends only on this ORDER." And "several rows per box (one per class) are allowed."
+
+What if we DON'T emit all 4 classes per box? What if we emit only the top-1 class per box (argmax)? Then each box contributes to exactly one class ranking. A misclassified box contributes to the wrong class as a pure FP (no chance to be a hit in its true class, but also no partial credit).
+
+Wait, but that's worse — currently a box can be a hit in its true class even if it's also a FP in another class. If we only emit top-1, a misclassified box is a pure FP in the wrong class and a miss in the true class. That's the worst case for the true class.
+
+Hmm, actually no. Let me reconsider. Currently with all-4-classes:
+- True box of class d, classifier says d (correct): hit in d (score conf*p_d), FP in c≠d (score conf*p_c).
+- True box of class d, classifier says c (wrong): hit in d? No — it's a true box of class d, and we emit it in class d at score conf*p_d. It WILL be a hit in class d if conf*p_d ranks it above... wait, it's a true box of class d, so in the class-d ranking it's a TP candidate. It will be a hit if it overlaps an unmatched true d-box (itself) by IoU>0.5 — yes it does. So it's a hit in class d regardless of score (as long as it's in the ranking and there's an unmatched true box). 
+
+Wait, that's important. Let me re-read: "a prediction is a hit if it overlaps an unmatched true box of that class by IoU > 0.5." So a prediction of class d that overlaps a true d-box is a hit. The score determines WHERE it sits in the ranking, which affects precision at that point.
+
+So for a true box of class d:
+- In class-d ranking: it's always a TP (hit), positioned by score conf*p_d.
+- In class-c ranking (c≠d): it's a FP (false positive), positioned by score conf*p_c.
+
+The damage: the FP in class-c ranking. If conf*p_c is high, it sits high in class-c ranking, inflating the FP count at high precision, hurting class-c AP.
+
+Also: false alarms (boxes that don't overlap any true box). In class-c ranking, they're FPs positioned by conf*p_c.
+
+So the total damage to class-c AP comes from:
+(a) true boxes of other classes that get high p_c, and
+(b) false alarms that get high p_c.
+
+Now, the score conf*p_c: conf is the detector conf. For false alarms, conf might be lower (detector less confident). For true boxes, conf is higher.
+
+Hmm. Let me think about what scoring would minimize this damage while keeping true boxes high in their own class.
+
+Idea: What if the score for class c is NOT conf * p_c, but something that more strongly suppresses wrong-class entries?
+
+Actually, here's a cleaner idea. The problem is that we're using p_c (a probability that sums to 1) as the score. But the ranking within class c only cares about the RELATIVE ordering of all class-c predictions. 
+
+For class c, the predictions are:
+- True c-boxes (T) at score conf_t * p_c(t)
+- Non-c true boxes (F) at score conf_f * p_c(f)
+- False alarms (A) at score conf_a * p_c(a)
+
+We want T ranked above F and A.
+
+The issue is p_c is the same function for all. A true c-box has high p_c (hopefully), a non-c box has low p_c (hopefully), a false alarm has some p_c.
+
+What if we use a score that's more discriminative? Like p_c / (1 - p_c) (odds)? Or p_c^k for k>1?
+
+Actually, p_c^k for k>1 would sharpen: true c-boxes (high p_c) stay high, non-c boxes (low p_c) get pushed down more. This is like temperature<1. But as I noted, it amplifies errors when the classifier is wrong.
+
+Hmm, let me think about the actual numbers. We're at 0.6288. Ceiling 0.758. The one-step baseline is 0.638. We're BELOW the one-step baseline. That's a strong signal that our approach has a real problem, not just a small optimization gap.
+
+Wait, the one-step detector does detection AND classification in one shot and gets 0.638. Our two-stage gets 0.6288. The two-stage stage-1 boxes are class-agnostic and score 0.755 as a single class. So the boxes are good. The classification is the problem.
+
+Actually, let me reconsider. Is there something about how we emit predictions that's suboptimal?
+
+Let me reconsider the "several rows per box" and "per image at most the 300 highest-scoring rows count." We emit 4 rows per box (one per class), 52964 rows total for 41879 boxes. Per image, if there are many boxes, only top 300 count. This could be an issue if some images have >300 boxes... but probably not the main issue.
+
+Let me think about the fundamental scoring issue again.
+
+Actually, here's a thought. The score conf * p_c. The conf is the detector's confidence. But conf is class-agnostic. For a true box, conf reflects "is there a defect here." For a false alarm, conf reflects "the detector thought there was a defect but there wasn't."
+
+Now, in the class-c ranking, we want to separate true c-boxes from everything else. The conf factor is common-ish. The p_c factor is the classifier's opinion.
+
+What if the real problem is that the classifier's p_c is not well-calibrated, and a better signal exists?
+
+Let me think about an alternative: instead of p_c, use the classifier's logit for class c directly, or use a margin-based score.
+
+Actually, let me step back and think about what's the LARGEST part of the error.
+
+Per-class AP: pore 0.496, deposit 0.629, disc 0.780, stain 0.609. Mean 0.6288.
+
+Pore is the weakest (0.496). Pore is a fine-grained texture. Stain is 0.609, deposit 0.629. Stain is often confused with deposit.
+
+The ceiling is 0.758 for all (perfect classes). So even pore could be 0.758 if classified perfectly.
+
+The gap for pore is 0.758 - 0.496 = 0.262. That's huge. For deposit 0.758-0.629=0.129. For disc 0.758-0.780 = -0.022 (we're ABOVE ceiling for disc? That's odd — maybe the ceiling number is an average and per-class varies). For stain 0.758-0.609=0.149.
+
+Wait, disc is 0.780 which is above the 0.758 "ceiling." That's strange. The ceiling is described as "stage-1 boxes with perfect classes: 0.758 mAP@0.5" — that's the average. So per-class, disc might be higher than 0.758. OK.
+
+So pore is the big problem. Pore AP 0.496 vs potential 0.758.
+
+Why is pore so bad? Pore is a fine-grained texture (small holes). The classifier confuses pore with... let me think. The background between defects might look like pore. Or pore looks like stain.
+
+Actually, here's a key insight I might be missing. Let me reconsider the whole two-stage setup.
+
+The stage-1 detector finds candidate boxes. Some are true defects, some are false alarms. The stage-2 classifier decides the type.
+
+But here's the thing: the stage-1 detector is CLASS-AGNOSTIC. It finds "defect-like" regions. Some of these regions might be... hmm.
+
+Let me think about pore specifically. Pores are small holes. A class-agnostic detector might find them. But the classifier, when given a crop of a pore, might not recognize it as a pore (fine-grained texture) and instead call it stain or background.
+
+Actually, wait. Let me reconsider. The problem says "A crop classifier given perfect boxes reaches macro-F1 ~0.87." So even with perfect boxes, the classifier only gets 0.87 macro-F1. The weak classes are pore and deposit. So the classifier fundamentally struggles with pore.
+
+Given that many attempts to improve the classifier failed (more data, bigger backbone, higher res, TTA, mixup), the classifier's intrinsic accuracy is capped around 0.87.
+
+So the path to improvement might not be "better classifier" but "better use of the classifier's output" (scoring) or "a fundamentally different method."
+
+Let me reconsider the scoring. e005 and e006 and e011 all tried scoring changes and failed (e011 not confirmed, slightly below).
+
+Hmm. Let me think about what's fundamentally different.
+
+Actually, wait. Let me reconsider the problem from scratch. We're below the one-step baseline (0.6288 < 0.638). The two-stage should be BETTER than one-step if the stage-1 boxes are good (0.755 class-agnostic). The fact that we're below one-step suggests our classification is actively HURTING.
+
+The one-step detector classifies each box it finds. It gets 0.638. Our two-stage classifier gets 0.6288 with BETTER boxes (0.755 vs whatever one-step's boxes are). So our classifier is worse than one-step's implicit classifier.
+
+Why? Because one-step's classifier is trained end-to-end with detection, so it's tuned to the detection task. Our classifier is a separate crop classifier.
+
+OK here's a genuinely different idea. What if we use the detector's confidence differently, or combine it with the classifier in a way that's more robust?
+
+Actually, let me reconsider. Let me look at the actual mechanism of damage again and think about the OPTIMAL scoring.
+
+For class c, we have predictions. The optimal ranking puts true c-boxes first. The score conf*p_c is our proxy. 
+
+The damage to class-c AP = the extent to which non-c predictions (F and A) are ranked above true c-boxes (T).
+
+To minimize damage, we want to push F and A down relative to T.
+
+Now, here's a thought: what if we use a score that's the product of conf AND a strong classifier signal, but we make the classifier signal more extreme?
+
+Alternatively — and this is a genuinely different idea — what if the problem is that we're treating all boxes equally, but we should be using the RELATIVE confidence within the classifier?
+
+Let me think about a concrete alternative scoring: score_c = conf * p_c / sum(p) ... no that's just conf * p_c.
+
+What about: for each box, only emit the top-2 classes (or top-1)? This reduces pollution. A box emits its top-1 class as a strong prediction and maybe top-2 as a weak one. Non-top classes get no row, so they don't pollute.
+
+Wait, but if a box's true class is its top-2 (not top-1), then it's a miss in its true class. Hmm.
+
+Actually, let me reconsider. Currently we emit all 4 classes. The pollution comes from the 3 non-true classes. If we emit only top-1, then:
+- Correct box: emits true class (top-1). Hit in true class. No pollution elsewhere. 
+- Wrong box (classifier says c but true is d): emits c. FP in c. Miss in d. 
+
+So top-1 emission: correct boxes are clean (hit, no pollution), wrong boxes are pure FPs in the wrong class and misses in the true class.
+
+All-4 emission: correct boxes are hits in true class + FPs in 3 other classes. Wrong boxes: hit in true class (d) at conf*p_d (low, since p_d is not top) + FP in c at conf*p_c (high).
+
+So with all-4, a wrong box still gets a hit in its true class (d) but at a LOW score (conf*p_d where p_d is low). This hit is positioned low in the class-d ranking, so it contributes to AP at a low-precision point. And it pollutes class c at a high score.
+
+With top-1, a wrong box gets NO hit in its true class (d). It's a pure miss in d and a pure FP in c.
+
+So which is better? It depends. With all-4, wrong boxes give partial credit (a low-ranked hit in true class) but also high pollution. With top-1, wrong boxes give no credit and lower pollution (only 1 FP instead of 3, but the 1 FP is in the top class which is high).
+
+Hmm, this is getting complicated. Let me think about which is empirically likely better.
+
+Actually, I recall that in object detection, emitting all classes per box is standard (like YOLO does — each box has a class score for all classes, and NMS is per-class). So all-4 is the standard approach.
+
+Let me reconsider. Maybe the issue isn't the emission strategy but the classifier quality for pore specifically.
+
+Let me think about pore. Pore AP 0.496. The classifier confuses pore with what? Probably stain (both are texture-ish) or background. 
+
+Idea: What if we specifically improve pore detection by changing the input for pore? Like, pore is small holes, so a higher resolution or a different crop context might help. But e003 (higher res) failed.
+
+Let me reconsider the whole thing. We've tried:
+- More data (low-res): failed
+- Bigger backbone: failed
+- Higher res: failed
+- Train on detector boxes: failed
+- Score changes (3): failed
+- TTA: failed
+- Mixup: failed
+- Different data (e009): failed
+
+That's a LOT of failures. The classifier is stuck at ~0.87 macro-F1.
+
+What's fundamentally different? Let me think...
+
+Option A: Ensemble of models. Train multiple different models (different architectures, different seeds) and average their probabilities. This could improve the classifier's accuracy beyond 0.87. But it costs time (more training). Within the budget, we could train 2-3 smaller models and ensemble. This is a "method change" not a "knob turn."
+
+Option B: A fundamentally different classifier input. Instead of two crops (tight + wide), use a different representation. E.g., the box crop PLUS the surrounding context at multiple scales, or a feature pyramid.
+
+Option C: Train the classifier to be calibrated / use a different loss. But class-weighted loss hurt (known).
+
+Option D: Use the detector confidence more cleverly. 
+
+Option E: Reconsider — maybe the issue is that we're training on "high" res crops only. e001 tried adding low-res and it failed (0.6246). 
+
+Hmm, let me think about ensembling more. It's a classic way to improve a classifier. We have a time budget of 180s. Currently we train 1 model for ~150s (435 steps). If we train 2 models, each for ~75s, and ensemble their probabilities, we might get a better classifier.
+
+But wait — would ensembling help? The models would be trained on the same data with the same recipe, just different seeds/architectures. If they make correlated errors, ensembling helps little. If they make uncorrelated errors, ensembling helps.
+
+Different architectures (e.g., efficientnet_b0 + resnet50 + convnext) would make less correlated errors. Ensembling 3 different architectures could meaningfully improve macro-F1.
+
+But the time budget: currently 1 model takes ~150s to train 435 steps. If I train 3 models, I need to fit them in ~150s total, so each gets ~50s, ~145 steps. That's less training per model. The ensemble of 3 less-trained models vs 1 well-trained model — which is better?
+
+Hmm, this is a real tradeoff. Ensembling usually helps even with less-trained models because it reduces variance.
+
+Actually, let me reconsider the time budget. 180s total, 55s reserve, so ~125s for training. Wait, the log says "done: 5 epochs, 435 steps, 163s total." And RESERVE_S=55, so t_end = deadline - 55 = 180-55 = 125s. But it ran 163s total? That's over 125. Oh wait, the reserve is for prediction and writing. Let me re-read.
+
+"deadline = T0 + args.seconds" = T0 + 180. "t_end = deadline - RESERVE_S" = T0 + 180 - 55 = T0 + 125. So training should stop at 125s. But the log says total 163s. Hmm, that means training stopped at ~125s (t_end) and then prediction took ~38s (163-125). Wait, but 125 < 163, and the reserve is 55s for prediction+writing. Prediction+writing took 163-125 = 38s, which is within the 55s reserve. OK so it's fine.
+
+Wait, let me recompute. The log: "epoch 4: loss 0.2204, 435 steps, 125s". So at 125s, 435 steps done. Then prediction. "done: ... 163s total". So prediction took 163-125 = 38s. Total 163s < 180s. Good, within budget.
+
+So training budget is ~125s (from T0 to t_end). Prediction ~38s. 
+
+If I ensemble 2 models, I'd train each for ~62s, then predict with both (~76s for prediction). Total ~62+62+76 = 200s > 180s. Over budget!
+
+Hmm. So ensembling 2 models of the same size doesn't fit. Unless I reduce prediction cost.
+
+Actually, prediction is 38s for 1 model over 41879 boxes (2 views each = 83758 crops). For 2 models, prediction is 76s. Training 2 models at 62s each = 124s. Total 124+76 = 200s. Over by 20s.
+
+I could reduce the reserve or the training. But it's tight.
+
+Alternatively, ensemble 1 well-trained model + use a lighter second model. Or train 2 models but with fewer steps each.
+
+Actually, let me reconsider. Maybe ensembling isn't the best use of the budget.
+
+Let me think about what's the highest-leverage change.
+
+The per-class AP: pore 0.496 is the biggest problem. If I could fix pore, the mean would go up a lot.
+
+Pore is a fine-grained texture (small holes). The classifier struggles with it. 
+
+Idea: What if pore is being confused because the crop is too small or the holes are lost in the resize? e003 tried higher IMG_SIZE (224) and it failed (0.6197). So that's not it.
+
+Idea: What if the issue is that pore boxes are small, and the two-crop input (1.5x and 2.5x) doesn't capture enough? Or that pore looks like stain?
+
+Let me reconsider. Actually, maybe I should look at this from the "what does the classifier see" angle. The two-crop input: tight (1.5x) + wide (2.5x). For a pore (small holes), the tight crop shows the holes, the wide crop shows context.
+
+Hmm.Thinking budget reached. Stop thinking now and write the reply in the required format.

@@ -1,0 +1,157 @@
+===== attempt 1 =====
+Let me analyze the current state:
+
+**Current best (e008):** 5-seed val mAP@0.5 = 0.6386, seed std 0.0020
+- Single wide-crop (2.5×) through EfficientNet-B0
+- Trained on GT crops + matched detector boxes (IoU≥0.5)
+- Score = detector conf × class probability
+- Per-class: pore 0.531, deposit 0.632, discontinuity 0.779, stain 0.612
+
+**Key observations:**
+1. The ceiling for stage 2 is 0.758 mAP@0.5 (perfect classes on stage-1 boxes)
+2. The single-class detector scores 0.755, so the class-agnostic detection is nearly perfect
+3. The gap between 0.6386 and 0.758 is mostly about wrong class assignments
+4. Pore (0.531) and stain (0.612) are the weakest classes
+5. Previous experiments:
+   - e001: Background class + detector boxes → 0.5691 (rejected)
+   - e002: Adding matched detector boxes → 0.6293 (new best)
+   - e003: Adding low-res GT crops → 0.6317 (new best)
+   - e004: Squaring probability → 0.6211 (rejected)
+   - e005: Background class (5th) → 0.6039 (rejected)
+   - e006: Focal loss → 0.6123 (rejected)
+   - e007: Mixup → 0.6233 (rejected)
+   - e008: Single crop (halving forward cost) → 0.6386 (new best)
+
+**What's been tried and failed:**
+- Background class (e001, e005) - both hurt
+- Squaring probability (e004) - hurt
+- Focal loss (e006) - hurt
+- Mixup (e007) - hurt
+- Class-weighted loss - hurt (mentioned in background)
+
+**What worked:**
+- Adding matched detector boxes (e002)
+- Adding low-res crops (e003)
+- Single crop to get more training (e008)
+
+**Ideas to try next:**
+
+1. **Better scoring function**: The current score is conf × prob. Since the ceiling is 0.758 and we're at 0.6386, the issue is class assignment. Maybe we should try a different scoring approach. But e004 (squaring) failed. What about using a temperature-scaled softmax or a different combination?
+
+2. **Test-time augmentation (TTA)**: At inference, average predictions from multiple augmented views (flip H, flip V, both). This is cheap and could improve classification accuracy. The model is already trained with flips, so it should generalize. This would cost ~4x inference time but inference is only ~20s (145s total - 125s training = ~20s for eval). Actually looking at the log: 145s total, 125s at end of epoch 1, so eval takes ~20s. With 4 TTA views, it'd be ~80s. But we have 55s reserve... Actually the reserve is for prediction AND writing. Let me recalculate: budget is 180s, reserve is 55s, so training gets 125s. Eval takes about 20s. With 4x TTA it'd be 80s, total would be 125+80=205s > 180s. That's too much.
+
+   But wait - we could reduce the TTA to just 2 views (original + horizontal flip) which would be ~40s for eval, total ~165s. That fits within 180s with a small margin. Or we could reduce the reserve.
+
+   Actually, let me reconsider. The training takes 125s (deadline - 55s reserve). If eval takes 20s normally, with 2 TTA views it'd be 40s, total 165s. That's within 180s. With 4 views it'd be 80s, total 205s - too much.
+
+   Actually, I could reduce RESERVE_S to 35s to give more training time, and use 2 TTA views. Or keep reserve at 55s and use 2 TTA views.
+
+   Wait, let me re-read: "RESERVE_S = 55 # seconds kept free for prediction and writing". So training stops at deadline - 55s. Then prediction + writing must fit in 55s. Currently prediction takes ~20s. With 2 TTA views, ~40s. That fits in 55s.
+
+   TTA hypothesis: Averaging predictions from horizontal flip and original at test time will improve classification accuracy (especially for pore and stain which are weak) without any training cost, since the model was already trained with random flips.
+
+3. **Different architecture**: Try a different backbone. The current one is EfficientNet-B0. Options include convnext_nano, resnet50, etc. But this is a bigger change and might not help if the bottleneck is data, not model capacity.
+
+4. **Higher resolution**: Currently IMG_SIZE=160. The images are high-res. Maybe 224 or 256 would help, but it would slow down training significantly. With single crop, we get ~2.3 epochs. At 224, it'd be slower per step.
+
+5. **Learning rate tuning**: Current LR=1e-3 with AdamW. Maybe a lower LR (5e-4) would help with the limited training.
+
+6. **Using the detector confidence more cleverly in scoring**: The current score is conf × prob. What if we use conf^0.5 × prob or some other combination? But e004 tried squaring prob and it hurt.
+
+7. **Ensemble with a second model**: Train two different models and average their predictions. But this would halve training time per model.
+
+8. **Increasing IMG_SIZE to 224**: More detail for pore/stain discrimination. With single crop, this would slow training. Let's estimate: 224/160 = 1.4, so ~1.96x more FLOPs. Training would get ~1.2 epochs instead of 2.3. Not great.
+
+9. **Using a different scoring: conf × (prob - 0.25)**: Subtracting the uniform baseline (1/4) would make the score more discriminative. But this could make scores negative for low-confidence predictions.
+
+10. **Temperature scaling at inference**: Use softmax with temperature < 1 to sharpen probabilities. This is similar to squaring but softer.
+
+Let me think about what's most likely to help:
+
+The per-class APs are: pore 0.531, deposit 0.632, discontinuity 0.779, stain 0.612. The weak classes are pore and stain. The background says "stain is often confused with deposit and background."
+
+TTA seems like a low-risk, potentially helpful change. It's a well-known technique that typically gives 1-3% improvement in classification accuracy. Since our bottleneck is classification (the detection is nearly perfect at 0.755), improving classification should help.
+
+Let me go with TTA: at inference, average the predictions from the original crop and its horizontal flip. This costs 2x inference time (~40s) but fits within the 55s reserve.
+
+Actually, let me think more carefully. The model was trained with 50% horizontal flip probability. So it should already be somewhat invariant to horizontal flips. TTA with flip would give a small boost.
+
+What about 4-view TTA (original, H flip, V flip, both)? That's 4x inference = ~80s. Too much for the 55s reserve. But I could reduce the reserve to 35s (giving 145s for training) and use 4-view TTA (80s for eval). Total: 145 + 80 + writing time (~5s) = 230s > 180s. Still too much.
+
+Wait, let me recalculate. The total budget is 180s. Loading takes ~17s. Training takes until deadline - reserve. If reserve is 55s, training gets 180-55-17 = 108s? No wait, the code says:
+```
+t_start = time.time()  # this is after loading
+t_end = deadline - RESERVE_S
+budget = max(1.0, t_end - t_start)
+```
+
+So t_start is after loading (17s). deadline = T0 + 180. t_end = T0 + 180 - 55 = T0 + 125. budget = 125 - 17 = 108s? But the log shows training took from 17s to 125s = 108s. Yes, that matches.
+
+Then eval takes from 125s to 145s = 20s. Writing takes a few seconds. Total 145s.
+
+If I use 2-view TTA: eval takes ~40s. Total: 125 + 40 + writing = ~170s. Fits within 180s.
+
+If I use 4-view TTA: eval takes ~80s. Total: 125 + 80 + writing = ~210s. Doesn't fit.
+
+So 2-view TTA (original + H flip) is the safe option.
+
+Actually, I could also reduce the reserve to 40s and use 4-view TTA: training gets 180-40-17 = 123s, eval takes 80s, writing ~5s. Total: 17+123+80+5 = 225s. Still too much.
+
+What about reducing reserve to 30s: training gets 180-30-17 = 133s, eval 80s, writing 5s. Total: 17+133+80+5 = 235s. No.
+
+The issue is that 4-view TTA is too expensive. Let's stick with 2-view TTA.
+
+Actually, wait. Let me reconsider. The eval has 41879 detections. With batch size 256, that's 164 batches. Each batch takes ~20s/164 ≈ 0.12s. With 2 views, it's 328 batches, ~40s. With 4 views, 656 batches, ~80s.
+
+Hmm, but actually the inference might be faster than I think since it's just a forward pass. Let me just go with 2-view TTA (original + horizontal flip) which should be safe.
+
+Let me write the code change:
+
+In the eval section, instead of:
+```python
+for x, _ in dl_ev:
+    x = x.to(device).to(memory_format=torch.channels_last)
+    probs.append(torch.softmax(model(x).float(), 1).cpu())
+```
+
+I'll do:
+```python
+for x, _ in dl_ev:
+    x = x.to(device).to(memory_format=torch.channels_last)
+    with torch.no_grad():
+        p1 = torch.softmax(model(x).float(), 1)
+        p2 = torch.softmax(model(x.flip(-1)).float(), 1)
+    probs.append(((p1 + p2) / 2).cpu())
+```
+
+Wait, but the DataLoader already has `torch.no_grad()` context. Let me check... Yes, the eval loop is:
+```python
+with torch.no_grad(), torch.autocast(**amp):
+    for x, _ in dl_ev:
+```
+
+So I just need to add the flip. The flip is on the spatial dimensions (H, W), which are the last two dims of the tensor (C, H, W). So `x.flip(-1)` flips W (horizontal), and `x.flip(-2)` flips H (vertical).
+
+For 2-view TTA: original + horizontal flip.
+
+Let me write the change:
+
+```python
+    # Classify every eval detection; one prediction per class with score = detector conf x class probability.
+    model.eval()
+    probs = []
+    with torch.no_grad(), torch.autocast(**amp):
+        for x, _ in dl_ev:
+            x = x.to(device).to(memory_format=torch.channels_last)
+            p1 = torch.softmax(model(x).float(), 1)
+            p2 = torch.softmax(model(x.flip(-1)).float(), 1)
+            probs.append(((p1 + p2) / 2).cpu())
+```
+
+This is a minimal, focused change. The hypothesis is that TTA with horizontal flip at inference will improve classification accuracy (especially for pore and stain) by averaging out the model's sensitivity to left-right orientation, which is particularly relevant for asymmetric defect shapes.
+
+Let me also consider: should I use vertical flip instead or in addition? Horizontal flip is more natural for weld beads (which are typically horizontal lines). Vertical flip might be less meaningful. Let's stick with horizontal flip only for the 2-view TTA.
+
+Actually, I realize I should double-check: the crop is a square, so flipping doesn't change the crop geometry, just the content. The model was trained with 50% horizontal flip, so it should be somewhat invariant. TTA would give a small but consistent boost.
+
+Let me finalize my answer.

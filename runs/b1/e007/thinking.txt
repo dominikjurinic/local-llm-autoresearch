@@ -1,0 +1,203 @@
+===== attempt 1 =====
+Let me analyze the situation.
+
+Current best: e002, 5-seed val mAP@0.5 = 0.6337. Per-class: pore 0.515, deposit 0.627, discontinuity 0.781, stain 0.611.
+
+Reference values:
+- One-step 4-class: 0.638 (baseline to beat)
+- Stage-1 boxes with perfect classes: 0.758 (ceiling)
+- Class-agnostic: 0.755
+
+So we're at 0.6337, below the one-step baseline of 0.638. The gap to the ceiling is 0.124, all class-decision error.
+
+History:
+- e001: data (train on detector boxes) — crashed (IoU broadcast bug)
+- e002: fixed the IoU bug → new best 0.6337. This is the current recipe: two-crop classifier (tight 1.5x + wide 2.5x, EfficientNet-B0), trained on GT crops + detector boxes labeled by overlap.
+- e003: architecture (tight crop at 224px) — crashed (NameError)
+- e004: fixed the NameError, tight 224px → 0.6325, rejected (no gain)
+- e005: data (higher-res wide crop? Let me re-read: "the weak classes (pore 0.515, stain 0.611) are the ones whose look depends on surrounding texture that a 160px downscale of a 1.5-2..." — probably rendering crops at higher resolution, e.g. 224 for both views) → 0.6366 seed-0, 5-seed 0.6315, not confirmed (no gain).
+- e006: augmentation (mixup + label smoothing) → 0.6241, rejected.
+
+Lessons:
+- data: 3 ideas, 2 executed, 1 new best, 1 close but not confirmed, 1 crashed.
+- architecture: 2 ideas, 1 executed, 0 new best, 1 crashed.
+- augmentation: 1 idea, 1 executed, rejected.
+
+What has been learned:
+1. Training on detector boxes (labeled by overlap) was the winning move (e002).
+2. Higher resolution (224 tight, 224 both) didn't help — e004, e005 both no gain. So resolution is exhausted.
+3. Mixup + label smoothing hurt (e006).
+4. Class-weighted loss hurt in the past (mentioned in "known" section).
+
+Where is the error? The gap to the ceiling is entirely class-decision error. Per-class AP: pore 0.515, stain 0.611, deposit 0.627 are weak; discontinuity 0.781 is good.
+
+Ideas not yet tried:
+1. **Scoring/ranking**: currently score = det conf × class prob. The metric only depends on the per-class ordering of predictions. The det conf is fixed across all classes for a given box, so multiplying by class prob is a per-class monotone transform... wait, no. For a given class c, the score of box i is conf_i * p_c(i). The ordering within class c is determined by conf_i * p_c(i). The det conf matters because boxes with low conf (likely false alarms) get downweighted. Hmm, but actually the ordering within class c is determined by the product. If we used just p_c(i), the ordering would change: boxes with high p_c but low conf would rank higher. Which is better? False alarms (boxes not overlapping any GT) tend to have lower det conf. True boxes have higher conf. So multiplying by conf pushes false alarms down in every class, which is good for AP. That's already in the recipe.
+
+Alternative: use a calibration of p_c — but a monotone transform per class doesn't change AP. The product with conf is not a monotone transform per class, so it does change the ordering.
+
+2. **Multiple rows per box**: we can output multiple rows per box with different classes. Currently we output one row per class (4 rows per box). That's already allowed and done.
+
+3. **Better use of the wide crop / different context**: try different context ratios? E.g. 1.2x and 3x? This is more of an architecture/data change. Hmm.
+
+4. **Train longer / better optimization**: currently ~424 steps in ~110s of training. The training set is 18271 boxes. 285 steps/epoch at batch 64 = 18240/64 ≈ 285. So 1 epoch = 285 steps. We get ~1.5 epochs total. LR 1e-3 AdamW with cosine from 5% warmup. Loss at end of epoch 1 is 0.2468 — still dropping fast. Maybe the model is undertrained? But e005 (higher res) had similar step count. Increasing training time: reduce RESERVE_S? The prediction pass takes ~35s (162 total, 125 at end of epoch... actually 125s at end of epoch 1, then prediction+write ~37s). Reserve is 55s. If prediction takes ~40s, we could lower reserve to ~45s to gain ~10s of training. That's a small gain, probably < 0.003.
+
+5. **Bigger model**: resnet50 or efficientnet_b2 or convnext. Bigger model = slower steps. EfficientNet-B0 at 160px with batch 64: 285 steps in ~57s (97-14=... hmm, epoch 0 ends at 97s including 14s load, so ~83s for 285 steps ≈ 0.29s/step). Wait, epoch 0: 97s total includes 14s load, so ~83s for 285 steps ≈ 0.29s/step. Epoch 1: 424-285=139 steps in 28s ≈ 0.20s/step. Total training budget ~110s → ~424 steps.
+
+A bigger model like resnet50 at 160px would be maybe 2-3x slower → ~150-200 steps. Probably not worth it. EfficientNet-B2 at 160 might be ~2x slower. Hmm.
+
+Actually, what about **training with more data / using "low" resolution crops too**? TRAIN_ON = ("high",). The crops.csv has "high" and "low" resolutions. Currently we only train on high-res crops. Adding low-res crops would double the training data (roughly). But low-res images are blurrier; the eval images — which resolution are they? The eval dets come from dets.csv with images in images/. The eval images are probably high-res (the paper's 0.69 is on high-res). Hmm, actually the reference value "one-step 4-class detector: 0.638" — the paper reports 0.69 on high-res. The val here is 0.638, so the val images might be a mix or lower quality.
+
+Wait — actually, adding low-res crops as training data: if eval images are high-res, low-res crops might not help or could hurt. But if eval is mixed, it could help. Risky, unknown.
+
+6. **Ensemble of two models**: train two different models (e.g. EfficientNet-B0 + ResNet18, or two seeds) and average their probabilities. This changes the class decision. Time budget: each model ~110s of training. Two models sequentially = 220s > budget. But we could train two smaller models each for 55s, or train one model for the full budget and... no, we can't save the model across runs.
+
+Alternative: train one model with a smaller batch for more steps? Batch 64 → 32: 2x steps but ~2x time per step (roughly, maybe 1.5x). Net: ~1.3x steps. Marginal.
+
+7. **Test-time augmentation**: flip both views at test time and average. The model was trained with flips, so TTA flips should be consistent. Cost: 2x forward passes at eval = ~+20s. Within reserve (55s, prediction currently ~37s → ~57s... hmm, that exceeds the reserve). Let me compute: total 162s, end of training at 125s, so prediction+write = 37s. Reserve 55s. TTA 2x → prediction ~70s, total ~195s > 180s. Too slow unless we cut training. We could lower RESERVE_S to 40 and do TTA: training ends at 140s, prediction 70s → 210s. No good.
+
+Actually wait, TTA with 2 flips (h, v) = 4x forward = 148s. No good. Single flip (horizontal only) = 2x = 74s. Total = 125 + 74 = 199 > 180. Hmm, if we cut training a bit: RESERVE_S = 60 → training ends at 120s, prediction 74s → 194s. Still over. We'd need to cut training by ~15s: RESERVE_S = 75. Then training ~100s (340 steps), prediction 74s → 174s. Fits with small margin. But is TTA worth losing 20 steps of training? TTA usually gives a small gain on classification (0.5-1% accuracy). Maybe 0.003-0.005 mAP. Borderline.
+
+8. **Better scoring: use both views' max or product?** Currently logits are averaged, then softmax. Alternative: score = p_tight * p_wide? Or max? Hmm, this changes the per-class ordering (not a monotone transform of the current score). For a class c, current score ∝ (p_t_c + p_w_c)/2 * conf. Alternative: p_t_c * p_w_c * conf. The product downweights boxes where one view is uncertain. This could improve ranking of false alarms vs true. But it's a subtle change, effect size uncertain.
+
+9. **The big one: false alarms.** The class-agnostic score is 0.755, the ceiling is 0.758. So the detector boxes are nearly perfect for detection; the 0.755→0.758 gap is only 0.003. Our 0.634 is 0.124 below the ceiling. So essentially all the error is wrong class assignment. Per-class AP: pore 0.515 vs ceiling... what's the per-class ceiling? Not given, but the macro ceiling is 0.758.
+
+The weak classes are pore (0.515) and stain (0.611). Pore and deposit are the weak classes; stain is often confused with deposit (from known info).
+
+10. **Use the detector conf as a feature for classification?** The conf might correlate with class (e.g., pores are detected with lower conf). Adding conf as an input feature to the classifier... that's a small architectural change. Hmm.
+
+11. **Train a second classifier on different crops and combine**: e.g., the current two-crop model + a model trained on just the tight crop... but time budget.
+
+12. **Label smoothing / mixup hurt. Class weighting hurt.**
+
+13. **Different backbone**: regnety_016, resnet26d, convnext_nano... convnext_atto/pico are tiny and fast. What about training two models in the budget: e.g., EfficientNet-B0 for 60s + ResNet18 for 50s, average probabilities? Each model alone is ~0.634; ensemble of two different models might give 0.64-0.645? Ensemble gains on classification are typically 1-2% accuracy → maybe 0.005-0.01 mAP. But each model is undertrained (half the steps). Hmm.
+
+Actually, let me reconsider. What's the most promising untried direction?
+
+Let me think about the error more carefully. The classifier's macro-F1 with perfect boxes is ~0.87 (starting recipe). With detector boxes it's probably a bit lower. 0.87 macro-F1 → ~13% of boxes get the wrong class. That's roughly consistent with the 0.124 gap.
+
+To reduce class error:
+- Better features (resolution tried, no gain; bigger model untried; ensemble untried)
+- Better training data (detector boxes tried; low-res untried)
+- Better loss (weighting tried and hurt; mixup/label smoothing tried and hurt)
+- Better inference (TTA untried; scoring tweaks untried)
+
+Wait, actually — what about **training on both high and low res**? Let me think about what "low" means. The dataset has two resolutions per image probably. If the eval images are the high-res ones (the paper's main result is on high-res), then low-res crops are a different domain. But the val mAP here (0.638 for the one-step) is lower than the paper's 0.69, suggesting the val set might include low-res or be harder. Hmm, actually the paper's 0.69 might be on a different split.
+
+Hmm, I can't be sure. Let me look at the data: "crops.csv labelled training boxes: id, res ("high"/"low"), image, ...". The eval images in dets.csv — their resolution is unknown. The images/ folder contains all images.
+
+Actually, I can check the image sizes! The dets.csv has img_w, img_h for eval boxes. The crops.csv has res. I could compare: if the eval images' dimensions match the "high" res crops' dimensions, then eval is high-res. But I can't run code to check — I can only propose edits. I could add a print statement... that wastes a run on diagnostics. Hmm, actually I could include a diagnostic print in an experiment run; the log shows prints. But that's a waste of a run.
+
+Alternatively, **just add low-res crops to training** and see. If eval is high-res only, low-res crops are a domain mismatch but still provide class information (defect appearance at low res). It might help generalization or hurt. Risky.
+
+Let me think about **scoring** more. The metric: per class, sort by score, a hit is IoU>0.5 with an unmatched GT of that class.
+
+Current score: conf * p_c. Consider a false-alarm box (no GT nearby) with high p_c (the classifier is confident it's class c). It competes with true class-c boxes. Its rank is determined by conf * p_c. False alarms tend to have lower conf (the detector's conf is lower for FPs). So conf helps push them down.
+
+But here's a subtlety: for a box that overlaps a GT of class a but is predicted as class c ≠ a (wrong class), it's a false positive for class c. Its score conf * p_c competes with true class-c boxes.
+
+The key question for AP: within each class, do true boxes rank above false boxes?
+
+One idea: **calibrate p_c with the prior of conf**. E.g., use a logistic regression mapping (conf, p_c) → P(true class c | box). But that's complex.
+
+Simpler: **score = conf^α * p_c** with α > 1? Higher α pushes low-conf boxes down harder. If FPs have systematically lower conf, α > 1 helps. If conf is uninformative about class correctness given p_c, it doesn't matter. This is a cheap experiment (no retraining? no — the model is trained in the same run; we can change the scoring formula in the same run). Actually yes! We can change the scoring formula without changing training. One run, quick to test. But effect size: uncertain, maybe 0.002-0.005.
+
+Hmm wait, actually there's a more principled scoring idea. The expected score for a box to be a true class-c detection is P(class c | box) × P(box is true). P(box is true) correlates with conf. So score = p_c × f(conf) is already the form. The question is the shape of f. Currently f = identity.
+
+Alternatively, we could estimate f empirically on the train split! We have train dets with conf and labels (by overlap). We can compute, for each class c and conf bin, the fraction of boxes that are true class c. Then use that as a lookup: score = empirical P(true class c | conf bin) × p_c? Hmm, but p_c already encodes class info; the empirical rate encodes both class and conf. Actually a cleaner approach: **score = empirical P(class c & true | conf bin)** — i.e., use the train split to build a joint model of (conf, p_c) → hit rate. But this is getting complex.
+
+Let me step back and think about what's likely to give ≥0.01.
+
+The biggest lever is probably **improving the classifier's accuracy on the weak classes (pore, stain)**. Ideas:
+- Bigger model (untried): resnet50 or efficientnet_b2. But slower → fewer steps. At 160px, resnet50 is maybe 2-3x slower than effnet-b0? Then ~150-200 steps. Undertrained. Probably net negative or neutral.
+- Ensemble (untried): two models, each half the time. Each undertrained. Probably net neutral.
+- **Use low-res crops as additional training data** (untried): doubles data, cheap (same model speed). If eval includes low-res, direct gain. If not, maybe small gain from data diversity or small loss.
+- **TTA** (untried): small gain, costs training time.
+- **Different crop contexts** (partially tried via resolution): e.g., 3 views (1.2x, 2x, 3.5x)? More forward passes at train and test. Test: 3 views = 1.5x current test cost. Hmm.
+
+Actually wait. Let me reconsider the problem. "Pore and deposit are the weak classes; stain is often confused with deposit." And per-class AP: pore 0.515, deposit 0.627, stain 0.611, discontinuity 0.781.
+
+Pores are tiny dark holes. In a 1.5x crop downscaled to 160px, a pore might be a few pixels. Higher res didn't help (e004, e005). Interesting — that suggests the bottleneck isn't resolution. Maybe the bottleneck is that pores look like noise/artifacts in the wide crop, or the training labels for pores are noisy (pore GT boxes might be unreliable).
+
+Hmm, what about **class imbalance**? How many pores vs deposits vs stains? If pores are rare, the classifier under-predicts them, and their AP suffers. Class weighting "hurt classification every time it was tried" — but that was on the classification metric (F1), maybe not mAP. Hmm, but it says it hurt every time, so let's not retry.
+
+What about **focal loss**? Not tried (weighting and mixup/label smoothing tried). Focal loss downweights easy examples, focuses on hard ones. Could help with the weak classes without explicit weights. Effect uncertain, maybe 0.003-0.008.
+
+Let me think about **data** again. e002's win was training on detector boxes (12219 of 18271). The other 6052 are GT crops. What about training on **both high and low res detector boxes**? The low-res detector boxes — wait, are there detector boxes on low-res images? dets.csv has train/eval splits. The train dets are on training images. If training images exist in both high and low res, there might be train dets on low-res images. The current code includes all train dets (regardless of res) in the training set! Let me re-read:
+
+```python
+crops = [r for r in read_csv(...) if r["res"] in TRAIN_ON]  # high-res GT crops only
+...
+crops = crops + [d for d in det_by_img.values() for d in d if "cls" in d]  # all labeled train dets
+```
+
+So detector boxes from both high and low res images are already included (if they exist). Only the GT crops are filtered to high. OK.
+
+So the training set already includes low-res detector boxes. Adding low-res GT crops would be a small addition.
+
+Hmm, what about **the eval images' resolution**? If eval images are low-res, then the current model (trained mostly on high-res GT crops + mixed detector boxes) is slightly mismatched. But e005 (higher res crops) didn't help, which is consistent with eval being high-res... or with resolution not mattering.
+
+Let me think about **inference/scoring** ideas more, since they're cheap to test in one run:
+
+Idea A: **score = conf * p_c / (sum of p over classes)** — no, that's just conf * p_c since p sums to 1.
+
+Idea B: **Drop the conf multiplication for ranking?** No, conf is important for suppressing FPs.
+
+Idea C: **Use the tight crop probability for ranking, wide for...** no.
+
+Idea D: **Empirical conf calibration**: on the train split, for each class c, compute the hit rate as a function of conf (e.g., 10 bins): r_c(b) = P(box in conf bin b is a true class-c box). Then score = r_c(bin(conf)) * p_c? Or just score = r_c(bin) (ignoring p_c)? Hmm. Actually, the cleanest is: the score should estimate P(prediction is a hit) = P(true box) × P(correct class | true box) × ... For a box with class prediction c: P(hit for class c) ≈ P(box overlaps GT of class c). We can estimate this directly on the train split as a function of (conf bin, p_c bin)! Build a 2D lookup: for each (conf bin, p_c bin), the fraction of train boxes that are true class c. Then score = that fraction. This is a proper scoring function that accounts for both the detector's reliability and the classifier's reliability.
+
+But is this likely to gain ≥0.01? The current score conf * p_c is already a reasonable estimate of P(hit). The lookup would correct miscalibrations. E.g., if the classifier is overconfident on FPs (p_c high but the box is false), the lookup fixes it. If conf is miscalibrated, the lookup fixes it. This could plausibly gain 0.005-0.015. And it's cheap (no retraining change, same model).
+
+Hmm wait, but there's a subtlety: the train split's hit rate depends on the train image distribution, which should match eval. OK.
+
+Actually, let me reconsider. There's an even simpler and more powerful idea I haven't considered: **the ordering within a class only matters, and conf is a fixed multiplier per box... no wait, conf varies per box.**
+
+Let me think about what dominates the AP loss. For class c, AP is computed over all class-c predictions (true + false). The false ones include: (a) detector FPs (no GT nearby) predicted as c, (b) true boxes of other classes predicted as c. The true ones: true class-c boxes predicted as c.
+
+AP@0.5 for class c ≈ how well the true class-c boxes are ranked above the false c predictions.
+
+The 0.755 class-agnostic number tells us: if we output every box as one class "defect" with score conf, AP = 0.755 (single class). So the detection ranking (conf) is good. When we split into 4 classes, each class's ranking is conf * p_c.
+
+For a true class-c box: p_c is usually high (classifier is right) → score ≈ conf. For a false box predicted as c: p_c is whatever the classifier says. If the classifier is confident (p_c high) on a false box, it ranks high and hurts AP.
+
+So the key: **the classifier's confidence on false boxes**. If the classifier outputs high p_c on detector FPs, those FPs rank high in class c and hurt AP. The conf multiplier helps only if FPs have lower conf.
+
+Do detector FPs have lower conf? Usually yes, that's how detectors work. But the class-agnostic AP of 0.755 vs ceiling 0.758 shows conf ranking is nearly perfect at the detection level.
+
+Hmm OK. So the loss is: true class-c boxes are sometimes predicted with low p_c (missed in ranking, or predicted as another class → they become FPs in another class and the true box is unmatched → both a miss and an FP).
+
+So improving classifier accuracy directly improves AP. The resolution experiments failed. What else improves accuracy?
+
+**Ensemble** is the classic way to boost accuracy without changing data/loss. Two models: EfficientNet-B0 (current) + a second backbone (e.g., resnet18 or regnety_016 or convnext_nano), each trained for half the time, average probabilities. Each model alone is undertrained (half the steps), but ensembles of undertrained diverse models can still beat a single well-trained model. Typically, ensembling two models each at 80% of the data/time gives ~1-2% accuracy gain over the best single.
+
+Time budget: currently training ~110s for 424 steps (effnet-b0). If we train effnet-b0 for 55s (~210 steps) + resnet18 for 55s (~? steps; resnet18 at 160px is comparable speed to effnet-b0, maybe slightly faster), total ~110s. Test: 2 models × 2 views = 4 forwards per box vs 2 currently → test time doubles: 37s → ~74s. Total: 14 (load) + 110 (train) + 74 (test) = 198s > 180s. Over budget!
+
+Hmm. We'd need to cut: reserve 55s, so training must end by 125s. Load 14s → training 111s. Test 74s → total 199s. Over.
+
+Options: reduce test batch views? Or use a lighter second model (convnext_atto/pico — very fast). convnext_atto is tiny: maybe 5x faster than effnet-b0. Then: effnet-b0 for 70s + convnext_atto for 40s (many steps), test: effnet 2 views (37s) + convnext_atto 2 views (~8s) = 45s. Total: 14 + 110 + 45 = 169s. Fits!
+
+But will convnext_atto (a tiny model) add value to the ensemble? It's a weak model; averaging with a strong one might dilute. Hmm.
+
+Alternative: **two seeds of the same model** (self-ensemble): train effnet-b0 seed A for 55s, then seed B for 55s, average. Same test cost issue: 2 models × 2 views = 4 forwards. Same as above: 74s test. Over budget unless we cut training to 90s: 14 + 90 + 74 = 178s. Just fits, no margin. Risky.
+
+Hmm, what about **1 view per model instead of 2**? I.e., model A on tight crop, model B on wide crop, each 1 view. Then test = 2 forwards (same as current). Train: each model sees 1 view. But the current 2-view averaging is part of what makes the recipe work... actually, is it? The "starting recipe (two-crop input)" achieves macro-F1 ~0.87. We don't know the 1-view F1.
+
+This is getting complicated. Let me think about simpler, higher-expected-value moves.
+
+**Reconsider: what about using the low-res images for eval?** No, eval is fixed.
+
+**What about training on more epochs by reducing batch size?** Batch 64 → 32: steps double (570/epoch), time per step ~1.3x (not 2x due to GPU utilization). Net ~1.5x steps in the same time. More steps at the same LR schedule... the schedule is time-based (cosine over the budget), not step-based, so more steps = smaller effective LR per step? No — the LR is set by time fraction, so at any given time the LR is the same; more steps at the same LR = more progress. This could be a real gain: ~1.5x steps. But batch 32 with AdamW... the effective batch changes, and the LR might need to be lower. Risky tuning. And the gain is probably small (0.002-0.005).
+
+**What about freezing the backbone and training only the head longer?** No, fine-tuning is better.
+
+**What about a stronger augmentation that targets the weak classes?** e006 (mixup + label smoothing) hurt. Color jitter? Random erasing? CutMix? These are all "augmentation" category, one attempt, rejected. The lesson says augmentation: 1 idea, rejected. Not exhausted (needs 3+ attempts). But mixup hurt... color jitter is different from mixup. Hmm.
+
+Actually, let me reconsider the **scoring** idea (empirical calibration). It's in the "scoring" category, which has 0 attempts. It directly targets the ranking of FPs vs TPs, which is exactly the AP mechanism. And it's cheap: same model, same training, just a different scoring formula computed from the train split.
+
+Let me design it concretely:
+1. After training, run the classifier on the **train** dets (the 12219 labeled ones + maybe more). We have their conf and (from overlap) their true class, and whether they're true (IoU>0.5 with a GT) — actually the label assignment already requires IoU>0.5, so all labeled train dets are "true" boxes with a class. Unlabeled train dets are FPs (or boxes that don't overlap any GT).
+
+Wait, actually the train dets include FPs (detector boxes that don't overlap any GT crop). Those are unlabeled (no "cls"). So on the train split we have:
+- True boxes: conf, true class, model's p_c
+-Thinking budget reached. Stop thinking now and write the reply in the required format.

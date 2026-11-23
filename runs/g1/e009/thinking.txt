@@ -1,0 +1,226 @@
+===== attempt 1 =====
+Let me organize the situation.
+
+Current best: e005, 5-seed average 0.6345. This replaced logit averaging with a small MLP on the concatenated backbone features.
+
+History:
+- e001: crashed (IoU bug in detector-box training data)
+- e002: fixed the crash, 0.6330 seed 0, 0.6307 over 5 seeds — not confirmed
+- e003: stage-1 error simulation (random shift/scale) — 0.6342 seed 0, 0.6294 over 5 seeds — not confirmed
+- e004: precomputing crops — 0.0531, bug
+- e005: MLP head on concatenated features — 0.6426 seed 0, 0.6345 over 5 seeds — new best
+- e006: widened the head — rejected
+- e007: box size/aspect-ratio scalar inputs — 0.6337 seed 0, 0.6317 over 5 seeds — not confirmed
+- e008: random zoom views — crashed (TIGHT_CONTEXT undefined)
+
+Diagnostics:
+- Confusion: pore is the weak class (62% correct), 21 out of 75 true pores are misclassified as stain, 5 as deposit. Stain: 41 out of 609 misclassified as deposit. Deposit: 48 out of 270 misclassified as stain.
+- "mAP@0.5 if all boxes had the correct class but kept my scores: 0.7464 (mine: 0.6345)". So the cost of wrong classes is 0.1119! That's huge. Wait, that's a big number. The gap between 0.6345 and 0.7464 is the cost of wrong classes. The remaining gap to the perfect-class ceiling 0.758 is the cost of scores relative to detector conf.
+
+Hmm, wait, but the confusion matrix says 62%/80%/96%/90% correct on boxes that overlap. The weighted mean is roughly (0.62*75 + 0.8*270 + 0.96*448 + 0.9*609)/1402 ≈ (46.5+216+430+548)/1402 ≈ 0.81. So 81% of overlapping boxes get the correct class. But the cost in mAP is 0.112? That seems too big for 19% errors... Actually, mAP@0.5 with wrong classes: a wrong-class prediction on a true box becomes a false positive for the wrong class and a miss for the true class. If it's a top-scored prediction, it hurts both. So 19% of ~1400 boxes ≈ 270 wrong-class predictions, each hurting two class APs. That's plausible.
+
+So the biggest lever is the class decision on detector boxes. The guide says: treat it as a train/test mismatch problem. Directions:
+1. Simulate detector error on true boxes during training (random shift/scale covering IoU 0.5–1.0). e003 tried this: "per training box, one shared center shift (magnitude uniform 0–0.3 box ...)" — 5-seed 0.6294, not confirmed. Hmm, that was one variant. The guide says "two failed variants of a direction: move to the next direction." e003 is one variant of box-error simulation. But it wasn't confirmed (0.6294 < 0.6345). Actually wait — e003's base was e000 (the original starting point), not e005. So it was tested on the old architecture. Hmm.
+
+2. Weight/sample training boxes by box quality.
+3. Combine the two views better (e005 already did the shared-head MLP; e006 tried widening it — rejected).
+
+4. Buy training steps: e004 crashed with a bug (0.0531). Precomputing crops is a good idea for speed. The log shows epoch 0: 94 steps in 44 seconds (from 13s to 57s), later epochs ~18s for ~94 steps. So the first epoch is slow due to DataLoader warmup/persistent workers. In fact, with persistent_workers=True and 8 workers, the first epoch still takes 44s vs 18s. Precomputing crops once at load time would eliminate per-step PIL work. 6052 boxes × 2 views × 160×160×3 uint8 = 6052*2*76800 = ~931 MB. That's fine for memory. Then the DataLoader just does normalization... Actually, if we precompute uint8 crops, we can skip PIL entirely in the worker. But e004 crashed with a bug (score 0.0531 — "suspicious (likely a bug)"). The bug is unknown. Probably the precomputed crops were normalized wrong, or the augmentation got broken. I need to be careful.
+
+Actually, let me think about what the biggest lever is.
+
+Key diagnostic: "mAP@0.5 if all boxes had the correct class but kept my scores: 0.7464 (mine: 0.6345)". So wrong classes cost 0.112. That's the dominant term. The remaining gap to the perfect-class ceiling 0.758 is the cost of scores relative to detector conf (0.0116).
+
+So I should focus on improving the class decision. The confusion matrix shows:
+- Pore: 62% correct; main confusion is pore→stain (21/75 = 28%).
+- Stain: 90% correct; main confusion is stain→deposit (41/609 = 6.7%).
+- Deposit: 80% correct; deposit→stain (48/270 = 18%).
+
+Pore is the weakest class (AP 0.505). The guide says "look for one change that helps the whole pore/deposit/stain confusion, not a single class."
+
+What fundamentally distinguishes pore from stain/deposit? Pores are small dark holes; stains are surface discolorations; deposits are extra material. Texture and shape matter. The current model sees a 160×160 crop.
+
+Ideas not yet tried:
+1. **Precompute training crops** (speed) — e004 crashed with a bug. Retrying with careful implementation is legitimate ("if a run crashed... read the log and fix the cause"). The lesson says "do not repeat without fixing the cause." The cause of the e004 bug is unknown — the log only says score 0.0531, suspicious. I don't have the actual e004 diff. Risky.
+
+2. **Train on detector boxes from the train split** — e002 got 0.6307 over 5 seeds, not confirmed (worse than 0.6345). The guide said "if it fails twice, drop it." It failed once (e002, not confirmed; e001 crashed). Hmm, "if confirmed, build on it; if it fails twice, drop it." e002 is one substantive failure. But e002's base was e000, not e005. So it hasn't been tested on top of e005. Still, the effect is small (+0.004 in past runs).
+
+3. **Random zoom (e008)** — crashed due to a bug (TIGHT_CONTEXT undefined in __getitem__). The idea itself: per-sample random tight zoom 1.0–1.8 and wide zoom 2.0–4.0. This is box-quality simulation via zoom. e003 tried center-shift simulation (0.6294, not confirmed). e008 crashed and never ran. Should I fix e008? The guide's direction #2: "simulate detector error on true boxes during training: random shifts and scale changes so the IoU between the jittered box and the true box covers the range the detector produces (roughly 0.5–1.0), not the current small crop jitter." e003 did shift (0–0.3 box) — not confirmed. e008 does random zoom — crashed. Two variants of "simulate detector error": e003 (shift) not confirmed, e008 (zoom) crashed. Hmm, the rule says "two failed variants of a direction: move to the next direction." A crash isn't a failed variant of the idea; it's a bug. The idea has only been substantively tested once (e003, not confirmed — actually worse: 0.6294 vs 0.6345, but e003's base was e000, which is 0.629–0.630; so e003's 0.6294 is roughly on par with the e000 baseline, meaning no gain).
+
+So box-error simulation: one substantive test, no gain.
+
+4. **Weight/sample training boxes by box quality** — not tried.
+
+5. **Better view combination** — e005 (MLP head) worked; e006 (wider MLP) rejected.
+
+6. **Buy training steps** — the log shows 436 steps over ~125s of training. Step time ~0.29s. If we can halve data loading, we get ~2x more steps. e004 crashed.
+
+7. **Higher resolution** — the "resolution" family was tried in past runs (9 attempts, no gain, best 0.634 not confirmed). Exhausted.
+
+8. **Backbone** — tried, no gain. Exhausted.
+
+9. **TTA** — tried, no gain. Exhausted.
+
+10. **Score rows** — tried 16 times, no gain. Exhausted.
+
+11. **Background class** — tried 9 times, no gain. Exhausted.
+
+12. **Augmentation** — tried, no gain.
+
+13. **Loss** — focal, class weights, no gain.
+
+14. **Box size/aspect inputs** — e007 not confirmed (0.6317). Past runs: 4 attempts, never properly tested. Hmm, "never properly tested: 2 crashes, 1 edit failure, 1 run at 0.629." So this family has had many attempts. e007 was 0.6317 over 5 seeds. Not confirmed. Probably exhausted.
+
+So what's left?
+
+The guide's plan:
+1. Consolidate: detector-box training data (e002, one failure).
+2. Close the box-quality gap: simulate detector error (e003 one failure, e008 crashed), weight/sample by box quality (untried), combine views better (e005 done, e006 failed).
+3. Buy training steps (e004 crashed, cause unknown).
+4. Fine-grained classes after 2 and 3.
+
+Hmm. Let me think about what's most promising and untried.
+
+Actually, wait. Let me reconsider the diagnostic more carefully. The confusion matrix is about "the class chosen on detector boxes that overlap a true defect." 81% correct. But the mAP cost of wrong classes is 0.112. Why so large? Because mAP@0.5 is sensitive: a wrong-class prediction on a true box is a false positive for the wrong class (hurting that class's precision) and a miss for the true class (hurting recall). Also, false alarms (boxes that don't overlap any true defect) with high conf and high class probability are false positives.
+
+Hmm, actually, wait. Let me reconsider: "mAP@0.5 if all boxes had the correct class but kept my scores: 0.7464." If all boxes had the correct class — including false alarms? Then false alarms would be class 0 (pore)? The perfect-class ceiling (0.758) keeps false alarms as class 0 with detector conf as score. In the 0.7464 scenario, "all boxes have the correct class but keep my scores" — my scores are conf × p. Hmm, if a false-alarm box's "correct class" is... it has no true box, so probably class 0. Anyway, the point is: wrong classes cost 0.112, score ranking costs 0.012 (0.758 - 0.7464).
+
+So the class decision is the dominant error. The model is 81% accurate on overlapping boxes, but that costs 0.112 mAP. To get a big gain, I need to substantially improve the class decision, especially for pore (62%).
+
+What would improve pore classification? Pores are small dark holes. In a 1.5× tight crop, a pore fills a small fraction. Stains are dark surface marks. Deposits are bright/irregular extra material.
+
+Ideas:
+- **More views / different scales**: the "third very wide view" family was tried in past runs (accepted twice, +0.005, mostly pore). But that was in past runs on the old architecture, and adds ~20s. Hmm, the guide says don't spend on families listed as "no gain" — the third view was actually accepted twice (0.6342 both times). But it's close to the time limit. On e005's architecture with a shared head, adding a third view means a 3×2560 concat. Could try, but time budget: e005 runs in 162s total, reserve 55s. Adding a third view adds ~20–30s of prediction + training time. Risky.
+
+- **Higher resolution**: exhausted in past runs.
+
+- **Train on detector boxes from the train split**: e002 not confirmed. The guide says consolidate this first. But it failed once substantively (0.6307 < 0.6345). Actually wait — e002's base was e000 (0.629–0.630). e002 got 0.6307 over 5 seeds. So +0.001 over its base. Small. Past runs got +0.004 twice. Hmm.
+
+Let me think about what's fundamentally different and untried.
+
+**Key insight from the diagnostic**: pore is the weak class, and pore→stain confusion is the biggest single confusion cell (21). Stain→deposit (41) is the biggest in absolute count. Deposit→stain (48).
+
+Actually, let me reconsider. The guide says: "use the confusion matrix in the diagnostics. Look for one change that helps the whole pore/deposit/stain confusion, not a single class."
+
+What do pore, stain, and deposit share? They're all dark-ish surface anomalies. Distinguishing them requires fine texture and shape.
+
+**Idea: multi-crop with more scale diversity at inference** — TTA family, exhausted.
+
+**Idea: train the model to be robust to box placement by sampling training boxes from detector boxes** — e002, one failure.
+
+**Idea: increase training steps by precomputing crops** — e004 crashed.
+
+Hmm, let me think about the time budget more. Current: 13s load, 125s training (436 steps), 24s prediction (162-13-125=24). Reserve 55s. Total 162s < 180s.
+
+Actually, the reserve is 55s but actual prediction+write is ~24s. So we have ~31s of slack. We could lower the reserve to ~35s and gain 20s of training (~70 steps). That's a "buy training steps" move. But is the model undertrained? Loss is still dropping: epoch 4 loss 0.1689. 436 steps. More steps would probably help.
+
+But wait — the guide says "every second of training gained is a free improvement." And e004 (precomputing crops) crashed. A simpler way to buy steps: lower RESERVE_S from 55 to 35. That's a one-line change, low crash risk. Let me estimate: 20s more training ≈ 70 more steps. Would that gain 0.01+? Hard to say. The model's loss is still dropping. But is the bottleneck data loading or GPU? Epoch 0: 94 steps in 44s (0.47s/step). Epochs 1–4: ~94 steps in ~18s (0.19s/step). So the steady-state step time is 0.19s. If data loading is the bottleneck, precomputing crops would help; if GPU-bound, it wouldn't. The drop from 0.47 to 0.19 suggests worker warmup, not a fundamental bottleneck. Actually, with persistent_workers=True, workers persist across epochs, so the first epoch includes worker startup + image decoding? No, images are preloaded into memory. The first epoch's slowness is probably worker process startup and CUDA warmup.
+
+Hmm, actually, the per-step work: 2 views × 160×160 crop extraction from a large image + PIL resize to 160×160 + normalization. That's non-trivial CPU work. With 8 workers and batch 64, each worker handles 8 samples × 2 views. Could be CPU-bound.
+
+Let me think about the most promising untried idea.
+
+**Option A: Precompute training crops (fix e004).** If data loading is the bottleneck, this buys many steps. But e004 crashed with an unknown bug, and I don't have its diff. I'd be reimplementing from scratch. Risk: another bug. But it's a well-defined change. The "optimisation" category has 1 idea, 0 new best, 1 bug. Not exhausted (need 3+).
+
+**Option B: Lower the reserve to buy steps.** One line, low risk. But the gain is uncertain and might be small.
+
+**Option C: Train on detector boxes from the train split (consolidation, guide step 1).** e002 failed once. The guide says to do this first. But it's a small gain (+0.004) and already failed once on the old base.
+
+**Option D: Random zoom (fix e008).** e008 crashed due to a bug. The idea is box-quality simulation via zoom. But e003 (shift simulation) was not confirmed. So this direction has one substantive failure + one crash. Fixing e008 would be the second variant. If it fails, the direction is exhausted.
+
+**Option E: Something fundamentally new for the pore/stain/deposit confusion.**
+
+Let me think harder about Option E. What's untried and could help the class decision broadly?
+
+The model sees two crops (1.5× and 2.5×) resized to 160×160. The tight crop at 1.5× of the box's long side: for a pore (small box), the crop is small and the pore is a small dark dot. For a stain (larger box), the crop shows the stain.
+
+**Idea: add a third, very tight view (1.0×)** to see the fine texture of small objects like pores. But the "third view" family was tried (wide view 4×). A tight view 1.0× is different. But it adds compute.
+
+**Idea: increase IMG_SIZE to 224** — resolution family, exhausted.
+
+**Idea: use a different backbone** — exhausted.
+
+Hmm. Let me reconsider. Actually, maybe I should focus on the single most reliable lever: **more training steps**. The model is clearly undertrained (loss 0.1689 at the end, still dropping). If I can get 2× the steps, that's a solid gain.
+
+How to get 2× steps:
+1. Precompute crops (eliminate per-step PIL). Risky (e004 bug).
+2. Lower the reserve (55→35). Gains 20s ≈ 70 steps (16% more). Low risk.
+3. Reduce per-step compute: smaller batch? No. Faster model? Bigger backbone was tried (no gain, fewer steps).
+
+Actually, the cleanest low-risk move: lower RESERVE_S. But is 35s enough for prediction? Actual prediction+write is 24s. With a safety margin, 35s is fine. Let me set it to 40s to be safe (gains 15s ≈ 50 steps).
+
+But wait, would 50 more steps (436→486, +11%) give 0.01+ mAP? Uncertain. Probably +0.002–0.005. Might not clear the 0.005 bar.
+
+Hmm. Let me reconsider the whole thing.
+
+Actually, let me reconsider the diagnostic numbers once more. The gap between my mAP (0.6345) and "correct class, my scores" (0.7464) is 0.1119. That's the cost of wrong classes. This is by far the largest term. To make real progress, I have to improve the class decision on detector boxes.
+
+The model is 81% accurate on overlapping boxes. The weak spot is pore (62%). What specifically would help pore?
+
+Pores: small, round, dark holes. In the tight 1.5× crop, a pore is a small dark blob on a bright weld background. Stains: dark, irregular, often larger surface discoloration. The pore→stain confusion (21 cases) suggests the model sees a dark blob and calls it a stain.
+
+**Key idea: the model needs to see the pore at higher relative resolution.** A pore's box is small (say 10×10 px in the original image). The 1.5× crop is 15×15 px, resized to 160×160 — that's a huge upscale, so the pore is a ~10 px dark blob in a 160 px image. Actually that's fine resolution-wise. The issue is more about context: stain and pore look similar at the crop level.
+
+Hmm, what about **the wide crop giving context that helps distinguish**? The 2.5× crop shows more surrounding weld. For a pore, the wide crop shows a small dot in a large area. For a stain, the wide crop shows a larger dark region.
+
+I think the real issue is that the model is undertrained and the classes are genuinely hard. Let me not overthink the "which class" and instead focus on the most reliable gain: **more training steps** via a safe method, plus possibly **training on detector boxes**.
+
+Actually, let me step back and think about the research strategy the guide wants. The guide's plan:
+1. Consolidate (detector-box training data) — first 2–4 experiments.
+2. Close the box-quality gap.
+3. Buy training steps.
+4. Fine-grained classes.
+
+We're at experiment 8. The guide says consolidation is first. e002 (detector boxes) failed once (0.6307, not confirmed, base e000). The guide says "if confirmed, build on it; if it fails twice, drop it and move on." It failed once. So I could try it again, ideally on top of e005 (the current best). That's a legitimate next step: "train on detector boxes from the train split, on top of e005."
+
+But would it give 0.005+? Past runs got +0.004. On top of e005 (which is +0.005 over e000), it might give +0.004 → 0.6385. That could clear the bar. And it's low crash risk if I implement the IoU carefully (e002 fixed the bug and ran fine).
+
+Actually, e002 already implemented it correctly (it ran, got 0.6307). So I can reuse e002's implementation. But I don't have e002's exact code — I only have the current best (e005) and the e008 diff. Let me re-implement the detector-box training data on top of e005.
+
+Wait, but the concern: e002's 5-seed mean was 0.6307, which is below e005's 0.6345. But e002's base was e000 (0.629–0.630). So e002 gave +0.001 over e000. That's weak. On top of e005, it might give +0.001 to +0.004. Might not clear 0.005.
+
+Hmm, this is risky. Let me think about what has the best expected value.
+
+Let me reconsider **buying training steps** more seriously, because it's a "free improvement" and the model is undertrained.
+
+The safest, highest-EV move might be a combination: but the rules say one idea per turn.
+
+Let me pick: **precompute training crops to buy steps** (fix e004). This is in the "optimisation" category (1 idea, 1 bug, not exhausted). If it works, it could buy 50–100% more steps, a solid gain. The risk is a bug, but I can implement it carefully.
+
+Actually, wait. Let me reconsider whether data loading is really the bottleneck. Let me look at the step times again:
+- Epoch 0: 94 steps, 13s→57s = 44s → 0.468s/step
+- Epoch 1: 94 steps, 57s→75s = 18s → 0.191s/step
+- Epoch 2: 94 steps, 75s→93s = 18s → 0.191s/step
+- Epoch 3: 94 steps, 93s→112s = 19s → 0.202s/step
+- Epoch 4: 60 steps, 112s→125s = 13s → 0.217s/step
+
+So steady-state is ~0.19–0.22s/step. The first epoch is slow (0.47s/step) due to worker startup + CUDA warmup.
+
+If I precompute crops, the per-step CPU work drops to just tensor indexing + normalization (or I precompute normalized float32). Then the bottleneck becomes the GPU forward/backward. EfficientNet-B0 at 160×160, batch 64, 2 views = effectively batch 128 forward. That's probably ~0.1–0.15s on a modern GPU. So precomputing might get us to ~0.12s/step, i.e., ~1.5–1.8× more steps. That's meaningful: 436 → ~700+ steps.
+
+But the risk: e004 crashed with a bug (score 0.0531). I don't know the bug. Common bugs in precompute:
+- Forgetting to apply normalization, or applying it twice.
+- Getting the crop extraction wrong (e.g., using the wrong context, or not handling the canvas padding).
+- Storing as float32 but the memory is too large (6052×2×3×160×160×4 = 3.7 GB — too much? Might OOM). Actually uint8 is 931 MB, fine. Float32 is 3.7 GB, might be OK but risky.
+- The augmentation (flip, brightness, jitter) needs to be applied on the precomputed crop. If I precompute the base crop (no jitter), I still need jitter at train time. The current jitter shifts the center and changes the scale — that requires re-extracting from the image, which I can't do on a precomputed crop!
+
+This is the key issue: the current training jitter (center ±0.1 side, scale 0.85–1.2) requires re-cropping from the original image. If I precompute the exact crop, I can't apply the jitter. So I'd have to either (a) drop the jitter (bad, loses augmentation), or (b) precompute a larger crop and extract sub-crops at train time (more complex), or (c) apply jitter as a spatial transform on the precomputed crop (approximate).
+
+This is getting complicated and bug-prone — exactly why e004 might have crashed.
+
+So precomputing crops is risky because of the interaction with jitter. Let me avoid it.
+
+**Alternative: lower the reserve.** One line, no interaction with jitter. Gains ~15–20s of training. Low risk. But the gain might be small (<0.005).
+
+Hmm. Let me reconsider.
+
+Actually, maybe the best move is to **train on detector boxes from the train split on top of e005**. It's the guide's step 1, it's low crash risk (e002 proved the IoU code works), and it directly targets the train/test mismatch (the classifier sees true boxes in training but detector boxes at test). The expected gain is +0.004 to +0.005. It might just clear the bar. And if it works, it's a solid foundation.
+
+But I'm worried it's too small. Let me think about whether there's a bigger lever.
+
+Actually, let me reconsider the **random zoom (e008 fix)**. The idea: per-sample random tight zoom 1.0–1.8 and wide zoom 2.0–4.0. This is box-quality simulation. e003 (shift simulation) was not confirmed (0.6294, base e000). So the "simulate detector error" direction has one substantive failure. e008 (zoom) crashed. If I fix e008 and it fails, the direction is exhausted (2 failures). If it works, great.
+
+But e003 already showed that shift simulation doesn't help. Zoom simulation is a different mechanism (scale vs. position). The detector's boxes are "slightly misplaced and of different sizes." So both position and size matter. e003 did position; e008 does size. It's plausible that size simulation helps where position didn't. But it's a gamble.
+
+Hmm, let me think about the expected values:
+- Detector-box training (on e005): +0.004, low risk. EV ≈ 0.004 × PThinking budget reached. Stop thinking now and write the reply in the required format.

@@ -1,0 +1,235 @@
+===== attempt 1 =====
+First let me think about the situation.
+
+Current best: e000, 5-seed mean 0.6302. Per-class: pore 0.504, deposit 0.630, discontinuity 0.780, stain 0.607.
+
+Reference values:
+- One-stage 4-class baseline: 0.638
+- Stage-1 boxes with perfect classes: 0.758
+- Class-agnostic: 0.755
+
+So the upper bound is 0.758. We're at 0.6302. The gap to the upper bound is about 0.128. The class-agnostic score is 0.755, so the box placement/ranking is nearly at the upper bound. The loss is almost entirely in the class decision.
+
+Per-class: pore 0.504 is the weakest, deposit 0.630, stain 0.607, discontinuity 0.780.
+
+Known info:
+- The crop classifier reaches macro-F1 ~0.87 with the starting recipe (two crops).
+- Pore and deposit are the weak classes; stain is often confused with deposit.
+- Tuning hyperparameters alone has had little effect; method changes have been more effective.
+- Class-weighted loss has always had a negative effect.
+
+We're at experiment 0, so there's no history. I should pick an experiment with a big expected effect.
+
+Where is the error? mAP@0.5 per class: for a given class, the prediction is sorted by score, and a hit is IoU>0.5 with an unmatched ground-truth box of that class. The box comes from stage 1 (fixed). So box placement error is shared with the upper bound. The class decision determines (a) which class a box is assigned to, and (b) the score ranking.
+
+Key insight: the current output writes 4 rows per box, one per class, with score = conf * p_c. So each box contributes to the candidate list of every class. In mAP, for class c, all predictions of class c across all boxes are sorted by score. A box whose true class is c but which is assigned class d with a higher score will consume... no wait, actually a prediction of class d that overlaps with a ground-truth box of class c is a false positive for class d (since it doesn't overlap with a ground-truth box of class d). Hmm, but wait — it could overlap with a ground-truth box of class d? Unlikely unless the boxes overlap.
+
+The problem with outputting 4 rows per box: for class c, the list contains every box with score conf*p_c. For a box whose true class is c, p_c is high, good. For a box whose true class is d, p_c is low, so it ranks low. That's fine. But false alarms (boxes that don't overlap any ground truth) also get rows for every class with score conf*p_c. Their relative ordering within class c is determined by conf*p_c.
+
+Actually, the main issue: the upper bound (0.758) keeps all boxes, assigns the correct class to boxes that overlap a true defect, and assigns class 0 (pore) to false alarms with score = conf. So the ranking within class c in the upper bound is: boxes that truly overlap with class c ground truth have score conf; false alarms have class 0 with score conf. Hmm wait, in the upper bound, false alarms are class 0 with score conf. So the class-0 list in the upper bound = (true pore boxes, score conf) + (all false alarms, score conf). Sorted by conf.
+
+In our current approach, the class-0 list = all boxes with score conf*p_0. For true pore boxes, p_0 is high; for false alarms, p_0 is whatever the classifier says. So the ranking differs from the upper bound.
+
+The main loss: misclassification. If a true pore box is classified as deposit (p_1 > p_0), then in the class-0 list its score is conf*p_0 (low), and it may rank below false alarms with high conf*p_0... actually, since it still appears in the class-0 list with score conf*p_0, it can still be a hit if it ranks high enough. But in the class-1 list it appears with score conf*p_1 (high), and it's a false positive for class 1 (no overlap with a class-1 ground truth... unless there's a class-1 ground truth nearby).
+
+So misclassification hurts both classes: it adds false positives to the wrong class's list at a high rank, and buries the true positive in its own class's list.
+
+So the biggest lever is improving classification accuracy, especially on the weak classes pore and deposit, and reducing stain/deposit confusion.
+
+What method changes could have a big effect?
+
+Ideas:
+
+1. **Better data usage: use low-res crops for training.** Currently TRAIN_ON = ("high",). The dataset has res "high"/"low". Using both would double training data (6052 → probably ~12k). More data usually helps. But low-res images may be blurrier; the eval set — which resolution are the eval images? The paper says 0.69 mAP on high-res images. The eval images are probably high-res. Hmm, but adding low-res data could still help via augmentation-like diversity. Risk: low-res labels may be noisier. This is a "data" category experiment. Expected effect: moderate.
+
+2. **Better crops / more context views.** Currently tight 1.5x + wide 2.5x. Pore vs deposit: pores are small round holes; deposits are extra material. Context matters. We could add a third view (e.g., 4x context) or change the context. Or use the box aspect ratio...
+
+3. **Ensemble of multiple models** (e.g., EfficientNet-B0 + ResNet) — but the time budget is tight.
+
+4. **Longer training / more steps**: currently 410 steps in ~110s of training. Loss is still decreasing (0.2174 at epoch 4). We could train longer by reducing RESERVE_S or increasing batch efficiency. But "tuning hyperparameters alone has had little effect" — though that was in earlier experiments (before this session? "in earlier experiments" — probably from a previous research phase). Hmm, the history here is empty but "known" facts suggest previous work. The known info says hyperparameter tuning had little effect; method changes were more effective.
+
+5. **Score calibration / ranking improvements**: the score is conf * p_c. In mAP, what matters is the ranking within a class. conf is the detector confidence, which correlates with "is this a real defect". p_c is the class probability. For ranking true positives above false alarms, conf*p_c is reasonable. But there's a subtle point: for class c, a true box of class c has score conf*p_c where p_c is high. A false alarm has score conf*p_c where p_c is the classifier's guess. If the classifier gives high p_c to false alarms (e.g., they look like defects), they rank high.
+
+Alternative scoring: use only the top-1 class per box (one row per box with the argmax class and score conf*p_argmax). This reduces false positives in the wrong class's list! Wait, but does that help? Let me think.
+
+Currently: 4 rows per box. For class c's list: every box appears with score conf*p_c. Consider a true pore box misclassified as deposit: in the class-0 list it has conf*p_0 (say 0.3), in the class-1 list conf*p_1 (say 0.6). If instead we output only the top-1 (class 1, 0.6), then the class-0 list doesn't contain this box at all — it's a miss for class 0 (not a false positive, just absent). The class-1 list contains it as a false positive at rank 0.6.
+
+Compared to the 4-row case: class-0 list contains it at 0.3 — if it ranks above the threshold needed, it's a hit (good). So 4 rows can only help class 0 (the box can still be a hit at a lower rank) while adding a false positive to class 1 at a high rank. Hmm, which is better depends on the situation.
+
+Actually wait, there's a subtlety in mAP: false positives at high ranks hurt precision at that rank. With 4 rows, the class-1 list has a false positive at 0.6 from the misclassified pore box. With top-1 only, the same. So the class-1 list is the same in both cases for that box. The difference is only in the class-0 list: 4 rows include it at 0.3 (potential hit), top-1 excludes it. So 4 rows weakly dominate top-1? Not exactly — with 4 rows, the class-0 list also contains all other boxes (true deposit boxes with p_0 low, etc.) at their respective conf*p_0. Those are false positives in the class-0 list. With top-1, the class-0 list contains only boxes whose argmax is 0.
+
+Hmm, so it's a trade-off. The 4-row approach: every box in every class's list. The false-positive rate in class c's list is determined by the distribution of conf*p_c across non-class-c boxes.
+
+Let me think about what the upper bound does: it outputs 1 row per box (the correct class for TP boxes, class 0 for FAs). And gets 0.758.
+
+Our 4-row approach gets 0.630. The gap must come from misclassification.
+
+6. **Training on detector boxes (dets.csv train split) instead of / in addition to ground-truth crops.** dets.csv has a "train" split with detector boxes on training images; their true class can be found by overlap with crops.csv. Training on detector boxes (the actual input distribution) rather than ground-truth boxes could reduce domain gap — the detector boxes are "slightly misaligned". The current training uses ground-truth crops (crops.csv), but at inference we classify detector boxes that are slightly misaligned. Training on detector boxes (with class labels from overlap) could align training and inference. This is a data/method change. But detector boxes include false alarms (no class) — we'd only use those that overlap a ground-truth box (IoU>0.5 probably). This is a legitimate "train on the actual input distribution" idea.
+
+7. **Use both high and low res** — data.
+
+8. **Better model**: efficientnet_b2 or tf_efficientnetv2_b0. Larger model = better classification. Time budget: 160px EfficientNet-B0, 94 steps/epoch in ~19s → ~200ms/step with batch 64 (2 views → 128 forward passes). Actually 94 steps * 64 = 6016 boxes per epoch ≈ 6052. 94 steps in ~19s (62-13=49? no wait: load 13s, epoch 0 ends at 62s so 49s for 94 steps ≈ 520ms/step). Hmm, that includes data loading. EfficientNet-B2 is ~3.6x the FLOPs of B0; at 160px it might be ~3x slower. That would cut steps to ~130. Fewer steps but better model. tf_efficientnetv2_b0 has better accuracy than efficientnet_b0 at similar speed. This is an architecture change with a plausible effect.
+
+Actually, let me think about what has the biggest expected effect.
+
+Per-class AP: pore 0.504, deposit 0.630, stain 0.607, discontinuity 0.780. Mean 0.630.
+
+If we had perfect classes (upper bound 0.758), the per-class would be much higher. The class-agnostic is 0.755, meaning the box ranking by conf is nearly perfect for detection. So the loss is: (a) misclassification causing FPs in wrong classes and buried TPs, (b) score ranking within a class differing from the upper bound.
+
+For (b): in the upper bound, class c's list = true c boxes (score conf) + (if c=0, all FAs at score conf). In ours, class c's list = all boxes at conf*p_c. For true c boxes, p_c is high but not 1, and varies; for FAs, p_c varies. The ranking correlation with conf is diluted by p_c. Hmm, but p_c for true c boxes is probably 0.8-0.95, so the ranking is roughly preserved.
+
+The dominant loss is misclassification. Macro-F1 ~0.87 means ~13% of boxes are misclassified. That's consistent with the 0.758 → 0.630 gap.
+
+So: improve classification, especially pore (weak) and deposit/stain confusion.
+
+Methods that change what the model sees or learns:
+
+A. **Train on detector boxes instead of ground-truth boxes** (close the train/test gap). The known info says "the crop classifier with perfect boxes reaches macro-F1 ~0.87" — with perfect boxes. At test time we have detector boxes (slightly misaligned). Training on ground-truth boxes means the model sees perfectly centered crops; detector boxes are shifted/scaled differently. Training on detector boxes (labeled by overlap) would align. This is a fundamentally different data source. Expected effect: could be significant if the domain gap matters.
+
+B. **Add low-res data** (double the data).
+
+C. **Larger/better backbone** (tf_efficientnetv2_b0 or efficientnet_b2).
+
+D. **More context views** — e.g., add a 4x context view, or use 3 views. Pores need tight context (small round holes), deposits need wider context. Currently 1.5x and 2.5x.
+
+E. **Test-time augmentation**: average over flips at inference. Cheap: 4x the inference cost. Inference is ~37s (162-125). 4x → ~148s, plus 125s training = too much? Training ends at 125s, RESERVE 55 → t_end = 180-55 = 125s. Inference 37s*4 = 148s > 55s reserve. Doesn't fit. Could reduce training reserve... risky. Actually we could do flip TTA with only 2 views... no, flips are 4 (h, v, hv, identity) — but the model is already trained with random flips, so TTA flips add little. Color jitter TTA? Marginal.
+
+F. **Ensemble of 2 models** (B0 + ResNet18, or 2 B0s with different seeds/augmentations). Time: training 2 models in the same budget halves each model's steps. Probably not worth it.
+
+G. **Score refinement**: instead of conf*p_c, use a calibrated score. But the metric ignores monotone transformations per class... well, not exactly — the score combines conf and p_c, and changing the function changes the ranking. E.g., score = conf^a * p_c^b. Hmm.
+
+Actually, wait. Let me reconsider the 4-row vs 1-row output. Let me think more carefully about which is better, because this is a "scoring" change that could have a big effect and is cheap to test.
+
+mAP@0.5 per class c: sort class c's predictions by score descending. Iterate: if it overlaps an unmatched GT box of class c with IoU>0.5, it's a TP; otherwise FP. AP = average precision over this list.
+
+Upper bound: 1 row per box: TP boxes get their true class, FAs get class 0, all with score conf.
+
+Our 4-row: every box gets 4 rows.
+
+Consider class c's list in the 4-row case: contains all N boxes. In the upper bound (for c>0): contains only true c boxes. So our class-c list (c>0) has many extra FPs (all non-c boxes). These FPs are interleaved by score conf*p_c. True c boxes have high p_c, so they mostly rank above non-c boxes (which have low p_c). But not always: a non-c box with high conf and moderate p_c could rank above a true c box with low conf and p_c 0.9.
+
+In the upper bound, class c's list has no FPs at all (for c>0), so AP_c = 1.0 * (fraction of GT found)... wait, no. In the upper bound, all boxes that overlap a GT of class c are kept as class c — but what about GT boxes that the detector missed? Those are misses (denominator in recall). AP in the upper bound: the list contains all detector boxes that overlap class c GTs (as TPs, since each overlaps an unmatched GT of class c) plus... wait, can a box overlap GTs of two classes? Possibly. And FAs are class 0, so they don't appear in class c's list for c>0. So class c's list (c>0) = all TPs, sorted by conf, AP = 1.0. For class 0: list = true 0 boxes + all FAs, sorted by conf; AP_0 < 1.
+
+So the upper bound's 0.758 = (AP_0 + 1 + 1 + 1)/4 → AP_0 = 0.758*4 - 3 = 0.032?? That can't be right. Wait, 0.758*4 = 3.032, minus 3 = 0.032. That's impossible. Let me re-read.
+
+"d2_boxes_perfect_classes_val_map50: upper bound. Every detector box that overlaps a true defect (IoU > 0.5) gets the correct class; every other box (false alarm) is kept as class 0 with the detector's conf. Each box's score is the detector's conf."
+
+Hmm, "overlaps a true defect" — if a box overlaps multiple GTs of different classes, which class? Probably the one with max IoU. OK.
+
+But then AP for classes 1,2,3 = 1.0 (all TPs, no FPs in the list), and class 0's AP is some value. Mean = (AP0 + 3)/4 = 0.758 → AP0 = 0.032. That's absurdly low. Unless... many GT boxes are missed by the detector (low recall), but that affects recall, not AP... no wait, AP includes recall: if the detector misses 50% of class c GTs, then even with zero FPs, AP_c = 0.5 (precision is 1 throughout, but you only reach 0.5 recall).
+
+Right! AP = area under the precision-recall curve. If the list is all TPs but covers only R fraction of GTs, then AP = R (precision stays 1, recall goes to R). So in the upper bound, AP_c = recall_c (fraction of class c GTs covered by a detector box). Mean 0.758 → detector recall is ~75.8% on average.
+
+So the upper bound's per-class: AP_c = recall_c. And class 0's AP is lower because FAs are in the class-0 list.
+
+Our current per-class: pore 0.504, deposit 0.630, discontinuity 0.780, stain 0.607. The upper bound's per-class is unknown but mean 0.758. If the detector recall is ~0.76 per class, then the loss from misclassification is: pore loses 0.76-0.50 = 0.26, deposit 0.13, stain 0.15, disc 0.02 (if upper-bound disc AP ≈ 0.78+...). Roughly.
+
+So pore is the biggest problem: 0.504 vs upper bound ~0.76+. Pore is the weakest class in classification (small holes, easy to confuse with stain/deposit, and the detector boxes for pores may be small).
+
+What specifically hurts pore? Pores are small round holes. The detector finds boxes; the classifier must say "pore". Pore vs stain confusion: stain is discoloration, pore is a hole. At 160px with 1.5x context, a small pore is a few pixels. Maybe the crop is too small / resolution too low for pores!
+
+Idea: **higher resolution for the tight crop**, or a dedicated high-res input. E.g., IMG_SIZE 160 → 224, or the tight crop at 320. But that slows everything down.
+
+Alternative: **use the original image resolution more** — the tight crop at 1.5x of a small box is tiny (MIN_CROP 16 → upscaled to 160). Upscaling a 16px crop to 160 loses no information. Higher IMG_SIZE doesn't help for small crops.
+
+Hmm, what about **multi-scale training**: train with random context ranges (e.g., context uniform in [1.2, 4]) so the model sees the defect at various scales. Currently fixed 1.5 and 2.5. Random context during training (with jitter) could make the model more robust. This is an augmentation change.
+
+Let me think about the most impactful, cheap, single experiment for turn 1.
+
+Given "tuning hyperparameters alone has had little effect; method changes have been more effective" and "class-weighted loss has always hurt", I should pick a method change.
+
+Top candidates:
+1. Train on detector boxes (train split of dets.csv) instead of ground-truth crops — closes the train/test distribution gap. Category: data.
+2. Add low-res training data — category: data.
+3. Better backbone (tf_efficientnetv2_b0) — category: architecture.
+4. Random/more context views — category: augmentation.
+
+Let me estimate the effect of each:
+
+1. Detector boxes: the known info says the classifier with perfect boxes reaches F1 0.87. The actual test uses detector boxes. If the domain gap is significant, training on detector boxes could improve a lot. How many detector boxes in the train split? dets.csv has train and eval splits; eval has 41879 boxes. Train probably similar, ~40k, of which those overlapping GT (IoU>0.5) get labels. That's a lot of labeled data (probably 10-20k). Much more than 6052 GT boxes. And exactly the input distribution. This looks like a strong experiment. Risk: detector boxes are misaligned, so labels from overlap are noisier (a box overlapping a pore GT but shifted might be labeled pore but the crop shows something else). But that's exactly the inference condition.
+
+Actually, wait — subtle point: at inference, a detector box may overlap a GT (TP) or not (FA). We classify both. Training only on TP detector boxes (with labels) means we never train on FA appearance... but FAs are also classified at test time; the model will give them some class probability. That's the same as now (GT-box-trained model also sees FAs at test time). Fine.
+
+Also, we could train on both GT boxes and detector boxes. But "one idea per turn" — let's make the idea "train on detector boxes (with labels from overlap) instead of GT crops". Or "add detector boxes to the training set". Hmm. Adding is safer (keep the 6052 GT + add ~15k det boxes). But the distribution shifts toward detector boxes, which is what we want. Let's go with "replace" or "add"?
+
+Let me think: the current model is trained on GT boxes (perfect boxes, F1 0.87 on perfect boxes). At test time, boxes are detector boxes. If we train on detector boxes, the model adapts to the misalignment. I think adding detector boxes to the training set (union) is the best bet: more data + correct distribution. The label for each train det box: max IoU overlap with a GT crop, require IoU > 0.5 (matching the metric's definition).
+
+Time: more training samples (6052 → ~20k) means fewer epochs in the same time, but more total steps? No — time budget is fixed; steps per second is the same; total steps ~410 regardless. More data per epoch means fewer epochs but more diverse data per step. Fine.
+
+2. Low-res data: the eval images — which resolution? The paper's 0.69 is "on high-res images". The hidden test is probably high-res. Low-res training data might not transfer well (blurry). Moderate effect.
+
+3. tf_efficientnetv2_b0: better pretrained features, similar speed. Plausible +0.01-0.02. But "architecture" — the known info says method changes helped more than hyperparameters; model choice is a method change. Still, the classification bottleneck is more about what the model sees (crops) than capacity. B0 at 160px with F1 0.87 — capacity might not be the limit.
+
+4. Context augmentation: random context during training. The model sees 1.5x and 2.5x fixed. Pores are small — maybe a tighter view (1.0-1.2x) helps pores see the hole clearly; deposits need wider. Random context in [1.0, 3.5] could help. Moderate effect.
+
+I think experiment #1 (train on detector boxes) is the most promising method change: it directly targets the train/test gap, uses a lot of new labeled data, and is cheap to implement. Let me also double-check the label assignment: "train" boxes are on training images (their true class can be found by overlap with crops.csv). So the harness explicitly supports this.
+
+Implementation:
+- Read dets.csv, take the train split.
+- For each train det box, find GT crops on the same image with IoU > 0.5; label = the class of the max-IoU GT. If none, skip (FA).
+- Build the training set = GT crops (6052) + labeled det boxes.
+
+Wait, should we keep the GT crops? Yes, they're clean labels. Union.
+
+Efficiency: 40k det boxes × 6052 crops overlap computation — need a spatial index. Group crops by image; per image, compute IoU between the image's det boxes and the image's crops. Per image: n_dets × n_crops IoUs. Total across images: sum of n_d_i * n_c_i. With 1022 images, average ~40 det boxes and ~6 GT boxes per image → 40*6*1022 ≈ 2.5M IoU computations — fine with numpy (vectorize per image, or even a full matrix with an image-ID filter). Simple approach: for each image, gather its det boxes and crops, compute IoU matrix (n_d × n_c), take argmax. Vectorize per image.
+
+Actually, the crops are only high-res (TRAIN_ON = high). Det boxes on low-res training images won't match any crops (crops.csv has both res? crops.csv has a res column "high"/"low"; TRAIN_ON filters to high). If a det box is on a low-res image, no overlap with high-res crops → skip. Fine.
+
+Hmm wait, actually — are det boxes and crops on the same images? dets.csv train split: "train" boxes are on training images. crops.csv: labeled training boxes. Yes, same images.
+
+One concern: class imbalance / duplication — detector boxes on a single GT defect: multiple det boxes may overlap the same GT (duplicates). That's fine, it's just more samples of the same defect.
+
+Another concern: det boxes that overlap GTs but are shifted — the crop is centered on the det box, and the label is the GT's class. That's exactly the inference condition.
+
+Let me also consider whether we should drop the GT boxes. Keep both.
+
+Now, the time budget: training data ~6052 + N_det. N_det = ? Unknown; probably ~10-20k labeled. Steps per second unchanged (~410 steps in 112s). More data → each epoch is longer → fewer epochs, but each step sees fresh data. Total steps ~410. Fine.
+
+Wait, actually there's a subtle point: with drop_last=True and more data, epochs take longer; the while loop runs until t_end. Total steps ~410 regardless. Fine.
+
+Let me write the code.
+
+Current relevant section:
+
+```python
+    crops = [r for r in read_csv(os.path.join(args.data, "crops.csv")) if r["res"] in TRAIN_ON]
+    dets = read_csv(os.path.join(args.data, "dets.csv"))
+    ev = [d for d in dets if d["split"] == "eval"]
+    needed = {r["image"] for r in crops} | {d["image"] for d in ev}
+    images = {p: np.asarray(Image.open(os.path.join(args.data, "images", p)).convert("RGB")) for p in needed}
+    print(f"train {len(crops)} boxes, eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
+```
+
+New: after reading, compute labels for train det boxes:
+
+```python
+    crops = [r for r in read_csv(os.path.join(args.data, "crops.csv")) if r["res"] in TRAIN_ON]
+    dets = read_csv(os.path.join(args.data, "dets.csv"))
+    ev = [d for d in dets if d["split"] == "eval"]
+    train_dets = [d for d in dets if d["split"] == "train"]
+    # label detector boxes on training images by IoU>0.5 overlap with ground-truth crops
+    by_img = {}
+    for r in crops:
+        by_img.setdefault(r["image"], []).append(r)
+    labeled = []
+    for img_name, gs in by_img.items():
+        ds = [d for d in train_dets if d["image"] == img_name]
+        if not ds:
+            continue
+        ...
+```
+
+Hmm, the per-image det filter is O(len(train_dets)) per image → 1022 * 40k = 40M comparisons, too slow in Python. Better: group train_dets by image first.
+
+```python
+    det_by_img = {}
+    for d in train_dets:
+        det_by_img.setdefault(d["image"], []).append(d)
+    labeled = []
+    for img_name, gs in by_img.items():
+        ds = det_by_img.get(img_name, [])
+        if not ds:
+            continue
+        g = np.array([[r["x1"], r["y1"], r["x2"], r["y2"]] for r in gs])
+        c = np.array([r["cls"] for r in gs])
+        d = np.array([[d_["x1Thinking budget reached. Stop thinking now and write the reply in the required format.

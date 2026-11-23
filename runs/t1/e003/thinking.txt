@@ -1,0 +1,317 @@
+===== attempt 1 =====
+Let me carefully analyze this task.
+
+The research lead has chosen:
+- BASE: last (which is e002, the 224px tight crop version)
+- CATEGORY: inference
+- HYPOTHESIS: Ensemble of two classifiers trained from different seeds, averaging logits before softmax.
+
+Wait, but the lead says BASE: last. Let me re-read. The most recent experiment e002 was "not confirmed" - its 5-seed gain over e000 was -0.0060. So e002 is NOT the current best. The current best is still e000.
+
+But the lead explicitly says "BASE: last". So I'm editing the most recent version (e002), not the best (e000).
+
+Hmm, this is a bit odd because e002 wasn't confirmed as better. But the lead's instruction is explicit: BASE: last. Let me follow that. Actually wait - let me reconsider. The e002 change was raising tight crop to 224px with TIGHT_WEIGHT 0.6. That wasn't confirmed (it was actually worse: -0.0060). 
+
+But the lead wants to build on it. Actually, let me think about whether this makes sense. The hypothesis is about ensembling two classifiers. The base being e002 vs e000 matters for the actual code I edit.
+
+Actually, I should just follow the lead's instruction exactly. BASE: last means I edit e002's train.py. Let me get the e002 train.py content.
+
+The e002 train.py differs from e000 by:
+- Added TIGHT_WEIGHT = 0.6
+- RESERVE_S = 70 (was 55)
+- Added TIGHT_IMG_SIZE = 224
+- make_crop takes img_size param
+- BoxDataset uses (TIGHT_CONTEXT, TIGHT_IMG_SIZE) and (CONTEXT, IMG_SIZE)
+- loss uses TIGHT_WEIGHT * model(xt) + (1 - TIGHT_WEIGHT) * model(xw)
+- probs uses same weighted sum
+
+Now I need to implement the ensemble of two classifiers.
+
+Let me think about the plan:
+1. Create a second training set with different random seed; run the same training loop for each model in sequence.
+2. For inference, produce per-class probabilities from both models.
+3. Average the raw logits of the two models before softmax.
+4. Score each prediction as conf * p_avg.
+5. Verify total time: 2x model training within budget.
+
+Wait, "Create a second training set with different random seed" - this is a bit confusing. The training data (crops) is fixed. What changes with a seed is the shuffling and augmentation. So "second training set with different random seed" really means training a second model with a different seed (different data order, different augmentations). That's a standard ensemble of two independently-trained models.
+
+Let me think about the time budget. The current run takes 162s total with 433 steps, using 55s reserve. Actually with e002 it's RESERVE_S = 70. Let me check the log: "done: 5 epochs, 433 steps, 53606 prediction rows, 162s total". So training took until ~162-55=107s? Wait, the reserve is 55 in e000. Let me recompute.
+
+Actually the log shown is for e000 (the current best). t_end = deadline - RESERVE_S = 180 - 55 = 125s. Training stops at 125s. Then prediction + writing takes until 162s. So prediction took 162-125 = 37s.
+
+Wait, but e000's log shows 433 steps at 125s (epoch 4 ends at 125s, "epoch 4: loss 0.2189, 433 steps, 125s"). Then "done ... 162s total". So prediction took 37s with RESERVE_S=55. That's tight - only 18s margin.
+
+For e002, RESERVE_S was raised to 70. So t_end = 180-70 = 110s. Training would stop at 110s.
+
+Now for the ensemble, I need to train TWO models. That means I need to split the training budget into two halves. Each model gets (budget)/2 time.
+
+Let me think about the total time:
+- Loading: ~13s
+- Training model 1: ~T1
+- Training model 2: ~T2
+- Prediction: 2x the forward passes (two models)
+- Writing: same
+
+The original training took ~112s (from 13s load to 125s t_end). Actually let me recompute. t_start = time after loading. Load took 13s. So t_start ≈ 13s. t_end = 125s (for e000). So training budget = 125-13 = 112s, giving 433 steps. Step time ≈ 112/433 ≈ 0.26s/step.
+
+For two models, I want to split the training budget. If I keep the same total training time (say t_end = 180 - reserve), and train two models each for half the time, each model gets ~216 steps. That's fewer steps per model but two models.
+
+Prediction: currently 37s for one model (two views each). For two models, that's 2x = ~74s. Plus the reserve for writing.
+
+Let me do the budget arithmetic carefully for e002 base (RESERVE_S = 70):
+- Total budget: 180s
+- Load: ~13s
+- Need reserve for prediction + writing.
+
+If prediction with 2 models takes ~74s and writing takes ~15s (writing 53606 rows... actually the writing of 53606 rows, let me estimate. Actually the "37s" for prediction included both forward passes AND writing. Let me separate.
+
+Hmm, hard to separate prediction forward time from writing time. Let me estimate. 41879 detections, batch 256, so ~164 batches. Two views, two forward passes per batch. With efficientnet_b0 at 160px (and 224px for tight in e002), on GPU. Let's say prediction forward took ~20s and writing took ~17s. Roughly.
+
+Actually, let me be careful and just reserve enough. Let me set up the timing:
+- t_start after loading
+- I'll train model 1 until t_mid, then model 2 until t_end_train.
+- Then predict with both models, then write.
+
+Let me define:
+- Total = 180s
+- Load ≈ 13s
+- Reserve for prediction (2 models) + writing: let's say ~90s to be safe.
+
+So training budget = 180 - 13 - 90 = 77s, split into two models = ~38s each, ~147 steps each.
+
+Hmm, that's a significant reduction in steps per model (from 433 to ~147). But the ensemble should help.
+
+Actually, wait. Let me reconsider. The lead's plan says "Verify total time: 2x model training within budget, no extra inference cost beyond small constant." But that's not right - inference DOES cost 2x (two models). The lead says "no extra inference cost beyond small constant" which is incorrect. I need to make the smallest fix.
+
+Let me re-read the plan point 5: "Verify total time: 2x model training within budget, no extra inference cost beyond small constant."
+
+This is wrong - inference with 2 models costs 2x forward passes. I should fix this: the inference cost is 2x, so I need to account for it in the reserve. Let me note this as a fix.
+
+Actually, re-reading: "no extra inference cost beyond small constant" - maybe the lead meant that the two models have the same architecture so inference is just 2x but that's not "small constant". I'll fix it: inference is 2x, so reserve must cover 2x prediction.
+
+Let me now think about the implementation details.
+
+Current structure:
+- One model, one training loop, one prediction loop.
+
+New structure:
+- Two models, each trained in sequence with a different seed.
+- Prediction: for each eval batch, get logits from both models, average them, softmax.
+
+Let me think about how to handle the seeds. The main seed is args.seed. For the two models, I'll use different seeds. E.g., model 0 uses args.seed, model 1 uses args.seed + 1 (or some offset). But the data loading uses a generator g seeded with args.seed. For the second model, I need a different data order / augmentation.
+
+Actually, the cleanest way: create two DataLoaders (or recreate the training loader) with different seeds, and train two models.
+
+Let me think about the structure. I'll:
+1. Load data (same as before).
+2. Create model 1, train it for half the budget.
+3. Create model 2, train it for the other half.
+4. Predict with both, average logits.
+
+For the training, I need to reset the data loader for the second model (new shuffle order). I can create a new DataLoader with a new generator.
+
+Let me think about the time split. I'll compute:
+- t_start = time after loading
+- t_end = deadline - RESERVE_S (reserve now covers 2x prediction + writing)
+- total_train_budget = t_end - t_start
+- Each model gets total_train_budget / 2.
+
+For model 1: train until t_start + total_train_budget/2.
+For model 2: train from there until t_end.
+
+Let me restructure the training loop to be a function that takes a model, a loader, and a time limit, and trains until the time limit.
+
+Actually, let me keep it simpler and modify the existing loop. Let me write a helper function train_model(model, dl, t_limit) that returns the model.
+
+Let me also think about the LR schedule. Currently it's based on frac = (time - t_start)/budget. For two models, each should have its own schedule from 0 to 1 over its own half. So I'll reset the schedule per model.
+
+Let me now think about the prediction. Currently:
+```python
+probs = []
+with torch.no_grad(), torch.autocast(**amp):
+    for xt, xw, _ in dl_ev:
+        xt = xt.to(device).to(memory_format=torch.channels_last)
+        xw = xw.to(device).to(memory_format=torch.channels_last)
+        probs.append(torch.softmax(((model(xt) + model(xw)) / 2).float(), 1).cpu())
+probs = torch.cat(probs).numpy()
+```
+
+For two models:
+```python
+probs = []
+with torch.no_grad(), torch.autocast(**amp):
+    for xt, xw, _ in dl_ev:
+        xt = xt.to(device).to(memory_format=torch.channels_last)
+        xw = xw.to(device).to(memory_format=torch.channels_last)
+        l1 = TIGHT_WEIGHT * model1(xt) + (1 - TIGHT_WEIGHT) * model1(xw)
+        l2 = TIGHT_WEIGHT * model2(xt) + (1 - TIGHT_WEIGHT) * model2(xw)
+        probs.append(torch.softmax(((l1 + l2) / 2).float(), 1).cpu())
+probs = torch.cat(probs).numpy()
+```
+
+Wait, but there's a subtlety. The lead says "Average the raw logits of the two models before softmax". So I average the logits (the weighted view sum is the per-model logit), then average across the two models, then softmax. That's what I have.
+
+Actually, let me reconsider. Each model produces a logit vector per view. The per-model "logit" is TIGHT_WEIGHT * model(xt) + (1-TIGHT_WEIGHT) * model(xw). Then average the two models' logits, then softmax. Yes.
+
+Now, the scoring stays the same: conf * p_avg.
+
+Now let me think about the seeds for the two models. The randomness in training comes from:
+- random.seed, np.random.seed, torch.manual_seed (set at start)
+- The DataLoader generator g (for shuffling)
+- worker_init_fn (seeds workers based on torch.initial_seed())
+- The augmentation uses random module
+
+For the second model to be a proper ensemble member, I want different data order and different augmentations. The simplest: before training model 2, re-seed everything with a different seed, and create a new DataLoader with a new generator.
+
+Let me structure:
+
+```python
+def train_model(model, dl, t_start, t_end, LR):
+    model.train()
+    steps = 0
+    budget = max(1.0, t_end - t_start)
+    done = False
+    while not done:
+        tot, nb = 0.0, 0
+        for xt, xw, y in dl:
+            frac = min(1.0, (time.time() - t_start) / budget)
+            f = frac / 0.05 if frac < 0.05 else 0.5 * (1 + math.cos(math.pi * (frac - 0.05) / 0.95))
+            for pg in opt.param_groups:
+                pg["lr"] = LR * max(f, 1e-3)
+            ...
+```
+
+Hmm, but the optimizer is tied to the model. Let me create the optimizer inside train_model, or pass it.
+
+Actually, let me restructure more carefully. Let me define a function that creates a fresh model, optimizer, and trains it.
+
+Let me think about what's cleanest and least error-prone given the SEARCH/REPLACE constraints. I need to copy exact lines from the current file.
+
+Let me get the exact current file content (e002). I'll reconstruct it from e000 + the diff.
+
+e000 file is given in full. The diff for e002:
+
+```
+@@ -47,4 +47,5 @@
+ CONTEXT = 2.5           # wide crop: side = CONTEXT * long side of the box
+ TIGHT_CONTEXT = 1.5     # tight crop
++TIGHT_WEIGHT = 0.6      # logit weight of the (higher-res) tight view vs wide
+ MIN_CROP = 16
+ TRAIN_ON = ("high",)    # resolutions of crops.csv used for training
+@@ -52,8 +53,9 @@
+ LR = 1e-3
+ WEIGHT_DECAY = 0.05
+-RESERVE_S = 55          # seconds kept free for prediction and writing
++RESERVE_S = 70          # seconds kept free for prediction and writing
+ MIN_SCORE = 0.001       # rows below this score are not written
+ MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+ STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
++TIGHT_IMG_SIZE = 224    # tight view resolution (higher for fine texture)
+```
+
+So in e002, the settings block is:
+```python
+MODEL = "efficientnet_b0"
+PRETRAINED = True
+IMG_SIZE = 160
+CONTEXT = 2.5           # wide crop: side = CONTEXT * long side of the box
+TIGHT_CONTEXT = 1.5     # tight crop
+TIGHT_WEIGHT = 0.6      # logit weight of the (higher-res) tight view vs wide
+MIN_CROP = 16
+TRAIN_ON = ("high",)    # resolutions of crops.csv used for training
+BATCH_SIZE = 64
+LR = 1e-3
+WEIGHT_DECAY = 0.05
+RESERVE_S = 70          # seconds kept free for prediction and writing
+MIN_SCORE = 0.001       # rows below this score are not written
+MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+TIGHT_IMG_SIZE = 224    # tight view resolution (higher for fine texture)
+```
+
+```
+@@ -69,5 +71,5 @@
+ 
+ 
+-def make_crop(img, r, context, train):
++def make_crop(img, r, context, train, img_size):
+     h, w = img.shape[:2]
+     cx, cy = (r["x1"] + r["x2"]) / 2, (r["y1"] + r["y2"]) / 2
+@@ -83,5 +85,5 @@
+     if sx1 > sx0 and sy1 > sy0:
+         canvas[sy0 - y0:sy1 - y0, sx0 - x0:sx1 - x0] = img[sy0:sy1, sx0:sx1]
+-    return np.asarray(Image.fromarray(canvas).resize((IMG_SIZE, IMG_SIZE), Image.BILINEAR), dtype=np.float32) / 255.0
++    return np.asarray(Image.fromarray(canvas).resize((img_size, img_size), Image.BILINEAR), dtype=np.float32) / 255.0
+```
+
+So make_crop in e002:
+```python
+def make_crop(img, r, context, train, img_size):
+    h, w = img.shape[:2]
+    cx, cy = (r["x1"] + r["x2"]) / 2, (r["y1" + r["y2"]) / 2
+    side = max(max(r["x2"] - r["x1"], r["y2"] - r["y1"]) * context, MIN_CROP)
+    if train:  # light geometric jitter
+        cx += random.uniform(-0.1, 0.1) * side
+        cy += random.uniform(-0.1, 0.1) * side
+        side *= random.uniform(0.85, 1.2)
+    s = max(2, int(round(side)))
+    x0, y0 = int(round(cx - s / 2)), int(round(cy - s / 2))
+    canvas = np.full((s, s, 3), 114, dtype=np.uint8)  # gray padding outside the image
+    sx0, sy0, sx1, sy1 = max(0, x0), max(0, y0), min(w, x0 + s), min(h, y0 + s)
+    if sx1 > sx0 and sy1 > sy0:
+        canvas[sy0 - y0:sy1 - y0, sx0 - x0:sx1 - x0] = img[sy0:sy1, sx0:sx1]
+    return np.asarray(Image.fromarray(canvas).resize((img_size, img_size), Image.BILINEAR), dtype=np.float32) / 255.0
+```
+
+```
+@@ -101,6 +103,6 @@
+             fh, fv, bright = random.random() < 0.5, random.random() < 0.5, random.uniform(0.8, 1.2)
+         views = []
+-        for ctx in (TIGHT_CONTEXT, CONTEXT):
+-            x = make_crop(img, r, ctx, self.train)
++        for ctx, sz in ((TIGHT_CONTEXT, TIGHT_IMG_SIZE), (CONTEXT, IMG_SIZE)):
++            x = make_crop(img, r, ctx, self.train, sz)
+             if fh:
+                 x = x[:, ::-1]
+```
+
+So BoxDataset.__getitem__ in e002:
+```python
+    def __getitem__(self, i):
+        r = self.rows[i]
+        img = self.images[r["image"]]
+        fh = fv = False
+        bright = 1.0
+        if self.train:  # same flips and brightness for both views
+            fh, fv, bright = random.random() < 0.5, random.random() < 0.5, random.uniform(0.8, 1.2)
+        views = []
+        for ctx, sz in ((TIGHT_CONTEXT, TIGHT_IMG_SIZE), (CONTEXT, IMG_SIZE)):
+            x = make_crop(img, r, ctx, self.train, sz)
+            if fh:
+                x = x[:, ::-1]
+            if fv:
+                x = x[::-1, :]
+            if self.train:
+                x = np.clip(x * bright, 0, 1)
+            x = (x - MEAN) / STD
+            views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))
+        return views[0], views[1], r.get("cls", -1)
+```
+
+```
+@@ -168,5 +170,5 @@
+             y = y.to(device, non_blocking=True)
+             with torch.autocast(**amp):
+-                loss = crit((model(xt) + model(xw)) / 2, y)
++                loss = crit(TIGHT_WEIGHT * model(xt) + (1 - TIGHT_WEIGHT) * model(xw), y)
+             opt.zero_grad(set_to_none=True)
+             loss.backward()
+```
+
+```
+@@ -186,5 +188,5 @@
+             xt = xt.to(device).to(memory_format=torch.channels_last)
+             xw = xw.to(device).to(memory_format=torch.channels_last)
+-            probs.append(torch.softmax(((model(xt) + model(xw)) / 2).float(), 1).cpu())
++            probs.appendThinking budget reached. Stop thinking now and write the reply in the required format.

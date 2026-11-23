@@ -1,0 +1,161 @@
+===== attempt 1 =====
+Let me analyze the situation:
+
+1. **Current best**: e001 with 5-seed val mAP@0.5 = 0.6302
+2. **e002 crashed**: It tried to switch from two-crop to single-crop but only changed the dataset's `__getitem__` to return 2 values instead of 3, without updating the training loop and inference loop that still expect 3 values.
+
+The crash is clear: the dataset now returns `(tensor, label)` but the training loop does `for xt, xw, y in dl_tr:` and the inference loop does `for xt, xw, _ in dl_ev:`.
+
+Now, let me think about what to do next:
+
+**Option A: Fix e002 (single tight crop)**
+The idea was to halve per-step cost to get ~2x more optimizer steps. The crash was just a bug - the training/inference loops weren't updated. Let me fix it properly.
+
+Let me think about whether single tight crop is a good idea:
+- Current: two crops (tight 1.5x + wide 2.5x), averaged logits
+- Proposed: single tight crop (1.5x)
+- The wide crop provides context. But the tight crop is the primary signal for classification.
+- Halving compute per step means ~2x more steps in the same budget
+- More steps with the same effective batch size should help optimization
+
+Actually wait - let me reconsider. The two-crop approach averages two forward passes. If we go to single crop, we halve the forward+backward cost per step. With ~430 steps currently, we'd get ~800-1000 steps. That's a meaningful increase in optimization.
+
+But there's a risk: the wide crop (2.5x) provides important context. The tight crop alone might not have enough context to distinguish stain from deposit (which are often confused). However, the tight crop at 1.5x still gives some context.
+
+Let me think about what other options exist:
+
+**Option B: Use a different/stronger model**
+- Currently using efficientnet_b0
+- Could try convnext_nano, resnet50, etc.
+- But this might not fit in the time budget with two crops
+
+**Option C: Increase IMG_SIZE**
+- Currently 160x160
+- Could try 224x224 for better resolution
+- But this increases compute per step
+
+**Option D: Train on single tight crop (fix e002)**
+- This is the most immediate fix and was a reasonable hypothesis
+- Halves compute per step → ~2x more steps
+- The tight crop at 1.5x should still provide adequate context
+
+**Option E: Use the wide crop only**
+- Single wide crop (2.5x) instead of two crops
+- More context but less detail
+- Same compute savings as option D
+
+I think fixing e002 is the most logical next step. The hypothesis was sound (more optimizer steps), and the crash was just a bug. Let me fix it properly.
+
+The fix needs to:
+1. Update the training loop: `for xt, xw, y in dl_tr:` → `for xt, y in dl_tr:`
+2. Update the model forward: `crit((model(xt) + model(xw)) / 2, y)` → `crit(model(xt), y)`
+3. Update the inference loop: `for xt, xw, _ in dl_ev:` → `for xt, _ in dl_ev:`
+4. Update the inference forward: `torch.softmax(((model(xt) + model(xw)) / 2).float(), 1)` → `torch.softmax(model(xt).float(), 1)`
+
+Let me write the fix. I'll use BASE: last to build on e002.
+
+Actually, let me reconsider. The single tight crop at 1.5x might lose too much context. The stain/deposit confusion is a key issue. Let me think...
+
+The tight crop is 1.5x the box size. The wide crop is 2.5x. The box itself is the defect region. So:
+- Tight: 1.5x box → shows the defect plus 25% margin on each side
+- Wide: 2.5x box → shows the defect plus 75% margin on each side
+
+For stain vs deposit confusion, the wider context (surrounding weld bead pattern) might be important. But the tight crop still shows the defect shape clearly.
+
+I'll go with fixing e002. The main benefit is 2x more optimizer steps, which should help general optimization. If the tight crop is insufficient, we can try other approaches later.
+
+Let me write the SEARCH/REPLACE blocks:
+
+1. Training loop: change `for xt, xw, y in dl_tr:` to `for xt, y in dl_tr:` and update the forward pass
+2. Inference loop: change `for xt, xw, _ in dl_ev:` to `for xt, _ in dl_ev:` and update the forward pass
+
+Let me look at the exact lines in e002's train.py:
+
+Training loop:
+```python
+        for xt, xw, y in dl_tr:
+```
+and
+```python
+            xt = xt.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            xw = xw.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            y = y.to(device, non_blocking=True)
+            with torch.autocast(**amp):
+                loss = crit((model(xt) + model(xw)) / 2, y)
+```
+
+Inference:
+```python
+        for xt, xw, _ in dl_ev:
+            xt = xt.to(device).to(memory_format=torch.channels_last)
+            xw = xw.to(device).to(memory_format=torch.channels_last)
+            probs.append(torch.softmax(((model(xt) + model(xw)) / 2).float(), 1).cpu())
+```
+
+I need to change these to single-input versions. Let me write the blocks carefully.
+
+For the training loop, I'll replace:
+```
+        for xt, xw, y in dl_tr:
+```
+with:
+```
+        for xt, y in dl_tr:
+```
+
+And:
+```
+            xt = xt.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            xw = xw.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            y = y.to(device, non_blocking=True)
+            with torch.autocast(**amp):
+                loss = crit((model(xt) + model(xw)) / 2, y)
+```
+with:
+```
+            xt = xt.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            y = y.to(device, non_blocking=True)
+            with torch.autocast(**amp):
+                loss = crit(model(xt), y)
+```
+
+For inference:
+```
+        for xt, xw, _ in dl_ev:
+            xt = xt.to(device).to(memory_format=torch.channels_last)
+            xw = xw.to(device).to(memory_format=torch.channels_last)
+            probs.append(torch.softmax(((model(xt) + model(xw)) / 2).float(), 1).cpu())
+```
+with:
+```
+        for xt, _ in dl_ev:
+            xt = xt.to(device).to(memory_format=torch.channels_last)
+            probs.append(torch.softmax(model(xt).float(), 1).cpu())
+```
+
+Let me verify these SEARCH strings are unique in the file. Yes, they should be.
+
+Let me also think about the budget. Currently:
+- 14s loading
+- ~71s per epoch (85-14=71s for epoch 0, 125-85=40s for epoch 1... wait that doesn't add up)
+
+Actually looking at the log:
+- 14s loading
+- epoch 0: 220 steps, ends at 85s → 71s for 220 steps → ~0.32s/step
+- epoch 1: 428-220=208 steps, ends at 125s → 40s for 208 steps → ~0.19s/step
+
+Wait, that's inconsistent. Let me re-read. The log says:
+```
+train 14128 boxes, eval 41879 detections, 2255 images (14s)
+epoch 0: loss 0.5923, 220 steps, 85s
+epoch 1: loss 0.3107, 428 steps, 125s
+done: 2 epochs, 428 steps, 56470 prediction rows, 162s total
+```
+
+So total 162s. Loading 14s. Training from 14s to ~125s = 111s for 428 steps ≈ 0.26s/step. Prediction from 125s to 162s = 37s.
+
+With single crop, step time should roughly halve (one forward+backward instead of two). So ~0.13s/step. Training budget is 180-55=125s minus 14s loading = 111s. At 0.13s/step, that's ~850 steps. That's roughly double the current 428 steps.
+
+Prediction: currently 37s for 41879 detections with 2 forward passes. With 1 forward pass, ~19s. Total: 14 + 111 + 19 = 144s, well within 180s.
+
+This looks good. Let me proceed with the fix.

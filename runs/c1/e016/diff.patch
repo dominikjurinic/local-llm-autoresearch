@@ -1,0 +1,106 @@
+--- e000/train.py
++++ e016/train.py
+@@ -47,4 +47,5 @@
+ CONTEXT = 2.5           # wide crop: side = CONTEXT * long side of the box
+ TIGHT_CONTEXT = 1.5     # tight crop
++EDGE_VIEW = True        # third view: Sobel gradient magnitude of the tight crop
+ MIN_CROP = 16
+ TRAIN_ON = ("high",)    # resolutions of crops.csv used for training
+@@ -69,5 +70,5 @@
+ 
+ 
+-def make_crop(img, r, context, train):
++def make_crop(img, r, context, train, edge=False):
+     h, w = img.shape[:2]
+     cx, cy = (r["x1"] + r["x2"]) / 2, (r["y1"] + r["y2"]) / 2
+@@ -83,5 +84,21 @@
+     if sx1 > sx0 and sy1 > sy0:
+         canvas[sy0 - y0:sy1 - y0, sx0 - x0:sx1 - x0] = img[sy0:sy1, sx0:sx1]
+-    return np.asarray(Image.fromarray(canvas).resize((IMG_SIZE, IMG_SIZE), Image.BILINEAR), dtype=np.float32) / 255.0
++    crop = np.asarray(Image.fromarray(canvas).resize((IMG_SIZE, IMG_SIZE), Image.BILINEAR), dtype=np.float32) / 255.0
++    if edge:
++        g = crop.mean(axis=2)
++        kx = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=np.float32)
++        ky = kx.T
++        gx = np.zeros_like(g); gy = np.zeros_like(g)
++        for i in range(1, IMG_SIZE - 1):
++            for j in range(1, IMG_SIZE - 1):
++                patch = g[i - 1:i + 2, j - 1:j + 2]
++                gx[i, j] = float((patch * kx).sum())
++                gy[i, j] = float((patch * ky).sum())
++        mag = np.sqrt(gx ** 2 + gy ** 2)
++        m = mag.max()
++        if m > 1e-6:
++            mag = mag / m
++        crop = np.dstack([mag, mag, mag])
++    return crop
+ 
+ 
+@@ -111,5 +128,13 @@
+             x = (x - MEAN) / STD
+             views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))
+-        return views[0], views[1], r.get("cls", -1)
++        if EDGE_VIEW:
++            x = make_crop(img, r, TIGHT_CONTEXT, self.train, edge=True)
++            if fh:
++                x = x[:, ::-1]
++            if fv:
++                x = x[::-1, :]
++            x = (x - MEAN) / STD
++            views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))
++        return views[0], views[1], (views[2] if EDGE_VIEW else None), r.get("cls", -1)
+ 
+ 
+@@ -139,9 +164,16 @@
+ 
+     g = torch.Generator().manual_seed(args.seed)
++    def collate(batch):
++        a = torch.stack([b[0] for b in batch])
++        b = torch.stack([b[1] for b in batch])
++        c = torch.stack([b[2] for b in batch]) if EDGE_VIEW else None
++        y = torch.tensor([b[3] for b in batch])
++        return a, b, c, y
+     dl_tr = torch.utils.data.DataLoader(BoxDataset(crops, images, True), batch_size=BATCH_SIZE, shuffle=True,
+                                         num_workers=workers, pin_memory=True, drop_last=True,
+-                                        persistent_workers=True, generator=g, worker_init_fn=worker_init)
++                                        persistent_workers=True, generator=g, worker_init_fn=worker_init,
++                                        collate_fn=collate)
+     dl_ev = torch.utils.data.DataLoader(BoxDataset(ev, images, False), batch_size=256, shuffle=False,
+-                                        num_workers=workers, pin_memory=True)
++                                        num_workers=workers, pin_memory=True, collate_fn=collate)
+ 
+     model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
+@@ -159,5 +191,5 @@
+     while not done:
+         tot, nb = 0.0, 0
+-        for xt, xw, y in dl_tr:
++        for xt, xw, xe, y in dl_tr:
+             frac = min(1.0, (time.time() - t_start) / budget)
+             f = frac / 0.05 if frac < 0.05 else 0.5 * (1 + math.cos(math.pi * (frac - 0.05) / 0.95))
+@@ -168,5 +200,9 @@
+             y = y.to(device, non_blocking=True)
+             with torch.autocast(**amp):
+-                loss = crit((model(xt) + model(xw)) / 2, y)
++                if EDGE_VIEW and xe is not None:
++                    xe = xe.to(device, non_blocking=True).to(memory_format=torch.channels_last)
++                    loss = crit((model(xt) + model(xw) + model(xe)) / 3, y)
++                else:
++                    loss = crit((model(xt) + model(xw)) / 2, y)
+             opt.zero_grad(set_to_none=True)
+             loss.backward()
+@@ -183,8 +219,13 @@
+     probs = []
+     with torch.no_grad(), torch.autocast(**amp):
+-        for xt, xw, _ in dl_ev:
++        for xt, xw, xe, _ in dl_ev:
+             xt = xt.to(device).to(memory_format=torch.channels_last)
+             xw = xw.to(device).to(memory_format=torch.channels_last)
+-            probs.append(torch.softmax(((model(xt) + model(xw)) / 2).float(), 1).cpu())
++            if EDGE_VIEW and xe is not None:
++                xe = xe.to(device).to(memory_format=torch.channels_last)
++                logits = (model(xt) + model(xw) + model(xe)) / 3
++            else:
++                logits = (model(xt) + model(xw)) / 2
++            probs.append(torch.softmax(logits.float(), 1).cpu())
+     probs = torch.cat(probs).numpy()
+     os.makedirs(args.out, exist_ok=True)

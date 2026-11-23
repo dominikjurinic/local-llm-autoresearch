@@ -1,0 +1,206 @@
+===== attempt 1 =====
+Let me carefully analyze the situation.
+
+**Current state:**
+- Best: e000, 5-seed mean 0.6297, per-class: pore 0.504, deposit 0.626, discontinuity 0.780, stain 0.609
+- Baseline to beat: one-step 4-class detector 0.638
+- Ceiling: 0.758 (stage-1 boxes with perfect classes)
+- Class-agnostic: 0.755
+
+**History analysis:**
+- e001 (data): crashed (NameError)
+- e002 (data): fixing e001, 0.5541 — rejected (this was the "emit one row per box" idea apparently? Actually 0.5541 is much lower, so that idea was bad)
+- e003 (inference): 4 views (tight+wide, each with 2 something?), 0.6355 seed-0, 5-seed 0.6301 — not confirmed (basically no gain)
+- e004 (scoring): 0.5689 — rejected (some scoring change, big drop)
+- e005 (architecture): backbone swap, 0.6240 — rejected
+- e006 (data): train on both resolutions, 0.6225 — rejected
+- e007 (scoring): 0.6192 — rejected
+- e008 (augmentation): mixup, 0.6356 seed-0, 5-seed 0.6327 — not confirmed (slightly above best 0.6297 but within noise; "not confirmed" means multi-seed mean didn't beat best... actually 0.6327 > 0.6297? Hmm, "not confirmed" — maybe the multi-seed mean of the new version was 0.6327 but with more seeds it didn't beat? The table says 5-seed mean 0.6327, outcome "not confirmed". Odd, but I'll take it as: no confirmed gain.)
+
+**Lessons:**
+- data: 3 ideas, no new best — marked EXHAUSTED?
+- scoring: 2 ideas, no new best
+- inference: 1 idea, close but not confirmed
+- architecture: 1 idea
+- augmentation: 1 idea, close but not confirmed
+
+So what's left? Let me think about where the error is.
+
+Key insight from the brief: "AP depends only on this ORDER. Any change that keeps the order of a class's predictions leaves its AP unchanged."
+
+Current scoring: score = detector conf × class probability p_c. For a given class c, all boxes get a row with score conf_c × p_c(box). The order within class c is determined by conf × p_c.
+
+The ceiling (0.758) uses score = detector conf, and every box overlapping a true defect gets the correct class, false alarms get class 0. So in the ceiling, the order within each class is basically detector conf (for true boxes of that class) — wait, no. In the ceiling, boxes that overlap true defects get the correct class with score = conf; false alarms kept as class 0 with conf. So class 0's list has true pores (scored by conf) plus all false alarms (scored by conf), ordered by conf. Other classes have only their true boxes, ordered by conf.
+
+In our system, class c's list contains: true c boxes with score conf × p_c, plus all other boxes (true non-c boxes and false alarms) with score conf × p_c. The p_c ranking is what separates them.
+
+The gap 0.63 vs 0.758: for classes 1-3, our list contains false positives (boxes that are actually other classes or false alarms) ranked by conf × p_c. In the ceiling they're absent (except class 0 gets all false alarms). So the loss comes from:
+1. Wrong class assignment: a true deposit box gets p_deposit < p_pore, so in the deposit list it's ranked lower than many false positives, hurting precision at that rank.
+2. Actually more precisely: AP for class c = integral of precision over the ranked list. False positives (non-c boxes) in the list hurt precision wherever they rank.
+
+So the key is: for each box, the p vector determines both which class it lands high in, and where it sits in each class's list.
+
+Now, what could plausibly gain ≥0.01?
+
+Ideas tried:
+- More views / TTA (e003): no gain.
+- Emitting fewer rows (e004, e007 scoring): big drop. Interesting — emitting all 4 rows per box is actually good? e004 was 0.5689, e007 was 0.6192. Both worse. So "emit all rows" is the right approach (makes sense: a box that is truly class c should appear in class c's list; if we drop rows we lose true detections).
+
+Wait, but actually there's a subtlety: emitting all 4 rows means each box appears in every class list. The per-image 300-row cap: 41879 detections × 4 rows = 167516 rows, per image cap 300. How many detections per image? 41879/1022 ≈ 41 per image on average, so 164 rows per image — under 300. OK, cap rarely binds.
+
+- Backbone swap (e005): no gain.
+- Training on low-res too (e006): no gain.
+- Mixup (e008): marginal, not confirmed.
+
+What haven't we tried?
+1. **Better use of detector confidence**: currently score = conf × p_c. The conf is stage-1 confidence. Maybe we can learn a calibration: fit a per-class function of (conf, p) on train dets (which have ground truth via overlap). E.g., on train split dets, we know which boxes overlap true crops (and their class). We could learn a re-scoring model: a small logistic regression / gradient boosting on features (conf, p_0..p_3, box size, etc.) predicting "is this box a true c", and use that as score. This changes the order within each class in a way that could help. This is a "scoring" category but different from e004/e007 which just dropped rows or changed combination. Hmm, but scoring category has 2 failed ideas. The lesson says "do not propose another variant unless fundamentally different". A learned calibrator is fundamentally different (uses train dets with labels, learns a nonlinear map). But is the scoring category exhausted? Only 2 ideas, so not marked exhausted.
+
+2. **Training with the detector conf as a feature / sample weighting**: weight training samples by conf? Probably small effect.
+
+3. **Two-crop vs single crop**: tried backbone, views...
+
+4. **Class imbalance**: class-weighted loss hurt every time (known). So no.
+
+5. **Better classifier**: the crop classifier macro-F1 ~0.87 is the bottleneck. Pore and deposit are weak. What makes pore hard? Pores are small dark spots. Maybe the tight crop at 1.5× is too tight or the wide crop dilutes. What about adding a third scale? e003 tried 4 views (no gain).
+
+6. **Training duration / more steps**: currently 432 steps in ~150s. Loss still decreasing (0.218 at end). More epochs would help if we had time. But budget is fixed at T (180s?). Actually --seconds T is given by harness; log shows 162s total. Reserve 55s. Hmm, RESERVE_S = 55 seems large; prediction took ~37s (162-125). If we reduce reserve to ~40s, we get ~15 more seconds ≈ 60 more steps. Small effect, probably <0.003. Not worth.
+
+7. **Freeze backbone / train only head first then fine-tune**: probably small.
+
+8. **Input: use both crops through separate models / concat features**: architecture change, e005 tried backbone swap. Concat features instead of averaging logits? Currently logits averaged. Feature concat with a small MLP head might help. That's an architecture change.
+
+9. **Test-time: use the wide crop's background to reject false alarms** — the classifier already sees context.
+
+10. **Key idea: rank fusion with detector conf learned per class**. Let me think about what the biggest error component is.
+
+Per-class AP: pore 0.504, deposit 0.626, discontinuity 0.780, stain 0.609. Average = (0.504+0.626+0.780+0.609)/4 = 2.519/4 = 0.62975. ✓.
+
+Ceiling 0.758. In the ceiling, what are per-class APs? Not given. But class-agnostic single-class is 0.755.
+
+Where's the loss? For class c in our system vs ceiling: ceiling's class c list (c>0) contains only true c boxes ranked by conf → AP_c_ceiling = 1.0? No wait — the ceiling keeps false alarms as class 0. So classes 1,2,3 in the ceiling have no false positives at all → AP = 1.0 for deposit, discontinuity, stain? Then ceiling mAP = (AP_0 + 3×1.0)/4 = 0.758 → AP_0 = 0.758×4 - 3 = 0.032?? That can't be right. Hmm wait, that would make AP_0 = 3×... let me recompute: 0.758 = (AP0 + AP1 + AP2 + AP3)/4. If AP1=AP2=AP3=1, then AP0 = 4×0.758 - 3 = 3.032-3 = 0.032. That's absurd. So my reading is wrong.
+
+Ah wait — "every detector box that overlaps a true defect (IoU > 0.5) gets the correct class". But a box can overlap a true defect of class c — but what if the box overlaps multiple? And crucially: mAP matching is greedy in score order. In the ceiling, class 1's list = all boxes overlapping a true deposit, ranked by conf. When matching, a prediction is a hit if it overlaps an unmatched true box of that class by IoU>0.5. Since every box in the list overlaps some true deposit... but if two boxes overlap the same true box, the second is a false positive. Also boxes overlapping true deposits are all "true positives" only if they match distinct true boxes. So AP1 < 1 due to duplicate boxes on the same defect. OK, so ceiling per-class APs are probably all around 0.75-0.9.
+
+Anyway, the point: our per-class losses are pore 0.504 and stain 0.609, deposit 0.626. Discontinuity 0.780 is near ceiling.
+
+The error is class decision: stain confused with deposit (known), pore is weak.
+
+What fundamentally different idea could gain ≥0.01?
+
+Let me think about the **scoring** more carefully. Currently score_c = conf × p_c. Within class c's ranked list, the order is by conf × p_c. Consider a true c box with high conf but moderate p_c, vs a false alarm with moderate conf but high p_c. The classifier's p_c is the main discriminator.
+
+Idea: **calibrate p_c with conf using train dets**. On train dets we have: for each train det box, we can find the overlapping true crop (IoU>0.5) → label (class or "false alarm"). We have the model's p vector and conf. Fit 4 independent binary classifiers (e.g., logistic regression on [conf, p_0..p_3, log box area]) to predict "true c". Then score_c = P(true c | features). This is a proper re-ranking that uses the conf information in a learned way and can correct miscalibration (e.g., if p_pore is systematically too high on false alarms that look like pores).
+
+But wait — does this actually change the order meaningfully? The logistic regression on (conf, p_c, ...) — if p_c alone is the best predictor, it won't change much. The gain comes if conf adds information beyond p_c, or if the interaction matters. Given the ceiling uses conf ranking and gets 0.758, conf carries real signal about "is this a true defect". Combining conf and p_c optimally could beat conf×p_c.
+
+Hmm, but actually there's a subtlety: the product conf × p_c is already a combination. A logistic regression on (conf, p_c) would learn something like σ(a·log conf + b·log p_c + c) — a different combination than the product. Could help a bit.
+
+Alternatively, a simpler and potentially bigger idea:
+
+**Idea: train the classifier to predict "defect vs background" jointly, or use the wide crop to detect false alarms.** False alarms (boxes on non-defect regions) hurt all class lists. The stage-1 conf already ranks them somewhat. If our classifier could output a "background" probability and we multiply... but we can't drop rows (e004 showed dropping rows hurts). Actually wait — e004 was 0.5689, a big drop. What did e004 do exactly? "The current code emits 4 rows per box, so every box injects 3 false-positive rows into the other classes' ranked lists" — so e004 probably emitted only the top-1 row per box. That dropped AP a lot, confirming: emitting all 4 rows is essential (a true box must be in its class list even if p is uncertain; also the 3 "wrong" rows are usually low-scoring and harmless).
+
+Hmm wait, is that right? If a box is truly deposit with p = [0.1, 0.8, 0.05, 0.05], the pore row scores conf×0.1 — it will rank low in the pore list, mostly harmless. OK.
+
+**Another angle: the 300-row cap.** 41 eval dets per image × 4 = 164 rows, under 300. Fine.
+
+**Angle: use more training data via the train dets themselves.** dets.csv has train boxes with conf. We can find the true class of each train det by overlap with crops. These are exactly the boxes our stage 2 will face at test time! Currently we train only on crops.csv (6052 boxes). The train dets are probably more numerous and closer to the eval distribution (detector boxes, including false alarms). Training the classifier on train det boxes (with labels from overlap, and false alarms labeled as... hmm, false alarms have no class).
+
+Wait — this is interesting. Training on crops.csv means the model sees "perfect" boxes (ground-truth boxes). At test time it sees detector boxes (slightly misplaced, plus false alarms). Distribution shift! Training on train dets (detector boxes) would align train and test distributions. False alarms could be included as a 5th class "background", or we could train the 4-class model on matched boxes only and add a separate background head.
+
+Actually, the two-crop classifier with wide context (2.5×) already sees surrounding context, so it can in principle learn "this box is on a non-defect". Adding a 5th class "background" trained on train-det false alarms, and at test time... but we must emit 4 rows per box (dropping rows hurt). Hmm, but we could use the background probability to *rescale* scores: score_c = conf × p_c / (1 + p_bg)? This changes order within class c: boxes that look like background get down-ranked. This is a legitimate re-ranking that targets false alarms!
+
+Wait, but does down-ranking false alarms help? In class c's list, false alarms (non-c boxes) hurt precision. If we push them down, precision at each true detection's rank improves → AP up. Yes, this directly targets the FP contamination. And it's different from e004/e007 (which dropped rows or changed the combination heuristically) — this learns a background signal from actual train false alarms.
+
+How many train false alarms are there? dets.csv train split — unknown count, but stage-1 detector on train images... eval has 41879 dets over 1022 images. Train probably similar scale. A large fraction might be false alarms (detector is class-agnostic, finds "defect-like" regions). Actually, the class-agnostic val AP is 0.755, so ~75% of dets are true (roughly). So ~25% false alarms available for background training.
+
+But wait: is this fundamentally different from e006 (train on both resolutions)? Yes. From e001/e002 (data)? e002 was a crash-fix of e001 whose idea was about ranking... e001's hypothesis was cut off: "the gap is a ranking problem, and the weakest class (pore..." — probably about pore data. e002's fix scored 0.5541 — that was bad, but it was a different idea (probably emitting 1 row? No wait, e004 was the "emit fewer rows" idea at 0.5689). Hmm, e002's hypothesis: "Restoring that writer (emitting the 4 class..." — cut off. Probably "emitting the 4 class rows with score = ..." something. It scored 0.5541, rejected.
+
+Anyway, training on train-det boxes + background class is new.
+
+Let me estimate the effect size. The gap to ceiling is 0.128. The false-alarm contamination: in class c's list, FPs are non-c boxes. Their count relative to true c boxes matters. If ~25% of all boxes are false alarms and classes are roughly balanced, then in pore's list there are ~3× as many boxes as true pores, of which ~25% are FAs and 75% are other-class true boxes. Down-ranking FAs by a learned background score could help, but the other-class true boxes remain (they're real defects, just wrong class — the background head won't down-rank them).
+
+Hmm, so the background head only addresses ~1/4 of the contamination. The rest is wrong-class, which is a classifier accuracy problem.
+
+Alternatively, **train on train dets (matched ones) for the 4-class task** to fix distribution shift (detector boxes vs GT boxes). That could improve p_c quality on the actual test input. This is a "data" change though — data category is marked EXHAUSTED? (3 ideas, no new best): e001 (crash), e002 (0.5541), e006 (0.6225). Hmm, "3+ attempts without confirmed gain = exhausted". The data category is flagged. But the background-class idea is different... the rule says don't propose another variant unless fundamentally different. Training on train-det boxes with a background class is fundamentally different from e006 (add low-res crops) and e001/e002 (unknown, probably pore-focused). But the category is flagged exhausted; safer to categorize it differently? The category is a label I choose; I could call it "sampling" (which is unused!) — sampling: which boxes to train on. Actually "sampling" fits: change the training sample distribution to match test (detector boxes instead of GT boxes).
+
+Hmm wait, let me reconsider. Is there a bigger fish?
+
+**The biggest single lever might be classifier accuracy on pore/stain.** Macro-F1 0.87. Pore AP 0.504 — very low. What's special about pore? Pores are small. In crops.csv, pore boxes are small. The detector's boxes for pores might be poorly placed. Hmm.
+
+Let me think about **resolution**: IMG_SIZE=160. Pores are small details; 160 might be too low for tight crops. Raising to 224 would help pore detail but cost time. EfficientNet-B0 at 160: ~1.9s/epoch... actually 94 steps per epoch, 18s/epoch → ~0.19s/step at batch 64. At 224 (1.96× pixels), step time ~1.96× → ~115 steps/epoch... wait, steps per epoch is fixed by dataset size (6052/64 = 94.5). Time per step increases → fewer epochs. Total steps maybe ~250 instead of 432. And eval: 41879 boxes × 2 views at 224 → prediction time scales 1.96×: currently prediction ≈ 162-125 = 37s → ~73s. Total: load 13 + train ~90 (fewer steps) + pred 73 = ~176s. Tight against 180! Risky. Could reduce reserve and use 192 instead of 224. Hmm.
+
+But wait — is resolution the bottleneck for pore? Pore crops at 1.5× box side, resized to 160. If the box is say 30px, the crop is 45px upscaled to 160 — blurry. Pores are small dark holes; upscaling a 45px crop to 160 loses nothing (it's already low-res). Actually upscaling doesn't lose info. The issue is the network's inductive bias. Probably marginal.
+
+**What about the two-crop averaging?** Logits averaged. What if the tight crop is more discriminative for class and the wide crop is more useful for background/FA rejection? Instead of averaging, concatenate features → MLP head. Architecture change. e005 tried backbone swap (convnext? or something) — rejected. Feature concat is different.
+
+Let me think about **what's most likely to give ≥0.01**:
+
+Option A: Train on train-det boxes (distribution match) + background class for FA down-ranking.
+Option B: Learned re-scoring (calibration) using train dets.
+Option C: Feature concat architecture.
+Option D: Higher resolution.
+Option E: Longer training (reduce reserve) — small.
+Option F: Something on stain/deposit confusion.
+
+Actually, wait. Let me reconsider Option B more carefully, because it's cheap and directly targets ranking.
+
+We have train dets with known labels (via overlap with crops). For each train det: features = [conf, p0, p1, p2, p3] (from our trained model), label = class or FA. Fit 4 logistic regressions (or a small GBM) predicting "true c". Score_c = model_c(features). This re-ranks within each class using conf in a calibrated way.
+
+But honestly, the logistic regression on (conf, p_c) is close to a monotone transform of (conf, p_c) — the product conf×p_c is already using both. The gain from a better combination is probably <0.005. Not compelling.
+
+Option A is more compelling: it changes what the model sees during training (detector boxes, including FAs) — "ideas that change what the model sees or learns from usually matter more".
+
+Let me detail Option A:
+1. Build training set from dets.csv train split: for each train det, find overlap with crops (IoU>0.5 with a crop of the same image). If matched → label = crop's cls. If not → label = 4 (background).
+2. Train a 5-class classifier (same two-crop recipe).
+3. At test: for each eval det, get p0..p4. Emit 4 rows with score_c = conf × p_c / (p0+..+p3)? Or conf × p_c × (1 - p_bg)? Hmm.
+
+Note: adding a background class changes the softmax: p_c = exp(z_c)/Σexp. A box that's background gets high p_bg, low p_c → all rows down-ranked relative to... wait, within class c's list, dividing all scores by (1-p_bg) or multiplying by (1-p_bg) re-ranks: background-like boxes get lower scores. True c boxes have low p_bg → relatively higher. Good.
+
+But there's a risk: the 5-class training dilutes the 4-class learning (background is ~25% of data). And the crop-based training data (6052 GT boxes) — should we keep it? The GT boxes are "cleaner" but distribution-shifted. We could train on both: crops (6052) + train dets (matched → class, unmatched → bg). Total maybe 6052 + ~40000? That's a lot of steps: 46000/64 = 720 steps/epoch vs 94. Epoch time ~250s — too long! We'd do <1 epoch. Hmm, that's a problem: with 150s budget and 720 steps/epoch at 0.19s/step = 137s/epoch. Just under 1 epoch. That's much less training than current 432 steps... actually 432 steps currently. 720 steps/epoch × 137s → we'd get ~150s/0.19 ≈ 790 steps ≈ 1.1 epochs. Comparable step count but each step is on a bigger, noisier dataset.
+
+Alternatively, subsample: use all train dets but... hmm.
+
+Wait, actually, how many train dets are there? Unknown. Let me think: eval is 41879 dets / 1022 images ≈ 41/image. Train images — crops.csv has 6052 boxes (high-res only; total crops including low-res probably ~12000). Number of train images unknown. If train has, say, 1500 images × 41 = 61500 dets. That's huge.
+
+Hmm, this is getting complicated and time-risky. Let me reconsider.
+
+**Simpler variant of Option A**: keep training on crops.csv (6052 boxes) but add train-det false alarms as a 5th class, and train on matched train dets as their class. To control step count, subsample matched train dets to balance with crops. E.g., all FAs (say ~15000?) — still a lot.
+
+Hmm, I don't know the counts. Risky.
+
+Let me step back and think about **what's the largest error component** using the reference numbers.
+
+- Our mAP: 0.630
+- Class-agnostic (single class "defect", score=conf): 0.755
+- Ceiling (perfect classes, FAs kept as class 0): 0.758
+
+The class-agnostic 0.755 means: if we put all detections in one class ranked by conf, AP = 0.755. The loss from 1.0 is due to FAs (non-defect boxes) and duplicate boxes on the same defect, ranked by conf.
+
+Our 4-class system: each class c's list = all boxes ranked by conf×p_c. Compared to the ideal "only true c boxes ranked by conf" (which would give ~0.755-ish per class), the contamination by non-c boxes (both other-class true boxes and FAs) is what drops AP.
+
+Now, the key question: within class c's list, how many non-c boxes are there, and where do they rank? If p_c for non-c boxes is well below p_c for true c boxes, the contamination sits at the bottom and hurts little. The damage is from non-c boxes with high p_c.
+
+For pore (AP 0.504): the model assigns high p_pore to many non-pore boxes. What non-pore things look like pores? Small dark spots — stains? FAs on texture?
+
+Given "pore and deposit are the weak classes; stain is often confused with deposit" — the confusion matrix is the issue.
+
+**What improves class separation?** Better features, better training. We tried backbone (no), mixup (marginal), views (no), resolution (no), data res (no), class weights (known bad).
+
+What about **training longer / better optimizer**? Loss at end 0.218, still decreasing. If we cut RESERVE_S from 55 to 40 (prediction took 37s, so 40 is safe... actually let me compute: total 162s, training ended at 125s, so prediction+write = 37s. Reserve 55 → 18s slack. Cutting to 40 gives 15 more training seconds ≈ 65 more steps ≈ +15% steps. Effect probably +0.002-0.004. Below noise threshold. Not worth a run alone.
+
+**What about a fundamentally different stage-2 design?** E.g., instead of crop classification, use the image with a box overlay (draw the box on the image, classify the whole image)? The network sees the box location as a visual cue. Probably marginal.
+
+**What about using the detector conf in training?** Sample weighting by conf: high-conf boxes are more likely true → weight them more. Or: train with labels only on high-conf boxes (drop low-conf boxes from crops? No, crops are GT).
+
+Hmm wait, actually there's something interesting: **crops.csv boxes are GT boxes; dets.csv train boxes are detector boxes.** The classifier is trained on GT crops but tested on detector crops. Detector boxes are "slightly misplaced". The wide crop (2.5×) mostly absorbs the misplacement. But the tight crop (1.5×) is sensitive to placement. Training on detector boxes would teach the model the actual test distribution of the tight crop.
+
+I keep coming back to Option A. Let me see if I can make it time-safe:
+
+Plan:
+- Build train set: crops.csv high-res boxes (6052, class labels) + train dets: matched → class, unmatched → bg (class 4).
+- To keep step count manageable: subsample the train-det portion. E.g., take all unmatched (FAs) but cap at N, and matched at M. Actually, simpler: cap total train-dets at ~6000 (3000 matched random, 3000 FA random) + 6052 crops = ~12000 samples → 187 steps/epoch, ~35s/epoch → ~4 epochs in 150s ≈ 750 steps. More steps than current, on a more relevant distribution.
+
+Hmm wait, but is it safe to guess the FA count? I don't know how many train dets exist. The code should handle whatever count: subsample to fixed cap. That's robust.
+
+But actually, holdThinking budget reached. Stop thinking now and write the reply in the required format.

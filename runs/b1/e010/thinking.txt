@@ -1,0 +1,363 @@
+===== attempt 1 =====
+Let me analyze the situation carefully.
+
+**Current state:**
+- Best: e002, 5-seed mean 0.6337 mAP@0.5
+- Per-class: pore 0.515, deposit 0.627, discontinuity 0.781, stain 0.611
+- Ceiling (perfect classes on stage-1 boxes): 0.758
+- Single-class (class-agnostic): 0.755
+- One-step baseline to beat: 0.638
+
+**History analysis:**
+
+1. **Data category:**
+   - e001: crashed (numpy broadcast bug in IoU)
+   - e002: fixed the bug, trains on detector boxes with GT labels → 0.6337 (new best)
+   - e005: higher-res crops (224px) → 0.6366 seed-0 but 0.6315 5-seed mean, not confirmed
+   - e009: added background class (5th class) for false alarms → 0.5984, rejected
+
+2. **Architecture:**
+   - e003: crashed (NameError)
+   - e004: fixed NameError, 224px tight crop → 0.6325, rejected
+
+3. **Augmentation:**
+   - e006: more augmentation → 0.6241, rejected
+
+4. **Scoring:**
+   - e007: timeout
+   - e008: score = p_class only (dropped detector conf) → 0.1692, likely bug (probably because dropping conf entirely makes false alarms rank high)
+
+**Key observations:**
+
+1. The gap to ceiling is 0.758 - 0.634 = 0.124. This is entirely class-decision error.
+2. The weakest classes are pore (0.515) and stain (0.611), with deposit (0.627) also weak.
+3. The class-agnostic score is 0.755, very close to the 0.758 ceiling. This means the detector boxes are well-placed; the issue is purely classification.
+4. Training on detector boxes (e002) helped vs GT boxes (the original).
+5. Higher resolution (e005, e004) didn't help.
+6. More augmentation (e006) hurt.
+7. Background class (e009) hurt significantly (0.5984).
+8. Dropping detector conf from score (e008) was catastrophic.
+
+**Where is the error?**
+
+The per-class APs: pore 0.515, deposit 0.627, discontinuity 0.781, stain 0.611.
+
+The ceiling is 0.758. If we had perfect classification, we'd get 0.758. Currently we get 0.634. The gap is 0.124.
+
+The fact that class-agnostic (single class) gets 0.755 means the boxes are fine. The error is in:
+1. Wrong class assigned to true defects (a pore detected as deposit, etc.)
+2. False alarms getting high scores for the wrong class, polluting the ranking
+
+Wait, let me think about this more carefully. In mAP@0.5 per class:
+- For class c, all predictions with cls=c are sorted by score.
+- A prediction is a TP if it overlaps an unmatched GT box of class c with IoU > 0.5.
+- AP = average precision over this sorted list.
+
+The issue: if a true pore is classified as deposit, then:
+- In the pore class list, this box is missing → recall drops
+- In the deposit class list, this box appears with its score → if it doesn't overlap a true deposit, it's a FP
+
+So wrong classifications hurt both the recall of the true class AND add false positives to the wrong class.
+
+The false alarms (boxes not overlapping any GT) also matter: they get a class assigned and a score. If they get high scores for some class, they pollute that class's ranking.
+
+**What haven't we tried?**
+
+Let me think about what could help:
+
+1. **Better model**: We're using EfficientNet-B0. Could try a larger model (EfficientNet-B2, ConvNeXt, etc.) but need to check time budget.
+
+2. **Training strategy**: 
+   - We train for ~148 seconds (deadline - 55s reserve). That's about 2 epochs on 18271 samples with batch 64.
+   - Could we train longer? The budget is 180s total, 55s reserved for prediction. So ~125s for training.
+   - Actually looking at the log: 14s loading, 97s epoch 0, 28s epoch 1 = 125s training, then 37s prediction. Total 162s.
+   - We could reduce the reserve or prediction time.
+
+3. **Score calibration**: The score is `conf * p_class`. The e008 experiment tried `p_class` only and got 0.1692 (bug). But what about a different combination? The key insight from e008 is that dropping conf entirely is bad. But maybe we can use a different weighting.
+
+   Actually wait - within a class, AP depends only on the ORDER of predictions. So for class c, the order is determined by `conf * p_c`. Since conf is the same for all classes of a given box, the order within class c is determined by `p_c` (because conf is a constant multiplier for all rows of the same box... wait no, conf is per-box, not per-class-row).
+
+   Actually, for a given box, we output 4 rows (one per class) with scores `conf * p_0`, `conf * p_1`, `conf * p_2`, `conf * p_3`. For class c, the relevant score is `conf * p_c`. Since `conf` is the same for all 4 rows of the same box, the ranking within class c is: box A ranks above box B if `conf_A * p_c(A) > conf_B * p_c(B)`.
+
+   So conf does matter for ranking within a class - it's not just a constant multiplier. A box with high conf but low p_c might rank below a box with low conf but high p_c.
+
+   The e008 experiment used `p_c` only (dropped conf) and got 0.1692. That's terrible. Why? Because false alarms (boxes not overlapping any GT) might have high p_c (the classifier is confident they're some defect) but low conf. Without conf, they rank high and pollute the class.
+
+   So the conf multiplier is important for suppressing false alarms. The current scoring seems reasonable.
+
+4. **What about the classifier itself?** 
+   - Pore is the weakest (0.515). Pores are tiny dark holes.
+   - Stain is confused with deposit.
+   - The classifier gets macro-F1 ~0.87 with perfect boxes.
+
+5. **Ensemble / test-time augmentation**: 
+   - We could do TTA at inference (flip, etc.) but it doubles prediction time.
+   - Current prediction: 41879 detections, 37s. With TTA (e.g., 2x for flip), it'd be ~74s. Total would be ~14s + 125s + 74s = 213s > 180s. Too slow.
+   - Unless we reduce training time.
+
+6. **Training on more data / different data**:
+   - We currently use "high" resolution crops + detector boxes from training images.
+   - Could we also use "low" resolution crops? The TRAIN_ON is ("high",).
+
+7. **Model architecture**:
+   - EfficientNet-B0 is small. Could try EfficientNet-B2 or ConvNeXt.
+   - But need to check time budget.
+
+8. **What about the two-crop approach?**
+   - We use tight (1.5x) and wide (2.5x) crops, average logits.
+   - Could try different contexts or more views.
+
+9. **Learning rate / optimizer**:
+   - Current: AdamW, LR=1e-3, weight_decay=0.05, 5% warmup + cosine.
+   - Training for only 2 epochs. Maybe the model isn't trained enough?
+   - Actually, the loss goes from 0.4582 to 0.2468 in 2 epochs. It's still decreasing.
+   - Could we train longer by reducing prediction time or reserve?
+
+10. **What about using a larger batch or different training duration?**
+    - 18271 samples / 64 batch = ~285 steps per epoch.
+    - 2 epochs = 570 steps in ~125s.
+    - If we reduce RESERVE_S from 55 to 40, we get 15s more training.
+    - Or if we make prediction faster (e.g., larger batch, no TTA).
+
+Let me think about what's most likely to help:
+
+**The biggest lever**: The classifier's accuracy. Pore at 0.515 AP means roughly half the pores are either missed or misclassified. Stain at 0.611 is similar.
+
+**Ideas ranked by expected impact:**
+
+1. **Train longer / better**: The model is only trained for 2 epochs. The loss is still dropping. More training could help. We can:
+   - Reduce RESERVE_S (55→40) to get more training time
+   - Use a smaller model that trains faster per step (but we're already using B0)
+   - Increase batch size to get more steps per second? No, batch size affects step time.
+   - Actually, the issue is wall-clock time. 125s for 2 epochs. If we get 150s, that's ~2.4 epochs. Not a huge improvement.
+
+2. **Better model**: EfficientNet-B2 is larger and might classify better. But it's slower per step. Let me estimate:
+   - B0: ~285 steps in 97s (epoch 0) → ~0.34s/step
+   - B2: maybe ~0.6-0.8s/step → ~150-190 steps per epoch → ~1.5 epochs in 125s
+   - Not clearly better.
+
+3. **ConvNeXt models**: convnext_nano might be a good middle ground. But similar timing concerns.
+
+4. **The scoring**: The current score is `conf * p_class`. What if we use a learned score or a different calibration?
+   - Actually, the key insight: within a class, the order matters. The current order is `conf * p_c`. 
+   - What if we use `p_c` with a temperature? Or `p_c^alpha`?
+   - These are monotone transforms of `p_c` for a fixed conf, but conf varies per box, so they're not equivalent.
+   - Hmm, but the e008 experiment showed that dropping conf is bad. So conf is important.
+
+5. **What about the false alarm problem?**
+   - The ceiling (0.758) keeps false alarms as class 0 with their conf. So false alarms DO contribute to the ceiling score.
+   - Wait, re-reading: "Every detector box that overlaps a true defect (IoU > 0.5) gets the correct class; every other box (false alarms) is KEPT, as class 0, with its detector conf."
+   - So in the ceiling, false alarms are assigned to class 0 (pore) with their conf as score. This means the ceiling score of 0.758 already accounts for false alarms polluting class 0.
+   - Our current system assigns false alarms to whatever class the classifier predicts. If the classifier says a false alarm is "pore" with high p_pore, it gets a high score in the pore class.
+   - The background class experiment (e009) tried to make the classifier learn to reject false alarms, but it hurt performance (0.5984). This makes sense: adding a 5th class dilutes the 4-class probabilities, and the background class might be too hard to learn (the false alarms look like real defects to the classifier).
+
+6. **What about training with the "low" resolution images too?**
+   - Currently TRAIN_ON = ("high",). The dataset has "high" and "low" resolution images.
+   - Adding "low" would double the training data.
+   - But "low" images might be noisier / less informative.
+   - This is a data augmentation in a sense.
+
+7. **What about the prediction score?**
+   - Currently: score = conf * p_class
+   - What if we use: score = conf * p_class / sum(p) = conf * p_class (same thing since p sums to 1)
+   - What if we use a rank-based score? No, that's complex.
+   - What if we threshold: only output the top-1 class per box? This reduces false positives in the wrong classes.
+     - Currently we output all 4 classes per box (54447 rows for 41879 boxes ≈ 1.3 rows/box, so some are filtered by MIN_SCORE).
+     - If we only output the argmax class, we'd have 41879 rows.
+     - This would eliminate cross-class false positives (a box classified as pore wouldn't also appear as deposit).
+     - But it might hurt recall if the argmax is wrong.
+     - Actually, for mAP, having a box in multiple classes means it's a potential TP in each class. If the box overlaps a true pore AND a true deposit (unlikely but possible), it could be a TP in both. But more commonly, it's a TP in one class and FP in the other.
+     - The FP in the wrong class hurts that class's AP.
+     - So outputting only argmax might help by reducing cross-class FPs.
+     - But it also means if the argmax is wrong, the box doesn't appear in the correct class at all.
+     - Hmm, this is a tradeoff. Let me think...
+     
+     Actually, with the current approach (all 4 classes), a true pore box that's classified 60% pore, 30% deposit, 10% stain would appear in all 3 classes. In the pore class, it's a TP (if it overlaps a true pore). In the deposit class, it's a FP (unless it also overlaps a true deposit). In the stain class, it's a FP.
+     
+     If we only output argmax (pore), it's a TP in pore, and doesn't pollute deposit or stain.
+     
+     The question is: does the reduction in cross-class FPs outweigh the loss of having the box in multiple classes?
+     
+     I think reducing cross-class FPs is likely beneficial, especially for the weak classes. A false deposit prediction (from a true pore box) hurts deposit's AP.
+     
+     But wait - the score matters too. If the box is 60% pore, 30% deposit, the deposit row has score conf*0.3. If there are many true deposits with score conf*0.9, the false deposit row ranks below them and might not affect AP much. But if it ranks above some true deposits, it hurts.
+     
+     This is worth trying. It's a simple change: only output the argmax class.
+
+8. **Actually, let me reconsider the problem structure.**
+
+The per-class APs: pore 0.515, deposit 0.627, discontinuity 0.781, stain 0.611.
+
+The ceiling is 0.758. If we had perfect classification:
+- Every true defect box gets the right class with its conf as score.
+- Every false alarm gets class 0 with its conf as score.
+- Result: 0.758.
+
+So in the ceiling, the pore class has: all true pore boxes (with conf) + all false alarms (with conf). The AP for pore in the ceiling is whatever it is.
+
+In our system, the pore class has: boxes classified as pore (with conf * p_pore). This includes:
+- True pores classified as pore (TP)
+- True non-pores classified as pore (FP)
+- False alarms classified as pore (FP)
+
+The ranking is by conf * p_pore.
+
+The key question: what's the main source of error?
+- Misclassification of true defects (pore→deposit, etc.)
+- False alarms getting high scores
+- Misplaced boxes not overlapping GT (IoU < 0.5)
+
+The fact that the class-agnostic score is 0.755 (vs 0.758 ceiling) suggests that box placement is fine. The 0.003 gap between 0.755 and 0.758 is just the effect of the ceiling's specific class assignment for false alarms.
+
+So the 0.124 gap is purely classification error.
+
+**What's the most impactful change?**
+
+Let me think about what we haven't tried:
+
+1. **Argmax-only output** (scoring): Only output the top-1 class per box. This reduces cross-class FPs. Simple to implement, low risk.
+
+2. **Train on "low" resolution too** (data): Double the training data. Might help generalization.
+
+3. **Larger model** (architecture): EfficientNet-B2 or ConvNeXt. Risk: time budget.
+
+4. **Longer training** (optimization): Reduce reserve, train more epochs.
+
+5. **Different loss** (loss): Focal loss? Label smoothing? The history says "class-weighted loss hurt every time" but focal loss is different.
+
+6. **Test-time augmentation** (inference): Flip augmentation at test time. Risk: time budget.
+
+Let me think about which is most likely to give ≥0.01 gain:
+
+- **Argmax-only**: Could help by reducing cross-class FPs. But could hurt if the argmax is often wrong. Given that macro-F1 is 0.87, the argmax is correct 87% of the time. The 13% wrong argmax means those boxes don't appear in the correct class at all. Currently, they might appear in the correct class with a lower score (e.g., 40% probability). So argmax-only trades: removing cross-class FPs vs. losing some TPs in the correct class. I think this is a wash or slightly negative. Not the best choice.
+
+- **Train on "low" too**: More data could help. The "low" images are presumably lower resolution versions of the same images. Adding them doubles the training set. This is a data change that could help the model generalize. Expected gain: maybe 0.005-0.015. Worth trying.
+
+- **Larger model**: EfficientNet-B2 has ~7.6M params vs B0's ~4.1M. It should classify better but takes ~2x longer per step. With 125s training budget, we'd get ~1 epoch instead of 2. Not clearly better. ConvNeXt-nano (50M params) would be even slower. Probably not worth it.
+
+- **Longer training**: Reduce RESERVE_S from 55 to 40. This gives 15s more training → ~0.15 more epochs. Marginal.
+
+- **Focal loss**: The model might be overconfident on easy examples and underweight hard ones. Focal loss could help focus on the hard (misclassified) examples. This is different from class-weighted loss (which was tried and failed). Expected gain: maybe 0.005-0.01.
+
+- **Label smoothing**: Could help calibration. But the score is conf * p_class, so calibration matters. If the model is overconfident, the scores might be poorly calibrated. Label smoothing (e.g., 0.1) could help. Expected gain: small.
+
+Actually, let me reconsider. The history shows:
+- Data changes: 1 success (e002), 1 not confirmed (e005), 1 rejected (e009)
+- Architecture: 0 successes
+- Augmentation: 0 successes
+- Scoring: 0 successes (1 timeout, 1 bug)
+
+The most successful category is data. And the one thing that worked was training on detector boxes (the actual distribution at test time).
+
+What data changes haven't we tried?
+- Training on "low" resolution images (currently only "high")
+- Training on more detector boxes (we already do this)
+- Different crop parameters
+
+Wait, I just realized: the current training uses GT crops from "high" resolution + detector boxes from training images. The detector boxes are labeled by IoU overlap with GT crops. But what about detector boxes that DON'T overlap any GT crop? In e002, those boxes don't get a "cls" field, so they're not included in training. In e009, they were included as class 4 (background), which hurt.
+
+So the current training set is: GT crops (high res) + detector boxes that overlap GT (labeled by the overlapped GT's class).
+
+What if we also include the "low" resolution GT crops? That would add more training data.
+
+Let me check: the crops.csv has "res" field with "high" or "low". Currently TRAIN_ON = ("high",). If we change to ("high", "low"), we double the GT crop training data.
+
+But wait - the detector boxes in dets.csv are on training images. Are they on "high" or "low" images? The dets.csv doesn't have a "res" field. The images are in the "images/" directory. I think each image file is either high or low resolution, and the crops.csv tells us which is which.
+
+Actually, looking at the code: `crops = [r for r in read_csv(crops.csv) if r["res"] in TRAIN_ON]`. So the crops are filtered by resolution. The detector boxes are all included (from dets.csv where split=="train").
+
+If we add "low" to TRAIN_ON, we get more GT crops from low-res images. But the detector boxes are the same (they're on specific images, which are either high or low res).
+
+Hmm, actually I'm not sure if the detector boxes are on high or low res images. The dets.csv has an "image" field that matches the image filename. The crops.csv also has an "image" field and a "res" field. So for a given image, we know its resolution from crops.csv.
+
+If we add "low" crops to training, we get more training samples. The detector boxes on low-res images would also be included (they already are, since we include all detector boxes from training images).
+
+This seems like a reasonable data change. Let's estimate the impact:
+- Current: 18271 boxes (12219 detector boxes + ~6052 GT crops)
+- With "low": maybe 25000-30000 boxes
+- More data → better generalization → hopefully better AP on weak classes
+
+Time impact: More training data means more steps per epoch. But we're time-limited, so we'd just do fewer epochs. The total number of steps in the training window stays roughly the same (since it's time-based, not epoch-based). Actually, with more data per epoch, each epoch takes longer, so we get fewer epochs. But the total steps in the time window is the same. So no time impact.
+
+Wait, actually the DataLoader iterates over the dataset. With more samples, each epoch has more batches. But the loop is time-based (it stops when time runs out). So the total number of steps is determined by time, not epochs. More data per epoch → fewer epochs but same total steps. The model sees more diverse data in the same number of steps. This should help.
+
+I think training on both "high" and "low" is a good next experiment. It's a simple change (one line), it's in the data category (which has the most successes), and it adds more training data without changing the model or scoring.
+
+Let me also consider: is there a risk that "low" resolution images are too noisy or different? The "low" images are presumably lower resolution versions of the same weld images. They should still show the same defects, just with less detail. The classifier is already trained to handle 160px inputs (the crops are resized to 160x160). So the "low" images, when cropped and resized to 160x160, should be similar to "high" images cropped and resized.
+
+Actually wait - the "low" images have lower native resolution. When we crop a region and resize to 160x160, the "low" crop would be upscaled from a smaller region, making it blurrier. This could actually be a form of data augmentation (the model learns to be robust to blur). Or it could hurt if the defects are too small to see in the low-res version.
+
+Given that pores are tiny, they might be even harder to see in low-res images. But the model is already struggling with pores (AP 0.515), so maybe the low-res images don't help much for pores but help for the other classes.
+
+Overall, I think this is worth trying. The expected gain is modest (0.005-0.01) but the risk is low.
+
+Let me also think about whether there's a bigger lever I'm missing.
+
+Actually, let me reconsider the problem. The per-class APs are:
+- pore: 0.515
+- deposit: 0.627
+- discontinuity: 0.781
+- stain: 0.611
+
+The ceiling is 0.758. If we could perfectly classify, we'd get 0.758. The per-class APs in the ceiling would be different from 0.758 for each class (the 0.758 is the average).
+
+The biggest gap is for pore: 0.515 vs (ceiling pore AP). We don't know the per-class ceiling APs, but the overall ceiling is 0.758.
+
+What if the main issue for pore is that pores are small and the crop doesn't capture them well? The tight crop is 1.5x the box size. If the box is small (pore), the 1.5x crop is also small, and when resized to 160px, the pore might be a few pixels. The wide crop (2.5x) gives more context.
+
+But we already tried higher resolution (e004, e005) and it didn't help. So the issue isn't resolution.
+
+What about the crop context? Maybe for pores, a smaller context (tighter crop) would be better, and for larger defects, a wider context. But we use the same context for all classes.
+
+Actually, I just thought of something: what if we use the detector's conf as a feature for the classifier? I.e., give the classifier the conf value as an additional input. The conf might correlate with whether the box is a true defect or a false alarm. But this is a scoring change, and the scoring category has been unsuccessful.
+
+Let me go with the "train on both high and low" data change. It's simple, low-risk, and in a successful category.
+
+Wait, actually let me reconsider one more time. Let me look at the numbers more carefully.
+
+Current: 0.6337 (5-seed mean)
+Ceiling: 0.758
+Gap: 0.124
+
+Per-class:
+- pore: 0.515 (gap to ceiling ≈ 0.24 if ceiling pore AP is ~0.75)
+- deposit: 0.627 (gap ≈ 0.13)
+- discontinuity: 0.781 (gap ≈ -0.03, already above average ceiling)
+- stain: 0.611 (gap ≈ 0.14)
+
+Discontinuity is already at 0.781, which is above the overall ceiling of 0.758. This means discontinuity is well-classified. The problem is pore, deposit, and stain.
+
+Pore and stain are the weakest. Pore is tiny dark holes. Stain is confused with deposit.
+
+For stain vs deposit confusion: these are visually similar (both are surface discolorations). The classifier needs to distinguish them. More training data might help if the stain/deposit distinction is subtle.
+
+OK here's another thought: what about using a **different model architecture** that's better at fine-grained classification? 
+
+Available timm models: convnext_atto, convnext_nano, convnext_pico, efficientnet_b0, efficientnet_b2, mobilenetv3_large_100, regnety_016, resnet18, resnet26d, resnet34, resnet50, tf_efficientnetv2_b0
+
+ConvNeXt models are designed for fine-grained classification. convnext_nano (50M params) might be better than EfficientNet-B0 (4M params) for distinguishing subtle visual differences.
+
+But the time budget: convnext_nano at 160x160 input. Let me estimate:
+- EfficientNet-B0: ~0.34s/step (from log: 97s / 285 steps)
+- ConvNeXt-nano: maybe ~0.5-0.7s/step
+- In 125s: ~180-250 steps vs ~370 steps for B0
+- Fewer steps but each step is on a more powerful model
+
+This is a gamble. The model might be better per-step but see fewer examples.
+
+Actually, I think the safest bet with the highest expected value is still the data change (train on both resolutions). Let me go with that.
+
+**Final decision: Change TRAIN_ON from ("high",) to ("high", "low")**
+
+Hypothesis: The classifier's weak classes (pore 0.515, stain 0.611, deposit 0.627) suffer from limited training data diversity. Adding the "low" resolution GT crops roughly doubles the training set, exposing the model to more varied crop scales and image qualities, which should improve generalization on the visually similar pore/deposit/stain classes. This differs from e005 (higher-res crops) and e004 (higher-res tight crop) which changed the input resolution; here we keep the 160px input but add more source data.
+
+Let me write the edit:
+
+```
+SEARCH: TRAIN_ON = ("high",)    # resolutions of crops.csv used for training
+REPLACE: TRAIN_ON = ("high", "low")    # resolutions of crops.csv used for training
+```
+
+This is a one-line change. Simple, safe, testable.
+
+Wait, I need to double-check: will this cause any issuesThinking budget reached. Stop thinking now and write the reply in the required format.

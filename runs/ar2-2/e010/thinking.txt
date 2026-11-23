@@ -1,0 +1,296 @@
+===== attempt 1 =====
+Let me analyze the current state and think about what to try next.
+
+Current best: e009, 5-seed val mAP@0.5 = 0.6387
+- Architecture: single wide-crop (2.5×) EfficientNet-B0
+- Training: GT crops (high+low) + matched detector boxes (IoU≥0.5)
+- Inference: TTA with horizontal flip
+- Score: conf × class_prob
+- Per-class AP: pore 0.528, deposit 0.637, discontinuity 0.779, stain 0.611
+
+Key observations:
+1. The ceiling with perfect classes on stage-1 boxes is 0.758 mAP@0.5. We're at 0.6387, so there's significant room.
+2. Pore (0.528) and stain (0.611) are the weakest classes.
+3. Previous experiments that failed:
+   - Background class (e001, e005) - hurt
+   - Squaring probability (e004) - hurt
+   - Focal loss (e006) - hurt
+   - Mixup (e007) - hurt
+   - Class-weighted loss - hurt (mentioned in background)
+
+4. What worked:
+   - Adding detector boxes to training (e002)
+   - Adding low-res crops (e003)
+   - Single wide crop instead of two-crop (e008) - allowed more training
+   - TTA horizontal flip (e009)
+
+Let me think about what to try next. The ideas in scope include:
+- Train classifier on detector boxes with background class (tried, failed)
+- Combine detector conf and classifier probs differently (tried squaring, failed)
+- Robustness to box misplacement (jitter)
+- Low-res training crops (tried, e003)
+- Test-time augmentation (tried H-flip, e009)
+- Ensembling within time budget
+- Architecture changes
+
+Let me think about what hasn't been tried:
+
+1. **Vertical flip TTA**: We tried horizontal flip. Could add vertical flip too. But this doubles the inference cost again.
+
+2. **Score calibration**: The score is conf × prob. Maybe we should use a different combination. For example, conf^0.5 × prob, or conf × prob^0.5. Or maybe we should use the max probability differently.
+
+3. **Training on detector boxes only (not GT crops)**: e001 tried this with background and failed. But what about training only on matched detector boxes (no GT crops)? This would make the model see the actual distribution of detector boxes. But e002 showed that adding detector boxes to GT crops helped.
+
+4. **Different architecture**: Try a different backbone. The current one is EfficientNet-B0. Maybe try convnext_nano or resnet50. But architecture changes are risky.
+
+5. **More aggressive data augmentation**: We have H-flip, V-flip, brightness jitter. Could add rotation, color jitter, etc.
+
+6. **Score: use (1 - max_prob) as a penalty**: If the model is uncertain (max prob is low), the score should be lower. Currently score = conf × prob[c]. If we multiply by max_prob or by (1 - (1-max_prob)), we might penalize uncertain predictions.
+
+Wait, actually the score is conf × prob[c]. If the model is uncertain, all probs are low, so all scores are low. That's already a form of uncertainty penalty. But the relative ranking between classes within a box might still be off.
+
+7. **Only output the top-1 or top-2 classes per box**: Currently we output all 4 classes per box. Maybe outputting only the top class (or top 2) would improve ranking by not having low-confidence rows that dilute the ranking.
+
+Actually wait - the problem says "Several rows per box (one per class) are allowed and often help." So outputting all 4 is probably good. But maybe we should filter out very low probability rows.
+
+8. **Score calibration with a learned temperature**: Train a small calibration model or use a temperature scaling.
+
+9. **Use the detector confidence differently**: Maybe conf^0.5 × prob would be better than conf × prob. The detector confidence might be overconfident or underconfident.
+
+10. **Ensemble two models**: Train two different models (e.g., EfficientNet-B0 and ConvNeXt-nano) and average their probabilities. This would use the time budget for two shorter training runs.
+
+Let me think about what's most likely to help:
+
+The per-class APs are: pore 0.528, deposit 0.637, discontinuity 0.779, stain 0.611. Pore and stain are weak.
+
+The ceiling is 0.758. We're at 0.6387. The gap is about 0.12.
+
+One thing I notice: the score is conf × prob. If the detector confidence is poorly calibrated (e.g., always around 0.5-0.8), then the ranking is mostly determined by prob. But if conf varies a lot, it could help or hurt.
+
+Let me think about the **score function** more carefully. Currently:
+- For each eval box, we output 4 rows: (det_id, c, conf * prob[c]) for c in 0..3
+- The mAP@0.5 scoring: for each class, we look at all predictions of that class, sorted by score. A prediction is a TP if it overlaps (IoU≥0.5) with a GT box of that class.
+
+The issue: if a box is a false alarm (background), all 4 class scores are low (because prob is spread), but they still compete with true detections. If a true detection has prob 0.8 for the correct class, its score is conf*0.8. A false alarm might have prob 0.3 for the correct class, score conf*0.3. So the ranking is mostly by prob, which is good.
+
+But what if we could better separate true from false? The background class experiments failed. Maybe a different approach: use the max probability as a "defect-ness" score.
+
+Actually, let me think about **score = conf * prob[c] * max_prob**. This would make the score proportional to how confident the model is overall. If max_prob is high (model is sure), the score is boosted. If max_prob is low (model is uncertain), the score is penalized more. This is different from just using prob[c] because it adds a multiplicative uncertainty penalty.
+
+Wait, but prob[c] ≤ max_prob, so prob[c] * max_prob ≤ max_prob². This would make high-confidence predictions stand out more. Let me think...
+
+Actually, a simpler idea: **score = conf * prob[c]^alpha** where alpha > 1. We tried alpha=2 (e004) and it failed. What about alpha=1.5? Or maybe the issue was different.
+
+Let me reconsider. e004 tried conf × prob² and got 0.6211 vs base 0.6317. That was a clear drop. So squaring hurt.
+
+What about **score = conf^0.5 * prob**? This reduces the influence of detector confidence and relies more on the classifier. Or **score = conf * (1 + prob)** - no, that's weird.
+
+Actually, let me think about a different angle. The problem says "good ranking: true detections should score higher than false ones." The key insight is that we need to rank true detections above false ones. 
+
+One approach: **use the classifier's max probability as an additional gate**. If max_prob < threshold, suppress all scores for that box. But this is a hard threshold and might lose some true detections.
+
+Another approach: **score = conf * prob[c] / (1 + sum of other probs)** - this is just conf * prob[c] / (1 + (1 - prob[c])) = conf * prob[c] / (2 - prob[c]). This slightly penalizes when prob[c] is low. Not a big change.
+
+Let me think about **training** improvements instead.
+
+Current training: GT crops (high+low) + matched detector boxes. The model is trained with standard cross-entropy.
+
+What about **training with the actual detector box distribution more heavily**? Currently, matched detector boxes are 12219 out of 26347 total (about 46%). What if we oversample detector boxes? Or what if we train only on detector boxes (the ones that match GT, without background)?
+
+Wait, e001 tried training on detector boxes with background and failed (0.5691). e002 added detector boxes to GT crops and it worked (0.6293 vs 0.6293... wait, e002 was 0.6293 which was new best at the time).
+
+Actually, let me re-read the history:
+- e000 (base): two-crop, GT crops only → some baseline
+- e001: detector boxes + background → 0.5691 (failed)
+- e002: GT crops + matched detector boxes → 0.6293 (new best)
+- e003: + low-res crops → 0.6317 (new best)
+- e004: conf × prob² → 0.6211 (failed)
+- e005: + background class → 0.6039 (failed)
+- e006: focal loss → 0.6123 (failed)
+- e007: mixup → 0.6233 (failed)
+- e008: single wide crop → 0.6386 (new best)
+- e009: + TTA H-flip → 0.6387 (new best)
+
+So the biggest gains came from:
+1. Adding detector boxes to training (e002)
+2. Single crop instead of two-crop (e008) - allowed more training
+3. TTA (e009) - small gain
+
+The model is currently doing 2 epochs in ~130s of training time. With a single crop, each sample is cheaper.
+
+What if we try a **different backbone** that's faster per sample, allowing more epochs? Or a bigger backbone that's more accurate?
+
+Actually, let me think about **convnext_nano** or **regnety_016**. These might be more accurate than EfficientNet-B0 for this task. But they might also be slower.
+
+Wait, the time budget is 180s total, with 55s reserved for prediction. So training gets about 125s. Currently 2 epochs in ~130s (including the 17s loading). So actual training is ~113s for 2 epochs.
+
+If we switch to a faster model, we could do more epochs. If we switch to a more accurate model, we might get better classification.
+
+Let me think about **ensembling**. What if we train two models (e.g., EfficientNet-B0 and ConvNeXt-atto) and average their probabilities? Each model gets ~60s of training instead of ~125s. The ensemble might be more robust.
+
+But training two models for 60s each might not be enough for either to converge well. The current model does 2 epochs in 125s. With 60s, it would do less than 1 epoch. That's probably not enough.
+
+What about **training one model for the full budget, then fine-tuning a second model briefly**? No, that's complex and might not help.
+
+Let me think about **data augmentation** more. Currently we have:
+- H-flip (50%)
+- V-flip (50%)
+- Brightness (0.8-1.2)
+- Geometric jitter in make_crop (center shift ±10%, side 0.85-1.2)
+
+What about **color jitter** (hue, saturation, contrast)? Or **random erasing** (cutout)? Or **Gaussian noise**?
+
+Actually, for weld defect detection, the defects have specific visual patterns. Color jitter might help with robustness to lighting variations. Let me try adding **color jitter** (random brightness, contrast, saturation, hue) as training augmentation.
+
+Wait, we already have brightness. Let me add **contrast and saturation jitter**.
+
+Actually, let me think about what's most impactful. The weakest classes are pore (0.528) and stain (0.611). 
+
+Pore: small circular holes. The classifier might struggle with small pores vs background.
+Stain: often confused with deposit and background.
+
+For stain, the issue is confusion with deposit. More diverse training examples might help.
+
+Let me think about **crop context size**. Currently CONTEXT=2.5 (wide crop is 2.5× the long side). What if we try a different context? A larger context (e.g., 3.0) would give more surrounding context, which might help distinguish stain from deposit (since stain might have different surrounding patterns). A smaller context (e.g., 2.0) would focus more on the defect itself.
+
+But changing CONTEXT would require re-training, and we're not sure which direction helps.
+
+Let me think about **score calibration** more carefully. 
+
+Current score: conf * prob[c]
+
+The mAP@0.5 scoring: for each class, predictions are sorted by score. The issue is that false alarms (background boxes) get some probability for each class, and their scores compete with true detections.
+
+What if we use **score = conf * prob[c] * (prob[c] / max_prob)**? This is conf * prob[c] * (prob[c]/max_prob) = conf * prob[c]^2 / max_prob. When the model is confident (max_prob ≈ prob[c]), this is ≈ conf * prob[c]. When uncertain (max_prob >> prob[c] for the wrong class), this penalizes more.
+
+Actually, that's similar to what we tried with prob². Let me think differently.
+
+What about **score = conf * (prob[c] - 0.25)**? This subtracts a baseline (uniform distribution would give 0.25 per class). If prob[c] < 0.25, the score is negative (or zero if we clip). This would suppress predictions where the model doesn't prefer that class over random.
+
+Hmm, but this might be too aggressive. Let me think...
+
+Actually, a simpler and more principled approach: **use the log-odds or logit difference**. Instead of prob[c], use log(prob[c] / (1 - prob[c])) or just the logit for class c. This gives a more spread-out score that better separates confident from uncertain predictions.
+
+But wait, the score needs to be in [0, 1] or at least positive for the CSV. Log-odds can be negative. We could clip to 0.
+
+Let me think about another angle: **the number of rows per box**. Currently we output all 4 classes per box. What if we only output the top-2 classes? This would reduce the number of low-confidence rows that might interfere with ranking.
+
+Actually, the problem says "Several rows per box (one per class) are allowed and often help." So outputting all 4 is probably the right call. But maybe we should filter: only output classes with prob > some threshold (e.g., 0.1).
+
+Let me look at the MIN_SCORE = 0.001. With conf typically around 0.3-0.9 and prob around 0.1-0.9, most rows will be above 0.001. So the filter isn't doing much.
+
+What if we increase MIN_SCORE to something like 0.01 or 0.05? This would suppress very low-confidence rows.
+
+Actually, let me think about this more carefully. The mAP@0.5 metric: for each class, we have a list of (score, is_tp) pairs. The AP is computed by sorting by score and computing precision-recall. If we have many low-score false positives, they don't hurt much because they're at the bottom of the ranking. The issue is when a false positive has a higher score than a true positive.
+
+So the key is: **true positives should have higher scores than false positives**. The score = conf * prob[c] achieves this if prob[c] is higher for true positives than for false positives of the same class.
+
+For a true pore detection: prob[pore] might be 0.7, conf might be 0.6 → score 0.42
+For a false alarm: prob[pore] might be 0.3, conf might be 0.7 → score 0.21
+
+So the true detection ranks higher. Good.
+
+But what if a false alarm has prob[pore] = 0.5 and conf = 0.9 → score 0.45, while a true pore has prob[pore] = 0.6 and conf = 0.5 → score 0.30? Then the false alarm ranks higher. This is where better calibration or a different score function might help.
+
+I think the most promising next experiment is to try a **different backbone**. Let me consider:
+
+1. **convnext_nano**: More modern architecture, might be better for fine-grained classification. Probably similar speed to EfficientNet-B0.
+2. **regnety_016**: ResNeXt variant, might be competitive.
+3. **tf_efficientnetv2_b0**: Newer EfficientNet variant, might be slightly better.
+4. **resnet50**: Classic, probably slower than EfficientNet-B0.
+5. **mobilenetv3_large_100**: Faster, might allow more epochs.
+
+Actually, let me reconsider the time budget. Currently:
+- Loading: 17s
+- Training: ~130s (2 epochs)
+- Prediction: ~15s (with TTA)
+- Total: ~147s out of 180s
+
+So we have about 33s of slack. If we switch to a model that's 20% faster per sample, we'd get ~2.5 epochs. If 20% slower, we'd get ~1.6 epochs.
+
+Let me think about what's most likely to give a meaningful improvement. The per-class APs suggest the model is struggling with pore and stain. A better backbone might help with these.
+
+Actually, I just realized something. The current model uses **pretrained weights** (PRETRAINED = True). This is important - the model starts from ImageNet pretrained weights and fine-tunes on weld defects. A backbone with better pretrained representations might help.
+
+Let me try **convnext_nano**. ConvNeXt architectures have been shown to be competitive with or better than EfficientNet for classification tasks, and they might handle the fine-grained texture patterns in weld defects better.
+
+Wait, but I need to be careful. The hypothesis should be testable and the edit should be focused. Let me propose switching to convnext_nano.
+
+Actually, let me reconsider. The biggest gain so far was from e008 (single crop, allowing more training). The model is compute-bound. If I switch to a model that's significantly faster, I get more training. If I switch to a model that's significantly more accurate, I get better classification.
+
+convnext_nano has 28M params vs efficientnet_b0's 4M params. It's significantly larger and will be slower per sample. This might not be the right direction.
+
+What about **convnext_atto** (1.5M params) or **convnext_pico** (0.4M params)? These are very small and fast. But they might not be as accurate.
+
+What about **regnety_016** (9.8M params)? It's a ResNeXt variant that's been shown to be very competitive for its size. It might be faster than EfficientNet-B0 due to the depthwise separable convolutions.
+
+Actually, let me think about this differently. The key bottleneck is training time. With 2 epochs, the model might not be fully converged. What if I try to **increase the number of training steps** by using a faster model?
+
+**mobilenetv3_large_100** is a fast model (5.4M params) designed for mobile. It's likely faster than EfficientNet-B0 per sample. If it's 30% faster, we'd get ~2.6 epochs instead of 2.
+
+But will it be as accurate? MobileNetV3 uses inverted residuals and squeeze-excite blocks. It might not be as good for fine-grained texture classification.
+
+Let me try a different approach. What about **training for more epochs with a smaller batch size**? Currently BATCH_SIZE = 64. If I reduce to 32, I get 2× the number of steps per epoch, but each step is faster (half the batch). Net effect: similar total time per epoch, but 2× the optimizer steps. More optimizer steps might help convergence.
+
+Wait, that's not quite right. With batch size 32, each epoch has 2× the number of batches. Each batch takes half the time. So total time per epoch is the same. But we get 2× the optimizer updates. This is like doing 2× the number of epochs in the same time (in terms of updates).
+
+Actually, this is a good idea! Reducing batch size from 64 to 32 would double the number of optimizer steps in the same wall-clock time. More steps = better convergence.
+
+But there's a catch: with a smaller batch, the gradient estimate is noisier. We might need to adjust the learning rate. A common rule is to scale LR proportionally to batch size. So LR would go from 1e-3 to 5e-4.
+
+Let me try: BATCH_SIZE = 32, LR = 5e-4.
+
+Actually, wait. Let me reconsider. The current setup does 771 steps in ~130s. With batch size 32, we'd do ~1542 steps in ~130s (same wall time, half the batch per step). That's 2× the steps.
+
+With LR = 5e-4 (scaled down), the learning should be stable and the model should converge better.
+
+This is a clean, testable hypothesis: "Reducing batch size from 64 to 32 (and scaling LR proportionally) doubles the number of optimizer steps in the same wall-clock time, improving convergence and classification accuracy."
+
+Let me go with this. It's a focused change in the optimisation category.
+
+Wait, but I should also consider: does the DataLoader with num_workers=8 handle smaller batches well? With batch size 32, we have more, smaller batches. The overhead per batch (data loading, transfer to GPU) might be a larger fraction of the time. But with persistent_workers and pin_memory, this should be manageable.
+
+Also, the cosine LR schedule is based on time fraction, not step count. So it should work the same way.
+
+Let me also consider: with batch size 32 and drop_last=True, we might lose a few more samples per epoch. But the dataset is 26347 samples, so 26347/32 = 823 batches per epoch (vs 411 with batch 64). The loss of a few samples is negligible.
+
+I'll go with BATCH_SIZE = 32 and LR = 5e-4.
+
+Actually, let me reconsider the LR scaling. The standard practice is:
+- Linear scaling: LR_new = LR_old * (batch_new / batch_old) = 1e-3 * (32/64) = 5e-4
+- Square root scaling: LR_new = LR_old * sqrt(batch_new / batch_old) = 1e-3 * sqrt(0.5) ≈ 7e-4
+
+Linear scaling is more common and conservative. Let me use 5e-4.
+
+Let me write the edit:
+
+Change BATCH_SIZE from 64 to 32.
+Change LR from 1e-3 to 5e-4.
+
+This is a focused, testable change. Let me formulate the hypothesis.
+
+HYPOTHESIS: Reducing batch size from 64 to 32 (with proportionally scaled LR) doubles the number of optimizer steps within the same wall-clock budget, improving model convergence and classification accuracy, especially for the weak pore and stain classes.
+
+Let me write the SEARCH/REPLACE blocks.
+
+Current lines:
+```
+BATCH_SIZE = 64
+LR = 1e-3
+```
+
+New lines:
+```
+BATCH_SIZE = 32
+LR = 5e-4
+```
+
+That's a clean, focused edit. Let me verify the SEARCH text appears exactly once in the file.
+
+Looking at the file:
+```
+BATCH_SIZE = 64
+LR = 1e-3
+```
+
+Yes, these appear once. Let me write the response.

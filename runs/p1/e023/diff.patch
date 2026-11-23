@@ -1,0 +1,84 @@
+--- e022/train.py
++++ e023/train.py
+@@ -152,4 +152,25 @@
+     dets = read_csv(os.path.join(args.data, "dets.csv"))
+     ev = [d for d in dets if d["split"] == "eval"]
++    dtr = [d for d in dets if d["split"] == "train"]
++
++    # Hybrid training data: label train-split detector boxes by overlap with GT boxes (max-IoU, keep IoU > 0.5).
++    gt_by_img = {}
++    for r in crops:
++        gt_by_img.setdefault(r["image"], []).append(r)
++    det_boxes = []
++    for d in dtr:
++        best_iou, best_cls = 0.0, -1
++        for r in gt_by_img.get(d["image"], ()):
++            ix1, iy1 = max(d["x1"], r["x1"]), max(d["y1"], r["y1"])
++            ix2, iy2 = min(d["x2"], r["x2"]), min(d["y2"], r["y2"])
++            inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
++            if inter <= 0:
++                continue
++            area = (d["x2"] - d["x1"]) * (d["y2"] - d["y1"]) + (r["x2"] - r["x1"]) * (r["y2"] - r["y1"]) - inter
++            iou = inter / area if area > 0 else 0.0
++            if iou > best_iou:
++                best_iou, best_cls = iou, r["cls"]
++        if best_iou > 0.5:
++            det_boxes.append(dict(d, cls=best_cls))
+     needed = {r["image"] for r in crops} | {d["image"] for d in ev}
+     images = {p: np.asarray(Image.open(os.path.join(args.data, "images", p)).convert("RGB")) for p in needed}
+@@ -163,7 +184,14 @@
+ 
+     g = torch.Generator().manual_seed(args.seed)
+-    dl_tr = torch.utils.data.DataLoader(BoxDataset(crops, images, True), batch_size=BATCH_SIZE, shuffle=True,
+-                                        num_workers=workers, pin_memory=True, drop_last=True,
+-                                        persistent_workers=True, generator=g, worker_init_fn=worker_init)
++    # Hybrid loader: each batch is 50/50 GT boxes and detector boxes (both sources shuffled independently).
++    ds_gt = BoxDataset(crops, images, True)
++    ds_det = BoxDataset(det_boxes, images, True)
++    dl_gt = torch.utils.data.DataLoader(ds_gt, batch_size=BATCH_SIZE // 2, shuffle=True, num_workers=workers,
++                                        pin_memory=True, drop_last=True, persistent_workers=True,
++                                        generator=g, worker_init_fn=worker_init)
++    dl_det = torch.utils.data.DataLoader(ds_det, batch_size=BATCH_SIZE // 2, shuffle=True, num_workers=workers,
++                                         pin_memory=True, drop_last=True, persistent_workers=True,
++                                         generator=torch.Generator().manual_seed(args.seed + 1),
++                                         worker_init_fn=worker_init)
+     dl_ev = torch.utils.data.DataLoader(BoxDataset(ev, images, False), batch_size=256, shuffle=False,
+                                         num_workers=workers, pin_memory=True)
+@@ -184,13 +212,12 @@
+                 for k in states[0]}
+ 
+-    def train_phase(rows, t_lim, swa_collect=False):
++    def train_phase(t_lim, swa_collect=False):
+         nonlocal steps, epoch
+-        ds = BoxDataset(rows, images, True)
+-        dl = torch.utils.data.DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=workers,
+-                                         pin_memory=True, drop_last=True, generator=g, worker_init_fn=worker_init)
+         model.train()
+         while time.time() < t_lim:
+             tot, nb = 0.0, 0
+-            for views, y in dl:
++            for views_gt, y_gt in dl_gt:
++                views = [torch.cat([a, b], 0) for a, b in zip(views_gt, next(dl_det)[0])]
++                y = torch.cat([y_gt, next(dl_det)[1]], 0) if False else torch.cat([y_gt, next(dl_det)[1]], 0)
+                 frac = min(1.0, (time.time() - t_start) / budget)
+                 f = frac / 0.05 if frac < 0.05 else 0.5 * (1 + math.cos(math.pi * (frac - 0.05) / 0.95))
+@@ -232,5 +259,5 @@
+     # Phase A: initial training on all boxes (~45% of the training budget) to get a model that can flag bad labels.
+     t_A = t_start + 0.45 * budget
+-    train_phase(crops, t_A)
++    train_phase(t_A)
+ 
+     # Phase B: label cleaning - drop boxes the model confidently mislabels (top-1 != label and margin > 0.25).
+@@ -243,9 +270,10 @@
+     keep = ((top1 == label) | (margin <= 0.25))
+     kept = [r for r, k in zip(crops, keep) if k]
+-    print(f"cleaning: kept {len(kept)}/{len(crops)} training boxes ({time.time() - T0:.0f}s)", flush=True)
++    print(f"cleaning: kept {len(kept)}/{len(crops)} training boxes, {len(det_boxes)} detector boxes in hybrid "
++          f"({time.time() - T0:.0f}s)", flush=True)
+ 
+     # Phase C: retrain on the cleaned set for the remainder of the budget, collecting SWA snapshots.
+     if time.time() < t_end - 5:
+-        train_phase(kept, t_end, swa_collect=True)
++        train_phase(t_end, swa_collect=True)
+ 
+     # SWA: include the final weights, then average all snapshots and load them back.

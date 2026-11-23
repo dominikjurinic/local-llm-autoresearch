@@ -1,0 +1,305 @@
+===== attempt 1 =====
+Let me carefully analyze the current state and the proposed experiment.
+
+**Current best (e009):** 0.6359 5-seed val mAP@0.5
+- 4-scale crop pyramid (1.25x, 1.75x, 2.5x, 3.5x)
+- EfficientNet-B0 backbone
+- MultiScaleClassifier with per-scale 1x1 conv projections + concat + MLP head
+- 160px crops
+- Trains ~157 steps in ~168s total (13s load, ~75s train, ~20s predict)
+
+**Error profile:**
+- pore: 63% right (48/76) — 19→stain, 7→deposit
+- deposit: 77% right (210/271) — 55→stain, 3→discontinuity
+- discontinuity: 95% right
+- stain: 90% right (551/614) — 43→deposit, 9→discontinuity, 7→pore
+
+The dominant confusion is pore→stain and deposit→stain. Both are being misclassified as stain.
+
+**The proposed experiment:** Add a second head that predicts box-area ratio (box area / image area) conditioned on class. Wait, let me re-read the hypothesis.
+
+"train the classifier to output per-class *expected box geometry* and combine it with appearance — specifically, add a second head predicting box-area ratio (box area / image area) conditioned on class, because pore boxes are small/compact, deposit boxes medium, and stain boxes large/irregular, giving the model an independent cue that distinguishes the three."
+
+Hmm, wait. Let me think about this more carefully. The idea is:
+- The classifier already sees the crop (which is centered on the box). The crop is made from the box with context multipliers. So the model sees the box region.
+- The box area ratio (box area / image area) is a scalar that's available at test time for each detection.
+- The idea: pore boxes tend to be small, stain boxes tend to be large. So if we know the box area ratio, we can use it as a cue.
+
+But wait — how do we use this at test time? At test time, for each eval detection, we know the box coordinates and image dimensions, so we can compute box_area / image_area. 
+
+The proposed approach: "add a second head predicting box-area ratio (box area / image area) conditioned on class". So the head predicts, for each class, what box-area-ratio that class's boxes typically have? Or does it predict the box-area-ratio as a function of the appearance?
+
+Actually, I think the idea is simpler than that. Let me re-read:
+
+"Adding a per-class geometric head and combining its class-conditional score with the appearance logit re-orders exactly these confusions."
+
+I think the idea is:
+1. The appearance classifier gives 4 class logits (as before).
+2. A second head predicts the box-area-ratio from the appearance (1 scalar output).
+3. At test time, we compare the predicted box-area-ratio against the actual box-area-ratio of the detection. If they match well for a particular class... 
+
+Hmm, but that's not quite "per-class expected box geometry". Let me think again.
+
+Actually, I think the cleanest interpretation is:
+- The model learns, for each class, the typical box-area-ratio distribution.
+- At test time, we compute the actual box-area-ratio of the detection.
+- We use a simple likelihood: for each class c, P(area_ratio | class c) — estimated from training data.
+- Combine: final_score(c) = conf * P_appearance(c) * P_geometry(area_ratio | c)
+
+But that's not really a "second head" — that's just a prior. Unless the "second head" is a regression head that predicts the area ratio from the crop, and then we check consistency.
+
+Wait, let me re-read the hypothesis more carefully:
+
+"add a second head predicting box-area ratio (box area / image area) conditioned on class"
+
+I think "conditioned on class" means: the head takes the class as input (or the class logits) and predicts the area ratio. But that's circular — you'd need the class to predict the area ratio, but you're trying to determine the class.
+
+Actually, I think the simplest and most sensible interpretation is:
+
+**Approach A (geometric prior):**
+- During training, compute the box-area-ratio for each training box.
+- Learn a per-class distribution of area ratios (e.g., mean and std, or a small histogram).
+- At test time, for each detection, compute its area ratio.
+- For each class c, compute a geometric score: how likely is this area ratio for class c? (e.g., Gaussian likelihood with class-specific mean/std).
+- Final score = conf * P_appearance(c) * P_geometry(area_ratio | c).
+
+This is simple, doesn't require a new neural head, and directly uses the geometric cue. But the hypothesis says "second head" which implies a neural network component.
+
+**Approach B (regression head):**
+- Add a regression head to the network that predicts the box-area-ratio from the crop.
+- At test time, the predicted area ratio is compared to the actual area ratio.
+- But how does this help classify? If the model predicts area ratio = 0.001 (small), and the actual box has area ratio = 0.001, that's consistent with pore. If the model predicts 0.01 but the actual is 0.001, there's a mismatch.
+
+Hmm, this is getting complicated. Let me think about what's actually implementable and makes sense.
+
+Actually, I think the cleanest interpretation that matches "per-class expected box geometry" is:
+
+**The model learns to predict, for each class, what the box area ratio should be.** So the head outputs 4 values (one per class), each being the predicted area ratio "if this were class c". Then at test time, we compare each predicted value to the actual area ratio, and the class whose prediction is closest gets a boost.
+
+But that's weird too — why would the model predict different area ratios for different classes from the same crop? The crop is the same regardless of class.
+
+OK let me step back and think about what would actually work and be implementable:
+
+**Simplest effective approach:**
+1. Compute box_area_ratio = (x2-x1)*(y2-y1) / (img_w*img_h) for each box.
+2. During training, for each class, compute the mean and std of log(box_area_ratio).
+3. At test time, for each detection, compute the geometric likelihood for each class: exp(-0.5 * ((log(ratio) - mean_c) / std_c)^2).
+4. Final score = conf * P_appearance(c) * geometric_likelihood(c).
+
+This is a "scoring" change, not an "architecture" change. But the lead categorized it as architecture.
+
+Actually wait, re-reading the lead's plan: "add a second head predicting box-area ratio (box area / image area) conditioned on class". 
+
+I think the most natural reading is:
+- The main head predicts 4 class logits (appearance).
+- A second head predicts 1 value: the box area ratio (regression).
+- "Conditioned on class" might mean the area ratio prediction is used in a class-conditional way at scoring time.
+
+But actually, I think there's an even simpler reading that makes the most sense:
+
+The "second head" is a per-class area ratio predictor. The network takes the crop features and outputs:
+- 4 class logits (as before)
+- 4 area ratio predictions (one per class): "if this is class c, the expected area ratio is X_c"
+
+At test time:
+- Compute actual area ratio r.
+- For each class c, the geometric score is how well X_c matches r: e.g., exp(-|X_c - r| / scale) or a Gaussian.
+- Final score = conf * P_appearance(c) * geometric_score(c).
+
+This makes sense! The model learns that "pore crops typically have small area ratios, stain crops have large ones" and outputs class-specific expected area ratios. At test time, the actual area ratio acts as a discriminator.
+
+But wait — the area ratio is a property of the BOX, not the crop. The crop is derived from the box. So the area ratio is known at test time (it's just (x2-x1)*(y2-y1)/(img_w*img_h)). The model doesn't need to "predict" it — it's given.
+
+So the real question is: does knowing the box area ratio help distinguish classes? If pores are small and stains are large, then yes. The model can use this as a prior.
+
+The simplest implementation:
+1. During training, compute log_area_ratio for each box.
+2. Learn per-class statistics: mean_c, std_c of log_area_ratio.
+3. At test time, compute log_area_ratio for each detection.
+4. Geometric score for class c: exp(-0.5 * ((log_r - mean_c) / std_c)^2).
+5. Final score = conf * P_appearance(c) * geometric_score(c).
+
+This doesn't require a new neural head at all — it's just a scoring modification. But the lead said "architecture" and "second head".
+
+Let me re-read the lead's exact words: "add a second head predicting box-area ratio (box area / image area) conditioned on class"
+
+I think the lead wants a neural head. Let me design it:
+
+**Neural head approach:**
+- The MultiScaleClassifier currently has a head that outputs 4 class logits.
+- Add a second head that outputs 4 values: the predicted area ratio for each class.
+- Training: the second head is trained with a regression loss. For each training sample, the target for class c's area ratio prediction is... what? The actual area ratio of the box? But that's the same for all classes. So the loss would be: for the true class c*, the predicted area ratio should match the actual area ratio. For other classes, there's no supervision (or we could say they should predict something different).
+
+Hmm, this is getting complicated. Let me think of a cleaner formulation.
+
+Actually, I think the cleanest neural approach is:
+
+**The head predicts the area ratio (1 value) from the crop features.** This is a regression task. The loss is MSE between predicted and actual log_area_ratio. At test time, we have both the predicted area ratio AND the actual area ratio. But how does this help classification?
+
+I don't think a pure regression head helps classification directly. The useful thing is the per-class prior on area ratio.
+
+Let me just go with the simple approach: **learn per-class area ratio statistics from training data, and use them as a geometric prior in scoring.** This is the most sensible interpretation of the idea, even if it's not strictly a "neural head". The lead's core insight is correct: box area ratio is a geometric cue that distinguishes pore (small) from stain (large), and we should use it.
+
+But wait — the lead specifically said "second head" and categorized it as "architecture". If I just add a scoring prior, that's more "scoring" category. Let me see if I can make a minimal neural component.
+
+Actually, you know what, let me re-read the hypothesis one more time:
+
+"Adding a per-class geometric head and combining its class-conditional score with the appearance logit re-orders exactly these confusions."
+
+I think "per-class geometric head" means: a head that, given the crop features, outputs a per-class geometric score. The "geometric" part is that it uses the box area ratio. So:
+
+- Input to the geometric head: the crop features (same as the classification head) AND the box area ratio (a scalar).
+- Output: 4 values, one per class, representing how well the area ratio matches that class.
+
+But that's just a lookup table / parametric model of the per-class area ratio distribution. The simplest version is:
+- Learn mean_c, std_c for each class.
+- Score_c = exp(-0.5 * ((log_r - mean_c) / std_c)^2).
+
+This is a "head" in the loose sense — it's a small parameterized model. And it's "per-class" and "geometric".
+
+OK here's my plan. I'll implement it as follows:
+
+1. **Compute log_area_ratio for each box** (both training and eval). This is `log((x2-x1)*(y2-y1) / (img_w*img_h))`.
+
+2. **During training, accumulate per-class statistics**: For each class c, track the running mean and variance of log_area_ratio. (Or just compute them after loading the data, before training.)
+
+3. **At test time, for each detection:**
+   - Compute log_area_ratio.
+   - For each class c, compute geometric_score_c = exp(-0.5 * ((log_r - mean_c) / std_c)^2).
+   - Final score = conf * P_appearance(c) * geometric_score_c.
+
+Wait, but this is just a scoring change. The lead wants an architecture change. Let me think about whether there's a way to make it a genuine architecture change.
+
+Alternative: **Add the log_area_ratio as an input feature to the classification head.**
+
+Currently, the head takes `num_scales * proj_dim` dimensional input and outputs 4 logits. If I add log_area_ratio as an extra input, the head input becomes `num_scales * proj_dim + 1`. The model can then learn to use the area ratio in its classification decision.
+
+This is:
+- An architecture change (the head's input dimension changes).
+- Uses the geometric cue.
+- Simple to implement.
+- Doesn't require a separate head or complex scoring.
+
+But wait — the lead specifically said "second head" and "per-class geometric head". Adding an input feature is different from adding a head.
+
+Hmm, but the lead also said: "This differs from the exhausted 'box size as extra input' family (2 crashes, 1 edit failure, 1 run only at 0.629) by being a *second classification head* fused via scores rather than an input feature."
+
+So the lead explicitly wants to AVOID the "box size as input" approach (which was tried and mostly crashed/failed) and instead wants a "second head fused via scores".
+
+OK so the lead's intent is clear:
+1. Do NOT add box size as an input feature (that family is exhausted/failed).
+2. DO add a second head that produces per-class geometric scores.
+3. Combine the appearance logits and geometric scores at scoring time.
+
+So the implementation should be:
+- Main head: 4 class logits (appearance) — unchanged.
+- Second head: takes the same features and outputs... what exactly?
+
+I think the second head should predict the log_area_ratio (a single scalar regression). Then at scoring time:
+- For each class c, we have the appearance probability P_app(c) and the predicted area ratio r_pred.
+- The actual area ratio is r_actual.
+- The geometric score for class c could be: how well does r_pred match r_actual? But that's the same for all classes, so it doesn't differentiate.
+
+That doesn't work. The geometric score needs to be class-specific.
+
+OK, here's another interpretation: **The second head predicts, for each class, the expected log_area_ratio.** So it outputs 4 values: [E[log_r | pore], E[log_r | deposit], E[log_r | discontinuity], E[log_r | stain]].
+
+Training: For the true class c*, the target for the c*-th output is the actual log_area_ratio. For the other outputs, there's no direct supervision. We could:
+- Only supervise the true class's output (with a mask).
+- Or use a different loss.
+
+At test time:
+- The head outputs [r_pore, r_deposit, r_disc, r_stain].
+- The actual log_area_ratio is r_actual.
+- For each class c, geometric_score_c = exp(-0.5 * ((r_actual - r_c) / sigma)^2) where sigma is a learned or fixed scale.
+- Final score = conf * P_app(c) * geometric_score_c.
+
+This makes sense! The model learns that "if this is a pore, the area ratio should be around X; if it's a stain, it should be around Y". At test time, the actual area ratio discriminates between classes.
+
+But this is a bit unusual. The model is predicting 4 different area ratios from the same crop, one for each hypothetical class. The supervision is: for the true class, the prediction should match the actual area ratio. For other classes, we don't supervise (or we could push them away).
+
+Actually, a simpler and more standard approach: **The second head is a regression head that predicts log_area_ratio (1 output).** The training loss is MSE. At test time, we have the predicted log_area_ratio. But how does this help classification?
+
+It doesn't directly help unless we use it in scoring. And if we use it in scoring, we need a class-specific component.
+
+I think the cleanest approach that matches the lead's description is:
+
+**Learn per-class area ratio statistics (mean, std) from the training data. Use them as a geometric prior in scoring.**
+
+This is:
+- "Per-class" ✓
+- "Geometric" ✓ (uses box area ratio)
+- "Fused via scores" ✓ (multiplied into the final score)
+- Different from "box size as input" ✓ (it's a scoring prior, not a model input)
+- Simple, robust, no crashes ✓
+
+The "second head" language is a bit of a stretch, but the functional effect is the same: the model's classification is augmented with a class-conditional geometric score.
+
+Let me go with this approach. It's the most robust, simplest to implement correctly, and directly targets the pore→stain and deposit→stain confusions.
+
+**Implementation plan:**
+
+1. After loading `crops` (training boxes), compute `log_area_ratio` for each: `log((x2-x1)*(y2-y1) / (img_w*img_h))`.
+2. Compute per-class mean and std of `log_area_ratio` (only for classes that appear in training).
+3. At test time, for each eval detection, compute `log_area_ratio`.
+4. For each class c, compute `geo_score_c = exp(-0.5 * ((log_r - mean_c) / std_c)^2)`.
+5. Final score = `conf * P_app(c) * geo_score_c`.
+
+Wait, but there's a subtlety. The geometric prior should be normalized or at least bounded so it doesn't dominate. The Gaussian likelihood can be very small for out-of-range values. Let me think about the scale.
+
+If the std of log_area_ratio within a class is, say, 0.5, and the difference between class means is, say, 1.0, then the geometric score ratio between two classes would be exp(-0.5 * (1.0/0.5)^2) = exp(-2) ≈ 0.135. So the geometric prior could shift the score by a factor of ~7x. That's significant but not overwhelming.
+
+Actually, I should be careful. Let me think about what the actual area ratio distributions look like.
+
+Weld images: let's say they're 1000x1000 pixels. A pore might be 10x10 = 100 pixels, so area ratio = 100/1000000 = 0.0001, log = -9.2. A stain might be 200x200 = 40000 pixels, area ratio = 0.04, log = -3.2. So the log area ratios are quite different between classes.
+
+But within a class, there's variance. A pore could be 5x5 to 30x30, so log area ratio ranges from -11 to -7.7. std might be ~1.0.
+
+The separation between class means might be ~2-3 in log space, with std ~1.0 within class. So the geometric prior would be quite discriminative.
+
+This seems like it could have a meaningful effect. Let me implement it.
+
+**Code changes:**
+
+1. After loading crops and computing needed images, compute per-class log_area_ratio statistics.
+2. In the prediction loop, compute log_area_ratio for each eval detection.
+3. In the score computation, multiply by the geometric score.
+
+Let me write the code:
+
+```python
+# After loading crops and images, compute per-class area ratio stats
+import math
+
+def log_area_ratio(r):
+    area = max(1e-8, (r["x2"] - r["x1"]) * (r["y2"] - r["y1"]))
+    img_area = max(1e-8, r["img_w"] * r["img_h"])
+    return math.log(area / img_area)
+
+# Compute per-class stats from training data
+class_stats = {}
+for c in range(4):
+    vals = [log_area_ratio(r) for r in crops if r["cls"] == c]
+    if len(vals) > 1:
+        arr = np.array(vals)
+        class_stats[c] = (float(arr.mean()), float(arr.std()) + 1e-6)
+    else:
+        class_stats[c] = (0.0, 1.0)  # fallback
+```
+
+Then in the prediction section:
+
+```python
+for d, p in zip(ev, probs):
+    lr = log_area_ratio(d)
+    for c in range(4):
+        mean_c, std_c = class_stats[c]
+        geo = math.exp(-0.5 * ((lr - mean_c) / std_c) ** 2)
+        s = d["conf"] * float(p[c]) * geo
+        if s > MIN_SCORE:
+            w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+
+Wait, but there's a problem. The geometric score is a likelihood, not a probability. It can be > 1 if the std is small. Let me normalize it.
+
+Actually, the Gaussian pdf is: (1 / (std * sqrt(2*pi))) * exp(-0.5 * ((x-mu)/std)^2). The normalization constant (1/(std*sqrt(2*pi))) varies perThinking budget reached. Stop thinking now and write the reply in the required format.

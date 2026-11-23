@@ -1,0 +1,125 @@
+===== attempt 1 =====
+Let me think about this carefully.
+
+Current state:
+- Best: e000, 5-seed mean 0.6297 mAP@0.5
+- Per-class: pore 0.504, deposit 0.626, discontinuity 0.780, stain 0.609
+- Ceiling (stage-1 boxes with perfect classes): 0.758
+- One-step baseline to beat: 0.638
+
+History:
+- e001 (data): crashed (NameError, missing writer)
+- e002 (data): fixed e001's crash, score 0.5541, rejected. What was e001/e002's idea? The hypothesis is truncated: "Since every eval box is emitted with one row per class, the hit sets per class are already fixed by stage 1 (same as the 0.758 ceiling); the 0.63 vs 0.758 gap is therefore a *ranking* problem, and the weakest class (pore..." — I don't know exactly what the data change was. Probably something about training data — maybe reweighting pore boxes? Hmm. Actually "data" category with pore mentioned. Maybe oversampling pore in crops. The result 0.5541 is far below best — that's a big drop, suggesting the idea hurt. Wait, but e002 was a fix of e001's crash, and it scored 0.5541. That's a big drop from 0.6297. So e001's data idea (whatever it was) was harmful. Hmm, but actually a drop of 0.075 is suspicious — could indicate something more. But it was scored, not crashed. So the idea itself was bad.
+
+Actually wait — e002's hypothesis says "Restoring that writer (emitting the 4 class..." — so e001's idea was something about data. The truncated hypothesis mentions ranking and pore. Maybe the change was: train on all boxes but upsample pore? Or filter training data? I can't tell exactly. The lesson: data category, 1 run, rejected at 0.5541.
+
+- e003 (inference): TTA with 4 views (tight+wide, each with flip?), score 0.6355 seed-0, 5-seed mean 0.6301 — not confirmed (within noise of 0.6297). So TTA didn't help.
+- e004 (scoring): argmax single class per box — 0.5689, rejected. So emitting 4 rows per box is better than 1 row. Interesting: 4 rows per box scored 0.630, 1 row (argmax) scored 0.569. So multi-row emissions help. Why? Because if a box is a true detection of class c, emitting rows for all classes means the class-c row can hit; with argmax, if the classifier picks the wrong class, the hit is lost. With 4 rows, the correct class's row is always present and ranked by conf*P(c). So the ranking within each class's list is what matters, and the 3 extra rows per box are false positives for other classes but... apparently that's fine, because they're ranked by conf*P(wrong class) which is usually low.
+
+So the key insight from e004: keep multi-row emission. The metric: per class, AP depends on the order of that class's predictions. Each box emits one row per class with score conf * P(c). The hit set for class c: boxes that overlap true c boxes. The order is by conf*P(c).
+
+Now, where is the error? Per-class AP: pore 0.504 (weak), deposit 0.626, stain 0.609, discontinuity 0.780.
+
+The gap to ceiling 0.758 is entirely in the ranking: for each class, true boxes (overlapping GT) must rank above false boxes. The classifier's P(c) is the ranking signal. Pore is the weakest class — the classifier confuses pore with others (per background, pore and deposit are weak; stain confused with deposit).
+
+Ideas:
+
+1. Improve classifier quality on pore specifically. But "class-weighted loss hurt every time" — known. Data: e001/e002 data idea failed (0.5541). Hmm, what was it? If it was pore oversampling, then it's exhausted. But I don't know. The hypothesis text: "the weakest class (pore" — truncated. Maybe "pore boxes are small/underrepresented, so...". Risky to repeat.
+
+2. Use detector conf better. Currently score = conf * P(c). Both are monotone per class... actually the order within class c is by conf * P_c. Both factors matter.
+
+3. Ensembling: train multiple models (e.g., different seeds/architectures) and average probabilities. Budget: currently 432 steps in ~150s training, 162s total with 55s reserve. T=180. Could train 2 models with half the budget each? That halves steps per model (216 each) but averages 2 models. e003 (TTA 4 views) didn't help — but TTA averages views of the same model; ensembling different models/architectures is different. Hmm, but e003 was "close but not confirmed" (0.6301 vs 0.6297). TTA is one form of test-time averaging; model ensembling is another. Is that "fundamentally different"? TTA averages views of one model; ensemble averages independent models with different training dynamics. Could help with pore confusion. But budget: 2 models × 216 steps each. Each step ~0.33s → ~70s per model, 140s for 2, plus 13s load + prediction time. Prediction: 41879 boxes × 2 views... currently prediction is fast (162-150=12s? actually reserve is 55s; total 162s, training ended ~150s? "done: 5 epochs, 432 steps... 162s total" — training ended at t_end = 180-55 = 125s. So training ~112s (from 13s load), prediction ~37s. Hmm wait: t_end = deadline - 55 = 125s. Training ran until 125s. Then prediction + writing took 162-125 = 37s. OK.
+
+If I train 2 models: budget for training = 125-13 = 112s. 2 models → 56s each → ~170 steps each (0.33s/step). Prediction: 2 models × 2 views = 4 forward passes per box vs 2 currently → prediction ~74s. Total: 13 + 112 + 74 = 199s > 180. Over budget! Unless I reduce: use 1 view per model at inference (drop wide crop) → 2 forwards per box (same as now) → prediction ~37s. Total 13+112+37 = 162s. OK, fits with 18s margin. But dropping the wide view at inference might hurt (it's part of the recipe; TTA e003 added views and didn't help, but removing a view is different).
+
+Alternatively, ensemble 2 models of the same architecture with 2 views each but smaller batch... no, prediction cost is the issue. Actually prediction is 41879 boxes × 2 views = 83758 forwards at batch 256 → 327 batches. 37s → ~0.11s/batch. 2 models × 2 views = 654 batches → ~74s. Too much. With 1 view per model: 327 batches → 37s. Fits.
+
+But is ensembling likely to gain ≥0.01? Seed noise is ±0.005 per run. Two independent models averaged reduces variance and often improves accuracy by a point or two. Pore is the weak class; independent models may make different pore errors. Hmm. Moderate probability.
+
+4. Better: target the ranking directly. The score is conf * P(c). What if we calibrate or adjust the per-class ranking? E.g., learn a per-class score multiplier from val? No — can't use eval labels (rule: don't look for eval labels). But we have train dets with known classes (overlap with crops.csv). We could fit a ranking on train dets... that's like a post-hoc score calibration. E.g., learn a per-class temperature or a small model that maps (conf, P) → score. But the metric ignores monotone transformations per class! "Any change that keeps the order of a class's predictions leaves its AP unchanged." So per-class monotone re-scoring does nothing. To change order, we need to change the relative ranking between boxes — e.g., use a different probability estimate (better classifier), or combine signals in a non-monotone way... any function of (conf, P_c) that changes the order relative to conf*P_c. E.g., score = conf * P_c / (sum of P) — that's just P_c, monotone in P_c per box... no wait, per class c, score_c = f(conf, P_c, P_other). If f is monotone in (conf, P_c) jointly... the order can change vs conf*P_c if f uses P_other in a non-separable way. E.g., score_c = conf * P_c * (1 - max_{c'≠c} P_{c'})? That's not a monotone transform of (conf, P_c) alone because it depends on other probabilities. It changes the order. Could it help? It down-weights boxes where the classifier is uncertain/confused. Hmm, hand-crafted; risky and probably small.
+
+5. Improve the classifier with a better architecture. Available timm models: convnext_nano, efficientnet_b2, resnet50, etc. Currently efficientnet_b0 at 160px. A stronger backbone (efficientnet_b2 or convnext_nano) might improve pore/deposit/stain discrimination. Budget: b2 is ~1.5-2x FLOPs of b0. Step time 0.33s → ~0.6s. Training budget 112s → ~190 steps. Fewer steps but stronger model. Prediction: 2 views × 41879 boxes at b2 speed... prediction is 37s at b0 → ~74s at b2. Total: 13 + 112 + 74 = 199 > 180. Over! Unless I drop to 1 view at inference: 13 + 112 + 37 = 162. Fits. Or keep 2 views and reduce reserve... reserve is for prediction+writing; if prediction is 74s, need reserve ≥ ~80s, leaving 180-80 = 100s for training → 87s training → ~145 steps at 0.6s. Hmm.
+
+Actually wait — let me recompute current prediction time. 162 total, training ended at 125s (t_end). So prediction+write = 37s. That includes 2 views × 41879 boxes = 83758 forward passes, batch 256 → 328 batches, plus writing 53378 rows. Writing CSV of 53k rows is probably 1-2s. So ~35s for 328 batches → 0.107s/batch at b0.
+
+For b2: forward ~1.8x → ~0.19s/batch → 62s for 328 batches. 1 view: 31s.
+
+Option A: efficientnet_b2, 2 views, reserve 70s → training budget = 180-70-13 = 97s → ~160 steps at 0.6s. Prediction ~62s + write 2s = 64s < 70. Tight but OK. Risky.
+
+Option B: efficientnet_b2, 1 view (tight only), reserve 55 → training 112s → ~185 steps. Prediction ~31s. Total ~156s. Safer. But dropping wide view — did wide view help? e003 added flip views (4 total) and didn't confirm improvement. The base recipe is 2 views (tight+wide). Removing wide is untested and might hurt.
+
+Hmm. What about convnext_nano? Similar size to b2. Or resnet50 — usually weaker than efficientnet at same budget. tf_efficientnetv2_b0 — similar to b0, probably marginal.
+
+6. Increase IMG_SIZE from 160 to 224? Pore is small; more pixels might help discrimination. b0 at 224: ~2x compute of b0@160 (area 1.94x). Step 0.33 → 0.64s. Same budget issue as b2. Prediction doubles similarly.
+
+7. Train on both resolutions? TRAIN_ON = ("high",) currently. crops.csv has high and low res. Adding low-res crops: more training data (how many low boxes? unknown; total 6052 high). More data could help. But low-res images are blurrier; might dilute. The e001/e002 "data" experiment — what was it? If it was about adding low-res or reweighting pore, it failed at 0.5541. That's a big drop, suspiciously big for a data mix change... unless the change was extreme (e.g., train only on pore?). I can't see the diff. Risky to touch data again.
+
+Actually, let me reconsider: a drop to 0.5541 (−0.076) is far beyond noise. The harness says "a score far below the current best usually means a bug." e002 was a crash fix; maybe the restored writer had a bug? Its hypothesis says "Restoring that writer (emitting the 4 class..." — truncated. Maybe it restored the writer but with a different emission (e.g., only argmax? or wrong score?). Hmm. e004 separately tested argmax and got 0.5689 — also a big drop. If e002's writer emitted argmax-like rows, 0.5541 is consistent with that. So e001's underlying data idea is still untested! The "data" category lesson says 1 ran, 0 new best, 1 crashed — the run that scored (e002) may have been testing the wrong thing.
+
+But I can't know what e001's data change was. The hypothesis fragment: "Since every eval box is emitted with one row per class, the hit sets per class are already fixed by stage 1 (same as the 0.758 ceiling); the 0.63 vs 0.758 gap is therefore a *ranking* problem, and the weakest class (pore..." — this reasoning is about ranking, not data. Maybe the data change was: augment pore boxes (crop jitter / oversampling) to improve pore ranking? If so, e002's 0.5541 might reflect it... but e002's hypothesis says the crash was because the writer was "accidentally deleted" and it restored it. So e002 = e001's data change + working writer. Score 0.5541. If the data change was pore oversampling, it hurt a lot. Oversampling a class in training usually doesn't hurt others that much... a 0.076 drop is weird. Unless the change was e.g. "train only on pore" or "filter to small boxes." I really don't know.
+
+Given the uncertainty, the safest high-value directions:
+
+(a) Stronger backbone (efficientnet_b2) — a method change, likely to improve classification especially on pore/deposit/stain confusion. Known lesson: "changes of method helped more than tuning." Architecture category has 0 experiments so far! Nothing in the history has tested architecture. This is unexplored.
+
+(b) Ensembling — inference category, but e003 (TTA) was close-but-not-confirmed; ensembling is different (independent models) but related.
+
+(c) Training on both resolutions — data, risky given e002.
+
+I think (a) is the best: architecture is a completely untried category, method-level change, targets the core error (class decision quality, especially pore 0.504 and stain 0.609). A stronger backbone should improve crop classification (macro-F1 0.87 → higher), which directly improves per-class ranking.
+
+Budget check for efficientnet_b2 @160, 2 views:
+- b2 vs b0: params 7.7M vs 4.1M; FLOPs ~1.5x at same resolution. Step time ~0.33 → ~0.5s.
+- Prediction: 328 batches × 0.107 × 1.5 ≈ 53s + write 2s ≈ 55s.
+- Reserve: set RESERVE_S = 75. Training budget = 180 - 75 = 105s minus load 13s → 92s → ~184 steps at 0.5s.
+- Total: 13 + 92 + 55 = 160s < 180. Margin 20s. OK.
+
+Hmm, but is 184 steps enough? Currently 432 steps reaches loss 0.218. With fewer steps and a bigger model... the model is pretrained; fine-tuning b2 for ~180 steps at LR 1e-3 should still be decent. The current recipe already shows loss dropping fast (0.73 → 0.22 in 432 steps). With b2, maybe 0.30 at 184 steps. Risk: undertraining. Alternative: drop wide view at inference to save prediction time and keep 2-view training? Inference with 1 view: prediction ~28s, reserve 55, training budget 112s → 224 steps. Hmm.
+
+Actually, what about keeping b0 and just increasing IMG_SIZE to 224? Pore discrimination might benefit from resolution. b0@224: FLOPs ~1.94x → step 0.64s, prediction 0.107×1.94 ≈ 0.21s/batch → 68s for 328 batches. Reserve 85 → training 95-13=82s → 128 steps. That's quite few steps. b2@160 gives more steps for similar cost.
+
+I'll go with efficientnet_b2, keep 2 views at both train and inference, RESERVE_S = 75.
+
+Wait, one more consideration: b2 input 160 — efficientnet_b2 supports arbitrary multiples of 32? 160 = 32×5, fine.
+
+Also, should I lower LR for b2? Pretrained b2 with AdamW 1e-3 is standard for fine-tuning. Keep.
+
+Expected gain: if b2 improves crop macro-F1 from 0.87 to ~0.90+, the ranking improves most on pore/stain. Could plausibly gain 0.01-0.02. Different from e003 (TTA, same model) — this changes what the model can represent.
+
+Let me also double-check the "don't repeat" rule: architecture category has 0 experiments. Good.
+
+One more alternative worth considering: train longer with b0 by reducing prediction cost (1 view at inference)? e003 showed adding views didn't help; maybe the wide view itself is unhelpful and dropping it frees budget for more b0 steps. But that's a guess, and architecture is a cleaner bet.
+
+Also consider: 2-view training with b2 — training step does 2 forwards. b2@160 forward+backward per view: b0@160 step (2 views) = 0.33s → per view ~0.165s forward+backward. b2 ~1.5x → step ~0.5s. OK as computed.
+
+Now let me write the edit:
+
+Change MODEL = "efficientnet_b0" → "efficientnet_b2"
+Change RESERVE_S = 55 → 75
+
+Two small blocks.
+
+Hypothesis: swap backbone to efficientnet_b2 (untested architecture category). The error is in class decision/ranking (pore 0.504, stain 0.609); a stronger backbone should improve crop classification (macro-F1 0.87) and thus per-class ranking, targeting the 0.63→0.758 gap. Budget: b2 is ~1.5x cost, steps ~180 instead of 432, prediction ~55s, reserve bumped 55→75s, total ~160s < 180. Differs from e003 (TTA averaged views of the same b0 model and did not help) because this changes model capacity, not averaging.
+
+Let me verify the SEARCH strings appear exactly once:
+
+"MODEL = "efficientnet_b0"" — appears once in settings. Yes.
+"RESERVE_S = 55          # seconds kept free for prediction and writing" — once.
+
+Let me copy exactly from the file:
+
+```
+MODEL = "efficientnet_b0"
+PRETRAINED = True
+```
+
+and
+
+```
+RESERVE_S = 55          # seconds kept free for prediction and writing
+```
+
+Good.
+
+Category: architecture.
+BASE: best.

@@ -1,0 +1,157 @@
+===== attempt 1 =====
+Let me carefully analyze the plan and the current code before writing the edit.
+
+The plan:
+1) Keep e009 architecture (4-scale pyramid, efficientnet_b0, 160px). Note: the plan says "SGD with cosine schedule" but the current code uses AdamW with a cosine-like LR schedule. I should keep what's there (AdamW) — the plan's mention of SGD is probably a mistake or refers to the general idea. Actually, wait — the plan says "SGD with cosine schedule" but current is AdamW. The instruction says "Implement exactly this experiment in the current train.py, nothing more." and "If a detail of the plan cannot work as written (time budget, tensor shapes, missing names), make the smallest fix that keeps the idea and say so at the end of the HYPOTHESIS."
+
+Hmm, "SGD with cosine schedule" — the current code uses AdamW. Changing optimizer to SGD would be a separate change. But the plan says to keep e009 architecture. I think the safest is to keep AdamW (the current optimizer) since the plan's main idea is the two-phase training, not the optimizer. Actually, let me re-read: "1) Keep the e009 architecture (4-scale pyramid, efficientnet_b0, 160px, SGD with cosine schedule)."
+
+This is describing what e009 has. But e009 actually uses AdamW, not SGD. So this is a misdescription. The smallest fix that keeps the idea: keep the existing optimizer (AdamW) and cosine schedule. I'll note this in the HYPOTHESIS as a fix.
+
+Actually, let me reconsider. The plan is the lead's. I need to implement "exactly this experiment." The core idea is the two-phase training: GT first, then detector boxes. The "SGD" detail is a misdescription of the current code. I'll keep AdamW to avoid introducing an unrelated change, and note it.
+
+2) Add a dataset flag and a second DataLoader that uses dets.csv 'train' rows as training targets:
+   - For each train split detector box, find crops.csv boxes overlapping it by IoU > 0.5.
+   - If found, label the row with that box's class.
+   - Else keep it as a false alarm and give it an extra negative class so the model learns to reject it.
+
+Wait — "give it an extra negative class so the model learns to reject it." This is a 5th class concept. But the model has num_classes=4. If I add a 5th class, I need to change num_classes to 5 in the model, and then at inference I need to handle it (the 5th class is "background" — I should NOT output rows for it, or output it with low score).
+
+Hmm, but the "background class" family was tried 9 times in the earlier research runs with "no gain." Let me check the brief:
+
+"5th 'background' class from detector false alarms (scores times 1 - p_bg) | 9 | no gain: seed 0 from 0.518 to 0.629; 2 crashes, 1 bug (0.0)"
+
+So a 5th background class was tried and gave no gain. But the plan here is different: it's not scoring by (1-p_bg), it's using the background class only during the fine-tune phase to help the model learn to reject false alarms, but at inference... hmm.
+
+Wait, let me re-read the plan. "else keep it as a false alarm and give it an extra negative class so the model learns to reject it."
+
+So the idea is: during the detector-box fine-tune phase, false alarms get a 5th "background" class label. This teaches the model to output low probability for all 4 defect classes on false alarms. At inference, we still output 4 classes (or do we use the background probability to down-weight?).
+
+Actually, the key question: does the background class affect inference? If the model has 5 outputs and we only use the first 4 at inference (normalized or not), then the background class acts as a regularizer that pushes down the 4 defect probabilities on false alarms. But since mAP@0.5 only depends on the ORDER within each class, and the score = conf * p_c, adding a background class that's normalized away... 
+
+Let me think about the scoring. Currently: score = conf * p_c where p_c is softmax over 4 classes. If I add a 5th class, softmax over 5 classes, and score = conf * p_c (c in 0..3), then the background class eats into the probability mass, lowering all defect scores on false alarms. But within a class, the ORDER of predictions... hmm, it's not a monotone transformation because the background probability differs per box. So it could re-order.
+
+Actually wait. Let me reconsider whether to add a 5th class at all. The plan says "give it an extra negative class so the model learns to reject it." This strongly implies a 5th class. But the background class family was "no gain." However, the plan's use is different: it's part of a two-phase fine-tune, and the background class is used to teach rejection. But at inference, do we use the background probability?
+
+Let me think about what's cleanest and matches the plan. The plan says "give it an extra negative class so the model learns to reject it." So:
+- Model num_classes = 5 (4 defect + 1 background).
+- GT phase: labels are 0-3 (no background).
+- Detector phase: labels are 0-3 for matched boxes, 4 for false alarms.
+- Inference: We need to decide how to score. Options:
+  a) score = conf * p_c for c in 0..3, using 5-class softmax. The background class implicitly down-weights.
+  b) score = conf * p_c * (1 - p_bg) — but that's the tried-and-failed approach.
+
+Hmm. Actually, if I use 5-class softmax and score = conf * p_c (c in 0..3), that's NOT the same as the failed "scores times 1 - p_bg" approach. The failed approach explicitly multiplied by (1-p_bg). Here, the background class is just another class in the softmax; the defect probabilities are p_c directly. But mathematically, p_c (5-class) = p_c (normalized over 5). And (1-p_bg) = sum of defect probs. So conf * p_c (5-class) is just a scaled version where the scaling depends on the box (through p_bg). So it's NOT a per-class monotone transform — it re-orders. This is essentially the same mechanism as the failed approach! Because conf * p_c(5-class) where p_c(5-class) = p_c(4-class-ish) / (1 + p_bg/(1-p_bg))... 
+
+Actually let me be careful. If the model outputs logits [l0,l1,l2,l3,l4], then p_c = exp(l_c)/sum(exp). The "background" version: score_c = conf * p_c. The failed approach: score_c = conf * p_c * (1-p_bg) where p_c is over 4 classes. These are different.
+
+Hmm, this is getting complicated. Let me step back and think about what actually matters for the metric.
+
+The metric: mAP@0.5 per class, depends only on the ORDER of that class's predictions. So the only thing that matters is, for each class c, the ranking of boxes by score_c.
+
+Currently score_c = conf * p_c (4-class softmax). 
+
+If I add a background class and score_c = conf * p_c (5-class softmax), then for a given class c, the ranking changes because p_c (5-class) = p_c_unnorm / (sum_unnorm) where sum includes background. Boxes where the model is "unsure" (high background prob) get all their defect scores lowered proportionally. This re-orders within class c: a true-defect box that the model is confident about (low bg) keeps high score; a false alarm that the model is unsure about gets lowered. This is exactly the mechanism the failed family used.
+
+So adding a background class for inference scoring is likely to not help (it was tried). BUT — the plan's point is that the background class is used during TRAINING (fine-tune phase) to teach the model, and the benefit comes from the model learning better representations, not necessarily from the scoring change.
+
+Hmm, but if I add a 5th class to the model, the inference scoring changes automatically (softmax over 5). Unless I explicitly compute the 4-class scores differently.
+
+Let me reconsider. Maybe the cleanest interpretation that matches "give it an extra negative class so the model learns to reject it" AND avoids the failed scoring mechanism:
+
+Option A: 5-class model. Inference: for each box, compute 5-class softmax. Output rows for classes 0-3 with score = conf * p_c (5-class). This changes scoring (bg eats mass). Risk: resembles failed family.
+
+Option B: 5-class model. Inference: compute 5-class softmax, but for scoring use only the 4 defect classes re-normalized: p_c' = p_c / sum(p_0..p_3). Then score = conf * p_c'. This is a monotone transform of p_c (5-class) per class? No — p_c' = p_c / (1 - p_bg). Within class c, dividing by (1-p_bg) which varies per box is NOT monotone. So it still re-orders. Hmm.
+
+Wait, actually, is it? For class c, score = conf * p_c / (1 - p_bg). The factor 1/(1-p_bg) varies per box. So two boxes with same conf and same p_c but different p_bg get different scores. So it re-orders. Not a clean monotone transform.
+
+Option C: Keep 4-class model. For false alarms in the detector phase, ... but then "give it an extra negative class" doesn't work with a 4-class model.
+
+Hmm. Let me reconsider the whole thing. The plan explicitly says "give it an extra negative class so the model learns to reject it." This requires the model to have a 5th class. So I'll go with a 5-class model.
+
+Now for inference, what's the most faithful to "the model learns to reject it" while being a reasonable scoring? I think the natural thing: the model outputs 5 classes; a false alarm should have high p_bg and low p_c for all c. When we output rows for classes 0-3 with score = conf * p_c, the false alarms naturally get low scores (because p_c is low when p_bg is high). This is the mechanism. And it's different from the failed family in that... hmm, actually it's quite similar.
+
+Wait, let me re-read the failed family description: "5th 'background' class from detector false alarms (scores times 1 - p_bg)". So the failed approach: 5-class model, score = conf * p_c * (1-p_bg)? Or score_c = conf * p_c where p is over 4 classes and then multiply by (1-p_bg)?
+
+"scores times 1 - p_bg" — so score = (something) * (1 - p_bg). If "something" = conf * p_c (4-class), then score_c = conf * p_c * (1-p_bg). That's different from Option A (score_c = conf * p_c where p is 5-class).
+
+In Option A: p_c(5) = p_c(4) * (1 - p_bg) approximately? Let's see: if p_bg is the 5th class prob, then sum of first 4 = 1 - p_bg. And p_c(5) = exp(l_c)/sum_all. p_c(4) = exp(l_c)/sum_first4. So p_c(5) = p_c(4) * (sum_first4/sum_all) = p_c(4) * (1-p_bg). Yes! So Option A score_c = conf * p_c(5) = conf * p_c(4) * (1-p_bg). That's EXACTLY the failed family's formula!
+
+So Option A is literally the failed "scores times 1 - p_bg" approach. That's bad — it was tried 9 times with no gain.
+
+So I should NOT do Option A for inference. 
+
+Hmm. So how do I use the background class for training but not change the inference scoring in a way that was already tried?
+
+Option: 5-class model for training. At inference, compute the 4 defect class probabilities by re-normalizing over just the 4 defect classes (ignore background): p_c' = p_c(5) / (1 - p_bg). Then score = conf * p_c'. 
+
+Is this a monotone transform of the current score? Current score = conf * p_c(4). If the model is the same 4-class model, p_c(4) = p_c'. But the model is now 5-class trained, so p_c' is different. Within class c, score = conf * p_c' = conf * p_c(5)/(1-p_bg). The factor 1/(1-p_bg) varies per box, so it re-orders relative to just using p_c(5). But is it a monotone transform of the CURRENT best's score? No, because the model changed.
+
+Hmm, this is getting too deep. Let me think about what the ACTUAL benefit is supposed to be.
+
+The core hypothesis: the model learns from clean GT boxes but must classify detector boxes (different distribution). Fine-tuning on detector boxes adapts it. The background class for false alarms teaches rejection. The benefit should come from the model's improved representation/calibration on the detector distribution.
+
+For the metric, what matters is the per-class ORDER. The benefit from fine-tuning on detector boxes should be that the model assigns higher p_c to true boxes and lower to false alarms, in a way that re-orders correctly.
+
+I think the cleanest and most faithful implementation:
+- 5-class model.
+- GT phase: labels 0-3.
+- Detector phase: labels 0-3 for matched, 4 (background) for unmatched.
+- Inference: I'll score with score = conf * p_c where p is the 5-class softmax but I'll... 
+
+Actually, you know what, let me reconsider. Maybe I'm overcomplicating. Let me reconsider whether the background class should even affect inference scoring.
+
+Alternative clean design: The background class is ONLY used to shape training. At inference, I compute the 4-class softmax by taking the 4 defect logits and doing softmax over just those 4 (ignoring the background logit). This way, the background logit during training acts as a "reject" signal that pushes down all 4 defect logits on false alarms, but at inference the 4 defect probs are normalized among themselves.
+
+Wait, but that's weird: during training the background logit competes with the 4 defect logits. At inference, if I drop the background logit and re-normalize the 4, then a false alarm (where background logit was high, defect logits low) would have the 4 defect logits all low but re-normalized they'd sum to 1, giving a "confident" wrong class. That's bad — it would make false alarms look confident.
+
+Hmm, that's the opposite of what we want. We want false alarms to have LOW scores.
+
+So actually Option A (score = conf * p_c(5)) is what makes false alarms get low scores. And that's the failed formula. Ugh.
+
+OK here's the thing. Let me reconsider the failed family more carefully. The failed family was "5th background class from detector false alarms (scores times 1 - p_bg)". The result: "no gain: seed 0 from 0.518 to 0.629". So it went from 0.518 (probably a buggy start) to 0.629, and the 5-seed best... it says "no gain". So the background class as a scoring mechanism didn't help beyond the baseline.
+
+But here's the key difference in the current plan: the background class is used in a TWO-PHASE fine-tune, where the model first learns good defect discrimination on GT, then adapts to detector boxes. The background class in the fine-tune phase might help the model learn to separate "this is a defect" from "this is a false alarm" in a way that improves the defect discrimination too (by providing clean negative examples). And the scoring... 
+
+Actually, I realize the difference might be: in the failed family, the background class was probably the ONLY change (a single-phase training with background). Here, the two-phase approach with GT first might produce a better model. But the scoring mechanism (scores times 1-p_bg) is the same.
+
+Hmm, but if the scoring is the same as the failed family, and the failed family showed no gain from that scoring, then even if the model is better, the scoring might not capture it.
+
+Let me think differently. What if I keep the 4-class model for inference scoring (score = conf * p_c, 4-class), but add a SEPARATE background head that's only used during the detector fine-tune phase? No, that's complex and the background head wouldn't affect the 4-class probs.
+
+Alternatively: What if the background class is used in training, but at inference I use the 4-class re-normalized scores? Let me reconsider whether that's bad.
+
+Actually, let me reconsider. The concern with 4-class re-normalization at inference: a false alarm has all 4 defect logits low (because background logit was high during training). Re-normalizing the 4 low logits gives a distribution that sums to 1 but is "flat-ish". The score = conf * p_c would be conf * (something like 0.25) for the argmax. Whereas a true defect has one logit high, others low, background low; re-normalized the argmax is high. So true defects still score higher than false alarms in the argmax class. And for a specific class c, a true c box has high p_c, a false alarm has low p_c (since all 4 are low-ish but the argmax of a false alarm is random). So the ORDER within class c: true c boxes high, false alarms low. That seems fine actually!
+
+Wait, but the issue is: with 4-class re-normalization, the background information is discarded at inference. So a box that's a false alarm but where the model put, say, 60% background and 40% split among defects — re-normalized, the argmax defect gets 40%/ (sum of 4) ... no wait. Let me be concrete.
+
+5-class logits for a false alarm: [l0,l1,l2,l3,l4] = [-2,-1.5,-1,-0.5,-0.1] (background highest). 
+5-class softmax: p = [0.05,0.09,0.13,0.21,0.52]. 
+If I re-normalize over 4: p' = [0.10,0.18,0.25,0.41]. Argmax = stain (class 3) with 0.41.
+Score for stain = conf * 0.41.
+
+For a true stain box: logits [-2,-2,-1,-0.5, 1.0]. 5-class softmax: p=[0.02,0.02,0.06,0.10,0.80]. Re-normalize over 4: p'=[0.11,0.11,0.33,0.55]. Score stain = conf*0.55.
+
+So true stain (0.55) > false alarm stain (0.41). Good ordering. But it's close. And the "no row" issue: we output all 4 classes per box.
+
+Hmm, actually the difference between true and false is smaller with re-normalization than with the raw 5-class probs. With raw 5-class: true stain 0.80 vs false alarm stain 0.21. Bigger gap. So raw 5-class (Option A) gives better separation. But Option A = failed formula.
+
+Argh. OK let me just make a decision. 
+
+I think the most faithful implementation of the plan, which explicitly says "give it an extra negative class so the model learns to reject it," is:
+- 5-class model.
+- Inference: score = conf * p_c where p is the 5-class softmax, for c in 0..3. (Option A)
+
+Yes, this is the same formula as the failed family. BUT the failed family was a single-phase training. The current plan is two-phase (GT first, then detector boxes with background). The hypothesis is that the two-phase training produces a better model. The scoring formula being the same as a failed family is a risk, but the plan explicitly describes this mechanism, and the difference is the training procedure.
+
+Hmm wait, but actually, let me reconsider. Let me re-read the failed family once more: "5th 'background' class from detector false alarms (scores times 1 - p_bg) | 9 | no gain: seed 0 from 0.518 to 0.629; 2 crashes, 1 bug (0.0)".
+
+"seed 0 from 0.518 to 0.629" — this suggests that within that family, they started at 0.518 (buggy) and got up to 0.629. The 0.629 is basically the baseline (0.629-0.630). So the background class family, at its best, reached baseline but didn't beat it. So the background-class scoring mechanism, even when it works, only reaches baseline. That strongly suggests the scoring mechanism itself is not the source of gain.
+
+So if I use the same scoring mechanism, I'm betting that the two-phase training improves the model enough to beat baseline. That's a reasonable bet but risky.
+
+Alternatively, maybe I should keep the inference scoring as the CURRENT best (4-class, score = conf * p_c) and use the background class ONLY to regularize training, by... hmm, but a 5-class model's 4-class re-normalized probs are different from a 4-class model's probs.
+
+Let me think about this from a different angle. What's the cleanest way to "give false alarms an extra negative class so the model learns to reject it" WITHOUT changing the inference scoring at all?
+
+Idea: Keep a 4-class model. In the detector fine-tune phase, for false alarms, instead of a 5th class, use a different loss: e.gThinking budget reached. Stop thinking now and write the reply in the required format.

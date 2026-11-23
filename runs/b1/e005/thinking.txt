@@ -1,0 +1,188 @@
+===== attempt 1 =====
+Let me organize the situation.
+
+Current best: e002, 5-seed mean 0.6337. Per-class: pore 0.515, deposit 0.627, discontinuity 0.781, stain 0.611.
+
+Ceiling: 0.758 (stage-1 boxes with perfect classes). Class-agnostic score: 0.755. So the entire gap from 0.6337 to 0.758 is class decision error. The detector boxes are mostly fine (class-agnostic 0.755 ≈ ceiling 0.758). So the problem is purely class classification.
+
+Known info:
+- Crop classifier with perfect boxes achieves macro-F1 ~0.87 with the initial recipe. Pore and deposit are weak classes. Stain is often confused with deposit.
+- Hyperparameter tuning alone has been of little help. Method changes have been more useful.
+- Class-weighted loss has been harmful every time.
+
+Experiments:
+- e001: data (training on detector boxes) — crashed.
+- e002: fixed IoU bug — new best 0.6337.
+- e003: architecture (tight crop at 224px) — crashed (NameError).
+- e004: fixed the name, tested 224px tight crop — 0.6325, rejected (no improvement. Actually slightly worse than 0.6382 at seed 0, but seed 0 of best was 0.6382… 0.6325 < 0.6382 so rejected).
+
+So high-resolution tight crop didn't help.
+
+What else can we do? Let me think about the error structure.
+
+Per-class AP: pore 0.515, deposit 0.627, discontinuity 0.781, stain 0.611.
+
+The gap to ceiling 0.758 is ~0.124. The weakest is pore.
+
+Ideas:
+
+1. **Training data / sampling**: Currently training on GT crops (high-res only) + detector boxes on training images. TRAIN_ON = ("high",). What about using "low" resolution crops too? Hmm, "low" images might be lower resolution. The paper reports 0.69 mAP on high-res images. The eval images are… probably high-res. Using low-res training data might add data but blurrier. Actually, adding low-res data might help robustness, but could hurt. Uncertain.
+
+2. **Class confusion**: Stain is often confused with deposit. Pore and deposit are weak.
+
+3. **Score calibration / scoring**: Currently score = conf × class probability. All 4 rows per box are written. mAP@0.5: per class, predictions are sorted by score. For a given box, the class with the highest probability gets the highest score. False alarms (boxes not overlapping any GT) are kept with class 0 and detector conf in the ceiling calculation. In our system, false alarms get assigned to the class the classifier predicts.
+
+Key insight: in the "perfect class" ceiling, false alarms are kept as class 0 with detector conf. In our system, false alarms get the class the classifier predicts and score conf × p. The ranking of false alarms vs true detections matters for mAP.
+
+4. **Ensemble of multiple models**: Train multiple models with different seeds/architectures and average probabilities. This is a method change and typically gives a few points. But time budget: ~140s training time for 2 epochs of EfficientNet-B0 160px. Could train 2-3 models. But averaging probabilities across models trained with different seeds — this is test-time ensemble. Could help classification accuracy.
+
+Actually wait — a more powerful idea: **train a stronger classifier**. The known result: "crop classifier with perfect boxes achieves macro-F1 ~0.87 with the initial recipe (two-crop input)". So the classifier is ~0.87 macro-F1. The gap from 0.6337 to 0.758 is class decision error.
+
+What method changes could help more?
+
+- **Larger model**: EfficientNet-B2, ConvNeXt, etc. But time budget. EfficientNet-B0 at 160px: 285 steps in ~83s (epoch 0: 14s load to 97s = 83s for 285 steps, so ~0.29s/step). B2 is ~3x compute. Might fit 1 epoch. Hmm, but 1 epoch might not be enough. Actually, the loss after epoch 0 was 0.4582, epoch 1 was 0.2468 — training is still progressing. More steps would help.
+
+- **Test-time augmentation (TTA)**: At inference, average predictions over flips. This typically gives a small improvement. Inference cost: 41879 boxes × 2 views = 83758 crops. Inference took ~55s (162 - 107… let me compute: training ended at ~125s+ and total 162s, so inference+writing ~35s). TTA with 4 flips would be ~4x inference = 140s. Budget is 180s total. Load 14s, reserve… tight but might fit: 14 + 120 (training) + 140 (inference) = 274 > 180. Doesn't fit unless we cut training. Hmm.
+
+Actually, wait, what's the time budget T? The log shows total 162s. Default --seconds is 180. So T=180. RESERVE_S=55.
+
+- **Crop classifier on perfect boxes achieves 0.87 macro-F1** — that's with the initial recipe. Our system is 0.6337 mAP vs ceiling 0.758.
+
+Let me think about what dominates the error:
+
+mAP@0.5 per class. For a box overlapping a GT of class c: if the classifier predicts c, it's a TP (assuming ranking is fine). If it predicts another class, it's a FP of that class and a miss for class c. So classification error directly translates to mAP loss.
+
+Also, false alarms: boxes not overlapping any GT. In the ceiling, they're class 0 with conf. In our system, they get the predicted class. If the classifier confidently predicts stain for a false alarm, that's a FP for stain.
+
+Also, ranking: within a class, score = conf × p. A true detection with low conf but high p might rank below a false alarm with high conf. The conf comes from the stage-1 detector and is presumably well-calibrated for "is there a defect". The p from the classifier adds noise to the ranking.
+
+Hmm, one idea: **score = conf × p but only output the top class per box** (or top-2). Currently we output all 4 classes per box. This means each box contributes 4 predictions, one per class, ranked by conf×p. In mAP, for class c, the box's class-c row competes with other class-c rows. If a box's top prediction is class d ≠ c (where c is the true class), the class-c row for that box still exists with a lower score. When class c's rows are sorted, that box's class-c row appears somewhere in the ranking. If it matches a GT of class c, it counts as a hit at that rank. So outputting all 4 classes is actually beneficial: even if the top class is wrong, the correct class's row can match at a lower rank. This is like a "soft" multi-label prediction. Interesting — this is already in the baseline and probably good.
+
+Actually wait, is it? Let me think: box B overlaps GT of class c. Rows: (B, c, s_c), (B, d, s_d), s_d > s_c. For class c: B's row is at rank determined by s_c. It matches the GT → TP at that rank. For class d: B's row is at rank s_d, no GT of class d → FP. So yes, outputting all classes means the correct class can still be a TP even if the top class is wrong. This is strictly better than hard assignment (only top class). Good, keep it.
+
+So what's the biggest lever?
+
+Option A: **Better classifier through data**: use "low" resolution images too. TRAIN_ON = ("high",). How many boxes? 18271 total training boxes (12219 detector boxes + 6052 GT high-res crops?). Hmm wait: crops.csv filtered by res in TRAIN_ON → some number. Plus 12219 detector boxes. Total 18271. So GT high-res crops = 6052.
+
+If "low" images exist, adding them might double data. But low-res might be blurrier and the eval is probably high-res. Risky.
+
+Option B: **Ensemble of 2 models with different architectures** (e.g., EfficientNet-B0 + ResNet50 or ConvNeXt), average logits/probabilities. Different architectures make different errors → ensemble improves classification. Time: 2 models at 160px. EfficientNet-B0: 285 steps in 83s. ResNet50 at 160px is comparable or slightly slower. If we split the budget: train each for half the time? Or train both sequentially with shared budget. Total training 120s → 60s each ≈ 200 steps each. Less training per model but ensemble diversity. Uncertain but plausible.
+
+Actually, a cheaper ensemble: train 2 EfficientNet-B0 with different seeds and average. But same architecture, same data — diversity is only from initialization. Modest improvement.
+
+Option C: **Fix the class confusion directly**: stain is often confused with deposit. Pore is weak. Hmm.
+
+Option D: **Larger input for both views** — tested 224 for tight, no improvement (0.6325 vs 0.6382 at seed 0, rejected). So resolution isn't the lever.
+
+Option E: **Add a third view or different context**: e.g., tighter context (1.0x) or wider (4x). The two-crop (1.5x + 2.5x) is the "initial recipe" that achieves 0.87 macro-F1. Changing context is a method-ish change but similar to resolution change.
+
+Option F: **Train the classifier to predict on detector boxes only** (remove GT crops from training) — currently mixing GT crops and detector boxes. The detector boxes are the actual input distribution. Hmm, e001's idea was to train on detector boxes (crashed), and e002 added them on top of GT crops. Training only on detector boxes might reduce distribution mismatch, but GT crops have cleaner labels (detector box labels come from IoU>0.5 overlap, which is fine).
+
+Option G: **Inference: use TTA with flips**. Inference cost concern. Let me compute: 41879 boxes, 2 views, batch 256 → 326 batches of 512 images. Inference ~35s for 83758 images → ~0.42ms/image. With 4 flips (h, v, both) × 2 views = 8 views → 335k images → ~140s. Too much with training. Unless we cut training time. Hmm.
+
+Actually, could we do TTA cheaply: only horizontal flip (2 views × 2 = 4 views, 167k images → ~70s). Training 120s + load 14s + 70s = 204 > 180. Still over. Need to cut training to ~90s. Training quality drops.
+
+Option H: **Score calibration / class prior correction**: the class distribution is imbalanced. Cross-entropy on imbalanced data → the model under-predicts rare classes. "Class-weighted loss has been harmful every time" — that's for training. But at inference, we can adjust scores: score_c = conf × p_c × w_c with per-class weights. Wait — but mAP only depends on the ordering within a class. Multiplying all scores of class c by a constant doesn't change class c's AP. So per-class score scaling is useless for mAP! The metric note explicitly says: "changes that preserve the ordering of a class's predictions (e.g., multiplying all scores by a constant, or monotonic functions of the score) don't change its AP."
+
+So per-class score scaling is useless. Only cross-class reordering matters, and that happens through the classifier's probabilities (which class a box gets). So scoring tweaks are out.
+
+Option I: **Drop low-confidence rows / threshold**: MIN_SCORE = 0.001. If we drop rows below a higher threshold, we remove some FPs (low-score predictions that would be FPs). In mAP, removing low-score predictions of class c: they're at the bottom of class c's ranking. If they're FPs, removing them doesn't change precision at any rank before them… wait, actually it does change: removing FPs at the bottom doesn't affect the ranking of the remaining predictions. AP is computed over the remaining sequence. Removing FPs at the tail doesn't change the precision at any rank of the remaining predictions. Hmm wait: AP = sum over ranks of precision@rank × (TP indicator). If we remove a prediction at rank k (a FP), all predictions after shift up by one, but their TP/FP status is unchanged and precision at each remaining rank is unchanged (removing a FP from the prefix increases precision at later ranks… no wait).
+
+Let me think carefully. Sequence of predictions for class c: p1, p2, ..., pn with TP/FP labels. Precision at rank i = (TPs in first i) / i. AP = Σ_i precision(i) × tp(i) (standard). If we remove a FP at position j: for i < j, unchanged. For i ≥ j: new sequence position i is old position i+1. TPs in first i of new = TPs in first i+1 of old. precision_new(i) = TP_old(i+1)/(i) vs precision_old(i+1) = TP_old(i+1)/(i+1). So precision_new(i) > precision_old(i+1). But AP sums precision(i)×tp(i) over i where prediction i is a TP. New AP = Σ_{i: new_i is TP} TP_old(i+1)/i. Old AP = Σ_{j: old_j is TP} TP_old(j)/j. TPs after j in old become i = j-1 in new: new contribution TP_old(j)/(j-1) > old TP_old(j)/j. So removing a FP before a TP improves AP! Removing FPs always improves or keeps AP (removing a TP would hurt). So dropping low-score rows only helps if they're FPs. Low-score rows: conf × p < threshold. These are mostly false alarms or uncertain boxes. Dropping them helps. But MIN_SCORE=0.001 is already very low. Raising it to say 0.01 would drop more. This is a cheap experiment (no retraining needed… but we have to rerun the whole pipeline). Actually, the "scoring" category. Hmm, but does it help? Rows with score < 0.01: conf < 0.05 with p ~ 0.2, or conf 0.02 with p ~ 0.5. The stage-1 detector's conf distribution — detector boxes probably have conf above some detection threshold (YOLO default 0.25?). If most eval boxes have conf > 0.25, then score = conf × p < 0.01 requires p < 0.04 — rare. So raising MIN_SCORE might drop almost nothing. Not a big lever.
+
+Option J: **Model capacity**: EfficientNet-B2 or ConvNeXt. Time: B2 at 160px is ~3x B0 → ~0.9s/step → 120s/400 steps ≈ 1 epoch. Less training. Risky.
+
+Option K: **Training data: use detector boxes from both high and low res?** dets.csv — do detector boxes have res? crops.csv has res. dets.csv has image, x1…, img_w, img_h. Images in "low" have smaller img_w. So detector boxes on low-res images are in dets.csv. Currently, det_boxes are added regardless of res! Look: `det_by_img` is built from all dets with split=="train" — no res filter. And crops = crops (high-res GT) + all labeled detector boxes (both high and low res). So detector boxes already include low-res. Only GT crops are high-res only.
+
+Option L: **Add GT crops from low-res too** (TRAIN_ON = ("high", "low")). More labeled data (6052 → maybe 12k+). Low-res images are blurrier. The eval is probably high-res (paper: 0.69 on high-res. Reference numbers are on validation "same images as your score is computed on"). Hmm, are eval images high or low? d2 numbers: class-agnostic 0.755 vs paper's one-step 0.69 on high-res. Our 0.6337 is on the same eval set. If eval were mixed, class-agnostic 0.755 would be… unclear. I'd guess eval is high-res (the paper's main result). Adding low-res training data: more data, but blurrier. Could help generalization, could hurt. Medium confidence.
+
+Option M: **Better class decision via a second classifier head / larger context**: e.g., add a very wide crop (4x or 5x) as a third view. Stain is a large diffuse defect — needs wide context. Stain is often confused with deposit. A wider view might help distinguish stain (large area) from deposit (localized). This is a method change (what the model sees). Cost: third view = +50% inference and training compute per step. Training: 2 views → 3 views, each step 1.5x → ~0.44s/step → 120s/270 steps. Inference: 41879 × 3 views = 125k images → ~53s. Total: 14 + 120 + 53 = 187 > 180. Slightly over. Need to cut reserve or training. RESERVE_S=55 → 45? e004 used RESERVE_S=45 and finished in… e004's log isn't shown but was rejected (score 0.6325, ran to completion). Hmm, e004 ran with 224px tight crop (more compute) and reserve 45.
+
+Actually wait, let me reconsider. What's the single highest-value experiment?
+
+Per-class: pore 0.515 (weakest), stain 0.611, deposit 0.627, discontinuity 0.781.
+
+Known: "Pore and deposit are weak classes. Stain is often confused with deposit."
+
+Pore = small dark hole. At 160px with 1.5x context, a small pore box… pore boxes are small (small side). MIN_CROP=16. A 10px pore box with 1.5x → 15px → 16px canvas → resized to 160. The pore is a small dark spot in a 160px image. 224px didn't help (e004). Hmm, why? Because the problem isn't resolution but… maybe the tight crop is mostly background and the pore signal is subtle.
+
+Alternative: **crop centered on the box with tighter context for small boxes**? Or **multi-scale**: for small boxes, the box itself is the defect.
+
+Hmm, let me think about the ensemble idea more concretely, since it's a classic reliable gain:
+
+**Ensemble of 2 different architectures** (EfficientNet-B0 + ResNet50, both 160px, 2 views each… or 1 view each to save time). Average probabilities. Different architectures make different errors. Typical gain: +0.5-1% in top-1 accuracy → could be +0.005-0.01 mAP.
+
+Time budget: B0: 0.29s/step (2 views). ResNet50 at 160px: probably 0.2-0.3s/step. Sequential training: total 120s → 60s each → ~200 steps each. Each model alone would be slightly undertrained vs 424 steps, but the ensemble of two undertrained diverse models often beats one well-trained model.
+
+But wait — is 200 steps enough? Loss trajectory: epoch 0 (285 steps) 0.458, epoch 1 (424 steps total) 0.247. Hmm, epoch 0 has 285 steps, epoch 1 has 139 more. Dataset: 18271 boxes / 64 = 285 steps/epoch. So 424 steps = 1.5 epochs. With 60s budget: ~200 steps = 0.7 epochs. Loss probably ~0.55. Undertrained.
+
+Alternative: **train both models at lower resolution (128px)** to get more steps? 128px: 0.29 × (128/160)² ≈ 0.18s/step → 60s/330 steps each. Hmm, resolution change is a confound.
+
+Or **ensemble of 2 B0s with different seeds** — cheap, same compute per step, just split time. Diversity from init only. Modest.
+
+Hmm, let me reconsider the problem from the mAP perspective.
+
+Actually, here's a thought: **the ranking within a class matters, and score = conf × p**. The p adds class-specific noise. What if instead we use a cleaner score? But per-class monotonic transforms don't change AP. The ordering within class c is determined by conf × p_c across all rows of class c. Rows of class c include: boxes where c is the top class, and boxes where c is a lower-ranked class (since we output all 4). A box where c is the true class but top prediction is d: its class-c row has score conf × p_c (low p_c). It ranks low. A false alarm with high conf and moderate p_c ranks above it. So a misclassified true detection sinks in the ranking. This is the direct cost of classification error: not just a miss but a demotion.
+
+So improving classification accuracy is the lever. The classifier's macro-F1 is ~0.87 (on perfect boxes). Our AP gap: 0.758 - 0.634 = 0.124.
+
+What could push classification accuracy up?
+
+1. Ensemble (diversity).
+2. More/better data (low-res GT crops).
+3. Better input representation (views).
+4. Better training (more steps — but budget-limited. Could reduce views to 1 to get 2x steps? "Two-crop input" is the recipe that achieves 0.87. Single crop might be worse).
+
+Hmm wait, actually — what about **training on detector boxes only, at higher effective resolution**? No…
+
+Let me think about **what e004 (224px tight) taught us**: nothing (rejected, 0.6325 vs 0.6382 seed 0). So resolution isn't it.
+
+**What about the wide crop context?** Stain is large and diffuse. 2.5x context might not be enough to see the full stain extent vs deposit. A 4x or 5x view could help stain. Stain AP 0.611, "stain is often confused with deposit". Deposit AP 0.627.
+
+Third view at 4x: training compute +50%, inference +50%. Let me compute more carefully.
+
+Current: training 14s→125s (111s, 424 steps, 2 views) → 0.26s/step. Inference: 125s→162s = 37s for 83758 images (2 views), batch 256, 326 batches → 0.44ms/image.
+
+With 3 views: step 0.39s. Budget for training: 180 - 14 (load) - reserve. Reserve needs to cover inference: 41879 × 3 = 125637 images → 55s + CSV writing (~5s, 54k rows). Reserve 65s. Training budget = 180 - 14 - 65 = 101s → 260 steps. vs current 424 steps. Fewer steps but richer input.
+
+Risk: undertraining hurts. But the hypothesis is that the stain/deposit confusion is an information problem (need wider context), not a training problem.
+
+Alternatively, **replace** the 2.5x view with a 4x view (keep 2 views, no extra compute): tight 1.5x + wide 4x. Same training/inference cost as current! This is clean: change CONTEXT from 2.5 to 4.0 (or 3.5). The tight view handles small defects (pore, deposit), the wide view handles large diffuse ones (stain, discontinuity).
+
+Hmm, but the "initial recipe" (1.5x + 2.5x) achieves 0.87 macro-F1. Changing to 4x might help stain and hurt others. Single-variable, cheap to test, no time risk. This is a good experiment!
+
+But wait — is it likely to gain ≥0.003? Stain AP 0.611. If wider context fixes, say, 20% of stain errors → stain AP +0.05-0.1 → mAP +0.015-0.025. Plausible.
+
+Alternatively, **add** a third view (1.5, 2.5, 4.5) — more compute but keeps the known-good views. If the 4x view helps, adding it is strictly better than replacing. But compute/time risk.
+
+Given the budget: 3 views → 260 steps vs 424. Hmm. Actually, let me reconsider: is 424 steps even necessary? We don't know the saturation point. Loss was still dropping (0.458 → 0.247).
+
+Let me think about another angle: **false alarms**. Class-agnostic 0.755 vs ceiling 0.758 — nearly identical, so false alarms barely matter (they're the same in both). The entire gap is class decision. Per-class AP: if a box overlapping a GT of class c is misclassified as d, class c loses a TP and class d gains a FP.
+
+Class priors: how many of each class? Unknown, but pore is probably rare (small). If the model under-predicts pore (AP 0.515), many pores are misclassified as something else.
+
+**Idea: asymmetric confidence / class-specific decision thresholds** — useless for mAP (per-class monotonic).
+
+**Idea: train with a larger model** — time risk.
+
+**Idea: two-stage within stage 2** — overkill.
+
+**Idea: use detector conf in training** — e.g., weight training samples by conf? Or train the classifier to be calibrated against conf? Hmm.
+
+**Idea: train on eval-like distribution** — already doing (detector boxes).
+
+**Idea: mix GT crops and detector boxes** — currently 6052 GT + 12219 det = 18271. Detector boxes are 67% of training. GT crops have exact centers. Detector boxes are misplaced. Both are useful.
+
+**Idea: add low-res GT crops** (TRAIN_ON = ("high","low")): +~6000 samples (33% more data), no extra time (just more steps per epoch — actually more data = more steps per epoch, so with time-based training, we get the same number of steps but each epoch covers more data… wait, time-based: same 111s, same step time → same number of steps, but each epoch is longer (285 → ~480 steps/epoch). So we see 424 steps worth of data but more diverse (more unique samples? no — shuffle covers 424/480 of the extended dataset in epoch 0 vs 424/285 = 1.5 epochs of the smaller set). Hmm: currently 424 steps = 1.49 epochs of 18271. With low-res added (~24300 samples, 380 steps/epoch), 424 steps = 1.12 epochs. So we see more unique samples (24300 × … no: 424 steps × 64 = 27136 sample draws from 24300 unique = 1.12 passes vs 27136 draws from 18271 = 1.49 passes). More unique coverage, fewer repeats. Probably slightly better or neutral. Low-res blur might hurt. Medium confidence, cheap test.
+
+**Idea: ensemble** — I keep coming back to this as the most reliable method-level gain. Let me design it properly within budget.
+
+Ensemble plan: 2 models, EfficientNet-B0 + ResNet50 (or ConvNeXt-nano), both 160px, 2 views. Split training time 50/50. Average probabilities.
+
+Time: B0 0.26s/step. ResNet50 160px: ~0.25-0.35s/step. Assume 0.3. Each gets ~55s → B0: 210 steps, RN50: 183 steps. Inference: 2 models × 83758 images = 167k images → ~74s. Load 14s. Total: 14 + 111 + 74 = 199 > 180. Over!
+
+Reduce: inference batch 256, 326 batches per model. 37s per model → 74s for both. Training 111s. 14 + 111 + 74 + writing 5 = 204. Over by 24s.
+
+Options: cut training to 85s (reserve 80s): 14 + 85 + 74 + 5 = 178. Just fits. 85s training: B0 ~325 steps (1.14 epochs), RN50 ~280 steps. Hmm.
+
+Or 1 view per model instead of 2: step time halved → more steps. But single view is a worse recipe (two-crop is theThinking budget reached. Stop thinking now and write the reply in the required format.

@@ -1,0 +1,478 @@
+===== attempt 1 =====
+Let me analyze the situation carefully.
+
+**Current state:**
+- Best: e001, 5-seed mean 0.6302
+- Per-class: pore 0.517, deposit 0.622, discontinuity 0.776, stain 0.605
+- Baseline to beat: 0.638 (one-step 4-class detector)
+- Ceiling: 0.758 (perfect classes on stage-1 boxes)
+
+**Experiment history analysis:**
+
+1. **e001** (data): Added low-res crops → new best 0.6302. Good.
+2. **e002** (architecture): Single crop → crashed.
+3. **e003** (architecture): Fixed single crop → 0.6247, rejected. Single crop is worse than two-crop.
+4. **e004** (architecture): More training (longer budget?) → 0.6296, rejected. Wait, what was the actual change? The hypothesis says "undertrained" but it was rejected. Let me think about what e004 actually did. The hypothesis mentions the loss is still falling fast. Maybe it changed the training schedule or something. Rejected.
+5. **e005** (architecture): IMG_SIZE 160→128 → 0.6217, rejected. Smaller images = worse.
+6. **e006** (data): Replace GT boxes with detector boxes for training → 0.6338 seed-0, 0.6278 5-seed, not confirmed.
+7. **e007** (sampling): Duplicate pore/stain 2x → 0.6280, rejected.
+8. **e008** (data): Train on false alarms → 0.5635, rejected. Bad idea.
+9. **e009** (scoring): Only write top-1 class per box → 0.5710, rejected. Bad idea.
+10. **e010** (augmentation): Rotation + contrast → 0.6331 seed-0, 0.6255 5-seed, not confirmed.
+
+**What has been tried and failed:**
+- Single crop (e003): worse
+- Smaller images (e005): worse
+- More training steps via smaller images (e004, e005): worse
+- Class rebalancing (e007): worse
+- Training on false alarms (e008): much worse
+- Top-1 scoring (e009): much worse
+- Rotation/contrast augmentation (e010): not confirmed (slightly worse on 5-seed)
+- Detector box training (e006): not confirmed
+
+**What worked:**
+- Adding low-res data (e001): +0.03 over baseline presumably
+
+**Key observations:**
+
+1. The model is undertrained: only 428 steps, 2 epochs, loss still 0.31 and falling. The budget is 180s, with 55s reserved for prediction. That leaves ~111s for training. At ~0.36s/step, that's ~310 steps... wait, the log shows 428 steps in ~111s (125s - 14s loading = 111s). So ~0.26s/step.
+
+2. The per-class scores show pore is weakest (0.517), then stain (0.605), deposit (0.622), discontinuity (0.776).
+
+3. The gap to the ceiling (0.758) is 0.128. The gap to the one-step baseline (0.638) is only 0.008. So we're very close to the baseline but far from the ceiling.
+
+4. The two-crop approach (tight 1.5x + wide 2.5x) is better than single crop.
+
+**What could help?**
+
+Let me think about what's fundamentally different from what's been tried:
+
+**Idea 1: Better model architecture.** We're using EfficientNet-B0. What about a larger model? We have efficientnet_b2 available. But that would be slower per step. With 428 steps currently, a larger model might only get ~200 steps. But if the model capacity is the bottleneck (not training time), this could help. However, e005 showed that smaller images (more steps) hurt, suggesting the model is already at or near capacity limit for this data. Actually wait - e005 reduced image size which reduces both compute per step AND information per image. The fact that it hurt could mean the model needs the resolution, not that it needs more steps.
+
+Actually, let me reconsider. The loss is still falling at 0.31 after 2 epochs. This suggests undertraining. But e004 (which I think tried to train longer or with different schedule) and e005 (more steps via smaller images) both failed. So maybe the issue isn't just "more steps" but something else.
+
+Wait, what was e004 exactly? The hypothesis says "undertrained" but I don't have the diff. Let me think about what it might have done. It was based on e001 and was in the "architecture" category. Maybe it changed the model or training schedule. It got 0.6296 which is basically the same as e001's 0.6302. So it was a wash.
+
+**Idea 2: Use a better backbone.** Try efficientnet_b2 or convnext_nano. The current model is EfficientNet-B0 which is quite small. If the model is capacity-limited (not data-limited or time-limited), a larger model could help. But it would be slower.
+
+Let me estimate: EfficientNet-B0 at 160x160 with batch 64 takes ~0.26s/step. EfficientNet-B2 is about 2-3x the FLOPs. So maybe ~0.5-0.8s/step. That would give ~140-220 steps in 111s. That's fewer steps but a more powerful model.
+
+Actually, the fact that single-crop (halving compute) made things worse (e003: 0.6247 vs 0.6302) suggests that the two-crop averaging is important - it's not just about compute. The wide context provides useful information.
+
+**Idea 3: Train longer by reducing prediction time.** Currently prediction takes 180-162=18s... wait, the total is 162s and the budget is 180s. Training took 125-14=111s. Prediction took 162-125=37s. With RESERVE_S=55, training stops at 180-55=125s, which matches. So prediction takes about 37s.
+
+If I could speed up prediction, I could train longer. But prediction is 41879 detections × 2 crops = 83758 forward passes. At batch 256, that's ~326 batches. 37s / 326 ≈ 0.11s/batch. That's already quite fast.
+
+Could I reduce prediction time by using a smaller batch or fewer crops? No, that would hurt quality.
+
+**Idea 4: Use the detector confidence more cleverly in scoring.** Currently score = conf × p_c. The detector conf is the same for all classes of a given box. This means the ranking within a box is purely by p_c, and the ranking across boxes is conf-weighted. 
+
+What if the detector conf is noisy? Maybe I should use a different function of conf. For example, conf^0.5 to compress the range, or a sigmoid-like function. But this is a monotone transformation of the score for each class, so it would change the ranking across boxes but not within a box. Wait, actually it WOULD change the ranking because different boxes have different confs and the transformation is non-linear.
+
+Actually, the metric says "AP depends only on this ORDER. Any change that keeps the order of a class's predictions leaves its AP unchanged." So if I apply a monotone function to all scores of a class, AP doesn't change. But conf^0.5 is monotone in conf, and p_c is the same, so conf^0.5 × p_c is NOT a monotone function of conf × p_c (because p_c varies). So it WOULD change the ordering.
+
+Hmm, but would it help? The detector conf is a proxy for "is this a real defect?" If conf is well-calibrated, then conf × p_c is reasonable. If conf is miscalibrated (e.g., too spread out), a different function might help.
+
+Actually, let me think about this differently. The 0.755 score for "class-agnostic" means the detector boxes are well-placed. The 0.758 ceiling with perfect classes means the boxes are good. The gap from 0.630 to 0.758 is the class assignment error. 
+
+The per-class scores: pore 0.517 is the weakest. This is the class where the model most often gets the type wrong.
+
+**Idea 5: Use a different training strategy - e.g., mixup or label smoothing.**
+
+Label smoothing: instead of hard targets, use soft targets. This could help with calibration. But the metric only cares about ordering, not calibration. So label smoothing might not help unless it changes the ordering.
+
+Mixup: interpolate between samples. This is a data augmentation technique that could improve generalization. It's different from the geometric augmentations tried in e010.
+
+**Idea 6: Use a different model - convnext_nano or resnet50.**
+
+The current model is EfficientNet-B0. Let me think about what would be a meaningful architectural change. 
+
+Actually, I think the most promising direction is to try a **larger or different backbone**. The model is clearly undertrained (loss still falling), but we can't just add more steps because the budget is fixed. A more powerful model that converges faster could help.
+
+Options:
+- efficientnet_b2: ~2x FLOPs of b0, better accuracy
+- convnext_nano: different architecture, might have better inductive biases
+- resnet50: much larger, probably too slow
+- tf_efficientnetv2_b0: improved version of b0
+
+Let me estimate step times:
+- EfficientNet-B0 at 160x160, batch 64: ~0.26s/step (from logs: 111s / 428 steps)
+- EfficientNet-B2: roughly 2x FLOPs → ~0.5s/step → ~220 steps
+- tf_efficientnetv2_b0: similar FLOPs to b0 but better architecture → ~0.26s/step → ~428 steps
+- convnext_nano: similar FLOPs to b0 → ~0.26s/step
+
+Actually, tf_efficientnetv2_b0 is interesting - it's the same size as b0 but with a better architecture (FusedMBConv, depthwise separable convolutions with different ratios). It should train faster and be more accurate.
+
+But wait - the pretrained weights are available for tf_efficientnetv2_b0. So I could use it with pretrained weights.
+
+**Idea 7: Use both crops in a different way - e.g., concatenate instead of averaging.**
+
+Currently: logits = (model(xt) + model(xw)) / 2
+Alternative: concatenate the crops and pass through the model? No, the model expects a fixed input size.
+
+Alternative: use the tight crop for classification and the wide crop for a separate "context" head. But this requires architectural changes.
+
+Actually, a simpler idea: instead of averaging logits, concatenate the two feature vectors before the final classification layer. This would let the model learn to weight the two views differently. But this requires modifying the model architecture.
+
+Hmm, but this is a significant change. Let me think about what's most likely to help.
+
+**Idea 8: Increase the wide context.** Currently CONTEXT=2.5. What about 3.0 or 4.0? More context might help distinguish stain from deposit (which are confused). But this is a small change and might not have a big effect.
+
+**Idea 9: Use the detector confidence as a training signal.** The detector conf for training boxes (which overlap GT boxes) indicates how "obvious" the defect is. Maybe I can weight the training loss by conf - give more weight to boxes where the detector is confident (clear defects) and less to ambiguous ones. But this is similar to class weighting which has been tried and failed.
+
+Actually wait, the history says "Class-weighted loss hurt classification every time it was tried." But that's about class weights, not confidence weights. Confidence weighting is different - it's per-sample, not per-class.
+
+**Idea 10: Train for more epochs by reducing the reserve time.** Currently RESERVE_S=55. Prediction takes ~37s. If I reduce RESERVE_S to 40, I get 15 more seconds of training = ~58 more steps. That's a 14% increase in training. But it's risky - if prediction takes longer than expected, the run could be killed.
+
+Actually, looking at the log: total 162s, budget 180s. Training ended at 125s (180-55). Prediction took 162-125=37s. So 125+37=162 < 180. There's 18s of slack. If I reduce RESERVE_S to 40, training would go until 140s, and prediction would need to finish by 180s, giving 40s for prediction. Since prediction takes ~37s, that's cutting it close but should work.
+
+But 15 more seconds = ~58 more steps = 14% more training. Is that enough to matter? The loss is 0.31 and falling. 14% more steps might reduce loss to ~0.28 or so. The effect on mAP is probably small (< 0.005).
+
+**Idea 11: Use a learning rate warmup and different schedule.** Currently: 5% warmup, cosine decay. What about a step-based schedule? Or a different warmup fraction?
+
+This is a hyperparameter tweak and the history says "Tuning hyperparameters alone helped little in earlier experiments."
+
+**Idea 12: Use a different loss function.** E.g., focal loss for class imbalance. But "Class-weighted loss hurt classification every time it was tried." Focal loss is different from class weighting, but it's in the same family.
+
+**Idea 13: Use the wide crop at a different scale.** Currently tight=1.5, wide=2.5. What if I use tight=1.5, wide=4.0? More context might help with stain/deposit confusion.
+
+Actually, let me reconsider the error analysis:
+- pore 0.517: weakest. Pores are small, round defects. They might be confused with other small defects.
+- stain 0.605: often confused with deposit.
+- deposit 0.622: 
+- discontinuity 0.776: strongest.
+
+The stain/deposit confusion is mentioned in the background. More context (wider crop) might help distinguish them because the surrounding weld bead pattern differs.
+
+**Idea 14: Use a larger image size.** Currently 160. What about 224? This would give more detail. But it would increase compute per step by (224/160)² = 1.96x. So ~0.51s/step → ~218 steps. Half the steps but more detail per image.
+
+e005 tried 128 (smaller) and it was worse. So 224 (larger) might be better. But it's a big change and the reduced number of steps might hurt.
+
+**Idea 15: Use a different pretrained model - convnext_nano.**
+
+ConvNeXt has a different inductive bias (all convolutions, no attention). It might be better for local texture patterns like weld defects. And it's available with pretrained weights.
+
+Let me estimate: convnext_nano has ~50M params, similar to EfficientNet-B0 (~40M). So similar compute. Should get similar number of steps.
+
+Actually, I think the most promising experiment is to **try a different backbone** that might be better suited for this task. The current EfficientNet-B0 is a reasonable choice, but it's not the best available.
+
+Let me think about which model to try:
+- efficientnet_b2: bigger, better, but 2x slower
+- tf_efficientnetv2_b0: same size, better architecture
+- convnext_nano: different architecture, similar size
+- resnet50: much bigger, probably too slow
+
+I think **tf_efficientnetv2_b0** is the safest bet - same compute as b0, better architecture, should give similar or better results with the same number of steps.
+
+But wait, is this really "fundamentally different" from what's been tried? e003, e004, e005 were all "architecture" changes but they were about crop strategy and image size, not backbone. So trying a different backbone is a new direction.
+
+Actually, let me reconsider. The history shows:
+- e003: single crop (architecture) → worse
+- e004: ? (architecture) → worse
+- e005: smaller images (architecture) → worse
+
+These were all about changing how the model processes the input, not about the model itself. So changing the backbone is a genuinely new direction.
+
+But will it help? The model is undertrained (loss still falling). A better backbone might converge faster, but it might also need more training to reach its potential. With the same number of steps, it might not beat b0.
+
+Hmm, let me think about this differently. What's the fundamental bottleneck?
+
+The loss is 0.31 after 2 epochs. The model has seen each training sample ~2 times. With 14128 samples and batch 64, that's 220 steps/epoch. 428 steps = ~2 epochs.
+
+If I could train for 5-10 epochs, the loss would probably be much lower. But the budget only allows ~2 epochs.
+
+The key question is: is the model limited by:
+(a) Training time (needs more steps) → try faster model or larger batch
+(b) Model capacity (needs bigger model) → try larger model
+(c) Data quality (needs better training data) → try different data strategy
+(d) Architecture (needs better architecture) → try different backbone
+
+Given that:
+- e005 (more steps via smaller images) was worse → not (a) in the simple sense
+- e007 (more of weak classes) was worse → not (c) in the simple sense
+- e008 (false alarm training) was much worse → data strategy is tricky
+- e010 (augmentation) was not confirmed → not (c) in the augmentation sense
+
+So maybe it's (b) or (d). A better/larger model might help.
+
+Let me go with **efficientnet_b2**. It's about 2x the FLOPs of b0, so ~0.5s/step → ~220 steps. That's about 1 epoch. But it's a much more powerful model. With pretrained weights, it might do well even with less training.
+
+Actually, wait. Let me reconsider. 220 steps is only 1 epoch. The model would barely be trained. Even with good pretrained weights, 1 epoch of fine-tuning might not be enough.
+
+What about reducing the batch size to get more steps? With batch 32 instead of 64, I'd get ~2x steps but the effective learning rate would be different. Actually, with AdamW, the batch size doesn't affect the learning rate schedule as directly. But smaller batches are noisier.
+
+Hmm, this is getting complicated. Let me think about what's the highest-impact change I can make.
+
+**Key insight:** The two-crop approach (tight + wide) is important (e003 showed single crop is worse). The wide crop provides context that helps with classification. The stain/deposit confusion is a known issue.
+
+**New idea: Use the wide crop at a much larger scale (e.g., 4x or 5x) to provide more context.** This is different from all previous experiments. The hypothesis is that more surrounding context helps distinguish stain from deposit and pore from other small defects.
+
+Currently CONTEXT=2.5. Let me try CONTEXT=4.0.
+
+This is a small code change (one number) and it's a genuinely new direction. The wide crop would show more of the surrounding weld bead, which should help with:
+- Stain vs deposit: the surrounding bead pattern differs
+- Pore vs other small defects: the context of the bead surface
+
+The compute cost is the same (the crop is resized to 160x160 regardless of the original crop size). So no change in training time.
+
+Wait, actually, the crop is resized to IMG_SIZE=160 regardless. So a 4x crop vs a 2.5x crop both become 160x160 images. The only difference is the field of view. A 4x crop shows more surrounding area, but the defect itself is smaller in the image. This could help or hurt depending on whether the model needs to see the defect clearly or needs context.
+
+For stain vs deposit: stain is a surface discoloration, deposit is extra material. The surrounding context should help distinguish them. A wider crop would show more of the bead, which is useful.
+
+For pore: pores are small holes in the bead. The context helps confirm it's in the bead (not on the surrounding material).
+
+I think this is a reasonable experiment. Let me go with CONTEXT=4.0.
+
+Actually, wait. Let me reconsider. The tight crop is 1.5x and the wide crop is 2.5x. If I change the wide crop to 4.0x, the two views become more different. The model averages the logits from both views. If the wide crop is too different from the tight crop, the averaging might not be as effective.
+
+But the model is trained with both views, so it should learn to handle the difference. And the wide crop at 4x would show the full bead cross-section, which is very informative.
+
+Let me go with this. It's a simple, testable change with a clear hypothesis.
+
+Actually, I want to reconsider one more time. Let me look at the per-class scores again:
+- pore 0.517: weakest
+- deposit 0.622
+- discontinuity 0.776: strongest
+- stain 0.605
+
+The gap between pore and discontinuity is 0.26. That's huge. Pore is the main problem.
+
+What makes pore hard? Pores are small, round, dark spots in the weld bead. They can be confused with:
+- Small deposits (extra material)
+- Stains (discoloration)
+- Discontinuities (gaps)
+
+The tight crop (1.5x) shows the pore clearly. The wide crop (2.5x) shows some context. Would a wider crop (4x) help? It would show more of the bead, which might help confirm it's a pore in the bead vs. something on the surrounding material.
+
+But pores are small. In a 4x crop, the pore would be even smaller relative to the image. The model might have a harder time detecting the pore features.
+
+Hmm, this is a trade-off. Let me think about whether there's a better experiment.
+
+**Alternative: Use three crops instead of two.** Tight (1.5x), medium (2.5x), wide (4x). Average the three logits. This gives the model more scale information.
+
+But this increases compute by 50% (3 forward passes instead of 2). So ~0.39s/step → ~285 steps. That's 33% fewer steps. The model might be undertrained.
+
+Actually, the current step time is 0.26s for 2 crops. 3 crops would be ~0.39s. 111s / 0.39 = ~285 steps. That's 33% fewer steps. But the model gets more information per step.
+
+This is a reasonable experiment. The hypothesis is that multi-scale information (three scales instead of two) helps the model better distinguish defect types, especially pore vs. deposit/stain.
+
+But wait, is this "fundamentally different" from e003 (single crop)? Yes - e003 removed a view, this adds one. And it's different from e001 (two crops) in that it adds a third scale.
+
+Let me go with this: **three crops (1.5x, 2.5x, 4.0x) with averaged logits.**
+
+Actually, I realize I should be more careful about the compute. Let me re-examine.
+
+Current: 2 crops, 428 steps in 111s → 0.26s/step
+With 3 crops: ~0.39s/step → 111/0.39 ≈ 285 steps
+
+That's 33% fewer steps. The loss after 285 steps (instead of 428) would be higher. But each step has more information.
+
+The question is: does the extra scale information outweigh the reduced number of steps?
+
+Given that e003 (1 crop instead of 2) was worse (0.6247 vs 0.6302), the trend suggests more crops is better. Going from 1→2 crops: +0.0055. Going from 2→3 crops: maybe +0.003? But with 33% fewer steps, maybe -0.005? Net: maybe -0.002? That's within noise.
+
+Hmm, this might not be a good experiment. The effect might be too small.
+
+Let me think of something with a bigger potential impact.
+
+**What about using a larger model?** Let me try efficientnet_b2.
+
+EfficientNet-B2: ~6.6M params (vs 4M for B0). About 2x FLOPs.
+Step time: ~0.5s → 111/0.5 = 222 steps (~1 epoch)
+
+That's only 1 epoch. The model would be severely undertrained. Even with good pretrained weights, 1 epoch of fine-tuning is probably not enough.
+
+What about reducing the image size for B2? At 128x128 instead of 160x160:
+(128/160)² = 0.64x compute → ~0.32s/step → 347 steps
+
+But e005 showed that 128x128 with B0 was worse. So 128x128 with B2 might also be worse.
+
+What about 144x144?
+(144/160)² = 0.81x → ~0.4s/step → 278 steps
+
+Hmm, this is getting into hyperparameter territory.
+
+**Let me try a completely different approach: use the detector confidence to reweight training samples.**
+
+The training boxes have detector boxes that overlap them. The detector conf for these boxes indicates how "obvious" the defect is. If I weight the training loss by the detector conf, the model would focus more on clear defects and less on ambiguous ones. This could improve the ranking of true detections vs. false alarms.
+
+But wait, the training boxes are GT boxes, not detector boxes. The detector conf is for the detector boxes. I'd need to match GT boxes to detector boxes and use the detector conf as a weight.
+
+This is similar to e006 (replace GT boxes with detector boxes) but different - I'd keep the GT boxes but weight the loss by the detector conf of the matching detector box.
+
+Actually, e006 replaced GT boxes with detector boxes and it was "not confirmed" (0.6278 vs 0.6302). So using detector boxes directly didn't help. Weighting by conf is a different approach, but it's in the same family.
+
+**Let me go back to the backbone idea.** I think trying a different backbone is the most promising unexplored direction. Let me try **convnext_nano**.
+
+ConvNeXt Nano: ~50M params. Similar compute to EfficientNet-B0.
+- Different inductive bias (all convolutions, no attention)
+- Might be better for local texture patterns
+- Available with pretrained weights
+
+Step time should be similar to B0 (~0.26s/step) → ~428 steps.
+
+The hypothesis: ConvNeXt's purely convolutional architecture with its specific inductive biases (depthwise separable convolutions, layer normalization, GELU) might be better suited for the local texture and pattern recognition needed for weld defect classification, especially for distinguishing pore from deposit/stain.
+
+This is a genuinely new direction (no previous experiment changed the backbone). The risk is that it might not be better than EfficientNet-B0, but it's worth trying.
+
+Actually, let me reconsider. The model is undertrained (loss 0.31, still falling). Changing the backbone might not help if the model is limited by training time, not architecture. But e005 (more steps via smaller images) was worse, suggesting it's not purely a training time issue.
+
+I think the most impactful change would be to **increase the training time** by reducing the prediction overhead. Let me look at this more carefully.
+
+Current timing:
+- Loading: 14s
+- Training: 111s (428 steps)
+- Prediction: 37s
+- Total: 162s
+- Budget: 180s
+- Reserve: 55s (training stops at 125s)
+
+If I reduce RESERVE_S from 55 to 40:
+- Training stops at 140s → 126s of training → ~485 steps (13% more)
+- Prediction has 40s (was 37s) → should be fine
+
+13% more steps might reduce the loss from 0.31 to ~0.28. The effect on mAP is probably small.
+
+What if I also speed up prediction? Currently prediction uses batch 256. What if I use batch 512? That would halve the number of batches and potentially speed up prediction.
+
+Actually, the prediction time is dominated by the forward passes, not the batch overhead. 41879 detections × 2 crops = 83758 forward passes. At batch 256, that's 326 batches. At batch 512, that's 163 batches. The GPU utilization might be better with larger batches, but the total FLOPs are the same.
+
+Hmm, this is a small optimization. Let me think bigger.
+
+**What about using a smaller model for prediction?** No, that doesn't make sense - I need the same model for training and prediction.
+
+**What about using half-precision for training?** The code already uses bfloat16 autocast for training and prediction. So that's already done.
+
+**What about using gradient accumulation?** This would allow a larger effective batch size without increasing memory. But it doesn't change the number of forward passes, so it doesn't save time.
+
+OK, I think I'm overthinking this. Let me go with the **backbone change to convnext_nano**. It's a clean, testable experiment with a clear hypothesis, and it's a genuinely new direction.
+
+Wait, actually, let me reconsider one more time. Let me look at what's been tried:
+
+1. Data: e001 (add low-res, +), e006 (detector boxes, ~), e008 (false alarms, -)
+2. Architecture: e003 (single crop, -), e004 (?), e005 (smaller images, -)
+3. Sampling: e007 (class duplication, -)
+4. Scoring: e009 (top-1, -)
+5. Augmentation: e010 (rotation+contrast, ~)
+
+What hasn't been tried:
+- Different backbone
+- Different loss function (focal loss, label smoothing)
+- Different learning rate schedule
+- Multi-scale training (3+ crops)
+- Different context sizes
+- Test-time augmentation
+- Ensemble of models
+- Different image size (larger)
+- Different batch size
+- Gradient accumulation
+- Mixup / CutMix
+
+I think **label smoothing** is a quick, testable experiment. The hypothesis: label smoothing (e.g., 0.1) prevents the model from becoming overconfident on training samples, which should improve the ranking of predictions and reduce the impact of mislabeled or ambiguous samples. This is different from class weighting (which was tried and failed) because it applies uniformly to all classes.
+
+But the metric only cares about ordering, not confidence. Label smoothing might not change the ordering much. It mainly affects calibration, not ranking. So it might not help with mAP.
+
+**Focal loss** is more targeted - it down-weights easy examples and focuses on hard ones. This could help with the weak classes (pore, stain) because the model would spend more capacity on the hard examples. But it's in the same family as class weighting, which was tried and failed.
+
+Let me go with the **backbone change**. I'll try **convnext_nano**.
+
+Actually, you know what, let me try **efficientnet_b2** at a reduced image size to keep the step count reasonable.
+
+EfficientNet-B2 at 128x128:
+- B2 is ~2x FLOPs of B0
+- 128/160 = 0.8, squared = 0.64
+- Net: 2 × 0.64 = 1.28x the compute of B0 at 160
+- Step time: ~0.26 × 1.28 = ~0.33s
+- Steps: 111 / 0.33 = ~336 steps
+
+That's 22% fewer steps but a significantly more powerful model. With pretrained weights, it might still do well.
+
+But e005 showed that 128x128 with B0 was worse (0.6217 vs 0.6302). So reducing the image size hurts. Would B2 at 128 be better than B0 at 160? Maybe, maybe not.
+
+What about B2 at 144x144?
+- (144/160)² = 0.81
+- Net: 2 × 0.81 = 1.62x
+- Step time: ~0.26 × 1.62 = ~0.42s
+- Steps: 111 / 0.42 = ~264 steps
+
+That's 38% fewer steps. Probably too few.
+
+I think the safest bet is to keep the image size at 160 and try a model with similar compute to B0. **tf_efficientnetv2_b0** is the best option - same size, better architecture, should give similar step count.
+
+Let me go with **tf_efficientnetv2_b0**.
+
+Hypothesis: tf_efficientnetv2_b0 uses FusedMBConv blocks and a more efficient architecture than EfficientNet-B0, leading to better feature extraction for local texture patterns (weld defects) with the same compute budget. This should improve classification accuracy, especially for the weak pore and stain classes, without changing the training dynamics.
+
+This is a clean, minimal change (one line: MODEL = "tf_efficientnetv2_b0") and it's a genuinely new direction (no previous experiment changed the backbone).
+
+Let me write the experiment.
+
+Actually wait - I need to double-check that tf_efficientnetv2_b0 is in the list of available pretrained models. Yes: "tf_efficientnetv2_b0" is listed.
+
+The change is simply:
+```
+MODEL = "efficientnet_b0"
+```
+→
+```
+MODEL = "tf_efficientnetv2_b0"
+```
+
+That's it. One line change.
+
+Let me verify the hypothesis makes sense:
+- tf_efficientnetv2_b0 has ~1.9x the FLOPs of efficientnet_b0 (actually, let me check: EfficientNet-B0 is ~0.39 GFLOPs at 224x224, EfficientNetV2-B0 is ~0.66 GFLOPs at 224x224). So it's about 1.7x the FLOPs.
+- At 160x160, the FLOPs scale by (160/224)² = 0.51. So B0 is ~0.20 GFLOPs, V2-B0 is ~0.34 GFLOPs.
+- Step time: ~0.26s × (0.34/0.20) = ~0.44s
+- Steps: 111 / 0.44 = ~252 steps
+
+That's 41% fewer steps. Hmm, that's a lot. The model would be more undertrained.
+
+Wait, I might be overestimating the FLOPs difference. Let me reconsider.
+
+Actually, the step time depends on many factors (batch size, GPU, memory bandwidth, etc.), not just FLOPs. Let me just estimate that V2-B0 is about 1.5-2x slower per step than B0.
+
+If 1.5x: 0.39s/step → 285 steps (33% fewer)
+If 2x: 0.52s/step → 213 steps (50% fewer)
+
+Either way, significantly fewer steps. The model would be more undertrained.
+
+Is the better architecture worth 33-50% fewer steps? It's hard to say. The loss would be higher at the end of training, but the model might generalize better.
+
+I think it's worth trying. The alternative is to keep trying small tweaks that are unlikely to have a big impact.
+
+Let me go with tf_efficientnetv2_b0.
+
+Actually, I just realized I should also consider **convnext_nano**. Let me compare:
+- ConvNeXt Nano: ~50M params, ~8.7 GFLOPs at 224x224
+- EfficientNet-B0: ~40M params, ~0.39 GFLOPs at 224x224
+- EfficientNetV2-B0: ~20M params, ~0.66 GFLOPs at 224x224
+
+Wait, ConvNeXt Nano is MUCH larger than EfficientNet-B0. 8.7 vs 0.39 GFLOPs? That seems too high. Let me reconsider.
+
+Actually, I think I'm confusing things. Let me look up the actual specs:
+- EfficientNet-B0: 40M params, 0.39 GFLOPs (at 224x224)
+- EfficientNetV2-B0: 20M params, 0.66 GFLOPs (at 224x224) - wait, that doesn't seem right either. V2-B0 should be smaller than B0 in params but similar in FLOPs.
+
+Actually, I think the FLOPs numbers I'm recalling are wrong. Let me just estimate based on the model sizes:
+- EfficientNet-B0: ~40M params
+- EfficientNetV2-B0: ~20M params (smaller!)
+- ConvNeXt Nano: ~50M params
+- ResNet18: ~11M params
+- ResNet34: ~22M params
+
+Wait, EfficientNetV2-B0 has fewer params than EfficientNet-B0? That seems counterintuitive. Let me check...
+
+Actually, yes! EfficientNetV2-B0 has 7.8M params (for the backbone) + 1M (classifier) ≈ 8.8M total. EfficientNet-B0 has 4.2M params. So V2-B0 is actually bigger.
+
+Hmm, I'm getting confused with the exact numbers. Let me just go with the experiment and see what happens.
+
+The key question is: will tf_efficientnetv2_b0 be significantly slower per step than efficientnet_b0? If it's within 1.5x, it should be fine. If it's 2x+, it might be too slow.
+
+Let me just try it. If it's too slow, the log will show fewer steps and I can adjust.
+
+OK here's my final decision: **Change MODEL from "efficientnet_b0" to "tf_efficientnetv2_b0".**
+
+This is a clean, minimal, testable experiment. The hypothesis is that the improved architecture of EfficientNetV2 (FusedMBConv, better scaling) leads to better feature extraction for weld defect classification, improving especially the weak pore and stain classes.
+
+Let me write the reply.

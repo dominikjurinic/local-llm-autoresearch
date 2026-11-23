@@ -1,0 +1,18 @@
+I've been over-thinking this without a clean, testable direction. Let me commit to one idea. The diagnostics are clear: wrong-class assignment on overlapping boxes costs ~0.11 mAP, dominated by pore (62%) and deposit/stain confusion (77%/89%). The remaining ranking/scoring error is only ~0.015 mAP. So the entire bottleneck is the classifier's accuracy on these boxes — especially for small defects.
+
+**Why the current model struggles:** it fuses tight (1.5x) and wide (2.5x) crops at a *fixed* 160px resolution, with per-class logit weights learned from ground-truth boxes. At test time it classifies detector boxes whose sizes vary widely. Small defects are much harder (80% vs 91-92% for medium/large). The current per-class fusion is too coarse — it can't adapt per-box to the actual context a detector box provides, and the fixed 160px means small defects don't fill enough of the crop.
+
+**A genuinely new idea:** per-box adaptive fusion weights and adaptive crop contexts. Rather than one fixed tight/wide pair for every box, use box-size-adaptive context (small boxes → more magnified tight crop, larger wide crop) plus per-box learned fusion (a small MLP taking box size/aspect ratio + detector conf as input and outputting the fusion weight). This directly targets "small 80% correct vs medium/large 91-92%" — a pattern no earlier family addressed. It's also computationally cheap: one extra small MLP, same two forward passes.
+
+**Budget:** the current run finishes at ~162s within the 180s budget (RESERVE_S=55). The per-box MLP adds negligible compute; the adaptive crop change requires no extra forward passes. Margin is safe.
+
+**How it differs from earlier experiments:** not another backbone, not another augmentation family, not just detector-box training data — this changes what the model *sees* and *how it fuses*, adapting to each box's geometry. The "third wide view" family proved per-class context weighting helps (+0.005); e010 crashed on an environment issue (triton/gcc build) before showing results; here I make context adaptive *per-box* with a cheap MLP, which should hit the small-defect error hardest.
+
+BASE: best
+CATEGORY: architecture
+HYPOTHESIS: Per-box adaptive fusion of tight/wide logits, driven by box size/aspect ratio/detector conf via a small MLP, targets the dominant error (wrong-class assignment on overlapping boxes, ~0.11 mAP) where small defects are 80% correct vs 91-92% for medium/large. Unlike earlier per-class logit fusion (e008, +0.005), this adapts to each box's geometry instead of using one fixed weight per class.
+PLAN:
+1. In `BoxDataset.__getitem__`, compute a context scale per view based on the row's box size: `scale_t = 1.5 * (1 + 0.5 * min(1, 40 / max(w2-w1, h2-h1)))` for the tight crop and `scale_w = 2.5 * (1 + 0.3 * min(1, 40 / max(...)))` so small boxes get proportionally bigger tight crops and moderately bigger wide crops (clipped so side doesn't exceed 200px before resizing). Pass these scales as extra arguments to `make_crop` via per-row scaling.
+2. Add a small MLP in `FusionModel`: an input layer over [box_w, box_h, conf] normalized, then 2 hidden layers of 16 units each, ReLU, output a single sigmoid fusion weight; forward passes return logits fused as `w * base(xt) + (1-w) * base(xw)` where w depends on the box. Pass the normalized box features to the MLP in the training and eval loops.
+3. In the eval loop, compute the box features for each eval row (detector conf from dets.csv), feed through the MLP to get per-box fusion weight, then combine logits before softmax; write predictions with score = det conf * p[c].
+4. Verify timing: two forward passes per batch unchanged (same model + same crop count); the MLP adds ~0.5ms/batch. Total stays well under 180s.

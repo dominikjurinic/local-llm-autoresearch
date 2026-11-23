@@ -1,0 +1,347 @@
+===== attempt 1 =====
+Let me analyze the situation:
+
+1. Current best is e012 with 5-seed mean 0.6373, using tf_efficientnetv2_b0, IMG_SIZE=160, RESERVE_S=50
+2. e015 (resnet50) timed out because it trained faster (more steps per epoch) but then inference took too long. The log shows it was still training at 130s, meaning it never got to the inference phase. Wait, actually looking more carefully - it was killed at 195s. The training was still going at 130s with epoch 7. The issue is that resnet50 trains faster per step but the model is larger so inference on 41879 detections × 4 TTA passes is slower.
+
+Actually wait - the log shows it was still in training at 130s (epoch 7). The deadline would be 180-50=130s. So it should have stopped training at 130s. But it was killed at 195s. Let me re-read...
+
+"Killed after 195 s (budget 180 s). Last log lines: ... epoch 7: loss 0.1898, 702 steps, 130s"
+
+So the last log line was at 130s. The training loop should have stopped at t_end = deadline - RESERVE_S = 180 - 50 = 130s. But it was killed at 195s. This means the inference phase took too long. With resnet50 being larger, 41879 detections × 4 TTA passes is much slower.
+
+The fix would be to either:
+- Increase RESERVE_S for resnet50
+- Reduce TTA passes
+- Use a smaller model
+
+But actually, let me think about what would be a good next experiment. Let me look at what's worked and what hasn't:
+
+Working:
+- TTA (horizontal flip) - e005
+- Reducing reserve from 90 to 50 - e008
+- tf_efficientnetv2_b0 - e012
+
+Not working:
+- Background class (e001, e004)
+- Low-res crops (e002)
+- Focal loss (e006)
+- Label smoothing (e007)
+- Max probability scoring (e009)
+- 224 resolution (e010, e011) - timeout or not confirmed
+- Mixup (e013) - not confirmed
+- Random rotation (e014) - rejected
+- ResNet50 (e015) - timeout
+
+Let me think about what ideas are still unexplored:
+
+1. **Scoring**: The current scoring is `d["conf"] * float(p[c])`. What about using `d["conf"] ** alpha * p[c] ** beta` for different alpha/beta? Or using the log of probabilities?
+
+2. **Training on detector boxes with background**: Tried in e001 and e004, both rejected. But maybe a different approach - instead of adding a 5th class, just train on detector boxes (matched by IoU to true crops) without the background class, to improve robustness to misalignment.
+
+Wait, e004 was "Training on detector boxes (dets.csv train) matched to true crops by IoU" - that was rejected at 0.6234.
+
+3. **Inference**: What about using only 2 TTA passes instead of 4? Or different TTA (e.g., vertical flip instead of horizontal)?
+
+4. **Architecture**: What about convnext_nano? e003 tried it but was "suspicious (likely bug)" at 0.3721. Let me think about what could have gone wrong... Maybe the model name was wrong or the head initialization was different.
+
+5. **Data/augmentation**: What about color jitter (saturation, hue)? Or random erasing?
+
+6. **Scoring refinement**: What about using `conf * (p[c] - mean(p))` or some other transformation? Or `conf ** 0.5 * p[c]` to be less aggressive in suppressing low-confidence detections?
+
+7. **Training strategy**: What about training for more epochs with a lower learning rate? Or using a different optimizer (SGD with momentum instead of AdamW)?
+
+8. **Input**: What about using 3 crops instead of 2 (e.g., 1.2x, 1.8x, 2.5x)?
+
+Let me think about what's most likely to help:
+
+The per-class APs are: pore 0.517, deposit 0.636, discontinuity 0.781, stain 0.616. Pore is the weakest. The gap between the best (discontinuity) and worst (pore) is 0.264.
+
+Looking at the scoring: `score = d["conf"] * float(p[c])`. The detector confidence is the same for all classes of a given box. So the ranking within a box is purely by class probability, and the ranking across boxes is by conf * prob.
+
+One idea: what if we use `conf ** 0.5 * p[c]`? This would be less aggressive in penalizing low-confidence boxes, which might help if the detector's confidence isn't perfectly calibrated. But this is a small change.
+
+Another idea: What about training with a different augmentation - specifically, random brightness/contrast changes? The current augmentation is just flips and brightness (0.8-1.2). Adding contrast jitter might help.
+
+Actually, let me think about what's most promising. The key insight from the background is:
+- "When all types are merged into one class, the same detector reaches 0.77, so many errors are wrong types, not missed defects."
+- "stage-1 boxes with perfect classes (ceiling for stage 2): 0.758 mAP@0.5"
+- "A crop classifier given perfect boxes reaches macro-F1 ~0.87"
+
+So the classifier is already pretty good (0.87 F1), but the mAP is 0.637. The gap suggests that:
+1. Some boxes are false alarms (background) - the classifier can't distinguish them well
+2. The ranking (score) isn't optimal
+3. Box misalignment causes some misses
+
+For the scoring, what if we try: `score = conf * p[c] * (p[c] - 0.25)`? No, that's weird.
+
+What about: `score = conf ** 2 * p[c]`? This would penalize low-confidence boxes more aggressively.
+
+Or: `score = conf * p[c] ** 2`? This would make the class probability more discriminative.
+
+Actually, let me think about this differently. The mAP@0.5 requires:
+1. A detection is "correct" if IoU > 0.5 with a ground truth of the same class
+2. For each class, AP is computed by ranking detections by score
+
+So for a given box, if the true class is pore but we predict stain with high confidence, that's a false positive for stain and a false negative for pore. The score matters for ranking.
+
+One idea I haven't tried: **using the second-highest probability as a penalty**. If the model is uncertain (all 4 classes have similar probabilities), the scores should be lower. This is different from e009 (max probability) which was "not confirmed" (0.6355 seed-0, 0.6298 5-seed).
+
+Wait, e009 tried `score = conf * max_prob * p[c]` and it was not confirmed. So that direction doesn't seem promising.
+
+Let me think about **training on detector boxes without background**. The idea is: take detector boxes from training images, match them to true crops by IoU > 0.5, and use those as additional training examples (with the matched class label). This doesn't add a background class but gives the model more examples at slightly different positions/sizes.
+
+But e004 tried this and got 0.6234, which was rejected. So that's out.
+
+What about **ensembling two different architectures**? For example, train both tf_efficientnetv2_b0 and convnext_nano, and average their predictions. This would give diversity. But it doubles training time...
+
+Actually, let me look at the time budget. With tf_efficientnetv2_b0, training takes about 130s (6 epochs, 471 steps) and inference takes about 40s. Total ~170s out of 180s budget.
+
+What if I train two smaller models (e.g., two convnext_pico or mobilenetv3_large_100) and ensemble them? Each would train faster, and I could fit both in the budget.
+
+Actually, a simpler idea: **use a different TTA strategy**. Currently we do horizontal flip. What about also doing vertical flip? Or a 180° rotation? The weld beads are often horizontal, so vertical flip might not be as useful, but let's think...
+
+Actually, for weld beads, the orientation matters. A bead going left-to-right vs right-to-left is the same (horizontal flip is fine). But a bead going top-to-bottom vs bottom-to-top might look different. So vertical flip might not be as good.
+
+Let me think about another angle: **the scoring formula**. Currently it's `conf * p[c]`. What if we try `conf * p[c] / (1 - p[c])`? This is the log-odds times conf, which might better separate confident from uncertain predictions.
+
+Or what about: `score = conf * (p[c] - 0.25) / 0.75`? This normalizes so that uniform predictions get score 0.
+
+Hmm, but these are all small tweaks. Let me think about bigger changes.
+
+**Idea: Train with a 5th "background" class but use it differently.**
+
+In e001, the background class was added and the score was `conf * p[c] * (1 - p_bg)`. This was 0.5512 - very bad. Maybe the issue was that too many background examples overwhelmed the training.
+
+What if instead, we just train on detector boxes that match true crops (IoU > 0.5), giving them the true class label, and for the rest, we don't use them at all? This is essentially e004 which got 0.6234.
+
+**Idea: Use a different loss weighting per class.**
+
+The brief says "Class-weighted loss hurt classification every time it was tried." So that's out.
+
+**Idea: Reduce the number of TTA passes to save time for more training.**
+
+Currently: 4 TTA passes (original + hflip for both views). What if we do only 2 (original for both views, no flip)? That saves inference time, allowing more training. But e005 showed TTA helps...
+
+Actually, let me reconsider. The current setup:
+- Training: ~130s (6 epochs, 471 steps)
+- Inference: ~40s (41879 dets × 4 forward passes)
+- Total: ~170s
+
+If I remove TTA (2 forward passes instead of 4), inference might be ~20s, giving me ~20s more for training. But TTA was shown to help (e005).
+
+**Idea: Use a wider crop context.**
+
+Currently: TIGHT_CONTEXT=1.5, CONTEXT=2.5. What about 1.3 and 3.0? A wider context might help the model see more of the surrounding weld bead, which could help distinguish stain (which is on the bead) from background.
+
+**Idea: Add random erasing to training augmentation.**
+
+Randomly masking a portion of the crop during training could act as a regularizer and help the model focus on the most discriminative features.
+
+**Idea: Use a different scoring: `conf ** 0.7 * p[c] ** 1.3`**
+
+This makes the score more sensitive to class probability and less to detector confidence. The rationale: the detector confidence is the same for all classes of a box, so it doesn't help discriminate between classes. But it does help rank boxes. By making p[c] more important (exponent > 1), we amplify the difference between the predicted class and others.
+
+Actually wait - `p[c] ** 1.3` would make high-probability classes even higher and low-probability classes even lower. This could help if the model is well-calibrated, but hurt if it's not.
+
+Let me think about what's most likely to give a clear signal...
+
+**Idea: Train on both high and low resolution crops, but with different augmentation intensity.**
+
+e002 tried adding low-res crops and got 0.6209 (rejected). But maybe the issue was that low-res crops are noisier and the model overfits to them. What if we use low-res crops with more augmentation (more jitter, more augmentation) to prevent overfitting?
+
+Actually, let me look at this from a different angle. The per-class APs are:
+- pore: 0.517 (weakest)
+- deposit: 0.636
+- discontinuity: 0.781 (strongest)
+- stain: 0.616
+
+Pore is a small circular defect. Stain is a discolored area. These are visually different but the model confuses them. 
+
+What if I try **increasing the image size to 192** (between 160 and 224)? This gives more resolution for small pores without the timeout risk of 224. The inference would be slightly slower but maybe not enough to cause a timeout.
+
+Let me estimate: at 160px, inference takes ~40s. At 192px, the compute is (192/160)^2 = 1.44x more, so ~58s. Training would also be ~1.44x slower per step, so maybe 4-5 epochs instead of 6. Total: ~150s training + ~58s inference = ~208s. That's over budget!
+
+What about 176px? (176/160)^2 = 1.21x. Training: ~157s, inference: ~48s. Total: ~205s. Still over.
+
+Hmm, that's tight. What if I reduce RESERVE_S to 40? Then training budget is 140s. At 176px, training might take ~157s... still over.
+
+This is risky. Let me think of something else.
+
+**Idea: Use `timm.create_model` with `global_pool='avg'` instead of the default.**
+
+Actually, tf_efficientnetv2_b0 already uses global average pooling by default. So that's not it.
+
+**Idea: Add a small fully-connected head with dropout.**
+
+The current model just uses the default head from timm. What if I add a custom head with a hidden layer and dropout? This could help with overfitting.
+
+Actually, let me look at what the timm model's head looks like. For tf_efficientnetv2_b0, the head is typically:
+- Global average pooling
+- Dropout
+- Linear (to num_classes)
+
+So there's already dropout. Let me check the default dropout rate... it's usually 0.2 or 0.3.
+
+**Idea: Use a different optimizer - SGD with momentum instead of AdamW.**
+
+SGD with momentum is often better for image classification with pretrained models. The learning rate would need to be higher (e.g., 0.1 with momentum 0.9). This could lead to better generalization.
+
+Let me think about this more carefully. AdamW with lr=1e-3 and weight_decay=0.05 is the current setup. SGD with momentum typically uses lr=0.01-0.1, momentum=0.9, weight_decay=1e-4 to 1e-3.
+
+This is a reasonable experiment. Let me go with it.
+
+Actually, wait. Let me reconsider the scoring idea. 
+
+**Idea: Score = conf * p[c] * (1 - p[c]) ... no, that's weird.**
+
+What about: **Score = conf * p[c] - conf * mean(p)**? No, that could be negative.
+
+What about: **Score = conf * (p[c] - 1/4)**? This centers the probabilities so that uniform predictions get 0. But this could cause negative scores which is problematic.
+
+Let me go with a more concrete idea.
+
+**Idea: Use `score = conf * p[c] ** 1.5`**
+
+This amplifies the difference between the top class and others. If p[top] = 0.5 and p[other] = 0.17, then:
+- Before: score_top = conf * 0.5, score_other = conf * 0.17, ratio = 2.94
+- After: score_top = conf * 0.354, score_other = conf * 0.069, ratio = 5.13
+
+This makes the ranking within a box more discriminative. The absolute scores are lower, but mAP only cares about ranking, so that's fine.
+
+But wait - this also affects the ranking ACROSS boxes. A box with p[top]=0.3 gets score conf*0.255, while a box with p[top]=0.6 gets score conf*0.465. The ratio is 1.82 vs the original 2.0. So the cross-box ranking is slightly compressed. This could go either way.
+
+Hmm, I'm not sure this is the best idea. Let me think of something with a clearer hypothesis.
+
+**Idea: Add random Erasing (stochastic depth) to training augmentation.**
+
+During training, randomly mask a rectangular region of the crop (e.g., 20-40% of the area). This forces the model to not rely on a single distinctive feature and instead learn more robust representations. This is a well-known regularization technique (RandErasing from the Cutout paper).
+
+Hypothesis: Random erasing will improve generalization, especially for the weak pore and stain classes, by preventing the model from over-relying on specific visual patterns and forcing it to learn more distributed features.
+
+Implementation: In the BoxDataset.__getitem__, after creating the crop (before normalization), randomly mask a rectangle with the padding color (114/255 ≈ 0.447).
+
+Let me implement this:
+
+```python
+def random_erasing(x, p=0.5, scale=(0.02, 0.3)):
+    """x is HxWx3 float array in [0,1]"""
+    if random.random() > p:
+        return x
+    h, w = x.shape[:2]
+    area = h * w
+    for _ in range(10):
+        target_area = random.uniform(*scale) * area
+        aspect = random.uniform(0.3, 3.3)
+        eh = int(math.sqrt(target_area * aspect))
+        ew = int(math.sqrt(target_area / aspect))
+        if eh < h and ew < w:
+            y = random.randint(0, h - eh)
+            x0 = random.randint(0, w - ew)
+            x[y:y+eh, x0:x0+ew] = 0.447  # gray
+            return x
+    return x
+```
+
+Wait, but the crop might have padding (gray 114). If I erase part of it, I'm adding more gray, which might confuse the model. Let me use a random color instead, or just 0.
+
+Actually, the standard RandErasing uses a random color or the mean color. Let me use a random value in [0,1].
+
+Hmm, but actually, thinking about it more - the crops are small (160x160) and the defects are the main content. Erasing a large portion might remove the defect entirely, which would be bad. I should keep the erasing small (scale 0.02-0.15) and only apply it with moderate probability (0.3).
+
+Let me refine:
+- Probability: 0.3 (not too aggressive)
+- Scale: (0.02, 0.15) of total area
+- Fill color: random in [0, 1]
+
+This should be a safe regularization that doesn't destroy the defect.
+
+Actually, let me reconsider. The current augmentation is:
+- Horizontal flip (50%)
+- Vertical flip (50%)
+- Brightness (0.8-1.2)
+- Geometric jitter (center ±10%, size 0.85-1.2)
+
+Adding random erasing on top of this should be fine. Let me go with this.
+
+Wait, I need to be careful about where to apply it. The crop is created in `make_crop`, then in `BoxDataset.__getitem__` it's flipped and brightness-adjusted. I should apply erasing after all other augmentations but before normalization.
+
+Let me write the code:
+
+```python
+def random_erasing(x, p=0.3, scale=(0.02, 0.15)):
+    """x is HxWx3 float array in [0,1]. Returns modified x."""
+    if random.random() > p:
+        return x
+    h, w = x.shape[:2]
+    area = h * w
+    for _ in range(10):
+        target_area = random.uniform(*scale) * area
+        aspect = random.uniform(0.3, 3.3)
+        eh = int(math.sqrt(target_area * aspect))
+        ew = int(math.sqrt(target_area / aspect))
+        if 0 < eh < h and 0 < ew < w:
+            y = random.randint(0, h - eh)
+            x0 = random.randint(0, w - ew)
+            x[y:y+eh, x0:x0+ew] = random.uniform(0, 1)
+            return x
+    return x
+```
+
+And in `__getitem__`, after the brightness adjustment:
+```python
+if self.train:
+    x = np.clip(x * bright, 0, 1)
+    x = random_erasing(x)
+```
+
+This is a clean, focused change. Let me go with it.
+
+Actually, one concern: the `x` array might not be contiguous after the flip operations. Let me make sure I'm working with the right array. Looking at the code:
+
+```python
+x = make_crop(img, r, ctx, self.train)
+if fh:
+    x = x[:, ::-1]
+if fv:
+    x = x[::-1, :]
+if self.train:
+    x = np.clip(x * bright, 0, 1)
+x = (x - MEAN) / STD
+views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))
+```
+
+After `x[:, ::-1]`, the array is a view with negative stride. Then `np.clip(x * bright, 0, 1)` creates a new array. So after that line, `x` is a new contiguous array. Good, I can safely modify it in-place for random erasing.
+
+Wait, actually `x * bright` creates a new array, and `np.clip(..., 0, 1)` also creates a new array (or modifies in place if the third argument is provided, but here it's not). So `x` after `x = np.clip(x * bright, 0, 1)` is a new array. I can safely do in-place modification.
+
+Let me finalize my experiment:
+
+BASE: best (e012)
+CATEGORY: augmentation
+HYPOTHESIS: Random erasing (stochastic masking of small regions during training) will act as a regularizer that prevents over-reliance on specific visual features, improving generalization especially for the weak pore (0.517) and stain (0.616) classes.
+
+The change:
+1. Add a `random_erasing` function
+2. Call it in `BoxDataset.__getitem__` during training, after brightness adjustment
+
+Let me write the SEARCH/REPLACE blocks.
+
+I need to:
+1. Add the `random_erasing` function (after `make_crop`)
+2. Add the call in `__getitem__`
+
+Let me find the exact lines to search for.
+
+For inserting the function, I'll search for the line after `make_crop`:
+```
+class BoxDataset(torch.utils.data.Dataset):
+```
+
+And for the call, I'll search for:
+```
+            if self.train:
+                x = np.clip(x * bright, 0, 1)
+```
+
+Let me write this out carefully.

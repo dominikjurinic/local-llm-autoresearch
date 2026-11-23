@@ -1,0 +1,156 @@
+===== attempt 1 =====
+Let me analyze the situation.
+
+Current best: e004, 5-seed mean 0.6342. Per-class: pore 0.522, deposit 0.624, discontinuity 0.780, stain 0.611.
+
+Reference numbers:
+- One-step 4-class baseline: 0.638
+- Stage-1 boxes with perfect classes: 0.758
+- Class-agnostic: 0.755
+
+So we're at 0.634, the ceiling is 0.758. The gap is 0.124. The error is dominated by class misassignment on boxes that overlap real defects.
+
+History:
+- e001 (scoring): single-row-per-box (argmax class) → 0.5749, rejected. So emitting one row per box at argmax is worse than 4 rows. Interesting.
+- e002 (data): adding low-res crops → 0.6383 seed-0, 5-seed mean 0.6293, not confirmed.
+- e003 (architecture): larger model (probably efficientnet_b2) → 0.6389 seed-0, 5-seed 0.6313, not confirmed.
+- e004 (data): pseudo-labeling detector boxes → new best 0.6342.
+- e005 (scoring): some score change → 0.1554, bug.
+- e006 (data): lowering IoU threshold for pseudo-labels from 0.5 to 0.3 → 0.6323 seed-0, rejected (worse than e004's 0.6326 seed-0... actually 0.6323 vs 0.6326, slightly worse).
+
+Lessons:
+- Scoring: 2 ideas, 1 bug. e001 showed single-row-per-box is much worse. e005 had a bug.
+- Data: 3 ideas, 1 new best (e004), 1 close (e002).
+- Architecture: 1 idea, close but not confirmed (e003).
+
+What's the largest part of the error? The gap from 0.634 to 0.758 is class misassignment. Pore is weakest (0.522), stain 0.611, deposit 0.624, discontinuity 0.780.
+
+Known: pore and deposit are weak classes; stain is often confused with deposit. Class-weighted loss hurt every time.
+
+Ideas:
+
+1. **Test-time augmentation (TTA)**: at inference, average over flips (4 views: original, hflip, vflip, both) and possibly both crop contexts separately. This improves classifier accuracy on borderline cases. Budget: currently prediction takes ~40s (162 total, 125s at end of epoch 1... actually 162s total, training ends around 125s, so prediction+write ~37s). With 4x TTA, prediction would be ~150s, total ~275s > 180s budget. Hmm, need to check. Actually wait — what's the actual budget T? The log shows 162s total. The default is 180s. The harness runs with --seconds T. I don't know T exactly, but the run finished in 162s, so T is probably 180. With 4x TTA, prediction time ~4x37 = 148s, plus training 125s = 273s > 180. Too much. 2x TTA (horizontal flip only): prediction ~74s, total ~200s. Still over. Hmm.
+
+Actually, let me reconsider: training uses 2 views per box (tight + wide). At inference we also use 2 views. TTA with flips would double per view → 4 forward passes instead of 2. So prediction time doubles: ~74s. Total ~125+74 = 199s > 180. Slightly over. Could reduce RESERVE_S... no, the reserve is for prediction. Could train for fewer steps to leave time for TTA. E.g., reduce training budget so total fits. Training to epoch 1 (125s) — could stop earlier, say at 100s, and do 2x TTA at ~74s → 174s. Tight but feasible. But is TTA likely to gain ≥0.01 mAP? Classifier F1 ~0.87; TTA typically improves classification by 1-3% absolute accuracy. On borderline misclassifications, could help. The AP depends on ordering within each class; better class probabilities → better scores → better ordering. Hmm, but does better class probability actually improve mAP?
+
+Wait, key insight about the metric: mAP@0.5 per class depends on the ORDER of predictions of that class. Score = conf × p(c). For a true detection of class c, its score in class c is conf × p_c(c). For a false alarm, its score in class c is conf × p_fp(c). The AP for class c depends on the ranking of all class-c rows (true + false).
+
+If the classifier is better (higher p_c for true c, lower for others), then true detections get higher relative scores → better precision at each recall → higher AP. So improving classifier accuracy should help.
+
+But there's a subtlety: each box emits 4 rows. A true pore box also emits a deposit row with score conf × p(deposit). If p(deposit) is low, that row ranks low in the deposit class list. Fine.
+
+e001 (argmax only, 1 row per box) was much worse (0.5749). Why? Because when argmax is wrong, the box is completely lost from the true class (no row at all for the true class), whereas with 4 rows, even if argmax is wrong, the box still has a row for the true class (with a lower score) and can still count as a detection at low recall. Actually, AP integrates over all recall levels; a true box with a low score still contributes at high-recall/low-precision region. Hmm, but 0.5749 vs 0.634 is a big drop. Also with 4 rows, false alarms in other classes... whatever, the lesson: keep 4 rows.
+
+2. **Better class probabilities → better scores.** The score formula conf × p(c): e005 tried to decouple and crashed (bug). What could go wrong in e005? I don't know exactly what e005 did. It said "multiplicative coupling amplifies conf's noise..." and the result was 0.1554 — probably a format bug (e.g., writing scores that are all similar, or wrong column). I shouldn't blindly retry scoring changes; the harness flagged it as a likely bug.
+
+3. **Ensemble of two models** (e.g., EfficientNet-B0 + MobileNetV3 or ResNet18) — average logits. Architecture category has 1 idea (bigger model, not confirmed). An ensemble of different architectures might help more than a single bigger model. Budget: training 2 models in the same time = half the steps each. Risky.
+
+4. **Use "low" resolution crops for training** — tried (e002), not confirmed (0.6293 vs 0.6342, actually slightly worse).
+
+5. **Class-specific handling**: pore and deposit are weak. Ideas:
+   - More training data for weak classes: oversample pore/deposit in the training set (sampling category — not tried yet!). Category "sampling" has 0 experiments. Oversampling weak classes in the DataLoader (e.g., weight pore and stain boxes 2x) could improve their F1. Class-weighted loss hurt, but resampling is different (doesn't change the loss, changes the data distribution seen). Hmm, but class-weighted loss "hurt classification every time it was tried" — resampling might have a similar effect. But it's a different mechanism: with resampling, the model sees more pore examples per epoch, which with a fixed number of steps means more effective pore training. Could help pore (0.522) and stain (0.611).
+   
+   - Actually, wait: is the problem that the classifier confuses pore with deposit? Pore is a small spot; deposit is extra material. In a 2.5x context crop, the surrounding bead texture matters.
+
+6. **Crop context / input changes**: the classifier sees tight 1.5x + wide 2.5x crops. What about adding the whole image, or a crop at the box's own size (1.0x)? Or using the detector box as-is without context? The detector box IS the defect region (approximately). A 1.0x crop might be more discriminative for pore (small holes) vs deposit. But changing the input is an architecture/data change. Budget: 3 views instead of 2 → training step time 1.5x. Currently ~0.34s/step (103s/285 steps... actually 285 steps in ~85s → 0.30s/step). 3 views → 0.45s/step, fewer steps in the same budget. Net effect unclear.
+
+7. **Train longer / different LR schedule** — optimisation category, 0 experiments. "Tuning hyperparameters alone helped little in earlier experiments" (per the known section). So avoid pure optimisation tweaks.
+
+8. **Confidence calibration / score blending**: score = conf × p(c). What about score = conf^a × p(c)^b? e005 tried something in this space and crashed. Risky.
+
+9. **Two-stage scoring within stage 2**: use a second classifier trained differently (e.g., on detector boxes only, or with different crops) and combine. Complex.
+
+10. **Fix the pseudo-labeling**: e006 lowered IoU to 0.3 and it got slightly worse (0.6323 vs 0.6326 seed-0). So 0.5 is fine. What about pseudo-labeling with the classifier itself (self-training / iterative)? I.e., after training the first model, classify train-split detector boxes that don't overlap true boxes, keep high-confidence ones, retrain. This adds data that matches the inference distribution (false-alarm-like boxes on train images). Hmm, but train-split detector boxes that don't overlap any true box are mostly false alarms; labeling them with the classifier's argmax would be circular but could help the model learn to be confident on them... actually, that would teach the model that those boxes ARE defects, which is wrong — they're false alarms. That would hurt. Unless we train a separate "false alarm" head... too complex.
+
+11. **Per-class score thresholding / row filtering**: e001 showed 1 row per box is bad. But what about 2 rows: argmax + 2nd? Or filtering: only emit a row for class c if p(c) > some threshold, but always emit the argmax row. Hmm, this changes which rows exist, affecting the false-positive count in each class. If a true pore box has p(pore)=0.3, p(deposit)=0.5, then the deposit row for this box is a false positive in the deposit class with score conf×0.5 — potentially high, polluting deposit's precision. Filtering rows where p(c) < 0.2 (keeping argmax) would reduce false positives in each class. But if p(c) is low for the true class, and it's not the argmax, filtering could remove true detections... but only if p(c) < threshold AND not argmax. With a low threshold like 0.1, we'd only remove rows with very low probability. This is a scoring change; the scoring category has 1 bug (e005) and 1 rejection (e001). But those were different ideas (e001: argmax only; e005: decouple conf). Row filtering by probability threshold is different. Expected gain? The false rows with p(c) < 0.1 have score < 0.1×conf; they rank low anyway and contribute little to AP (at high recall). Removing them barely changes AP. Probably < 0.003. Skip.
+
+12. **Better use of detector conf**: the conf is a class-agnostic "is there a defect" confidence. For ranking within a class, conf × p(c) is the natural joint probability. Fine.
+
+13. **Multi-crop ensemble at inference with different contexts** — TTA-like.
+
+14. **Train on both tight and wide as separate samples with per-view loss** vs averaging logits. Currently: loss on (logit_tight + logit_wide)/2. Alternative: train each view separately (2 losses) — same thing effectively. Or train two separate models (one per view) and average at inference. More parameters trained per step... same compute. Probably no gain.
+
+15. **Resolution**: IMG_SIZE=160. Pore defects are small; a 160px crop of a 1.5x box might downsample pore detail. Higher resolution (224 or 256) might help pore/deposit discrimination. Budget: 256/160 = 2.56x pixels → step time 2.56x (0.30 → 0.77s/step), steps in budget: ~85s/0.77 ≈ 110 steps vs 285. Fewer steps but higher resolution. EfficientNet-B0 at 256 is its native size (pretrained at 224). Hmm, this is a real method change (what the model sees). Pore is the weakest class; pore = small holes, detail matters. This could plausibly help ≥0.01.
+
+But wait — the crop is resized to IMG_SIZE regardless. At 160, a tight 1.5x crop of a pore box: if the box is ~20px, the crop is 30px upscaled to 160 — blurry. At 256, still upscaled but slightly more. For larger boxes (deposit can be big), 160 downsamples a lot; 256 preserves more texture.
+
+Alternatively, keep 160 but... hmm.
+
+16. **Use the box's own aspect ratio / no square crop**: currently square canvas. Could preserve aspect. Minor.
+
+17. **Add a third view: crop at 1.0x (the box itself)**: the detector box tightly bounds the defect. For pore (small holes in the bead), the tight box content is the most discriminative. Currently tight is 1.5x. Adding 1.0x gives the model the raw defect region. 3 views → 1.5x step time. In the same wall budget, ~2/3 the steps. Net: more info per step but fewer steps. Risky but plausible.
+
+Actually, let me think about what's most likely to gain ≥0.01 mAP.
+
+The gap: 0.634 vs 0.758 (perfect classes). With perfect classes, AP = 0.758. Our class assignment: macro-F1 ~0.87. The misassigned boxes: a box assigned to the wrong class becomes a false positive in the wrong class and a missed detection in the true class. With 4 rows per box, the "missed" part is softened (the box still has a true-class row with lower score).
+
+Per-class AP: pore 0.522. If pore's problem is confusion with deposit (and stain?), improving pore/deposit separation directly raises pore AP and deposit AP.
+
+What distinguishes pore from deposit? Pore: small round holes (dark spots) in the bead. Deposit: extra material (bright, raised). In a wide crop, both appear on the same bead background. The classifier must look at texture/contrast. Higher input resolution would help spot-level detail.
+
+Also: the two-crop input averages logits. If the tight crop is more informative for pore and the wide crop is more informative for stain (stain is a large area, needs context), the averaging might dilute. Alternative: let the model learn to weight views (train with per-view loss instead of averaged logits — effectively the same as two models sharing... no wait, currently one model sees both views as two forward passes and averages logits. Training with loss on each view separately (sum of two losses) trains the model to classify from either view alone, which is stronger than averaging. At inference, we can average or take max. Hmm, this is a loss change. "Class-weighted loss hurt" but this is different.
+
+Actually, the current loss: crit((lt+lw)/2, y). Alternative: (crit(lt,y)+crit(lw,y))/2. The latter forces each view to be individually discriminative. This is a real method change in the loss category (0 experiments). Could help: each view becomes a better classifier, and at inference we average 2 better classifiers. Expected gain: moderate. But is it ≥0.003? Uncertain.
+
+Let me think about budget for the resolution change:
+Current: 18s load, ~105s training (285+397 steps... wait, epoch 0: 285 steps at 103s, epoch 1: 397 steps at 125s. So training from ~18s to 125s = 107s for 682 steps → 0.157s/step. Then prediction 125→162 = 37s for 41879 boxes with 2 views.
+
+At 256 resolution: step time ~0.157 × (256/160)² ≈ 0.157 × 2.56 ≈ 0.40s/step. In 107s budget → ~265 steps. Prediction: 37s × 2.56 ≈ 95s. Total: 18 + 107 + 95 = 220s > 180. Over budget! Unless T is larger. Hmm, what is T? The run used 162s out of T. The default is 180. If T=180, we have 18s of slack. 256 resolution is infeasible. 208 resolution: (208/160)² = 1.69x. Training 107s (same steps? no — fewer steps: 107/1.69 ≈ 63s of steps... wait, training runs until t_end = deadline - 55s. If T=180, t_end = 125s from T0, so training budget is fixed at ~107s regardless. At 1.69x step time, ~403 steps. Prediction: 37 × 1.69 ≈ 63s. Total: 18 + 107 + 63 = 188s > 180. Slightly over. Reduce RESERVE to fit? The reserve is just a parameter; the actual constraint is T. If prediction takes 63s and training ends at 125s, total = 18+107+63 = 188 > 180. Over by 8s. Could set RESERVE_S = 65 → training ends at 115s, total = 18+97+63 = 178s. Tight but OK. Hmm, but is T exactly 180? The harness shows "162s total" and the run succeeded, so T ≥ 162. Probably 180 (the default). I'll assume 180.
+
+208 resolution is marginal. What about 192: (192/160)² = 1.44x. Prediction 37×1.44 = 53s. Training ends at 125s (reserve 55). Total = 18+107+53 = 178s. Just fits. Steps: 107/1.44 ≈ 74s of... wait, step time 0.157×1.44 = 0.226s, steps = 107/0.226 ≈ 473. OK.
+
+Hmm, but honestly the gain from 160→192 is small. 160→224: (224/160)² = 1.96x. Prediction 37×1.96 = 73s. Total = 18+107+73 = 198 > 180. Infeasible without cutting training. If RESERVE_S=85: training ends at 95s, total = 18+77+73 = 168s. Feasible! But training gets only 77s (≈340 steps at 0.31s/step... 0.157×1.96=0.31s/step → 250 steps). Fewer steps + higher res. Trade-off.
+
+Alternatively, keep 160 and do flip TTA at inference (2x): prediction 74s. RESERVE_S=80 → training ends at 100s (82s of training, ~520 steps). Total = 18+82+74 = 174s. Feasible. TTA (hflip+vflip, 4 views total per box... wait, currently 2 views; with 2 flips → 4 forward passes) improves classifier accuracy. Typical TTA gain for classification: 0.5-2% accuracy. Here F1 0.87; maybe +0.5-1% → misassignment on overlapping boxes drops. Does that translate to ≥0.003 mAP? The class-assignment error is the dominant gap (0.634 vs 0.758 = 0.124). If TTA fixes 5% of the misassigned boxes... hard to estimate. Probably ~0.005-0.01. Plausible.
+
+Hmm wait, actually there's a subtlety about TTA and the score: averaging probabilities over flips gives a more calibrated p(c), which improves the ranking. Yes.
+
+But actually, let me reconsider the problem. Let me recompute where the error is:
+
+- Class-agnostic (1 class): 0.755. So box placement + conf ranking gives 0.755 if we don't care about class.
+- Perfect classes: 0.758 (slightly higher because correct classes... whatever).
+- Ours: 0.634.
+
+So essentially all the loss (0.12) is from class assignment. The boxes are fine.
+
+Now, per-class AP with perfect classes would be... unknown, but the macro is 0.758. Our per-class: pore 0.522, deposit 0.624, disc 0.780, stain 0.611.
+
+If pore's AP is 0.522, and the box recall for pore is high (class-agnostic 0.755 suggests good box performance), then pore's loss is: (a) pore boxes ranked low within the pore class because p(pore) is low (confused with deposit/stain), (b) false positives in the pore class (non-pore boxes with decent p(pore), and true deposits/pores... no, true deposits with p(pore)>0 create pore-class false positives).
+
+To raise pore AP: make p(pore) high on true pores and low on everything else. That's a pore-specific classifier quality issue.
+
+Ideas targeting pore specifically:
+- Pore = small holes. The tight crop (1.5x) is where pore signal lives.
+- Higher resolution.
+- More pore training data (oversample).
+- A pore-specific auxiliary input: e.g., a "difference" feature? Too exotic.
+
+Oversampling pore (and stain) in the DataLoader: sampling category, 0 experiments. Mechanism: build a weighted sampler that upweights pore boxes 2-3x. With AdamW and cosine LR over a fixed number of steps, the effective number of pore examples per epoch goes up. Risk: overfitting to pore, hurting other classes. Class-weighted loss hurt before — resampling is related but not identical. Hmm. The known section says "class-weighted loss hurt classification every time it was tried." Resampling is the data-level analogue. I'd say it's a different experiment (category sampling, 0 runs), but the prior suggests it might not help.
+
+What about the input? Let me think about what the model sees for a pore box: a 1.5x square crop resized to 160. If the pore box is small (say 15px), the crop is 22px → upscaled 7x to 160. The pore (a few px hole) becomes ~10-20px in the 160 image. At 256 it'd be ~16-32px. Marginal difference.
+
+For a deposit box (larger, say 60px), the crop is 90px → downscaled to 160 (1.8x). At 256: 2.85x. More texture preserved.
+
+Honestly, the single biggest lever might be **training the classifier better on the hard confusion pairs**. But we can't do targeted pair training easily.
+
+Alternative big lever: **the two-crop logit averaging might be suboptimal**. What if we train the model to classify from the tight crop alone (drop the wide crop) and use the saved time for more steps or higher res? The wide crop (2.5x) adds context — stain is a large-area defect that needs context; deposit vs stain confusion ("stain is often confused with deposit") suggests context helps stain. So keep both.
+
+What about **a third view at 1.0x**? For pore, the box itself. Let me estimate the budget: 3 views → step time ×1.5 = 0.235s, steps in 107s ≈ 454 (vs 682). Prediction: 3/2 × 37 = 56s. Total = 18+107+56 = 181s. Just over! Reduce reserve to 60 → training ends at 120s: total = 18+102+56 = 176s. Feasible.
+
+Hmm. Both the 3-view and TTA options are marginal in budget.
+
+Let me think about **ensembling two different architectures** — e.g., train EfficientNet-B0 and MobileNetV3-Large in parallel (interleave batches), average probabilities at inference. Different architectures make different errors; ensembles usually help 1-3% in classification. Budget: same total steps, split between 2 models → each model gets half the steps. Halving steps hurts a lot (682 → ~340 steps each, and the current model isn't fully converged: loss 0.24 at end of epoch 1, still dropping). Ensembling half-trained models might not beat a fully-trained single model. Risky.
+
+**Train longer with a smaller/faster model?** regnety_016 or convnext_pico are faster → more steps. But smaller models have lower accuracy. The current 682 steps at 0.157s/step... with convnext_pico (much smaller), step time might be 0.08s → 1300 steps. More steps + weaker model. Unclear.
+
+Let me reconsider the **scoring** angle, since it's where the metric actually is. AP depends on ordering. Score = conf × p(c). Consider a true pore box with conf 0.4 and p(pore) 0.6 → score 0.24. A false alarm with conf 0.9 and p(pore) 0.15 → score 0.135. OK, the true one ranks higher. But a false alarm with conf 0.9, p(pore) 0.3 → 0.27 > 0.24. The false alarm outranks the true detection. The classifier's false p(pore) on false alarms is the issue. Can we reduce it? A separate "is this a defect" signal... the detector conf already encodes that. conf × p(c) is the joint. The issue is p(c) is not calibrated: the classifier is trained to always pick a class (no "none" class), so on false alarms it outputs a confident-looking class.
+
+Idea: **train the classifier with a "background/none" class** — include crops from non-defect regions (random points on train images, or detector boxes that don't overlap any true box) as class 4 ("none"). At inference, p(defect) = 1 - p(none), and score = conf × p(c) × ... hmm, or score = p(c) × (1-p(none)) × conf. This would downweight false alarms in all classes → better precision → higher AP. This is a real method change (data + loss). It targets the ranking of false alarms vs true positives, which is part of the error (the class-agnostic 0.755 vs perfect 0.758 shows boxes+conf are near-ceiling, so false-alarm ranking is already decent... wait, class-agnostic 0.755 means with 1 class the AP is 0.755 — false alarms are already ranked below true ones reasonably well by conf alone).
+
+Hmm, so where exactly is our 0.634 losing? Two components:
+(a) True boxes: their true-class score conf×p_true(c) might be lower than ideal → they rank lower than they should within the class → recall at high precision drops.
+(b) False boxes: their true-class... no, false boxes create false positives in each class with score conf×p_fp(c).
+
+With perfect classes (ceiling 0.758), false alarms are kept as class 0 with detector conf — and AP is 0.758. So false alarms with conf ranking are fine. Our 0.634 vs 0.758: the loss is from (a) true boxes having their true-class probability diluted (p_true(c) < 1, and often the argmax is wrong), and (b) false alarms getting non-trivial p(c) in the wrong classes, adding false positives that didn't exist in the perfect-class ceiling (where all false alarms are class 0 only).
+
+Actually (b) is interesting: in the ceiling, false alarms are ALL class 0. So classes 1,2,3 have zero false alarms from this source → their AP is limited only by ranking of true boxes vs... nothing. In our system, every false alarm has rows in all 4 classes. A false alarm with p(deposit)=0.25, conf 0.9 → deposit scoreThinking budget reached. Stop thinking now and write the reply in the required format.

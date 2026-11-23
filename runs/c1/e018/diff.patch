@@ -1,0 +1,121 @@
+--- e000/train.py
++++ e018/train.py
+@@ -44,7 +44,7 @@
+ MODEL = "efficientnet_b0"
+ PRETRAINED = True
+-IMG_SIZE = 160
+-CONTEXT = 2.5           # wide crop: side = CONTEXT * long side of the box
+-TIGHT_CONTEXT = 1.5     # tight crop
++IMG_SIZE = 224
++CONTEXT = 4.0           # wide context crop: side = CONTEXT * long side of the box
++MAX_TIGHT = 192         # native-scale tight region clamped to this many px
+ MIN_CROP = 16
+ TRAIN_ON = ("high",)    # resolutions of crops.csv used for training
+@@ -86,4 +86,40 @@
+ 
+ 
++def make_composite(img, r, train):
++    """Single 224x224 input: the detector box region at NATIVE scale (top-left) plus a wide context crop.
++    The tight region keeps its real pixels (no rescale-to-fixed-size), so small defects are not blurred."""
++    h, w = img.shape[:2]
++    x1, y1, x2, y2 = r["x1"], r["y1"], r["x2"], r["y2"]
++    if train:  # light geometric jitter on the box
++        dx, dy = random.uniform(-0.1, 0.1) * (x2 - x1), random.uniform(-0.1, 0.1) * (y2 - y1)
++        x1, y1, x2, y2 = x1 + dx, y1 + dy, x2 + dx, y2 + dy
++    # native-scale tight region, clamped to a sane max so huge boxes do not dominate
++    tw = max(2, int(round(x2 - x1)))
++    th = max(2, int(round(y2 - y1)))
++    scale = 1.0
++    if max(tw, th) > MAX_TIGHT:
++        scale = MAX_TIGHT / max(tw, th)
++        tw, th = int(round(tw * scale)), int(round(th * scale))
++    cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
++    tx0, ty0 = int(round(cx - tw / 2)), int(round(cy - th / 2))
++    tight = np.full((th, tw, 3), 114, dtype=np.uint8)
++    sx0, sy0, sx1, sy1 = max(0, tx0), max(0, ty0), min(w, tx0 + tw), min(h, ty0 + th)
++    if sx1 > sx0 and sy1 > sy0:
++        tight[sy0 - ty0:sy1 - ty0, sx0 - tx0:sx1 - tx0] = img[sy0:sy1, sx0:sx1]
++    tight = np.asarray(Image.fromarray(tight).resize((tw, th), Image.BILINEAR), dtype=np.uint8)
++    # wide context crop at fixed context
++    wide = make_crop(img, r, CONTEXT, train)  # already 224x224 float in [0,1]
++    wide_u8 = np.clip(wide * 255.0, 0, 255).astype(np.uint8)
++    comp = np.full((IMG_SIZE, IMG_SIZE, 3), 114, dtype=np.uint8)
++    comp[:th, :tw] = tight
++    comp[th:, tw:] = wide_u8[th:, tw:]  # wide context fills the rest (both are IMG_SIZE square)
++    x = comp.astype(np.float32) / 255.0
++    if train:
++        bright = random.uniform(0.8, 1.2)
++        x = np.clip(x * bright, 0, 1)
++    x = (x - MEAN) / STD
++    return torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1)))
++
++
+ class BoxDataset(torch.utils.data.Dataset):
+     def __init__(self, rows, images, train):
+@@ -96,20 +132,11 @@
+         r = self.rows[i]
+         img = self.images[r["image"]]
+-        fh = fv = False
+-        bright = 1.0
+-        if self.train:  # same flips and brightness for both views
+-            fh, fv, bright = random.random() < 0.5, random.random() < 0.5, random.uniform(0.8, 1.2)
+-        views = []
+-        for ctx in (TIGHT_CONTEXT, CONTEXT):
+-            x = make_crop(img, r, ctx, self.train)
+-            if fh:
+-                x = x[:, ::-1]
+-            if fv:
+-                x = x[::-1, :]
+-            if self.train:
+-                x = np.clip(x * bright, 0, 1)
+-            x = (x - MEAN) / STD
+-            views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))
+-        return views[0], views[1], r.get("cls", -1)
++        x = make_composite(img, r, self.train)
++        if self.train:  # same flips for the composite
++            if random.random() < 0.5:
++                x = x[:, :, ::-1].contiguous()
++            if random.random() < 0.5:
++                x = x[:, ::-1, :].contiguous()
++        return x, r.get("cls", -1)
+ 
+ 
+@@ -139,8 +166,8 @@
+ 
+     g = torch.Generator().manual_seed(args.seed)
+-    dl_tr = torch.utils.data.DataLoader(BoxDataset(crops, images, True), batch_size=BATCH_SIZE, shuffle=True,
++    dl_tr = torch.utils.data.DataLoader(BoxDataset(crops, images, True), batch_size=48, shuffle=True,
+                                         num_workers=workers, pin_memory=True, drop_last=True,
+                                         persistent_workers=True, generator=g, worker_init_fn=worker_init)
+-    dl_ev = torch.utils.data.DataLoader(BoxDataset(ev, images, False), batch_size=256, shuffle=False,
++    dl_ev = torch.utils.data.DataLoader(BoxDataset(ev, images, False), batch_size=128, shuffle=False,
+                                         num_workers=workers, pin_memory=True)
+ 
+@@ -159,5 +186,5 @@
+     while not done:
+         tot, nb = 0.0, 0
+-        for xt, xw, y in dl_tr:
++        for xt, y in dl_tr:
+             frac = min(1.0, (time.time() - t_start) / budget)
+             f = frac / 0.05 if frac < 0.05 else 0.5 * (1 + math.cos(math.pi * (frac - 0.05) / 0.95))
+@@ -165,8 +192,7 @@
+                 pg["lr"] = LR * max(f, 1e-3)
+             xt = xt.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+-            xw = xw.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+             y = y.to(device, non_blocking=True)
+             with torch.autocast(**amp):
+-                loss = crit((model(xt) + model(xw)) / 2, y)
++                loss = crit(model(xt), y)
+             opt.zero_grad(set_to_none=True)
+             loss.backward()
+@@ -183,8 +209,7 @@
+     probs = []
+     with torch.no_grad(), torch.autocast(**amp):
+-        for xt, xw, _ in dl_ev:
++        for xt, _ in dl_ev:
+             xt = xt.to(device).to(memory_format=torch.channels_last)
+-            xw = xw.to(device).to(memory_format=torch.channels_last)
+-            probs.append(torch.softmax(((model(xt) + model(xw)) / 2).float(), 1).cpu())
++            probs.append(torch.softmax(model(xt).float(), 1).cpu())
+     probs = torch.cat(probs).numpy()
+     os.makedirs(args.out, exist_ok=True)

@@ -1,0 +1,239 @@
+===== attempt 1 =====
+Let me analyze the situation.
+
+Current best: e000, 5-seed mean 0.6288 (seed-0 was probably around 0.63).
+
+Per-class AP: pore 0.502, deposit 0.624, discontinuity 0.780, stain 0.609.
+
+Reference values:
+- one-step 4-class baseline: 0.638 (the number to beat)
+- stage-1 boxes with perfect class labels: 0.758 (ceiling)
+- class-agnostic: 0.755
+
+So the classifier is the bottleneck: with perfect classes it's 0.758, and we're at 0.6288. The gap between our score and the ceiling is 0.13. Per-class: pore is weak (0.502), stain (0.609), deposit (0.624).
+
+Lessons from the experiments so far:
+- e001 (training on detector boxes): rejected, 0.6264.
+- e002 (adding low-res): 0.6296 seed-0, 5-seed 0.6261, not confirmed.
+- e003 (background class): rejected, 0.5935.
+- e004 (temperature sharpening): rejected, 0.6119.
+- e005 (IMG_SIZE 224): seed-0 0.6303, 5-seed 0.6251, not confirmed.
+
+Hmm, interesting: e002 and e005 both looked promising on seed-0 (0.6296, 0.6303 vs best seed-0 ~0.63?) but failed to confirm on 5 seeds. Wait, the current best is 5-seed 0.6288. e002's 5-seed is 0.6261, e005's is 0.6251. So both were actually below the best on 5-seed. The seed-0 numbers were just noise.
+
+So what does this tell us? Training on low-res didn't help much; 224 resolution didn't help much either. Temperature sharpening hurt. Background class hurt.
+
+The weak classes are pore (0.502) and stain (0.609), deposit is 0.624. "Pore and deposit are the weak classes; stain is often confused with deposit."
+
+Known: the crop classifier with perfect boxes reaches macro-F1 ~0.87 with the initial recipe. The loss is concentrated in the class decision for boxes overlapping real defects.
+
+What can plausibly improve the classifier's accuracy?
+
+Ideas:
+1. Better data augmentation: color jitter, rotation, stronger geometric transforms. Weld images — rotation might be useful since beads can be oriented in any direction. Actually, weld beads are elongated; defects (pores) are roughly circular blobs. Rotation augmentation could help the model be orientation-invariant. But wait — the crop is a square around the box; rotating the crop might help.
+
+2. Use a stronger model: convnext_nano, resnet50, efficientnet_b2, tf_efficientnetv2_b0. The budget: currently 433 steps in ~140s of training. A bigger model would slow training. tf_efficientnetv2_b0 is similar size to efficientnet_b0. convnext_nano is bigger. resnet50 is bigger.
+
+Actually, wait — the key point: the crop classifier with perfect boxes reaches macro-F1 ~0.87 with the initial recipe. Our mAP is 0.6288 vs ceiling 0.758. The gap is partly due to class confusion (pore/deposit/stain), and partly due to false alarms (stage-1 boxes that don't overlap any defect). The class-agnostic score is 0.755, so box placement is fine; the whole gap is class assignment.
+
+If the classifier's macro-F1 is 0.87, the AP loss from misclassification is… let me think: with perfect boxes, if the classifier gets 87% macro-F1, the AP would be… roughly, if 13% of boxes are misclassified, they become false positives of the wrong class and misses of the right class. mAP would drop from 0.758 to maybe around 0.65-0.70. We're at 0.6288, so there's additional loss — probably from boxes that are slightly misplaced (IoU between 0.5 and 1) and from ranking.
+
+So improving classifier accuracy is the main lever. What's the biggest lever?
+
+Ideas:
+A. Stronger augmentation: rotation (weld beads can be at any angle), color jitter. The current augmentation is: crop jitter (0.85-1.2 scale, ±10% shift), flip, brightness 0.8-1.2. No rotation, no color jitter (other than brightness). Pores are circular holes; stain is discolored area; deposit is excess material; discontinuity is a gap. Rotation invariance might help.
+
+B. Train longer / more steps: currently 433 steps in ~140s. Loss is still dropping (0.2189 at epoch 4). We could reduce RESERVE_S to train longer. Prediction takes ~45s (162 total - 117 end of training… actually training ends around 125s, prediction is 125→162 = 37s). RESERVE_S=55, budget is 180-55=125s. Training ended at 125s. So we can lower RESERVE_S to ~40 to get ~15 more seconds, ~50 more steps. But the effect of 50 more steps on a 433-step run is small. Not a big lever.
+
+C. Better model: swap to a stronger backbone. tf_efficientnetv2_b0 has comparable compute to efficientnet_b0. convnext_nano is ~2.2x the compute. resnet50 is bigger. The model is run twice per sample (two views), so inference cost doubles.
+
+Actually, wait — there's a subtle point: the two-crop averaging (tight + wide through the same model, logits averaged). Could we use an ensemble of two different models? E.g. efficientnet_b0 + convnext_pico, or two different crops with different models. Budget: 433 steps for 6052 boxes = 14 batches per epoch… wait, 6052/64 = 94.5 batches per epoch, 5 epochs = 472 steps? But the log says 433 steps (drop_last=True so 94 per epoch, 5 epochs = 472; but it stopped mid-epoch at the deadline: 433 steps).
+
+Ensemble: train two models sequentially in the same budget → each gets ~half the steps. Probably net negative.
+
+D. Class-specific handling: the weak classes are pore, stain, deposit. Class-weighted loss hurt every time it was tried (per "known" info). So no.
+
+E. Multi-view / more context: the two-crop recipe (tight 1.5x + wide 2.5x). We could add a third view, or change the context. But that's a "knob" change, and the lessons say method changes matter more than knobs.
+
+F. Test-time augmentation: average over flips at inference. This is cheap: 4x the inference cost for eval (currently 37s → ~148s, too much? total budget 180s. Training ends at 125s, reserve 55s. TTA 4x = 148s → total 273s. Too much. 2x (horizontal flip) = 74s → total 199s. Still too much. Hmm, need to cut training. Actually, TTA on crops: the crop is a square; flipping the crop is equivalent to flipping the image. Average logits over original + horizontal flip + vertical flip = 2x or 4x inference. Inference is 37s for 41879 boxes at batch 256… that's 164 batches, 2 forward passes each (two views) = 328 forwards in 37s ≈ 0.11s/forward. 4x TTA = 148s. Too much unless we cut training.
+
+Alternative: reduce training time and use the saved time for TTA? But training longer probably helps more.
+
+G. Better use of the detector confidence: currently score = conf × class prob. The ranking of false alarms vs true detections uses conf. We could add a "background" score to the score: e.g. score = conf × p_class × (something). But e003 (background class) hurt. Hmm, e003 added a 5th background class trained on false alarms and probably used it to downweight. It dropped to 0.5935 — a big drop, suggesting the background training confused the classifier.
+
+H. The "known" info says: "A crop classifier given perfect boxes reaches macro-F1 ~0.87 with the initial recipe (two-crop input)." So with perfect boxes F1 is 0.87. Our mAP 0.6288 vs ceiling 0.758. Let me decompose: if the classifier had F1 0.87 on true boxes, and false alarms were all kept as class 0 (pore) with conf score… the ceiling keeps false alarms as class 0. Hmm.
+
+Actually, let me think about where the 0.13 gap comes from. The ceiling (0.758) gives correct class to all boxes overlapping a true defect, keeps the rest as class 0 with conf. Our system: classifier assigns classes. Misclassified true boxes → miss of true class + FP of wrong class. False alarms get class from the classifier (probably pore-ish) with score conf × p.
+
+Per-class AP: pore 0.502. Pore is probably the most frequent class and the most confused. Stain confused with deposit.
+
+What's the biggest lever to improve classification? Options:
+
+1. Augmentation (rotation, color). Category: augmentation. Not yet tried (no augmentation experiments in history). The "Lessons" table only has data (3), scoring (1), architecture (1). Augmentation is untried. This is a fresh category.
+
+2. Model swap (architecture): only tried once (IMG_SIZE 224, which is strictly resolution, not architecture). Trying a stronger backbone is a different idea. E.g. tf_efficientnetv2_b0 (similar speed, usually better) or convnext_nano. convnext_nano at 160px: ~10M params vs 4M. Training step time probably 2x → ~200 steps. Hmm, trade-off: fewer steps but better model. Risky.
+
+Actually, let me think about what's most likely to give ≥0.01.
+
+The classifier is the bottleneck. Its accuracy determines everything. The initial recipe reaches macro-F1 0.87. To improve F1: better data (more augmentation), better model, better training (longer, better LR schedule).
+
+Training: 433 steps, loss 0.2189 and still dropping. The model is probably undertrained. But we're constrained by time. Can we train more efficiently? Reduce batch size? No, that changes dynamics.
+
+Actually — key observation: we train on 6052 boxes for ~5 epochs, but each box is used with random augmentation. 433 steps × 64 = 27,700 samples ≈ 4.6 epochs. Loss curve: 0.72 → 0.37 → 0.29 → 0.25 → 0.22. Still dropping. More steps would help, but the budget is fixed at 180s.
+
+Can we speed up training? Currently: 2 forward passes per batch (two views through the same model). We could batch the two views as one forward of 2×batch. Same compute. Use of channels_last, AMP bfloat16. num_workers=8.
+
+Hmm, what about reducing IMG_SIZE? No, e005 showed 224 didn't help; 160 is fine.
+
+What about a smaller/faster model that lets us do many more steps? E.g. convnext_pico or regnety_016 (very small). More steps of a smaller model vs fewer steps of a bigger model. The initial recipe with efficientnet_b0 reaches F1 0.87. A smaller model would probably be worse.
+
+Let me think about the augmentation idea more concretely. Current train-time augmentation:
+- Crop: center jitter ±10% of side, scale 0.85-1.2
+- Flip (h and v, independent)
+- Brightness 0.8-1.2
+
+Missing: rotation (weld beads at arbitrary angles — pores are circular so rotation-invariant; deposit/discontinuity are elongated along the bead), color jitter (contrast, saturation — weld images have varying illumination), possibly stronger scale.
+
+Rotation: the crop is a square canvas; rotate the image within the crop. But note: the crop canvas includes padding (gray 114) outside the image. Rotating the crop image (after canvas construction) is fine — it's a square.
+
+Actually, an important consideration: defects like stain and deposit are elongated along the weld bead direction. If the model is trained with rotation augmentation, it becomes orientation-invariant, which should help distinguish stain from deposit… hmm, actually if both are elongated, rotation doesn't help distinguish them. But pores are circular, so rotation helps pore recognition.
+
+Alternatively, color/contrast jitter: stain is literally a color change (discoloration). Stain vs deposit confusion might be color-driven; if we jitter color too much, the model can't rely on color and might get worse. Hmm. But stain detection probably needs color cues. Risky.
+
+Brightness jitter already exists (0.8-1.2). We could extend to contrast/saturation.
+
+Let me think about what's most likely to give ≥0.01.
+
+Another angle: the score. Currently score = conf × p_class. For mAP, what matters is the ranking within each class. conf is fixed per box. So within-class ranking is determined by p_class (since conf is a constant per box… wait, no! conf varies per box. For boxes of the same class, both conf and p vary. The ranking is by conf × p.
+
+Interesting: if we output only the top class per box (1 row per box, score = conf × p_top), the ranking within class c is by conf × p_c among boxes where c is the argmax. Currently we output 4 rows per box. For class c, boxes where c is not the argmax also appear with score conf × p_c (small). These are low-scoring FPs of class c. Do they hurt? They're at the bottom of the ranking, so they only affect AP if there are more FPs than TPs of that class… actually, AP is computed over the full ranking; low-scoring FPs at the tail don't hurt precision at high recall… wait, they do: AP = integral of precision over recall. FPs at the tail (after all TPs are found) don't affect the integral because recall is already maxed… no wait, recall is over true boxes; once all true boxes of class c are matched, recall is 1.0 and the integral stops (precision × drecall, drecall=0 after that). So FPs after full recall don't hurt. FPs interleaved with TPs hurt.
+
+So outputting only the argmax class per box: the ranking of class c is by conf × p_c over boxes where argmax=c. Versus all 4 rows: boxes where argmax≠c but p_c is high (2nd place) also appear. Hmm.
+
+Actually, there's a subtle benefit to outputting all rows: a box that is a true pore but classified as deposit with p_pore=0.4, p_deposit=0.6 appears in the pore ranking with score conf×0.4. If that score is high enough, it might match the true pore box (IoU>0.5) as a TP of pore! Whereas if we only output argmax, that box is only a deposit prediction and the pore is missed. So outputting all 4 rows can recover misclassified boxes as TPs of the true class (at the cost of FPs of the wrong class). This is probably why the score is conf × p for all classes.
+
+OK, so the scoring scheme is reasonable. The main lever is classifier accuracy.
+
+Let me reconsider: what's the single biggest lever?
+
+Option 1: Augmentation with rotation. Fresh category, plausible effect. Weld defects: pores are circular (rotation-invariant), deposit/discontinuity/stain are elongated along the bead. Hmm, if we rotate the crop, the elongated shapes appear at all angles during training — the model learns orientation-invariant features for those classes. At test time, beads can be at any angle, so this should help. I think rotation augmentation is a solid bet.
+
+Option 2: Stronger backbone (convnext_nano or tf_efficientnetv2_b0). tf_efficientnetv2_b0: similar FLOPs to b0 (roughly), usually better accuracy. Same speed → same number of steps, better model. Low risk, moderate gain. Actually, tf_efficientnetv2_b0 has ~19M params vs efficientnet_b0's 4M, but FLOPs are comparable (729 vs 356 MFLOPs at 224). At 160px, FLOPs scale as (160/224)² = 0.51. So v2_b0 at 160: ~370 MFLOPs vs b0's ~180 MFLOPs. ~2x slower. 433 steps → ~220 steps. Trade-off.
+
+Option 3: Train longer by cutting prediction cost. Prediction: 41879 boxes × 2 views at batch 256. 37s. Can we speed up prediction? E.g. skip the wide view? No, that changes the method.
+
+Option 4: Use both high and low resolution crops… e002 tried that, not confirmed.
+
+Option 5: Two models for two views — e.g. tight crop through one model, wide through another? No, that doubles training cost.
+
+Option 6: Label smoothing? A loss change. Probably small.
+
+Option 7: Mixup / cutmix. A data/augmentation change. Mixup on crops: blend two crops of the same class. Pores are small circular holes; mixup might blur them. Risky.
+
+Option 8: Learning rate / schedule: "tuning hyperparameters alone barely helped in prior experiments" — per known info. Avoid.
+
+Option 9: Ensemble of 2 crops through 2 different models (e.g. efficientnet_b0 + convnext_pico), each trained with half the budget. Doubles inference cost. Risky on time.
+
+Option 10: Train on more data — e001 (detector boxes) rejected, e002 (low-res) not confirmed. Data category is "EXHAUSTED?" per the harness.
+
+Option 11: Inference TTA (flip). Time-constrained.
+
+Let me reconsider the time budget more carefully:
+- Total: 180s
+- Loading: 13s
+- Training: ~112s (13s → 125s), 433 steps → ~0.258s/step
+- Prediction: ~37s (125 → 162)
+- Writing: ~2s
+
+RESERVE_S=55 keeps training under 125s.
+
+For TTA (2x, horizontal flip): prediction 74s → total 13+112+74+2 = 201s > 180. Need to cut 21s. If we cut training to ~90s (RESERVE_S=77), total = 13+90+74+2 = 179s. Just barely. And TTA gain is usually small (0.002-0.005). Not worth it.
+
+For rotation augmentation: no time cost (slight PIL rotation cost in the dataloader, negligible). Fresh category. Let me estimate the effect: adding rotation to a crop classifier typically gives 1-3% F1 improvement on texture/shape tasks. If macro-F1 goes 0.87 → 0.90, mAP might go 0.629 → 0.65+. Plausible ≥0.01.
+
+But wait — is rotation actually useful here? The crop is a square around the defect box. The defect (pore) is roughly centered. The surrounding context is the weld bead, which is elongated in some direction. If we rotate the crop image by angle θ, the bead direction changes. The model sees pores in all contexts. I think it helps, especially for pore (circular, orientation-agnostic) and for not overfitting to specific bead orientations.
+
+Hmm, but there's a counterargument: stain is a discolored region; its appearance is orientation-agnostic. Deposit is a bulge; discontinuity is a gap. All are more or less orientation-agnostic in a square crop. Rotation augmentation should be safe and helpful.
+
+Alternatively, color jitter (contrast + saturation). Stain vs deposit confusion: stain is color change (e.g. discoloration from heat), deposit is excess material (shape/texture). If the model is over-relying on exact color values, jitter would help generalization. But if stain is defined by color, heavy color jitter would hurt. Moderate jitter (contrast 0.8-1.2, saturation 0.8-1.2) is probably safe.
+
+I could combine rotation + color jitter in one experiment… but the rule says one idea per turn. Rotation is the cleaner idea. Let me go with rotation.
+
+Actually, wait. Let me reconsider. Let me re-examine the per-class numbers and think about where the error is:
+
+- Pore 0.502: weakest. Pores are small circular holes. Confused with what? Probably deposit (e001's notes said "stain is often confused with deposit" and "pore and deposit are the weak classes"). Pore vs deposit confusion: pore is a dark hole, deposit is a bright bulge. In low-res or bad lighting they might look similar.
+- Stain 0.609: confused with deposit.
+- Deposit 0.624.
+- Discontinuity 0.780: good.
+
+Rotation doesn't obviously fix pore vs deposit. Color jitter might help stain (color-driven class). Hmm.
+
+What about resolution? Pores are small; at 160px input with a 1.5x tight crop, the pore might be a few pixels. e005 (224px) didn't confirm — 5-seed 0.6251 vs 0.6288. Slightly worse! Interesting. So higher resolution didn't help (or slightly hurt, within noise).
+
+What about the wide crop context? CONTEXT=2.5. Pores need local texture; deposit/discontinuity need bead context. The two-view averaging handles both.
+
+Let me think about the model again. The known info says the initial recipe reaches macro-F1 ~0.87 "with perfect boxes." Our mAP 0.6288. Let me estimate what mAP we'd get with F1 0.87: roughly, each class AP ≈ (fraction correct) × ceiling-ish… if 87% of true boxes are correctly classified and the rest are misclassified (becoming FPs of another class), and false alarms are kept… hard to compute exactly, but 0.629 vs 0.758 ceiling suggests F1 is probably around 0.80-0.85 on actual detector boxes (worse than on perfect boxes).
+
+To gain 0.01+ mAP, we need ~1.5-2% improvement in classification accuracy. That's achievable with:
+- Better augmentation (rotation, color)
+- Better model
+- More training
+
+Let me think about "more training" more. The loss is still dropping at the end (0.2189 at epoch 4, epoch 3 was 0.2532 — a 0.034 drop per epoch, decelerating). With cosine LR decay, late steps contribute less. 433 steps with 5% warmup + cosine. The model is probably undertrained. But we can't add time… unless we make each step cheaper or prediction cheaper.
+
+Prediction cost: 41879 boxes, 2 views, batch 256 → 164 batches × 2 forwards. 37s. If we use a single view (drop the wide crop at inference)? That changes the method (the two-crop recipe is core). No.
+
+Hmm, what about training efficiency: batch size 64, 2 views. We could increase batch to 128 (fewer, larger steps; same samples per step… no, same samples per step, just fewer optimizer steps per epoch). Actually, larger batch with same LR → fewer effective updates. Not obviously better.
+
+OK, another thought: the biggest structural issue might be that the classifier sees a crop but the box is slightly off (stage-1 boxes are "slightly misplaced"). The crop center jitter (±10%) helps with that. We could increase the jitter to ±20%? That's a knob change within augmentation.
+
+Let me settle on: rotation augmentation. It's a fresh category (augmentation has 0 experiments), it's a method-level change to what the model sees during training, and it's time-free.
+
+Implementation: in BoxDataset.__getitem__, after building the two views (or in make_crop), apply a random rotation to the crop image (before normalization). Apply the same rotation to both views (tight and wide) to keep them consistent. Use PIL's rotate with expand=False, fillcolor=gray (114,114,114) to match the padding.
+
+Angle: uniform in [-45, 45] or full [0, 360)? For weld beads, the orientation is arbitrary, so full 360 is fine, but ±90 might be enough. Let me use a random angle in [-90, 90]… actually, full circle [0, 360) is standard. But note: rotating by 180° combined with the existing flip augmentation covers everything. Let me use uniform(-180, 180).
+
+Wait, one concern: the crop canvas has gray padding for out-of-image regions. Rotating the canvas rotates the padding too — that's fine, it's just more gray.
+
+Another concern: the rotation should be applied to the raw crop (uint8 or float) before normalization. In the current code, make_crop returns a float array [0,1] (H,W,3). Then flip, brightness, normalize. I'll add rotation right after make_crop, using PIL.
+
+Let me write the code:
+
+```python
+def make_crop(img, r, context, train):
+    ...
+    return np.asarray(Image.fromarray(canvas).resize((IMG_SIZE, IMG_SIZE), Image.BILINEAR), dtype=np.float32) / 255.0
+```
+
+In __getitem__:
+```python
+        views = []
+        angle = random.uniform(-180, 180) if self.train else 0
+        for ctx in (TIGHT_CONTEXT, CONTEXT):
+            x = make_crop(img, r, ctx, self.train)
+            if angle:
+                x = np.asarray(Image.fromarray((np.clip(x, 0, 1) * 255).astype(np.uint8)).rotate(angle, fillcolor=(114, 114, 114)), dtype=np.float32) / 255.0
+            ...
+```
+
+Hmm, but make_crop already returns float [0,1]. Converting to uint8 for PIL rotation loses a tiny bit of precision — fine.
+
+Actually, cleaner: do the rotation inside make_crop? No — make_crop is also used at eval time (train=False), where angle=0, so it's a no-op. But it's simpler to keep make_crop as is and add rotation in __getitem__.
+
+Wait, but there's a subtlety: the flip is applied after the crop. If I rotate and then flip, that's fine (both are random).
+
+Let me also consider: should the rotation be shared between the two views? Yes — the tight and wide crops are of the same box; they should be consistent (same orientation). The current code shares flip and brightness between views. I'll share the angle too.
+
+Efficiency: PIL rotate on a 160×160 image is ~1ms. Two views → 2ms per sample. 64 samples per batch → 128ms per batch of augmentation overhead… hmm, that's significant: current step time is 0.258s. Adding 0.13s → ~0.39s/step → ~290 steps instead of 433. That's a 33% reduction in steps! Not negligible.
+
+Can I rotate faster? PIL rotate with BILINEAR on 160×160… let me estimate: PIL is C-based, 160×160×3 = 76800 pixels. Rotation with bilinear is probably 0.5-1ms. Two views: 1-2ms. Per batch of 64: 64-128ms. Hmm. Plus the uint8 conversion overhead.
+
+Alternative: only rotate one of the views? No, both should be rotated consistently.
+
+Alternative: precompute? No, random per epoch.
+
+Alternative: use a smaller rotation grid — e.g. only rotate in 15° increments (24 discrete angles)? PIL rotate cost is the same.
+
+Alternative: apply rotation at a smaller resolution? The crop is resized to 160 at the end anyway. Could I rotate the canvas at native size before resize? The canvas size s varies (could be large, e.g. 2.5× box size, box up to ~200px → s up to 500). Rotating 500×500 is more expensive. No — rotate at 160.
+
+Actually, let me reconsider: is the dataloader the bottleneck? num_workers=8, persistent_workers. Augmentation happens in workers in parallel with GPU training. If workers can keep up, no slowdown. 8 workers each producing 64 samples per batch… per-sample augmentation cost: 2 crops (resize from canvas to 160) + 2 rotations + flip + brightness. The current per-sample cost is already 2 resizes. Adding 2 rotations roughly doubles the per-sample CPU cost. With 8 workers, if the GPU consumes a batch every 0.258s, workers have 0.258s to produce 64 samples → 4ms/sample budget. 2 crops + 2 rotations in 4ms? Resize of a 160 outputThinking budget reached. Stop thinking now and write the reply in the required format.

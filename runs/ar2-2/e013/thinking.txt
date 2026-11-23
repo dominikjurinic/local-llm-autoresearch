@@ -1,0 +1,582 @@
+===== attempt 1 =====
+Let me analyze the situation:
+
+Current best (e009): 5-seed val mAP@0.5 0.6387
+- Single wide-crop (2.5×) through EfficientNet-B0
+- Trained on GT crops (high + low res) + matched detector boxes (IoU ≥ 0.5)
+- TTA: horizontal flip at inference
+- Score = detector conf × class probability
+- Per-class: pore 0.528, deposit 0.637, discontinuity 0.779, stain 0.611
+
+Key observations:
+1. The ceiling with perfect classes is 0.758 mAP@0.5
+2. Current is 0.6387, so there's ~0.12 gap to close
+3. Pore (0.528) and stain (0.611) are the weak classes
+4. Previous experiments that failed:
+   - Background class (e005): 0.6039 - hurt
+   - Focal loss (e006): 0.6123 - hurt
+   - Mixup (e007): 0.6233 - hurt
+   - Batch size reduction (e010): 0.6229 - hurt
+   - Weighted sampler (e011): 0.6305 - hurt
+   - More TTA (e012): 0.6370 - hurt
+   - Squaring probability (e004): 0.6211 - hurt
+   - Training on detector boxes with background (e001): 0.5691 - hurt
+
+5. What worked:
+   - Adding matched detector boxes (e002): improved robustness
+   - Adding low-res crops (e003): slight improvement
+   - Single wide crop (e008): more epochs, better
+   - H-flip TTA (e009): slight improvement
+
+Let me think about what to try next. The key insight from the research brief:
+- "mAP@0.5 rewards, per class: (a) the right class on boxes that overlap a true defect, and (b) good ranking: true detections should score higher than false ones."
+- "Detector boxes include false alarms (background) and slightly misplaced boxes; the starting classifier was trained only on perfect boxes and has no notion of 'not a defect'."
+
+The background class approach (e005) failed. But maybe the issue was how it was implemented. Let me think about alternatives.
+
+Key ideas not yet tried:
+1. **Score calibration / temperature scaling**: The classifier might be overconfident or underconfident. A temperature parameter could help with ranking.
+2. **Different scoring formula**: Instead of conf × prob, maybe conf^α × prob^β with different exponents. But e004 tried prob² and it hurt.
+3. **Ensemble of two models**: Train two different architectures and average their predictions.
+4. **Larger model**: Try efficientnet_b2 or convnext_nano instead of efficientnet_b0.
+5. **Learning rate / optimizer changes**: Maybe a different LR schedule or higher LR.
+6. **Training on detector boxes with IoU threshold lower than 0.5**: Use partial overlap as a soft signal.
+7. **Score = conf × max(0, prob - prob_bg)**: But we don't have a background class.
+8. **Two-stage scoring**: Use the classifier to both classify AND estimate whether it's a real defect, then combine.
+
+Wait, let me think more carefully. The key issue is:
+- The detector produces boxes that are sometimes false alarms (background)
+- The classifier was trained on GT crops + matched detector boxes
+- The classifier has no notion of "not a defect"
+- Score = conf × prob[class]
+
+The problem: when the detector produces a false alarm, the classifier will still assign some probability to each class (it has to sum to 1), so it will produce a non-zero score. The detector's conf is supposed to handle this, but maybe it's not well-calibrated.
+
+One idea: **Use the classifier's confidence as a "defect-ness" signal**. If the classifier is very confident (high max prob), it's more likely a real defect. If it's uncertain (prob close to 0.25 each), it might be a false alarm. But this is somewhat captured by the score already.
+
+Another idea: **Try a different architecture**. The current model is EfficientNet-B0. Maybe a slightly larger model like EfficientNet-B2 or ConvNeXt-Nano would help, especially for the weak classes. The tradeoff is fewer training steps, but if the model is more expressive, it might converge faster.
+
+Actually, let me reconsider. The training takes about 130s for 2 epochs (771 steps). With a larger model, we'd get fewer steps. But the model might be better per-step.
+
+Let me think about what's most likely to help:
+
+1. **Architecture change to a slightly larger model**: efficientnet_b2 has ~6.6M params vs B0's ~4M. ConvNeXt-Nano has ~12M params. The larger model might handle the confusing pore/stain/deposit distinctions better. But it'll be slower per step.
+
+2. **Score modification**: Instead of conf × prob, try conf × prob^0.5 (square root). This would make the score less peaked, potentially helping with ranking. Actually, e004 tried prob² which made it MORE peaked and hurt. So prob^0.5 would go the other direction.
+
+3. **Training with a different augmentation strategy**: Maybe more aggressive geometric augmentation would help with robustness to box misplacement.
+
+4. **Two-model ensemble**: Train two models (e.g., EfficientNet-B0 and a different architecture) and average their probabilities. This could help if the models make different errors.
+
+Let me think about what's most promising given the constraints:
+
+The time budget is 180s total, with 55s reserved for prediction. That leaves ~125s for training. Currently using ~130s (17s loading + 113s training + 10s prediction).
+
+Actually wait, looking at the log: 17s loading, then training from ~17s to ~147s = 130s training, then prediction. Total 147s. So we have about 33s of slack.
+
+For a larger model like efficientnet_b2, each step would be maybe 1.5-2× slower. So we'd get maybe 1-1.5 epochs instead of 2. That might not be enough.
+
+What about convnext_nano? It's 12M params, probably 2-3× slower per step. That would be too slow.
+
+What about regnety_016? That's a very small model (0.9M params), probably faster per step but less expressive.
+
+Actually, let me reconsider the problem. The per-class APs are:
+- pore: 0.528 (weakest)
+- deposit: 0.637
+- discontinuity: 0.779 (strongest)
+- stain: 0.611
+
+The gap between current (0.6387) and ceiling (0.758) is 0.119. The main sources of error are:
+1. Wrong class assignment (especially pore vs stain vs deposit)
+2. False alarms getting high scores
+3. Missed detections (but stage 1 is fixed, so this is limited)
+
+Since the detector is fixed, we can't improve recall. We can only improve:
+- Precision (by suppressing false alarms)
+- Class accuracy (by better classification)
+- Ranking (by better score calibration)
+
+Let me think about the scoring more carefully. Currently: score = conf × prob[class]
+
+The issue with false alarms: if the detector conf is high but it's actually background, the classifier will still assign some probability to each class. The score will be conf × prob, which might be high enough to be a false positive.
+
+One approach: **Use the classifier's uncertainty as a penalty**. If the classifier is uncertain (all probs close to 0.25), multiply by a factor. But this is hard to implement cleanly.
+
+Another approach: **Temperature scaling**. Instead of using raw softmax probabilities, use a temperature-scaled version: softmax(logits / T). If T > 1, the probabilities become more uniform (less confident). If T < 1, they become more peaked. 
+
+Actually, for ranking purposes, what matters is the relative ordering of scores. If we apply a monotonic transformation to the score, the ranking doesn't change. But conf × prob is not a monotonic transformation of just prob (it's scaled by conf). So the temperature would affect the balance between conf and prob.
+
+Hmm, actually, let me think about this differently. The score is conf × prob. The ranking is determined by this product. If I change to conf^α × prob^β, I'm changing the relative weight of conf vs prob.
+
+What if I try conf × prob^0.5? This would make the prob component less influential and the conf component more influential. Since the detector's conf is already a decent signal, this might help.
+
+Actually, wait. Let me reconsider. The fact that e004 (prob²) hurt suggests that making prob more influential hurts. So making prob less influential (prob^0.5) might help.
+
+But actually, the issue might be more nuanced. Let me think about what happens with false alarms:
+- True defect: conf is moderate-high, prob[correct_class] is high → score is high ✓
+- False alarm: conf is moderate (detector thinks it's a defect), prob[all classes] are moderate (classifier is uncertain) → score is moderate
+- The problem: some false alarms have high conf AND the classifier assigns high prob to some class → high score → false positive
+
+If I use prob^0.5, the false alarm scores go up (since prob < 1, prob^0.5 > prob). That would make things worse for false alarms.
+
+If I use prob^2, the false alarm scores go down more (prob² < prob for prob < 1). But e004 showed this hurts overall. Why? Because it also reduces the score gap between true detections of different confidence levels, hurting the ranking within true detections.
+
+So the prob exponent approach is tricky. Let me think of something else.
+
+**Idea: Use a learned scoring function.** Instead of a fixed formula, train a small model to predict the final score given (conf, prob_vector). But this is complex and might not be worth it.
+
+**Idea: Two-model ensemble.** Train EfficientNet-B0 and another model (e.g., resnet18 or regnety_016) and average their probabilities. The ensemble might be more robust. But this doubles training time...
+
+Actually, with the time budget, I could train two smaller models in parallel (sequentially) and average. For example:
+- Model 1: EfficientNet-B0 (current)
+- Model 2: resnet18 (similar size, different architecture)
+
+Each would get half the training time. The ensemble might be better than either alone.
+
+But wait, the time budget is tight. Currently 130s for training. If I split it, each model gets 65s, which is about 1 epoch. That might not be enough.
+
+**Idea: Better augmentation for robustness.** The current augmentation includes:
+- Geometric jitter in make_crop (±10% center, 0.85-1.2× side)
+- Random horizontal/vertical flip (50% each)
+- Random brightness (0.8-1.2)
+
+What about adding:
+- Random color jitter (hue, saturation)
+- Random erasing (cutout)
+- Random rotation (small angles)
+
+Actually, the research brief says "Tuning hyperparameters alone helped little in earlier experiments; changes of method helped more." So I should focus on method changes.
+
+**Idea: Use the detector's conf as a training signal.** During training, for matched detector boxes, weight the loss by the detector's conf. Higher-conf boxes get more weight. This might help the model focus on the boxes the detector is most confident about, which are more likely to be real defects.
+
+Actually, this is interesting but might not help much since we're already filtering by IoU ≥ 0.5.
+
+**Idea: Train with a "soft" background signal.** Instead of a hard background class, use the detector's conf as a soft indicator. For unmatched detector boxes (conf < threshold), treat them as "low defect-ness" and use a soft label. But this is complex.
+
+**Idea: Score = conf × prob × (1 - uncertainty).** Where uncertainty = 1 - max(prob). This would penalize uncertain predictions. For a true defect, max(prob) is high, so the penalty is small. For a false alarm, max(prob) is lower, so the penalty is larger.
+
+Let me think about this more carefully:
+- True defect: prob = [0.7, 0.1, 0.1, 0.1], max = 0.7, uncertainty = 0.3, factor = 0.7
+  Score = conf × 0.7 × 0.7 = conf × 0.49
+- False alarm: prob = [0.3, 0.25, 0.25, 0.2], max = 0.3, uncertainty = 0.7, factor = 0.3
+  Score = conf × 0.3 × 0.3 = conf × 0.09
+
+This would significantly suppress false alarms. But it might also suppress some true detections where the classifier is uncertain (e.g., pore vs stain confusion).
+
+Actually, this is similar to using prob^2 but with a different formula. Let me check:
+- prob × (1 - (1 - max_prob)) = prob × max_prob
+- For the correct class: prob_c × max_prob. If max_prob = prob_c, this is prob_c².
+- So it's essentially the same as prob² for the argmax class.
+
+Hmm, so it's not fundamentally different from e004.
+
+**Idea: Try a different backbone.** Let me think about which backbone might work better.
+
+Current: EfficientNet-B0 (4M params, 160×160 input)
+
+Options:
+- EfficientNet-B2 (6.6M params): slightly larger, better accuracy, ~1.5× slower
+- ConvNeXt-Nano (12M params): much larger, ~3× slower
+- ResNet18 (11M params): different architecture, ~2× slower
+- RegNetY-016 (0.9M params): very small, ~2× faster
+- MobileNetV3-Large (5.4M params): similar size to B0, different architecture
+
+Actually, for the time budget, I need to be careful. Let me estimate:
+- Current: 771 steps in ~113s → ~0.147s/step
+- EfficientNet-B2: maybe 0.2s/step → ~565 steps in 113s
+- ResNet18: maybe 0.25s/step → ~452 steps in 113s
+
+The question is whether the larger model's per-step improvement outweighs the fewer steps.
+
+Actually, I think the most promising unexplored direction is **using a different scoring strategy that better handles the false alarm problem**.
+
+Let me reconsider the problem. The key insight from the brief:
+"mAP@0.5 rewards, per class: (a) the right class on boxes that overlap a true defect, and (b) good ranking: true detections should score higher than false ones."
+
+The current score is conf × prob. The detector's conf is a fixed signal from stage 1. The classifier's prob is what we control.
+
+What if the issue is that the classifier is not well-calibrated? For example, if it's overconfident on false alarms (assigning high prob to some class even when it's background), the score will be too high.
+
+One approach: **Calibrate the classifier's probabilities using the training data.** We can compute the classifier's predictions on the training set and fit a calibration function (e.g., Platt scaling or isotonic regression). But this is complex and might not help much.
+
+Another approach: **Use the classifier's training loss as a signal.** If the model is still learning (high loss), its predictions might be less reliable. But we're using the final model, so this doesn't apply.
+
+Let me think about what else could help...
+
+**Idea: Use a larger input size.** Currently IMG_SIZE = 160. What about 224 or 256? A larger input might capture more context and help with classification. But it would be slower per step.
+
+At 160×160, EfficientNet-B0 processes a batch of 64 in ~0.147s. At 224×224, it would be about (224/160)² ≈ 1.96× slower, so ~0.29s/step. That would halve the number of steps. Probably not worth it.
+
+**Idea: Use a different training strategy.** What about:
+- Training with a lower LR for longer (more fine-tuning)
+- Using a different optimizer (SGD vs AdamW)
+- Using gradient accumulation
+
+Actually, the current LR schedule is: 5% warmup, then cosine decay. The LR starts at 1e-3 and decays to ~1e-6. This seems reasonable.
+
+**Idea: Use the detector's conf distribution to weight training samples.** For matched detector boxes, weight the loss by conf. This would make the model focus more on high-conf boxes (which are more likely to be real defects and more important for the final score).
+
+Actually, this is a good idea. Let me think about it:
+- GT crops: weight = 1.0 (always real defects)
+- Matched detector boxes with high conf: weight = conf (e.g., 0.8)
+- Matched detector boxes with low conf: weight = conf (e.g., 0.3)
+
+This would make the model pay more attention to the boxes that the detector is confident about, which are the ones that matter most for the final score.
+
+But implementing this requires modifying the loss function to use per-sample weights. This is a moderate change.
+
+Actually, let me think about a simpler approach that's more likely to help.
+
+**Idea: Use a temperature-scaled softmax for the score.** Instead of score = conf × prob, use score = conf × softmax(logits / T)[class] where T is a temperature parameter. If T > 1, the probabilities are more uniform. If T < 1, they're more peaked.
+
+For ranking purposes, what matters is the relative ordering. If I use T = 2, the probabilities become more uniform, which means:
+- True defects: prob[correct] goes from 0.7 to maybe 0.55, prob[wrong] goes from 0.1 to 0.15
+- False alarms: prob[all] go from [0.3, 0.25, 0.25, 0.2] to [0.28, 0.26, 0.26, 0.24]
+
+The ratio of true/false scores changes. Let me compute:
+- T=1: true score = conf × 0.7, false score = conf × 0.3 → ratio = 2.33
+- T=2: true score = conf × 0.55, false score = conf × 0.28 → ratio = 1.96
+
+So T=2 makes the ratio smaller, which is bad for separation.
+
+- T=0.5: true score = conf × 0.85, false score = conf × 0.35 → ratio = 2.43
+
+So T=0.5 makes the ratio larger, which is good. But this is essentially the same as using prob^2 (more peaked probabilities).
+
+Hmm, so temperature scaling is equivalent to exponentiation in terms of the ranking effect. And we already know that prob² (e004) hurt.
+
+Wait, but e004 used prob² which is equivalent to T=0.5 in terms of the probability distribution. And it hurt. So temperature scaling in the "more peaked" direction hurts.
+
+What about the "less peaked" direction (T > 1)? That would make the probabilities more uniform, reducing the score gap between true and false detections. This would hurt ranking.
+
+So temperature scaling doesn't seem promising.
+
+**Let me think about this from a different angle.**
+
+The per-class APs are:
+- pore: 0.528
+- deposit: 0.637
+- discontinuity: 0.779
+- stain: 0.611
+
+The weak classes are pore and stain. The research brief says:
+"Pore and deposit are the weak classes; stain is often confused with deposit and background."
+
+Wait, it says "Pore and deposit are the weak classes" but the APs show deposit (0.637) is better than stain (0.611). Maybe the brief is referring to the crop classifier's macro-F1, not the mAP.
+
+Anyway, the key issue is that pore and stain are hard to distinguish, and stain is confused with deposit and background.
+
+**Idea: Use a two-crop approach again, but with different crop sizes.** The original two-crop approach (e000) used tight 1.5× and wide 2.5×. The single wide crop (e008) improved things by allowing more training steps. But maybe a different combination would work.
+
+Actually, e008 showed that single wide crop (2.5×) was better than two-crop (1.5× + 2.5×) because it allowed more epochs. The two-crop approach required 2× the forward passes, halving the number of epochs.
+
+What if I use a single crop at a different size? Like 2.0× instead of 2.5×? This might capture less context but be slightly faster (though the speed difference at 160×160 is minimal since the crop is resized to 160×160 anyway).
+
+Actually, the crop size doesn't affect the forward pass speed since everything is resized to 160×160. The crop size only affects what's in the crop. So changing from 2.5× to 2.0× wouldn't change speed, just the content.
+
+**Idea: Use a mix of crop sizes during training.** Instead of always using 2.5×, randomly choose between 1.5×, 2.0×, and 2.5×. This would give the model exposure to different context levels, improving robustness.
+
+This is a data/augmentation change. Let me think about whether it would help.
+
+The detector's boxes can be slightly misplaced. If the model is trained only on 2.5× crops, it might be sensitive to the exact crop size. Training on a range of crop sizes would make it more robust.
+
+But the current training already has geometric jitter (±10% center, 0.85-1.2× side), which somewhat covers this. The jitter varies the crop size by ±20%, which is a range of 2.0× to 3.0× for a 2.5× base. So the model already sees some variation.
+
+Hmm, maybe the jitter is not enough. Let me think...
+
+**Idea: Use a different evaluation strategy.** Instead of one prediction per class, use a different scoring formula.
+
+Actually, let me reconsider the problem from the mAP perspective. mAP@0.5 for a class c:
+- A detection is a TP if it overlaps (IoU ≥ 0.5) with a GT of class c AND is assigned to class c
+- A detection is a FP if it doesn't overlap with any GT, or overlaps with a GT of a different class, or is assigned to the wrong class
+
+For the ranking:
+- Within class c, TPs should have higher scores than FPs
+- FPs include: boxes that don't overlap any GT, boxes that overlap a GT of a different class, and boxes assigned to the wrong class
+
+The current score is conf × prob[c]. For a box that overlaps a GT of class c but is assigned to class d:
+- Score for class c: conf × prob[c] (might be moderate)
+- Score for class d: conf × prob[d] (might be high)
+- The box is counted as a FP for class c (wrong class) and a TP for class d (if d is the GT class) or FP for class d (if d is not the GT class)
+
+This is complex. The key is to make the score for the correct class high and the score for wrong classes low.
+
+**Idea: Use a margin-based score.** Instead of conf × prob, use conf × (prob[correct] - max(prob[other])) or something similar. But this requires knowing the correct class, which we don't have at test time.
+
+**Idea: Use the classifier's logit difference.** Instead of softmax probability, use the difference between the top-1 and top-2 logits as a confidence signal. score = conf × exp(logit_max - logit_2nd) × prob[argmax]. This would penalize predictions where the top two classes are close.
+
+Actually, this is similar to the uncertainty penalty I mentioned earlier. Let me think about it more carefully.
+
+logit difference = logit_max - logit_2nd
+If the top two are close (e.g., 2.0 and 1.8), the difference is 0.2, exp(0.2) = 1.22
+If the top is clearly ahead (e.g., 3.0 and 1.0), the difference is 2.0, exp(2.0) = 7.39
+
+So this would boost confident predictions and penalize uncertain ones. This is similar to using prob^k for k > 1, which we know hurts (e004).
+
+Hmm, I'm going in circles. Let me think about what's fundamentally different.
+
+**Key insight: The problem is not just classification accuracy but also the interaction between the detector's conf and the classifier's prob.**
+
+The detector's conf is a fixed signal. It's not perfectly calibrated. Some false alarms have high conf, and some true detections have low conf.
+
+What if I use the classifier to also estimate the "defect-ness" of the box, independent of the class? This is essentially the background class idea, which failed (e005).
+
+But e005 used a hard background class with a cap. Maybe a softer approach would work.
+
+**Idea: Use the classifier's top-1 probability as a defect-ness signal.** If the top-1 prob is high, the box is likely a real defect. If it's low (close to 0.25), it might be a false alarm.
+
+score = conf × prob[class] × (top1_prob / 0.25)
+
+This would boost confident predictions and penalize uncertain ones. But again, this is similar to prob^2.
+
+OK let me try a completely different direction.
+
+**Idea: Train a second model with a different architecture and ensemble.**
+
+The time budget is 180s. Currently:
+- Loading: 17s
+- Training: ~113s (2 epochs, 771 steps)
+- Prediction: ~10s
+- Total: 140s (with 40s slack)
+
+If I train two models:
+- Model 1 (EfficientNet-B0): 60s training
+- Model 2 (ResNet18 or similar): 50s training
+- Prediction: 20s (two forward passes)
+- Total: 17 + 60 + 50 + 20 = 147s (fits in 180s)
+
+But 60s of training is only about 1 epoch for EfficientNet-B0. That might not be enough.
+
+Actually, let me reconsider. The current training does 771 steps in ~113s. That's 0.147s/step. If I split the time:
+- 60s → ~408 steps (~0.75 epochs)
+- 50s → ~340 steps for the second model
+
+That's not a lot of training for either model. The ensemble might not be better than a single well-trained model.
+
+**Idea: Use a lighter model for the ensemble.** Instead of two full models, use one EfficientNet-B0 (current) and one very small model (e.g., RegNetY-016 with 0.9M params). The small model would train much faster.
+
+RegNetY-016 at 160×160 with batch 64: maybe 0.05s/step. In 50s, that's 1000 steps. That's a lot of training for a small model.
+
+But the small model might not be very accurate. The ensemble might not help much.
+
+**Let me reconsider the problem from scratch.**
+
+The current best is 0.6387. The ceiling is 0.758. The gap is 0.119.
+
+What are the main sources of error?
+1. Wrong class assignment: The classifier confuses pore/stain/deposit. This is the main issue.
+2. False alarms: The detector produces boxes on background, and the classifier assigns them a class.
+3. Score ranking: The score doesn't perfectly rank true detections above false ones.
+
+For (1), the only way to improve is a better classifier. Options:
+- Better architecture (larger model)
+- Better training data (more diverse)
+- Better augmentation
+- Better loss function
+
+For (2), the options are:
+- Background class (tried, failed)
+- Score modification (tried prob², failed)
+- Better classifier that's less confident on background
+
+For (3), the options are:
+- Score formula changes (tried, mostly failed)
+- Calibration
+
+Let me focus on (1) since it's the biggest issue.
+
+**What about using a larger model with a smaller input size?** For example, EfficientNet-B2 at 128×128 instead of 160×160. The smaller input would be faster, compensating for the larger model.
+
+EfficientNet-B2 at 160×160: ~0.2s/step (estimated)
+EfficientNet-B2 at 128×128: ~0.13s/step (estimated, (128/160)² = 0.64× slower)
+
+So at 128×128, EfficientNet-B2 would be about the same speed as B0 at 160×160. But the smaller input might lose important details.
+
+Actually, the crop is resized to IMG_SIZE × IMG_SIZE. If I reduce IMG_SIZE to 128, the crop loses detail. This might hurt classification.
+
+**What about using a different input size for the wide crop?** The current crop is 2.5× the box's long side, resized to 160×160. What if I use a larger crop (3.0×) but keep the input at 160×160? This would give more context but at the same computational cost.
+
+Actually, the crop size (2.5× vs 3.0×) determines how much of the image is included in the crop. A larger crop includes more background/context. This might help the model distinguish defects from background.
+
+But the current 2.5× already includes quite a bit of context. Going to 3.0× might not help much.
+
+**Let me think about what's truly unexplored.**
+
+Looking at the experiment history:
+- e001: detector boxes + background → failed
+- e002: detector boxes (matched) → success
+- e003: low-res crops → success
+- e004: prob² → failed
+- e005: background class → failed
+- e006: focal loss → failed
+- e007: mixup → failed
+- e008: single wide crop → success
+- e009: H-flip TTA → success
+- e010: batch 32 → failed
+- e011: weighted sampler → failed
+- e012: more TTA → failed
+
+Unexplored ideas:
+1. Different architecture (larger model)
+2. Different input size
+3. Different crop size
+4. Score = conf^α × prob^β with α ≠ 1
+5. Learning rate changes (higher LR, different schedule)
+6. Gradient accumulation
+7. SGD instead of AdamW
+8. Different augmentation (color jitter, cutout, rotation)
+9. Ensemble of two models
+10. Two-stage scoring (classify then score)
+11. Using the detector's conf distribution for training weighting
+12. Training with a different loss (e.g., label smoothing)
+13. Using a different pretrained model
+14. Fine-tuning strategy (freeze early layers, etc.)
+
+Let me pick the most promising one.
+
+I think **trying a different architecture** is the most promising unexplored direction. The current EfficientNet-B0 might not be the best model for this task. A slightly larger model like EfficientNet-B2 or a different architecture like ConvNeXt might handle the confusing classes better.
+
+But the time constraint is a concern. Let me think about which model to try.
+
+Options:
+1. **EfficientNet-B2** (6.6M params): ~1.5× slower per step. In 113s, ~510 steps vs 771. About 1.3 epochs vs 2.
+2. **ConvNeXt-Nano** (12M params): ~3× slower per step. In 113s, ~257 steps. About 0.5 epochs. Probably not enough.
+3. **ResNet18** (11M params): ~2× slower per step. In 113s, ~385 steps. About 0.7 epochs.
+4. **MobileNetV3-Large** (5.4M params): ~1.3× slower per step. In 113s, ~593 steps. About 1.5 epochs.
+
+EfficientNet-B2 seems like the best tradeoff. It's only 1.5× slower, and the architectural differences from B0 (deeper, wider) might help with classification.
+
+But wait, I should also consider that the pretrained weights for EfficientNet-B2 are on ImageNet, which is a different distribution from weld defects. The fine-tuning needs to adapt the model to the new domain. With fewer epochs, the adaptation might be less complete.
+
+On the other hand, B2 has more capacity, so it might adapt better even with fewer epochs.
+
+Let me go with **EfficientNet-B2** as the next experiment.
+
+Actually, wait. Let me reconsider. The time budget is tight. Let me check if there's a way to make the training faster.
+
+Current: batch_size=64, IMG_SIZE=160, EfficientNet-B0
+- 771 steps in ~113s → 0.147s/step
+- Each step: forward (64×3×160×160) + backward + optimizer
+
+If I use EfficientNet-B2:
+- Forward pass is ~1.5× slower (more params, deeper)
+- Backward pass is also ~1.5× slower
+- Total: ~0.22s/step
+- In 113s: ~514 steps
+
+That's about 1.3 epochs (514/411 ≈ 1.25). Not a huge difference from 2 epochs.
+
+The question is whether B2 at 1.3 epochs is better than B0 at 2 epochs. I think it's a reasonable bet.
+
+But actually, I just realized: the crop is resized to 160×160 regardless of the model. So the input size is the same. The only difference is the model's internal resolution and depth.
+
+Let me also consider: what if I use a smaller batch size with B2 to get more steps? But e010 showed that reducing batch size from 64 to 32 (with LR scaling) hurt. So that's probably not the way to go.
+
+OK, let me go with EfficientNet-B2. The hypothesis is that the larger model's increased capacity will improve classification accuracy, especially for the confusing pore/stain/deposit distinctions, even with slightly fewer training steps.
+
+Wait, actually, I want to reconsider one more time. Let me think about what's most likely to give a >0.005 improvement (the noise floor).
+
+The per-class APs are:
+- pore: 0.528
+- deposit: 0.637
+- discontinuity: 0.779
+- stain: 0.611
+
+The macro average is (0.528 + 0.637 + 0.779 + 0.611) / 4 = 0.63875 ≈ 0.6387 ✓
+
+To improve the macro average by 0.005, I need to improve the sum of APs by 0.02. That's a small improvement.
+
+If I improve pore by 0.01 and stain by 0.01, that's a sum improvement of 0.02, giving a macro improvement of 0.005. That's exactly at the noise floor.
+
+To be safe, I want an improvement of at least 0.01 in macro, which means a sum improvement of 0.04. That's more substantial.
+
+A larger model might give a 0.02-0.05 improvement in classification accuracy, which could translate to a 0.01-0.03 mAP improvement. That's within the range of what I need.
+
+Let me go with EfficientNet-B2.
+
+Actually, hold on. Let me reconsider the time budget more carefully.
+
+The log shows:
+- Loading: 17s
+- Training: epoch 0 at 87s (so 70s for epoch 0), epoch 1 at 125s (so 38s for epoch 1)
+- Total training: ~108s (from 17s to 125s)
+- Prediction: 125s to 147s = 22s
+- Total: 147s
+
+Wait, that doesn't add up. Let me re-read:
+"train 26347 boxes (14128 gt + 12219 det), eval 41879 detections, 2255 images (17s)"
+"epoch 0: loss 0.5353, 411 steps, 87s"
+"epoch 1: loss 0.2784, 771 steps, 125s"
+"done: 2 epochs, 771 steps, 55539 prediction rows, 147s total"
+
+So:
+- Loading: 0-17s
+- Epoch 0: 17-87s (70s, 411 steps)
+- Epoch 1: 87-125s (38s, 360 steps)
+- Prediction: 125-147s (22s)
+- Total: 147s
+
+The training takes 108s total. The RESERVE_S is 55s, so t_end = deadline - 55 = 180 - 55 = 125s. Training stops at 125s. Then prediction takes 22s, ending at 147s.
+
+So the training budget is 125 - 17 = 108s. With B2 at 1.5× slower, I'd get about 108/1.5 = 72s worth of B0 training, which is about 1.03 epochs (411 × 72/108 ≈ 274 steps).
+
+Hmm, that's only 1 epoch. That might not be enough.
+
+Actually, let me recalculate. B0 does 411 steps in 70s → 0.170s/step. B2 would be ~0.255s/step. In 108s, that's 423 steps, which is about 1.03 epochs.
+
+So B2 would get about 1 epoch of training, vs B0's 2 epochs. The question is whether B2 at 1 epoch is better than B0 at 2 epochs.
+
+This is a gamble. B2 has more capacity, so even with 1 epoch, it might be better. But it's also possible that B0 at 2 epochs is better because it's more thoroughly fine-tuned.
+
+I think it's worth trying. The hypothesis is testable: if B2 at 1 epoch beats B0 at 2 epochs, it becomes the new best.
+
+Let me write the experiment.
+
+Actually, wait. I want to also consider whether I should reduce the RESERVE_S to give more time for training. Currently RESERVE_S = 55s, but prediction only takes 22s. I could reduce it to 30s, giving 25s more for training.
+
+With 25s more training time:
+- B0: 108 + 25 = 133s → 411 × 133/108 ≈ 503 steps → 1.22 epochs
+- B2: 72 + 25 = 97s → 423 × 97/72 ≈ 568 steps → 1.38 epochs
+
+That's a meaningful increase. But reducing RESERVE_S is risky if the prediction takes longer than expected (e.g., if the eval set is larger on the hidden test).
+
+Actually, the eval set size is fixed (41879 detections). The prediction time should be consistent. 22s for prediction seems safe. I could reduce RESERVE_S to 35s, giving 20s more for training.
+
+But the rules say "Keep the contract. Use the seed. Respect the time budget." I should keep a safety margin. Let me keep RESERVE_S at 40s (giving 15s more for training) to be safe.
+
+Actually, the instructions say "Keep a safety margin." The current margin is 180 - 147 = 33s. If I reduce RESERVE_S to 40s, the training budget becomes 180 - 40 - 17 = 123s (vs current 108s). That's 15s more. Prediction would end at 123 + 17 + 22 = 162s, leaving 18s margin. That's still safe.
+
+But wait, I'm changing two things: the model AND the reserve time. The rules say "One idea per turn." So I should only change the model.
+
+Let me just change the model to EfficientNet-B2 and keep everything else the same.
+
+Actually, I realize I should also consider: does the model need to be created with a specific input size? EfficientNet-B2's default input size is 260×260. But since I'm resizing the crop to 160×160, the model will receive 160×160 input. timm should handle this fine (it just changes the internal resolution).
+
+Let me write the experiment:
+
+Change MODEL from "efficientnet_b0" to "efficientnet_b2".
+
+That's it. One line change.
+
+Hypothesis: EfficientNet-B2's increased capacity (6.6M vs 4M params) will improve classification accuracy for the confusing pore/stain/deposit classes, even with slightly fewer training steps, because the larger model can better learn the fine-grained visual distinctions needed for defect classification.
+
+Let me write the SEARCH/REPLACE block.
+
+The current line is:
+```
+MODEL = "efficientnet_b0"
+```
+
+Change to:
+```
+MODEL = "efficientnet_b2"
+```
+
+That's the only change. Let me verify this is a focused, single-idea change. Yes, it's just changing the model architecture.
+
+Wait, I should double-check that efficientnet_b2 is in the list of available pretrained models. The list says:
+"convnext_atto, convnext_nano, convnext_pico, efficientnet_b0, efficientnet_b2, mobilenetv3_large_100, regnety_016, resnet18, resnet26d, resnet34, resnet50, tf_efficientnetv2_b0"
+
+Yes, efficientnet_b2 is available.
+
+Let me finalize the experiment.

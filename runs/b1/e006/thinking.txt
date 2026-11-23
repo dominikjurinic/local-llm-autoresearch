@@ -1,0 +1,257 @@
+===== attempt 1 =====
+Let me think carefully about the next experiment.
+
+Current state:
+- Best: e002, 5-seed mean 0.6337, per-class AP: pore 0.515, deposit 0.627, discontinuity 0.781, stain 0.611
+- Ceiling (perfect classes on stage-1 boxes): 0.758
+- One-step baseline to beat: 0.638 (we're at 0.6337, just below!)
+- e003/e004: higher-res tight crop (224) — rejected (0.6325 on seed 0, not confirmed, likely no gain)
+- e005: adding low-res crops to training — not confirmed (0.6366 on seed 0, 5-seed mean 0.6315, slightly worse)
+
+Lessons:
+- data: 3 ideas, 1 new best (training on detector boxes), 1 close-but-not-confirmed (low-res), 1 crashed (the IoU bug)
+- architecture: 2 ideas, 1 crashed (name error), 1 rejected (higher-res tight crop)
+
+Where is the error? The gap to the ceiling is 0.758 - 0.634 = 0.124. This is class-decision error on boxes that overlap true defects. The per-class APs: pore 0.515 is the weakest, then stain 0.611, deposit 0.627, discontinuity 0.781.
+
+Wait, but the ceiling is 0.758 with perfect classes. So if the classifier were perfect, we'd be at 0.758. We're at 0.634. So the classifier is making a lot of class errors. The macro-F1 of the crop classifier on perfect boxes is ~0.87. So there's room.
+
+Key insight: the per-class APs show pore is weakest (0.515). Pore is a tiny dark hole. The known weak classes are pore and deposit; stain is often confused with deposit.
+
+Let me think about what could plausibly gain 0.01+.
+
+Ideas tried:
+1. Training on detector boxes (data) — this is the current best, it worked (e002).
+2. Higher-res tight crop (architecture) — rejected.
+3. Adding low-res crops (data) — not confirmed, slightly worse.
+
+What hasn't been tried?
+- Different model (e.g., a stronger model, or ensemble). But budget...
+- Test-time augmentation (inference) — not tried.
+- Scoring changes — the metric says monotone transforms don't help. But combining class probability with something else could help.
+- Loss changes — class-weighted loss hurt every time.
+- Sampling — not tried.
+- Augmentation — the current augmentation is light geometric jitter + flips + brightness. Could be improved.
+
+Let me think about the biggest lever. The gap is class-decision error. The classifier macro-F1 is ~0.87 on perfect boxes. The weak classes are pore and deposit.
+
+Actually, let me reconsider. The per-class AP on the actual system is pore 0.515, deposit 0.627, discontinuity 0.781, stain 0.611. The ceiling is 0.758 overall. 
+
+Hmm, wait. Let me reconsider what limits the score. There are two sources of error:
+1. Class decision error on boxes that overlap real defects (wrong type).
+2. Ranking of false alarms against true detections.
+
+The ceiling 0.758 keeps ALL boxes (including false alarms) but with perfect classes. So the 0.758 already includes false alarms. The difference between 0.758 and our 0.634 is purely class-decision error (since the boxes and their conf are the same; only the class assignment differs). Wait, is that right?
+
+Actually the ceiling: "Every detector box that overlaps a true defect (IoU > 0.5) gets the correct class; every other box (false alarms) is KEPT, as class 0, with its detector conf." So the ceiling assigns correct class to TP boxes and class 0 to FP boxes. Our system assigns class = argmax of classifier, with score = conf * prob.
+
+So the difference between ceiling and us is:
+- For TP boxes: we might assign the wrong class (class error).
+- For FP boxes: we assign some class (argmax), the ceiling assigns class 0. This affects the AP of class 0 (pore) because FP boxes assigned to pore could be ranked... hmm.
+
+Actually the scoring: score = conf * prob[c]. For a FP box, the ceiling gives it class 0 with score = conf. We give it argmax class with score = conf * prob[argmax]. The ranking within a class matters.
+
+This is getting complex. The main point: the dominant error is class decision. Let me focus on improving the classifier's accuracy, especially for pore and deposit.
+
+What's a strong, untried idea?
+
+Option A: Test-time augmentation (TTA). Average predictions over multiple crops/augmentations at inference. This is a method change (inference category), not a hyperparameter. It could improve classifier accuracy. But budget: prediction is currently done on 41879 detections in one pass. TTA would multiply prediction time. Let me check the budget.
+
+Current: load 14s, training ~148s (2 epochs), prediction ~14s (162-148). Total 162s out of 180s budget. RESERVE_S = 55. So training runs until deadline - 55 = 180-55 = 125s... wait, t_end = deadline - RESERVE_S = T0 + 180 - 55 = T0 + 125. Training started at ~14s, so training budget = 125-14 = 111s. It used 148-14 = 134s? No wait, the log says epoch 1 ended at 125s and done at 162s. Hmm, t_end = T0 + 125. Training loop: it breaks when time.time() >= t_end. t_start = time.time() at start of training (~14s after T0). So t_end = T0+125 = 125s. Training from 14s to 125s = 111s budget. Log shows epoch 0 at 97s, epoch 1 at 125s. So training ended at 125s (t_end). Then prediction: 125s to 162s = 37s. Total 162s. Under 180s. Good.
+
+Wait, that's prediction taking 37s. Let me recompute. Actually the reserve is 55s for prediction and writing. Prediction + writing took 162-125 = 37s. So we have 55-37 = 18s of slack. 
+
+If I do TTA with, say, 3 views (original + flip + small crop variation), prediction time would roughly triple from 37s to ~111s, total would be 125 + 111 = 236s > 180s. Too much. So TTA on all 4 views is too expensive. 
+
+Hmm. Unless I reduce training time to make room. But training is important.
+
+Actually, let me reconsider. The prediction is 41879 detections × 2 views = 83758 crops, in batches of 256. That's ~327 batches. 37s / 327 = 0.113s per batch. For TTA with 2x (e.g., add a flip), it'd be ~74s prediction, total 125+74 = 199s > 180. Still too much.
+
+So TTA is budget-constrained. Maybe not the best.
+
+Option B: A better model. The current model is EfficientNet-B0. Could try a stronger model like efficientnet_b2 or convnext_nano. But a stronger model might be slower per step, reducing training steps. Also, the classification is the bottleneck. Let me think: does a stronger model help? The macro-F1 is 0.87. A stronger model might push it to 0.90+. That could help the weak classes. But it's a method change in architecture. However, we already tried one architecture change (higher-res) that failed. A model swap is different though.
+
+Actually, let me reconsider the problem. The weak classes are pore and deposit. Pore is tiny. The issue might be that the classifier can't distinguish pore from deposit or stain well. 
+
+Let me think about what's fundamentally different and likely to matter.
+
+Option C: Ensemble of two crops differently — but that's what we have (tight + wide averaged).
+
+Option D: Change the scoring to be smarter. The metric says monotone transforms don't help. But what if we use a different combination? Currently score = conf * prob[c]. The conf is the detector confidence. Is it useful? Maybe the detector conf is noisy. But changing scoring is risky and the metric is order-based.
+
+Actually, wait. Let me reconsider. The score = conf * prob[c]. Within a single class c, all predictions have score = conf * prob[c]. So the ranking within class c is by conf * prob[c]. Since prob[c] varies per box, the ranking is a mix of conf and prob[c]. Is that optimal? 
+
+Hmm, for mAP, what we want is: true positives ranked above false positives. The "correctness" is determined by IoU > 0.5 with a GT box of that class. The score should reflect P(box is a true defect of class c). 
+
+conf * prob[c] is a reasonable estimate: P(true) * P(class c | box). Actually conf ≈ P(box is a real defect) and prob[c] ≈ P(class c | box is real). So conf * prob[c] ≈ P(box is real AND class c). That's a good score. 
+
+But there might be a subtlety: for a box that overlaps a GT of class c, we want high score. conf * prob[c] gives that. For a FP box, conf is moderate and prob[c] is whatever. 
+
+I think the scoring is already reasonable. Let me not mess with it.
+
+Option E: Better training data / sampling. We train on GT crops (high res) + detector boxes (labeled by overlap). The detector boxes are the distribution we score. Maybe we should weight the detector boxes more, or use them more. Actually, we already added them (e002). 
+
+Hmm, let me think about the class imbalance. The classes might be imbalanced. Class-weighted loss hurt. But maybe a different approach: oversample the weak classes (pore, deposit) in the training set. That's a sampling change, not a loss change. Oversampling pore and deposit could help the classifier learn them better without the downside of class-weighted loss.
+
+Actually, that's a good idea and fundamentally different from class-weighted loss. Class-weighted loss changes the loss magnitude per class; oversampling changes the frequency of seeing each class. Both target the same thing (weak classes) but via different mechanisms. The history says "Class-weighted loss hurt classification every time it was tried." But oversampling is a different mechanism.
+
+Wait, but is oversampling likely to help? If pore is underrepresented, oversampling it gives the model more pore examples. But if the issue is that pore looks like deposit/stain (confusion), more pore examples might not help if the distinguishing features aren't there. Hmm.
+
+Let me reconsider. The known issue: "Pore and deposit are the weak classes; stain is often confused with deposit." So the confusion is stain↔deposit, and pore is weak.
+
+Let me think about the data more. We have high-res and low-res crops. e005 tried adding low-res and it was slightly worse (0.6315 vs 0.6337). So low-res doesn't help.
+
+Let me think about the crop context. The classifier sees tight (1.5x) + wide (2.5x) crops. For pore (tiny hole), the tight crop at 1.5x might be too zoomed or the hole is tiny. Higher-res tight crop (224) failed. 
+
+Hmm, what about adding a THIRD view? Like a medium crop? Or changing the contexts? That's an architecture/data change. But it increases per-sample compute (3 forward passes instead of 2), which affects training speed and prediction time.
+
+Let me reconsider budget for a 3rd view. Training: currently 2 forward passes per batch (xt, xw). With 3 views, 3 forward passes. That's 1.5x slower per step. Training budget 111s would give ~0.67x the steps. Prediction: 41879 × 3 views = 125637 crops, ~491 batches, 491 × 0.113 = 55s. Total 125 (training, but training would be shorter now)... this is getting complicated. Let me not go there.
+
+Let me step back and think about the highest-leverage, most-likely-to-matter change.
+
+The gap to ceiling is 0.124, all class error. Per-class: pore 0.515 (gap to ~0.76 = 0.245), stain 0.611 (gap 0.147), deposit 0.627 (gap 0.131), discontinuity 0.781 (gap ~0). So pore is the biggest problem.
+
+What makes pore hard? Pores are tiny dark holes. In a 1.5x crop downscaled to 160px, a tiny pore might be just a few pixels. The classifier struggles.
+
+Idea: For pore, the distinguishing feature is the small dark spot. Maybe a higher-res view helps, but 224 failed. Maybe the issue is that the pore is so small that even 160px isn't enough, OR that the crop is centered slightly off.
+
+Alternatively, maybe the issue is that pore vs deposit vs stain are genuinely hard to distinguish from the crop alone, and we need context. The wide crop (2.5x) provides context.
+
+Hmm, let me think about a fundamentally different approach: use the detector's confidence differently, or use a two-class or hierarchical approach.
+
+Actually, here's a thought. The confusion is stain↔deposit and pore is weak. What if we do a coarse-to-fine: first classify into {pore, non-pore}, then {deposit, stain, other}? That changes the architecture/loss. But it's complex and might not help.
+
+Let me reconsider. What's the single most likely change to gain 0.01+?
+
+Let me reconsider the model. We're using EfficientNet-B0 at 160px. The pretrained EfficientNet-B0 was trained at 224px. Downscaling to 160 loses some detail. e004 tried 224 for the tight crop and it was rejected (0.6325, essentially same). So resolution isn't the lever.
+
+What about a stronger backbone? convnext_nano or efficientnet_b2. A stronger backbone might classify better, especially for the subtle differences between pore/deposit/stain. This is an architecture change but fundamentally different from the resolution change. Let me estimate budget: efficientnet_b2 is ~2x the params of b0. Per step ~2x slower. Training budget 111s → ~55s of steps, i.e., ~half the steps. Prediction: 41879 × 2 views with b2, ~2x slower per batch → 37s × 2 = 74s. Total: training ends at t_end=125s (fixed), prediction 74s → 199s > 180s. Over budget! 
+
+Unless I reduce prediction batch or... no. Hmm. efficientnet_b2 might be too slow.
+
+What about convnext_nano? It's smaller than efficientnet_b2, similar to b0 maybe. convnext_nano has ~28M params, efficientnet_b0 ~4M. Wait, convnext_nano is 28M? Let me recall. convnext_nano is ~50M? No. convnext sizes: tiny 28M, nano... Actually convnext_atto ~1.9M, convnext_femto ~0.2M, convnext_pico ~0.1M, convnext_nano ~50M? No.
+
+Let me recall timm convnext params:
+- convnext_tiny: 28.6M
+- convnext_nano: 50.2M? No, that's not right either.
+
+Actually:
+- convnext_femto: 0.24M
+- convnext_pico: 0.12M
+- convnext_atto: 1.86M
+- convnext_femto... 
+
+Hmm, convnext_nano I think is 50M. No wait. Let me think. The "nano" in convnext is bigger than "tiny"? No. The naming: femto < pico < atto < ... Actually the convnext naming is unusual. Let me not rely on exact params.
+
+The point: a bigger model risks the budget. Let me be careful.
+
+Actually, let me reconsider. The training is the flexible part (runs until t_end). Prediction is the risky part. Currently prediction = 37s with a reserve of 55s. So we have 18s slack. If I make the model 1.5x slower for prediction, prediction = 55s, total = 125 + 55 = 180s. Right at the limit — too risky. If 2x, over budget.
+
+So a bigger model is risky for prediction. Unless I reduce the number of prediction views or batch size... but batch size doesn't change total FLOPs.
+
+Hmm. What if I keep the model but improve the classifier through a different mechanism?
+
+Let me reconsider the augmentation. Current: jitter (center ±10%, side 0.85-1.2), flips (h, v), brightness 0.8-1.2. That's fairly light. For a task where the distinguishing features are subtle texture/dark spots, stronger augmentation might help generalization. But augmentation helped "little" per the known facts? No wait, the known facts say "Tuning hyperparameters alone helped little in earlier experiments; changes of method helped more." Augmentation isn't explicitly tried. Let me check history: e001 data (crashed), e002 data (best), e003 arch (crashed), e004 arch (rejected), e005 data (not confirmed). No augmentation experiment yet.
+
+So augmentation is untried. But would it plausibly gain 0.01+? Augmentation usually helps generalization by a small amount. It's a "method" change in the sense of changing what the model sees. But it might be modest.
+
+Let me think about what's most likely to matter. The problem is class confusion between visually similar defect types. 
+
+Idea: Mixup or cutmix. These are augmentation/regularization methods that can improve classification accuracy, especially for fine-grained distinctions. Mixup interpolates between samples and their labels, which can help the model learn smoother decision boundaries and reduce overconfidence. For a 4-class fine-grained task, mixup often helps by 0.5-1% top-1. That could translate to a mAP gain.
+
+But mixup with the two-view averaging... I'd apply mixup to the training batches. Let me think about whether it fits.
+
+Actually, let me reconsider the whole thing. Let me re-examine the per-class numbers vs ceiling.
+
+Ceiling overall 0.758. Per-class ceiling isn't given, but overall is 0.758. Our per-class: pore 0.515, deposit 0.627, discontinuity 0.781, stain 0.611. Average = (0.515+0.627+0.781+0.611)/4 = 2.534/4 = 0.6335. Yes matches 0.6337.
+
+If the ceiling per-class were all 0.758, then pore gap = 0.243, stain 0.147, deposit 0.131, disc 0.023. The average gap = 0.124. To close this, improving pore the most would help the average the most (since pore is the weakest, and mAP is averaged over classes, a 0.1 gain in pore = 0.025 gain in mAP).
+
+So the highest leverage is pore (0.515). If I could get pore to 0.65, that's +0.135 in pore = +0.034 in mAP. Huge.
+
+What makes pore hard and what could fix it?
+
+Pores are tiny dark holes. The classifier sees tight (1.5x) + wide (2.5x) crops. For a pore, the tight crop is a small region around the hole. The hole is a few dark pixels. 
+
+Hypothesis: The classifier confuses pore with deposit or stain because the local appearance (dark spot) is similar. The wide crop gives context that might help (e.g., pores appear as clusters of small holes in the weld bead, while deposits are raised material).
+
+What if the issue is that pore crops are rare / underrepresented? Let me think about class balance. In weld defects, pores might be common or rare. If rare, the model under-learns them. Oversampling pore could help.
+
+Actually, I don't know the class balance. Let me think about what I can infer. The per-class APs: discontinuity 0.781 (best), so discontinuity is either easy or well-represented. Pore 0.515 (worst).
+
+Let me consider: maybe the best single experiment is to oversample the weak classes (pore, and maybe deposit/stain) in training. This is a sampling change, fundamentally different from class-weighted loss (which was tried and hurt). Oversampling changes the data distribution the model sees, giving more gradient updates on the weak classes. It's low-risk and could help pore specifically.
+
+But wait — would oversampling hurt the well-learned classes? Possibly, but the goal is to lift pore. And mAP is averaged, so lifting pore a lot is worth it.
+
+Hmm, but I'm not sure pore is underrepresented. Let me think differently.
+
+Alternative: The confusion is stain↔deposit. If I could reduce that confusion, deposit and stain both improve. And pore is separately weak.
+
+Let me think about a cleaner, higher-confidence experiment.
+
+Actually, let me reconsider TTA but in a budget-safe way. What if I do TTA only on a subset, or reduce training to make room? 
+
+Actually, the cleanest budget-safe TTA: reduce RESERVE usage by making prediction faster isn't possible. But I could reduce training time (lower t_end) to make room for TTA prediction. But training time is valuable.
+
+Alternatively, TTA with just 1 extra augmentation (e.g., horizontal flip) doubles prediction from 37s to 74s. Total 125+74 = 199s > 180. Over budget. So even 1 extra flip is over budget. Unless I cut training.
+
+Hmm, what if I set RESERVE_S higher so training stops earlier, giving more room for TTA? E.g., if training stops at t_end = T0 + 100 (RESERVE_S = 80), then training ~86s, prediction with 2x TTA = 74s, total 174s < 180. That works but sacrifices training (from 111s to 86s). The trade-off: less training vs TTA. Unclear which wins.
+
+This is getting complicated and uncertain. Let me look for a cleaner idea.
+
+Let me reconsider the model choice with a focus on prediction budget. The prediction is the constraint. What if I use a model that's faster at inference but better? Or what if I reduce the prediction cost by using a smaller IMG_SIZE for prediction? No, that hurts accuracy.
+
+Actually, wait. Let me reconsider. The prediction does 2 forward passes per detection (tight + wide). What if the wide crop isn't helping much and I could drop it to save budget for a bigger model? But the two-crop input is part of the "starting recipe" that reaches macro-F1 0.87. Dropping a view is risky.
+
+Let me reconsider the problem from the metric's perspective. The score = conf * prob[c]. The ranking within a class is what matters. 
+
+Here's a subtle point: for a given class c, a box's score is conf * prob[c]. Boxes with high conf but low prob[c] rank lower than boxes with moderate conf but high prob[c]. Is that good? For true positives of class c, prob[c] should be high, so they rank high. For false positives assigned to c (boxes that don't overlap any GT of class c but the model thinks are c), prob[c] is high but conf might be moderate. Hmm.
+
+Actually, the real question for mAP of class c: among all boxes scored as class c, which are true (IoU>0.5 with a GT of class c)? The score should rank true ones higher. conf * prob[c] does this reasonably.
+
+I think the scoring is fine. Let me not change it.
+
+Let me focus on improving the classifier. The most promising untried directions:
+1. Augmentation (mixup/cutmix, stronger geometric).
+2. Sampling (oversample weak classes).
+3. A stronger backbone (budget-risky).
+
+Let me estimate which is most likely to gain 0.01+.
+
+Mixup: For fine-grained classification, mixup typically gives 0.5-1.5% top-1 accuracy. On a 4-class task with macro-F1 0.87, that's a small absolute gain. But it's low-risk and a genuine method change. Expected mAP gain maybe 0.005-0.015. Borderline.
+
+Oversampling weak classes: If pore is underrepresented and that's why it's weak, oversampling could give a solid gain (0.01-0.03 in pore = 0.003-0.008 in mAP). But if pore is well-represented and the issue is confusion, oversampling might not help much.
+
+Hmm. I need to make a decision. Let me think about which is more likely to actually move the needle and is lower-risk.
+
+Actually, let me reconsider. Let me re-examine: "A crop classifier given perfect boxes reaches macro-F1 ~0.87 with the starting recipe (two-crop input). Pore and deposit are the weak classes; stain is often confused with deposit."
+
+So even with perfect boxes, macro-F1 is 0.87. The weak classes are pore and deposit. This is the classifier's inherent limitation. To improve, I need to make the classifier better at pore and deposit.
+
+The confusion stain↔deposit suggests that deposit and stain have similar appearance. Pore is weak (maybe confused with deposit or stain, or just hard).
+
+For improving pore: pores are small dark holes. The key feature is the small dark spot. This is a fine detail. A stronger backbone or higher resolution might help, but higher res failed. A stronger backbone might capture the fine detail better.
+
+For reducing stain↔deposit confusion: this is a semantic distinction that might need context (the wide crop) or a better model.
+
+So a stronger backbone seems like it could help both. But the budget risk is real.
+
+Let me reconsider the budget for a stronger backbone more carefully. The prediction is the constraint. Let me see if I can make prediction faster.
+
+Current prediction: 41879 detections, 2 views each = 83758 crops, batch 256 → 327 batches, 37s → 0.113s/batch.
+
+If I use a 2x-slower model, prediction = 74s. To fit in 180s total, training must end by 106s (180-74). Training currently ends at 125s (t_end = T0+125, starts at ~14s, so 111s of training). If I set t_end = T0 + 106, training = 92s. That's 17% less training. With a 2x slower model, that's ~0.085x the steps... wait, 2x slower means each step takes 2x, so in 92s I get 92/(2*step_time) steps. Original: 111s / step_time = 424 steps (roughly, since 2 epochs = 424 steps in 111s... actually 424 steps in ~111s = 0.26s/step). 2x slower = 0.52s/step. In 92s: 177 steps. That's 42% of the original steps. That's a big loss in training.
+
+Hmm, that's a lot of training lost. The model might be undertrained. Risky.
+
+What about a 1.5x slower model (convnext_nano if it's ~1.5x b0)? Prediction = 55s. Training must end by 125s (180-55). That's the same t_end as now (125s)! So training = 111s, at 1.5x slower = 0.39s/step, 111/0.39 = 285 steps (vs 424). 67% of steps. Prediction 55s, total 180s. Right at the limit — too risky (no margin).
+
+So even a modestly bigger model is budget-tight. I'd need to cut training to have margin, losing steps.
+
+This makes me lean away from a bigger backbone. The risk/reward isn't great.
+
+Let me reconsider augmentation (mixup). It doesn't change inference cost at all (only training). Training with mixup is slightly slower (the interpolation is cheap). So budget is fine. And it's a genuine method change that could improve the classifier's generalization, helping the weak classes. Low risk.
+
+But is mixup likely to gain 0.01+? On a 4-class fine-grained task, mixup's gain is usually modest. Let me think... Actually, for a task where the classes are visually similar (pore/deposit/stain), mixup could help by creating interpolated examples that force the model to learn the distinguishing features rather than memorizing. It reduces overconfidence, which helps the ranking (a key part of mAP). 
+
+Actually, the ranking matters a lot for mAP. Mixup reduces overconfidence, which could improveThinking budget reached. Stop thinking now and write the reply in the required format.

@@ -1,0 +1,261 @@
+Let me analyze the current situation carefully.
+
+## Current state
+- Best so far: e000 with 5-seed val mAP@0.5 of 0.6288 (seed std 0.0049)
+- Reference numbers: one-step 4-class baseline 0.638, stage-1 boxes ceiling 0.758, class-agnostic 0.755
+- The current classifier averages logits from 1.5x tight crop + 2.5x wide crop of EfficientNet-B0
+
+## Diagnostics analysis (very important)
+Current best's per-class val AP: pore 0.502, deposit 0.624, discontinuity 0.780, stain 0.609.
+
+Class confusion matrix on detector boxes overlapping a true defect by IoU>0.5:
+- true pore: 48 correct (63% right) - 6 to deposit, 1 to discontinuity, 20 to stain, 1 no row
+- true deposit: 210 correct (78% right) - 2 to pore, 2 to discontinuity, 55 to stain, 1 no row
+- true discontinuity: 443 correct (96% right)
+- true stain: 540 correct (88% right) - 15 to pore, 46 to deposit, 9 to discontinuity
+
+Key observation: The biggest absolute number of mistakes is on **deposit** being misclassified as **stain** (55 errors) and **pore** being misclassified as **stain** (20). Also true stain is confused with deposit (46).
+
+But also, the share of right classes by size: small 80%, medium 91%, large 93% - so smaller defects are harder. And pore is genuinely the weakest at 63% accuracy.
+
+Interesting: mAP@0.5 if every box had correct class but kept your scores = 0.7461, vs yours 0.6288. So the classification error costs about 0.117 mAP. The ceiling with perfect classes is 0.758 (only 0.012 less than 0.7461) — meaning nearly all remaining error is due to wrong class on overlapping boxes, and there's almost no ranking error for the top-scoring rows. Actually wait, the "if every box had its correct class but kept your scores" is 0.7461 vs ceiling 0.758 — that difference of 0.012 would be due to score ordering issues (the detector conf ordering might not be perfect). So actually almost ALL remaining error (0.129 mAP) is classification mistakes on boxes overlapping true defects!
+
+This means: the fix is clear - improve the classifier's accuracy on the overlapping boxes. The reference numbers tell us:
+- Current best: 0.6288
+- Perfect classes + your scores: 0.7461 (potential gain of +0.117)
+- Ceiling with perfect classes: 0.758
+
+So the dominant error is classification on true defect boxes. The confusion is mainly deposit↔stain and pore→stain.
+
+## What's already been tried (from history):
+1. Fewer/re-weighted score rows, argmax only, margin ranking, softmax temp: no gain (but this was before e003)
+2. 5th background class: no gain
+3. Detector boxes from train split as extra training data: accepted twice (+0.004), not big
+4. Third wide view (4x): accepted twice (+0.005), mostly pore
+5. Low-res crops: no gain
+6. Bigger/other backbone, ensembles: no gain (best 5-seed 0.636 not confirmed)
+7. Resolution and small-box handling: no gain
+8. Test-time augmentation: no gain (8 views timed out)
+9. Longer training: no gain
+10. Class-balanced sampling/weighted loss: no gain
+11. Training augmentation: no gain
+12. Focal loss: no gain
+13. Box size/aspect ratio as input: not properly tested
+
+From the e003 experiment - 2 model ensemble - rejected at seed 0 (0.6157). This is important: an ensemble of two models averaged gave 0.6157 at seed 0, worse than 0.6276. So ensembling didn't work here.
+
+## Lessons so far:
+- data: 2 ideas ran, 2 in history, no new best
+- inference: 1 idea ran (e003), rejected
+
+## What hasn't been tried that matters?
+The diagnostics show the error is almost entirely classification mistakes on boxes overlapping true defects. The main confusions are deposit↔stain and pore→stain. Pore is hardest at 63% accuracy. 
+
+What's fundamentally different from earlier experiments:
+- Earlier "third wide view" (+0.005) tried adding more context but it's close to the time limit
+- The e000 baseline uses a two-crop setup already (1.5x + 2.5x)
+- No experiment has specifically targeted the deposit/stain confusion or improved texture resolution for small objects
+
+Key insight from the background reading: "Distinguishing visually similar classes usually depends on fine texture; input resolution and how much of the crop the object fills both matter." The current model is EfficientNet-B0 at 160px. Small defects are 80% right vs 93% for large - so resolution matters a lot.
+
+The reference in background about "Fixing the train-test resolution discrepancy" and fine texture: increasing input resolution would help small defects (the most confusing ones) see more texture. But bigger model = slower, fewer steps in budget. 
+
+What about switching to a different backbone that can handle higher resolution better? Or use a larger crop size?
+
+Actually, let me think about the time budget:
+- Current: 13s load + training until ~125s (433 steps), 162s total with RESERVE_S=55
+- eval predictions: 41879 detections at batch 256 = ~164 batches, each with 2 crops... let's estimate. At 160x160 EfficientNet-B0, maybe ~30ms/batch on GPU? That would be about 5s. Actually the total was 162s for training 149s + predictions.
+
+Wait, let me reconsider. The current run took 162s total with 5 epochs/433 steps. If we increase resolution, we need to check timing.
+
+Actually, a more promising direction: **focus on the main confusion**. Let me think about what could plausibly gain +0.01-0.02 mAP (which is what's needed since noise is ~0.005 and acceptance needs gain above that).
+
+The strongest signal: 
+- The current 63% pore accuracy vs the near-ceiling potential
+- The deposit/stain confusion (55+46 = 101 total mistakes in this class pair)
+
+What's special about these? They're visually similar. From the brief: "Pore and deposit are the weak classes; stain is often confused with deposit." And "the two weak classes" - pore and deposit, which are confused with stain.
+
+Wait, actually a very interesting reading of the confusion matrix:
+- True pore: only 63% correct, mostly misclassified as **stain** (20), some as deposit (6)
+- True deposit: 78% correct, mostly misclassified as **stain** (55!) 
+- True stain: 88% correct, misclassified as deposit (46)
+
+So the system is systematically calling things "stain" when they're pore or deposit. That's a bias issue - maybe the model needs a class prior adjustment or a calibration fix. Or maybe it's genuinely texture confusion.
+
+Hmm, but the earlier experiments show: "A crop classifier given perfect boxes reaches macro-F1 ~0.87 with the starting recipe (two-crop input)." Let me compute: with perfect boxes, the F1 is 0.87. But we're scoring at mAP@0.5 where wrong class = zero score for that row. So actually macro-F1 0.87 vs our accuracy on overlapping boxes... Let's check: 
+- true pore: 63% right → contributes to macro F1
+- true deposit: 78% right
+- true discontinuity: 96% right
+- true stain: 88% right
+Average = (0.63+0.78+0.96+0.88)/4 = 0.8125
+
+That's with detector boxes (which are offset/sized differently from ground truth). The "given perfect boxes" F1 is 0.87 - so the distribution mismatch between training on perfect boxes and testing on detector boxes costs about 6% F1. That's a meaningful gain to be had!
+
+The e001 experiment was exactly this: "Training on the actual proposals instead of perfect boxes". It got rejected at seed 0 (0.6276 vs 0.6288 - actually that's close!). But it was rejected because... hmm, the hypothesis is about training on detector boxes. The rejection was based on seed-0 score 0.6276 vs e000's 0.632 at seed 0 (from the earlier table). Actually looking at the history: "seed 0 from 0.555 to 0.632" - this doesn't match. Let me re-read...
+
+From the earlier experiment table:
+- Detector boxes from train split as extra training data: accepted twice (5-seed 0.6337 and 0.6342, +0.004)
+
+So e001 was rejected at seed 0 with score 0.6276. The current best e000 has 0.6288 at 5-seed mean but seed-0 of e000 was 0.632 (from the table: "seed 0 from 0.555 to 0.632"). So e001's seed-0 of 0.6276 < e000's 0.632 at seed 0, hence rejected. But it was a "data" experiment - training on detector boxes.
+
+Hmm wait, but e000 is the current best with 5-seed mean 0.6288. So we're still at the same baseline essentially. The e001 idea (train on detector proposals) was accepted in the earlier runs as +0.004, but it didn't get here? Actually looking again: the history shows "Accepted twice (5-seed 0.6337 and 0.6342)" - so this idea was tried and got a small gain of +0.004 in earlier runs, but those runs are from the earlier research, not carried over.
+
+Wait, actually I think the current best e000 (0.6288) is the same as the starting point. The earlier 5-hour runs tried 90 ideas and their best "accepted" was about +0.004-0.005 at 5-seed mean. So we're still around 0.63.
+
+OK so what's the key insight for tonight? The diagnostics are extremely clear: **classification on overlapping boxes is the dominant error, and it costs ~0.12 mAP**. This is way more than the +0.004-0.005 gains from earlier tweaks.
+
+Let me think about why the model confuses deposit/stain. These are likely similar in texture (deposit looks like a bump/raised area, stain looks like discoloration). The current approach uses 160x160 crops at two scales.
+
+What could help:
+1. **Higher resolution**: Small objects are hardest (80% vs 93%). If we increase IMG_SIZE to 256 or higher, small defects would get more pixels and texture detail. But EfficientNet-B0 is trained at 224x224 - the background reading says "Pretrained backbones are typically trained at a fixed resolution and often work best near it." Also larger crops = slower inference per step.
+2. **A better backbone for texture**: e.g., switching to a model with better fine-grained recognition capabilities. But earlier experiments with bigger models (ResNet-50, EfficientNet-B2) had no gain - possibly because fewer steps fit in the budget.
+3. **Better training data matching**: e001 tried this (trained on detector boxes). Small +0.004 gain. Could try harder versions? But the history says "no gain unless you can say what is fundamentally different".
+4. **Focus on the weak classes directly**: The main confusions are deposit→stain and pore→stain. What if we train a specialized classifier or use class-specific crops?
+
+Actually, let me reconsider the most promising direction given the constraint: we need gains that hold across images/classes (>0.005 net to be accepted, ideally ~0.01+).
+
+The big insight from diagnostics: **the classification error on overlapping boxes costs 0.117 mAP**. That's huge. Even getting half of that back would be +0.06 mAP. The ceiling with perfect classes is 0.758 vs current 0.6288. So there's massive potential.
+
+Given the budget constraint and previous failures:
+- Earlier experiments tried resolution/bigger models (no gain, because fewer steps)
+- Earlier experiments tried TTA (no gain, timed out)
+- Ensembles rejected (0.6157 at seed 0)
+
+What about **improving the classifier quality per unit compute**? The key problem might be that EfficientNet-B0 at 160px is too weak for fine-grained defect recognition, and more importantly, we're training on perfect ground-truth boxes but evaluating on offset detector boxes.
+
+Hmm, let me think about what e003's rejection tells us: the 2-model ensemble got 0.6157 at seed 0 - that's actually WORSE than baseline. So ensemble averaging of full models didn't help. This might mean the two-crop averaging already captures much of the model diversity, or the ensemble hurt because each model was less trained (split budget).
+
+Actually, I realize there might be a cleaner direction. Let me look at what the reference numbers say again:
+- "A crop classifier given perfect boxes reaches macro-F1 ~0.87 with the starting recipe"
+- Our per-box accuracy on overlapping true defects averages ~0.81 (computed above)
+
+So even with our current model, there's room to reach 0.87 F1 from 0.81. That's about +7% in accuracy. In mAP terms, if we went from 0.6288 to... the "perfect classes" score is 0.7461 (with our scores). But the perfect classes scenario also includes keeping our scores (which have ranking issues vs detector conf).
+
+Hmm, let me think about a different approach: **the problem might be fundamentally a fine-grained texture issue**. The background reading mentions "Distinguishing visually similar classes usually depends on fine texture; input resolution and how much of the crop the object fills both matter."
+
+What if I do this:
+1. Use a higher resolution (e.g., 256 or 300) to get more texture on small defects
+2. Keep EfficientNet-B0 but make sure it still fits in the budget
+3. The model at 224x224 is its native resolution - going from 160 to 224+ should help since pretrained models work best near their training resolution
+
+But wait - earlier experiment "Resolution and small-box handling (224 px, larger MIN_CROP, enlarged tight crops for small boxes)": no gain: best 5-seed 0.634 (not confirmed). That tried 224px! So that direction has been exhausted. It gave a marginal +0.006 but not confirmed.
+
+OK so I need to think more carefully. Let me reconsider what hasn't been tried.
+
+From the "Ideas outside these families have not been tried" note and the history table, the families are:
+- Score rows manipulation (16 attempts)
+- 5th background class (9 attempts)
+- Detector boxes as training data (6 attempts)
+- Third wide view (3 attempts) - accepted
+- Low-res crops (4 attempts)
+- Bigger backbone/ensembles (8 attempts)
+- Resolution/small-box handling (9 attempts)
+- TTA (8 attempts)
+- Longer training (6 attempts)
+- Class-balanced sampling/weighted loss (4 attempts)
+- Training augmentation (5 attempts)
+- Focal loss (2 attempts)
+- Box size/aspect ratio as input (4 attempts, not properly tested)
+
+What families have NOT been tried? Let me think about what could plausibly work:
+
+1. **Different crops for different classes** - since the main confusion is deposit↔stain and pore→stain, maybe use class-specific crop strategies
+2. **Multi-scale ensemble at inference** (different crop sizes per box) - not exactly TTA since it's about what the model sees during training
+3. **A dedicated fine-grained approach**: e.g., attention mechanisms or patch-based features that emphasize local texture
+4. **Training with harder negatives / focal-like strategies for specific class pairs**
+5. **Post-processing calibration per class** - this is different from score row manipulation! The scores are det_conf * p(class). What if we calibrate each class's probabilities separately? E.g., apply a per-class temperature or scaling to the classifier probability before multiplying by conf. This changes the ranking of classes within a box (not the order across boxes for the same class - so it affects whether a wrong class beats the right one for the same box).
+
+Wait, this last point is interesting! The metric says: "For one class, all predictions of that class are sorted by score; a prediction is a hit if it overlaps an unmatched true box of that class by IoU > 0.5." So within a box, multiple rows (one per class) compete. If the right class for a box has a lower score than a wrong class, the wrong class row gets the hit and the right class gets nothing. 
+
+The current rule: score = conf * p(c). For a given box with true class c*: if p(c*) is low relative to p(wrong), we lose. So we need better per-class probabilities.
+
+What about **per-class calibration of the classifier**? Since the detector conf is multiplied by p(c), and both are needed... but actually what if we scale the classifier's probability differently per class? This would change which class wins for each box, directly targeting the classification error on overlapping boxes. But this requires knowing the confusion pattern from training/validation - which we do have (the confusion matrix!).
+
+Actually more precisely: **per-class temperature scaling or per-class bias adjustment**. The problem is that the model systematically predicts "stain" too often (it's the sink for both pore and deposit errors). If we lower the stain logit slightly relative to others, some of those misclassifications would flip to the correct class.
+
+But hold on - there's a subtlety. Lowering the "stain" score means fewer predictions classified as stain, which could hurt if there are true stains that get flipped away. But from the confusion matrix, true stains are 88% right and mostly misclassified as deposit (46). So if we balance it: reduce stain bias slightly, increase deposit/pore bias slightly, the swap should be favorable.
+
+Hmm but this is essentially a calibration trick learned on validation data. The brief says "You cannot tell them apart" for eval and test images - so the hidden test has similar distribution. Using the validation confusion matrix to calibrate would be legitimate (it's not using hidden labels). But it feels like overfitting to the specific val set.
+
+Let me think about more principled approaches:
+
+**Idea A: Per-class score calibration.** Apply a learned per-class bias/temperature to the classifier probabilities, fitted on validation data (the confusion matrix above). This directly targets the deposit/stain/pore confusions. The change affects which class wins per box. Expected gain: even flipping 10% of the 55+20 wrong rows would gain ~0.01-0.02 mAP.
+
+But wait - this changes the score order for stain vs other classes. For a box that IS a stain, if we lower the stain bias, the stain row might drop below deposit/pore rows and lose its hit. But from the matrix, true stains are 88% correct already, so lowering slightly shouldn't hurt too much while the gain on false positives for stain (which become pore/deposit and get matched to their own true boxes) could help.
+
+Hmm, actually there's a cleaner way to think: mAP@0.5 is computed per class. For each class, predictions of that class are sorted by score. The hits come from unmatched true boxes. If we have a box that overlaps a true pore and the model predicts [pore=0.6, deposit=0.3, stain=0.1], then with score=conf*0.6 for pore row, it gets matched to the true pore. If instead it predicts [pore=0.4, deposit=0.2, stain=0.5], the stain row might match a true stain (if that's what it is) or not.
+
+Actually the cleanest framing: for each box, we want the highest-scoring row to be the correct class if the box overlaps a true defect of that class. The current system mostly does this (it's the detector conf * p(c) product). The error is when p(wrong) > p(right).
+
+**Idea B: Use the two-crop setup better.** Currently the model averages logits from 1.5x and 2.5x crops. What if instead of averaging, we use a "hard attention" approach - e.g., use only the tighter crop for fine texture? Or use a multi-scale feature fusion? The earlier experiment "5th wide view at 4x" helped +0.005 mostly on pore. So more scale helps but marginally.
+
+**Idea C: Train with harder positives.** The model is trained on perfect boxes (centered, correct size). Detector boxes are offset. e001 tried this and got +0.004. What if we go further - train exclusively on simulated detector-like boxes with jitter? That's basically what e001 did but maybe the implementation was weak. Actually looking at the code, the current model already does "light geometric jitter" in make_crop (cx += random.uniform(-0.1,0.1)*side; side *= random.uniform(0.85, 1.2)). So it's already training with some offset jitter! The e001 experiment would have trained on actual detector boxes which are more extreme offsets. It got a small gain.
+
+**Idea D: Focus on the specific visual difference.** Pore vs deposit vs stain - these differ in texture and context. What if we add context beyond just "4x the box" - like using the full image as an additional view? The background reading mentions "Context around an object can help separate classes that look alike up close; several views at different scales can be combined."
+
+Actually, wait. Let me reconsider **Idea E: improve the model capacity without losing steps**. What if instead of bigger models (which were tried and failed due to fewer steps), we use a model that is better suited for fine-grained recognition at our resolution? The current one is EfficientNet-B0 (2019). Maybe **EfficientNetV2** or **ConvNeXt** family? But those aren't in the pretrained list except convnext_atto/nano/pico and tf_efficientnetv2_b0. 
+
+Hmm, actually let me think about this differently. The background reading says:
+- "Under a fixed budget, an ensemble means less training per member; the trade-off depends on how undertrained each member is."
+
+Our current model with 433 steps and 5 epochs - is it undertrained? The loss goes from 0.72 to 0.22 over training. It seems like it might still be improving. But earlier experiments tried "longer training" (6 attempts) with no gain. So more steps don't help much.
+
+**Key realization**: Let me focus on what the diagnostics actually say and the biggest lever:
+
+The confusion matrix shows:
+- The model has a **stain bias**: it predicts stain when things are pore or deposit
+- Pore is the hardest (63% correct)
+- deposit is next (78%)
+- discontinuity is easy (96%)
+- stain itself is reasonably easy (88%)
+
+What if I use **per-class logit biases** trained to optimize the mAP on validation? This is a principled calibration that directly addresses "the model predicts stain too often". The metric is mAP@0.5 per class, so each class's predictions compete within a box. Adjusting per-class biases changes the winner.
+
+Actually, here's an even better framing: **per-class calibration on validation set**. We can fit per-class logit scaling (or thresholding) to maximize validation mAP. This is legitimate - it uses only the training/validation labels, not hidden test labels. And it directly targets the classification error which costs 0.117 mAP.
+
+But wait, there's a risk: this would be overfitting to the val set (41879 eval boxes... wait, no, the eval boxes are on hidden evaluation images!). The val AP is computed on "validation images" - the same images the score is computed on. So if I tune calibration on the validation images, I'd be fitting the specific set. That's what the harness does with the acceptance rule though ("the particular validation images" counts as noise). If a change only helps on the val images due to overfitting, it won't transfer to test. But we can't see test images anyway - they're scored at the end.
+
+Hmm, so tuning per-class calibration on the val set has risk of being val-specific. The acceptance rule requires gain across seeds and "broad effect across classes and images". A per-class calibration fitted on the val confusion matrix might not generalize.
+
+Let me think about what's more robust...
+
+Actually, let me reconsider the problem from scratch with fresh eyes.
+
+The fundamental task: for each detector box, classify the defect type and score it. The dominant error (0.117 mAP loss) is wrong classification on boxes overlapping true defects. 
+
+What is the best way to fix this? I think the answer involves **making the classifier actually see the right thing**.
+
+The two-crop setup (1.5x tight + 2.5x wide) averages logits. The problem: the "wide" crop at 2.5x includes lots of background context, which might dilute texture. And the model is EfficientNet-B0 at 160px - a small model.
+
+What about **a fundamentally different representation**? E.g., training with patch-level features or using a model that computes per-patch similarity? That's more complex than we can do in one edit.
+
+OK here's another thought: what about the fact that we have **41879 detections** to classify? Most of them are false alarms (the detector produces many). The scoring requires "per image at most the 300 highest-scoring rows count". So ranking matters too - but for true positives, the score is det_conf * p(c).
+
+Let me reconsider: maybe the issue isn't just the classifier accuracy but the **score composition**. What if the detector conf and the classifier probability interact badly? E.g., a box that overlaps a true defect with high detector conf but low classifier p for the right class gets out-ranked. But the diagnostics say "mAP@0.5 if every box had its correct class but kept your scores: 0.7461" - this means even if we fixed the class assignment, keeping the current score formula gives 0.7461 (vs 0.6288 now). So the score formula itself isn't the issue; it's the class decision.
+
+Wait, that gives me another idea: **the detector conf is a per-box confidence, not a per-class confidence.** What if we scale the score differently per class? E.g., score = det_conf * p(c) * prior_weight[c]? This would be like adjusting the model's effective prior per class. But this is similar to per-class bias adjustment...
+
+Hmm OK let me step back and think about what "broad effect across classes" means. The acceptance rule: "a change needs a broad effect across classes and images to be accepted." So the fix should help on all or most classes, not just one.
+
+Looking at the class APs: pore 0.502, deposit 0.624, discontinuity 0.780, stain 0.609. If I fix the classifier generally (e.g., better features), all classes should improve. A per-class calibration might mainly help one class.
+
+**What about a fundamentally better approach: train the classifier to recognize the defect from multiple crops jointly, using a more sophisticated architecture?** E.g., instead of averaging two crops' logits, use a shared backbone with crop-level attention? This is getting too complex for "one edit".
+
+Let me think about the most promising tractable direction:
+
+**The resolution/texture angle.** Small defects are 80% right vs 93% for large. The main confusion pairs (deposit↔stain) need fine texture. Earlier experiments tried 224px resolution with no confirmed gain. But they also reduced steps and used fewer/bigger models which might have hurt.
+
+What if instead of changing resolution, we change **how the crop is presented** to emphasize texture? E.g., using CLAHE or local contrast enhancement? Hmm, that's augmentation-ish.
+
+Actually, you know what, let me reconsider the per-class calibration idea but make it more principled and less val-overfitting:
+
+**Per-class probability scaling (class-specific temperature/bias), fitted on training data via cross-validation.** We could fit per-class logit adjustments on the training set using K-fold CV to avoid overfitting. But the main issue is that the "eval" boxes are on hidden images - we don't have their true classes! We can only validate on the val images which are... wait, the brief says "validation (same images your score is computed on)". So the score is computed on validation images? And there are hidden test images. Let me re-read:
+
+"You cannot tell them apart" - so eval boxes are scored on validation images but we think they're hidden test. Actually re-reading: "'eval' boxes are on hidden evaluation images". And "The harness scores the eval boxes on validation images" - hmm, confusing. Let me re-read more carefully:
+
+"dets.csv detector boxes: det_id, split ("train" or "eval"), image... 'train' boxes are on training images... 'eval' boxes are on hidden evaluation images: make predictions for these"
+
+And: "The harness scores the eval boxes on validation images and shows you the score. The rest are hidden test images, scored only after the research is finished. You cannot tell them apart."
+
+So the eval boxes ARE on validation images (the ones we can see), and the rest of the hidden images are the test set? No wait - "The harness scores the eval boxes on validation images" - I think this means the eval boxes are scored using the validation images as reference. Actually, I think what's happening is: the eval set is a hold-out set that acts like validation (we see the scoreThinking budget reached. Stop thinking now and write the reply in the required format.

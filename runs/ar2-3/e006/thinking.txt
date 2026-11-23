@@ -1,0 +1,804 @@
+===== attempt 1 =====
+Let me analyze the situation carefully.
+
+Current best: e000 with 5-seed val mAP@0.5 = 0.6311
+
+Key observations:
+1. The baseline one-step 4-class detector gets 0.638 mAP@0.5
+2. Stage-1 boxes with perfect classes get 0.758 mAP@0.5 (ceiling)
+3. Stage-1 boxes scored as single class 'defect' get 0.755 mAP@0.5
+4. Current best (e000) gets 0.6311 - below the one-step baseline
+
+The per-class AP: pore 0.506, deposit 0.630, discontinuity 0.780, stain 0.608
+
+What's been tried:
+- e001: Training on detector boxes with background class - crashed
+- e002: Fixed e001 crash - 0.5172 (rejected, much worse)
+- e003: Including low-res crops - 0.6251 (rejected, slightly worse)
+- e004: Squaring class probability - 0.6161 (rejected)
+- e005: Training on detector boxes overlapping GT (IoU>0.5) - 0.6248 (rejected)
+
+Key insights from the brief:
+- "A crop classifier given perfect boxes reaches macro-F1 ~0.87 with the starting recipe (two-crop input). Pore and deposit are the weak classes; stain is often confused with deposit and background."
+- "Tuning hyperparameters alone helped little in earlier experiments; changes of method helped more."
+- "Class-weighted loss hurt classification every time it was tried."
+- "mAP@0.5 rewards, per class: (a) the right class on boxes that overlap a true defect, and (b) good ranking: true detections should score higher than false ones."
+- "Detector boxes include false alarms (background) and slightly misplaced boxes; the starting classifier was trained only on perfect boxes and has no notion of 'not a defect'."
+- "Several rows per box (one per class) are allowed and often help."
+
+The fact that e002 (training on detector boxes with background) got 0.5172 is very concerning - that's much worse. But e005 (training on detector boxes overlapping GT, no background) got 0.6248, which is close to e000's 0.6311 but slightly worse.
+
+Wait, let me re-read e002. It got 0.5172 which is way below. The hypothesis was about adding a background class. But the issue might be that the IoU>0.5 threshold for matching was too strict, or the background class was too dominant, or there was some other issue.
+
+Let me think about what could help:
+
+1. The score formula is `conf * p[c]`. The problem is that for background boxes, all class probabilities might be moderate (like 0.25 each), so the scores aren't well-separated. The detector conf helps but maybe not enough.
+
+2. The key issue: the classifier was trained only on true boxes (no background). So when it sees a background crop, it still assigns probabilities to the 4 classes. The ranking between true and false detections depends on the detector conf and the classifier probabilities.
+
+3. One idea that hasn't been tried: using a softmax temperature or calibration. But that's similar to e004 (squaring).
+
+4. Another idea: the two-crop approach averages logits. What if we use a different architecture or a different combination?
+
+5. What about using the detector confidence more cleverly? Currently score = conf * p[c]. What if we use conf^alpha * p[c]^beta for some alpha, beta?
+
+6. What about test-time augmentation? The brief mentions it as in scope.
+
+7. What about a different scoring approach? Instead of conf * p[c], what about using the margin (p[c] - max of other p's) or something?
+
+Actually, let me think more carefully. The mAP@0.5 metric:
+- For each class, we need to rank detections so that true positives come before false positives
+- A detection is a true positive if it overlaps (IoU > 0.5) with a ground truth box of the same class
+- The score determines the ranking
+
+Current approach: score = conf * p[c] for each class c.
+
+The problem: for a background box, p[c] might be around 0.2-0.3 for each class (since the model was trained only on defects). So the score for a background box might be conf * 0.25. For a true defect, the score might be conf * 0.7. So the ranking should work... but the issue is that the detector conf for background boxes might be similar to defect boxes.
+
+Wait, actually the key insight from the brief: "stage-1 boxes scored as a single class 'defect': 0.755 mAP@0.5". This means if we just use the detector conf as the score for a single class, we get 0.755. The 4-class baseline gets 0.638. So the multi-class assignment is hurting us a lot!
+
+The issue is: when we assign 4 rows per box (one per class), we're creating 4x more predictions. For a true pore, we output 4 rows: (pore, high score), (deposit, low score), (discontinuity, low score), (stain, low score). The low-score rows for the wrong classes become false positives for those classes.
+
+Wait, but that's how it's supposed to work. The mAP calculation should handle this - the low-score rows for wrong classes would be ranked low and would only become false positives if there aren't enough true positives above them.
+
+Actually, let me reconsider. The problem might be more subtle. With 4 rows per box, we have 4 * 41879 = ~167K predictions. For each class, we're ranking all predictions of that class. The false positives for class c include:
+- All true defects of other classes that have a non-zero score for class c
+- All background boxes that have a non-zero score for class c
+
+If the classifier is not very confident (p ~ 0.3 for the correct class, 0.23 for others), then the false positive scores are close to the true positive scores, which hurts the ranking.
+
+One idea: instead of outputting all 4 classes, only output the top-1 class (or top-2) for each box. This would reduce false positives for wrong classes.
+
+But wait, the brief says "Several rows per box (one per class) are allowed and often help." So maybe the issue isn't the number of rows.
+
+Let me think about what's different between the "single class defect" score (0.755) and the 4-class score (0.631). In the single-class case, all boxes get one row with score = conf. The ranking is purely by detector confidence. In the 4-class case, the ranking is by conf * p[c], which adds noise from the classifier.
+
+If the classifier is good (macro-F1 ~0.87), then p[c] should be high for the correct class and low for others. But the issue is:
+1. For background boxes, p[c] is non-zero for all classes, creating false positives
+2. The classifier might be wrong on some boxes (13% error rate), and when it's wrong, it boosts the wrong class
+
+Actually, I think the key issue is the background boxes. The classifier was trained only on true defects, so it has no concept of "not a defect". When it sees a background crop, it still outputs probabilities summing to 1 across the 4 classes. These create false positives.
+
+The e002 experiment tried to add a background class but got 0.5172, which is terrible. Let me think about why...
+
+In e002, the training data included background boxes (detector boxes with no IoU>0.5 match to any GT). The model was trained to classify into 5 classes (4 defects + background). But the score formula was probably still conf * p[c] for the 4 defect classes. If the model learned to assign high probability to background for false boxes, then p[c] for defect classes would be low for those boxes, which should help. But the score of 0.5172 suggests something went wrong.
+
+Wait, maybe the issue is that with 5 classes, the model's probabilities for the 4 defect classes are lower overall (since they need to sum to less than 1 when background is also present). This would reduce the scores for true defects too, potentially below the MIN_SCORE threshold.
+
+Actually, looking at e002 more carefully - it got 0.5172 which is way below even the one-step baseline. This suggests a fundamental problem with the approach, not just a tuning issue.
+
+Let me think about other approaches:
+
+1. **Margin-based scoring**: Instead of conf * p[c], use conf * (p[c] - mean(p)) or conf * (p[c] - max_{c'≠c} p[c']). This would better separate true from false.
+
+2. **Top-1 only**: Only output the top-1 class for each box. This reduces false positives for wrong classes.
+
+3. **Confidence thresholding**: Only output a row if p[c] > some threshold.
+
+4. **Different architecture**: Try a different backbone.
+
+5. **Test-time augmentation**: Average predictions over multiple crops (different sizes, flips).
+
+6. **Ensemble**: Train multiple models and average.
+
+Let me focus on what's most likely to help. The brief says "changes of method helped more" than hyperparameter tuning.
+
+I think the most promising direction is improving the scoring function. The current score = conf * p[c] is a simple product. The issue is:
+- For background boxes, p[c] is non-zero (maybe 0.2-0.3), creating false positives
+- The ranking between true and false depends on both conf and p[c]
+
+What if we use a different scoring function? For example:
+- score = conf * p[c] * (1 - p_bg) where p_bg is estimated somehow
+- score = conf * (p[c] - p_bg) where p_bg is the minimum class probability
+- score = conf * p[c] / sum(p) (but p already sums to 1, so this is just conf * p[c])
+
+Actually, since p sums to 1, p[c] / sum(p) = p[c]. So that doesn't help.
+
+What about using the margin? score = conf * max(0, p[c] - mean_{c'≠c} p[c'])?
+
+Or what about: score = conf * p[c]^2 / (p[c] + (1-p[c])/3)? This is a form of calibration.
+
+Actually, let me think about this differently. The problem is that the classifier doesn't know about background. So for a background box, it outputs something like [0.25, 0.25, 0.25, 0.25] (uniform). For a true pore, it outputs [0.7, 0.1, 0.1, 0.1]. 
+
+The score for a background box for class 0: conf * 0.25
+The score for a true pore box for class 0: conf * 0.7
+
+If the detector conf is similar for both, the true pore should rank higher. But the issue is that there are many more background boxes than true defects, so even with lower scores, they can accumulate and hurt the AP.
+
+One approach: use a higher power of p[c]. We tried p^2 (e004) and it got worse (0.6161 vs 0.6311). So that's not the direction.
+
+What about using the log-odds? score = conf * sigmoid(logit[c] - mean(logit))?
+
+Or what about a different approach entirely: instead of using the classifier probability directly, use it as a re-ranking factor. The detector conf already provides a good ranking (0.755 as single class). The classifier should only adjust the ranking slightly.
+
+What if score = conf * (0.5 + 0.5 * p[c])? This would keep the detector ranking mostly intact while using the classifier as a mild re-ranker. For background boxes, p[c] ~ 0.25, so score = conf * 0.625. For true defects, p[c] ~ 0.7, so score = conf * 0.85. The ratio is 0.85/0.625 = 1.36, compared to 0.7/0.25 = 2.8 for the raw product. This compresses the range and keeps the detector ranking more intact.
+
+Actually wait, I need to think about this more carefully. The mAP metric cares about the ranking within each class. For class c:
+- True positives: boxes that overlap GT of class c
+- False positives: all other boxes
+
+The score for a true positive of class c: conf * p[c] (where p[c] is high, say 0.7)
+The score for a false positive (background) for class c: conf * p[c] (where p[c] is low, say 0.25)
+The score for a false positive (wrong class) for class c: conf * p[c] (where p[c] is low, say 0.1)
+
+The ranking is determined by these scores. If the detector conf is well-calibrated (higher for true defects), then the product should work. But if the detector conf is noisy, the classifier probability adds noise too.
+
+The fact that single-class (just conf) gets 0.755 while 4-class (conf * p[c]) gets 0.631 suggests that the classifier is adding more noise than signal. The classifier's macro-F1 is 0.87, which means 13% of the time it's wrong. When it's wrong, it boosts the wrong class and suppresses the right class.
+
+Hmm, but 0.87 F1 should be good enough to help. Let me think about what else could be going on.
+
+Actually, I wonder if the issue is with the crop size. The detector boxes might be slightly misplaced compared to the true boxes. The classifier was trained on true boxes with some jitter, but the detector boxes might have different misplacement patterns.
+
+The brief mentions "robustness to box misplacement (jitter matching the detector's errors)" as an in-scope idea.
+
+Let me think about another angle. What if we use a different combination of the two crops? Currently, we average the logits: (model(xt) + model(xw)) / 2. What if we use the tight crop only, or the wide crop only? Or what if we concatenate the features instead of averaging logits?
+
+Actually, let me focus on a specific, testable hypothesis.
+
+**Hypothesis: Using the top-1 class only (instead of all 4 classes) for each box will improve mAP by reducing false positives for wrong classes.**
+
+Wait, but the brief says "Several rows per box (one per class) are allowed and often help." So maybe top-1 is not the way to go.
+
+Let me think about another idea: **using the classifier to adjust the score but keeping the detector conf as the primary ranking signal.**
+
+What if score = conf * (1 + alpha * (p[c] - 0.25)) where alpha is a small number? This would use the classifier as a mild re-ranker. For alpha=0, it's just conf (single class behavior). For alpha=1, it's conf * p[c] (current behavior). For alpha=0.5, it's in between.
+
+But this is essentially a hyperparameter change, and the brief says "Tuning hyperparameters alone helped little."
+
+Let me think about more structural changes.
+
+**Idea: Use a different scoring based on the logit difference (margin).**
+
+score = conf * softmax(logit)[c] is the current approach.
+What about score = conf * exp(logit[c] - max_logit) / sum(exp(logit[c'] - max_logit))?
+That's just softmax, same thing.
+
+What about score = conf * (logit[c] - mean(logit)) / (max(logit) - min(logit) + eps)?
+This normalizes the logits to [0, 1] range. For a confident prediction, the correct class gets close to 1 and others close to 0. For an uncertain prediction, all classes get close to 0.5.
+
+Actually, this is similar to the softmax but with a different scaling. Let me think...
+
+If logits are [2, 0, 0, 0], softmax = [0.95, 0.016, 0.016, 0.016], normalized logit = [1, 0, 0, 0].
+If logits are [0.5, 0.5, 0.5, 0.5], softmax = [0.25, 0.25, 0.25, 0.25], normalized logit = [0.5, 0.5, 0.5, 0.5].
+
+So the normalized logit gives a more extreme difference between confident and uncertain cases. This might help with ranking.
+
+But I'm not sure this would help much. Let me think of something more impactful.
+
+**Idea: Train with a different loss that accounts for the scoring function.**
+
+Actually, the brief says "Class-weighted loss hurt classification every time it was tried." So loss changes are probably not the way.
+
+**Idea: Use a larger model or a different architecture.**
+
+The current model is EfficientNet-B0. What about trying ConvNeXt or a different backbone? The brief lists available pretrained models.
+
+But architecture changes might not help if the fundamental issue is the scoring function.
+
+**Idea: Test-time augmentation (TTA).**
+
+Instead of using a single crop, use multiple crops (different sizes, flips) and average the predictions. This could improve the classifier's accuracy, especially for the weak classes (pore and deposit).
+
+Let me think about what TTA would look like:
+- For each eval box, create multiple crops: original, horizontal flip, vertical flip, different context sizes
+- Average the logits across all crops
+- Use the averaged logits for scoring
+
+This is a straightforward change and could improve classification accuracy. The time cost is moderate (maybe 2-4x the inference time for eval, which is a small fraction of the total budget).
+
+Actually, looking at the time budget: the log shows 162s total for 180s budget. Training takes about 125s, inference takes about 37s. With TTA, inference might take 75-150s, pushing the total to 200-275s. That might exceed the budget.
+
+But we could reduce the training time to make room for TTA. Or use a smaller TTA set.
+
+Let me think about a simpler TTA: just add horizontal flip. This doubles the inference time for eval but not training.
+
+Actually, the current code already uses flips during training (random horizontal and vertical flips). For inference, it doesn't use flips. Adding TTA with flips at inference time would be:
+- Create crop, flip crop
+- Run both through model
+- Average logits
+
+This doubles the eval inference time. Current eval inference is about 37s (162-125). With TTA, it would be about 74s. Total would be about 199s, which is close to the 180s budget but might exceed it.
+
+Wait, let me re-read the log:
+```
+train 6052 boxes, eval 41879 detections, 1022 images (13s)
+epoch 0: loss 0.7254, 94 steps, 60s
+...
+done: 5 epochs, 421 steps, 53543 prediction rows, 162s total
+```
+
+So loading takes 13s, training takes about 125s (from 13s to 138s?), and inference+writing takes about 24s (138s to 162s). Wait, let me recalculate:
+- Start: 0s
+- Loading: 13s
+- Training: 13s to ~138s (5 epochs, 421 steps)
+- Inference + writing: ~138s to 162s = 24s
+
+With RESERVE_S = 55, the training stops at deadline - 55 = 180 - 55 = 125s. So training runs from 13s to 125s = 112s. Then inference runs from 125s to 162s = 37s.
+
+If I add TTA (2x inference), inference would be 74s, total = 125 + 74 = 199s > 180s. That's over budget.
+
+I could reduce RESERVE_S or reduce training time. But the training seems to still be improving (loss going down each epoch), so cutting training might hurt.
+
+Alternative: use a smaller TTA set. Instead of 2 crops (tight + wide) * 2 flips = 4 forward passes, use just 2 crops * 1 flip = 3 forward passes (original + flip of tight crop only). Or just add flip to the existing 2 crops: 2 * 2 = 4 forward passes.
+
+Actually, the current inference does 2 forward passes per box (tight + wide). With TTA flip, it would be 4 forward passes per box. That's 2x the current inference time.
+
+To fit in the budget, I could:
+1. Reduce RESERVE_S from 55 to 30 (giving more time for training)
+2. Reduce the number of training steps
+3. Use a faster model
+
+Or I could just accept a shorter training and use TTA.
+
+Actually, let me reconsider. The training loss is still decreasing at epoch 4 (0.2132). More training would help. But the time budget is tight.
+
+Let me think about a different approach that doesn't require TTA.
+
+**Idea: Use the detector confidence more effectively in the score.**
+
+Currently: score = conf * p[c]
+
+What if the detector confidence is not well-calibrated? What if high-conf background boxes are a problem?
+
+One approach: use a threshold on conf. Only output predictions for boxes with conf > some threshold. But this is a hyperparameter change.
+
+Another approach: use conf^alpha * p[c] where alpha > 1 to penalize low-conf boxes more. But e004 tried p^2 and it didn't help.
+
+**Idea: Use a two-pass approach.**
+
+First pass: classify all boxes with the current model.
+Second pass: for boxes where the classifier is uncertain (max p < 0.5), use a different strategy (e.g., only output the top-1 class, or suppress the prediction).
+
+This is getting complicated. Let me focus on a single, clear idea.
+
+**Idea: Add horizontal flip TTA at inference time, and reduce RESERVE_S to make room.**
+
+Hypothesis: Test-time augmentation with horizontal flip will improve classification accuracy (especially for pore and deposit, which are the weak classes) by providing a second view of each crop, leading to better mAP.
+
+The change:
+1. In the eval inference loop, for each batch, also create horizontally-flipped versions of the crops and average the logits.
+2. Reduce RESERVE_S from 55 to 30 to allow more training time.
+
+Wait, but reducing RESERVE_S means less time for inference. If inference takes longer due to TTA, we need more reserve, not less. Let me think...
+
+Current: training up to 125s, inference 37s, total 162s.
+With TTA (2x inference): training up to X, inference 74s, total X + 74 + 13 (loading) = X + 87s.
+For total < 180s: X < 93s. So training would run from 13s to 93s = 80s.
+
+Currently training runs for 112s (13s to 125s). With TTA, it would only run for 80s. That's 29% less training. This might hurt more than TTA helps.
+
+Alternative: keep the same training time and accept a longer total. But the harness kills at the deadline, so we can't exceed 180s.
+
+Hmm, this is tricky. Let me think of a different approach.
+
+**Idea: Use a margin-based score instead of the raw probability.**
+
+score = conf * max(0, p[c] - 0.25)
+
+This subtracts the "background" probability (0.25 = uniform across 4 classes). For a confident prediction (p[c] = 0.7), score = conf * 0.45. For an uncertain prediction (p[c] = 0.25), score = conf * 0. For a wrong-class prediction (p[c] = 0.1), score = conf * 0.
+
+This effectively adds a "background" class without changing the model architecture. It's a scoring change.
+
+Let me check: e004 tried p^2 and got 0.6161 (worse than 0.6311). The margin approach is different from p^2. p^2 makes the difference between classes more extreme but doesn't explicitly handle background. The margin approach explicitly zeros out uncertain predictions.
+
+Actually, p^2 for [0.7, 0.1, 0.1, 0.1] gives [0.49, 0.01, 0.01, 0.01]. The margin approach gives [0.45, 0, 0, 0]. Similar in effect but the margin approach zeros out the wrong classes completely.
+
+For a background box with p = [0.25, 0.25, 0.25, 0.25]:
+- p^2: [0.0625, 0.0625, 0.0625, 0.0625]
+- margin: [0, 0, 0, 0]
+
+The margin approach would eliminate all background boxes, which is very aggressive. This might help or hurt depending on how many true defects have p[c] close to 0.25.
+
+Let me think about the expected impact:
+- True defects with high confidence (p[c] > 0.5): score = conf * (p[c] - 0.25), reduced by about 36% compared to conf * p[c]
+- True defects with medium confidence (p[c] ~ 0.4): score = conf * 0.15, reduced by about 63%
+- Background boxes (p[c] ~ 0.25): score = 0, eliminated
+- Wrong-class predictions (p[c] ~ 0.1): score = 0, eliminated
+
+The reduction in true positive scores is a concern. The absolute scores don't matter for mAP (only ranking matters), but the relative ranking does. If we reduce the scores of medium-confidence true positives more than high-confidence ones, we're effectively re-ranking them, which could help or hurt.
+
+Actually, for mAP, only the ranking matters. So the key question is: does the margin-based score rank true positives higher than false positives better than the raw product?
+
+For a true positive with p[c] = 0.4 and conf = 0.5: score = 0.5 * 0.15 = 0.075
+For a background box with p[c] = 0.25 and conf = 0.8: score = 0.8 * 0 = 0
+
+The true positive ranks higher. Good.
+
+For a true positive with p[c] = 0.3 and conf = 0.5: score = 0.5 * 0.05 = 0.025
+For a background box with p[c] = 0.3 and conf = 0.8: score = 0.8 * 0.05 = 0.04
+
+The background box ranks higher! This is bad. But wait, if p[c] = 0.3 for the background box, that means the classifier is somewhat confident about class c for a background box. This is a case where the classifier is wrong, and the margin approach doesn't help because p[c] > 0.25.
+
+Hmm, the margin approach is only helpful when the classifier is uncertain (p[c] close to 0.25). If the classifier is confidently wrong (p[c] = 0.4 for a background box), the margin approach still gives a non-zero score.
+
+I think the margin approach might help somewhat but it's not a silver bullet.
+
+Let me think about another approach.
+
+**Idea: Use the top-1 class only for each box, with a confidence threshold.**
+
+For each box, only output the top-1 class if its probability exceeds a threshold (e.g., 0.3). This reduces the number of false positives for wrong classes.
+
+Current: 4 rows per box, 4 * 41879 = 167K rows.
+With top-1 only: 1 row per box (if above threshold), ~41K rows (or fewer with threshold).
+
+This is a significant reduction in false positives. The tradeoff is that we lose the ability to have multiple rows per box, which the brief says "often help."
+
+But wait, the brief says "Several rows per box (one per class) are allowed and often help." This suggests that the current 4-row approach is already beneficial. So top-1 might be worse.
+
+Let me think about why multiple rows help. In mAP, for each class independently, we rank all predictions of that class. Having multiple rows per box means that a single box can contribute to multiple classes. If the box is a true pore, the pore row is a true positive and the other 3 rows are false positives. But since the other 3 rows have lower scores, they rank lower and don't hurt much.
+
+The issue is when a background box has moderate probabilities for all 4 classes. All 4 rows become false positives for 4 different classes. This is where the 4-row approach hurts.
+
+So the question is: is the benefit of multiple rows (better ranking within each class) greater than the cost (more false positives from background boxes)?
+
+Given that the current score is 0.631 and the single-class score is 0.755, it seems like the cost is greater than the benefit. The classifier is not good enough to make the 4-row approach work well.
+
+But wait, the single-class score of 0.755 is for a different setup (all boxes scored as one class 'defect'). In that case, there's only one class, so mAP is just AP for that class. The 4-class mAP is the average of 4 APs. These are not directly comparable.
+
+Actually, they are comparable in the sense that both are mAP@0.5. The single-class mAP is just the AP for the 'defect' class. The 4-class mAP is the average of 4 APs. The single-class AP of 0.755 means that the detector conf alone provides a good ranking for detecting "any defect." The 4-class mAP of 0.631 means that the classifier's class assignment is hurting the ranking.
+
+So the classifier is adding noise to the ranking. The question is how to use the classifier to help rather than hurt.
+
+**New idea: Use the classifier only to adjust the score, not to change the class assignment.**
+
+Wait, that doesn't make sense. The classifier IS the class assignment.
+
+**Idea: Use a softer combination of detector conf and classifier probability.**
+
+score = conf^0.5 * p[c]^0.5 (geometric mean instead of product)
+
+For a true positive: conf=0.5, p=0.7 → score = 0.5^0.5 * 0.7^0.5 = 0.714
+For a background: conf=0.5, p=0.25 → score = 0.5^0.5 * 0.25^0.5 = 0.354
+Ratio: 2.02
+
+With product: 0.5*0.7 = 0.35 vs 0.5*0.25 = 0.125, ratio: 2.8
+
+The geometric mean compresses the ratio, making the ranking less extreme. This might help if the detector conf is noisy (the classifier probability becomes less dominant).
+
+But this is essentially a hyperparameter change (the exponents), and the brief says hyperparameter tuning helped little.
+
+Let me think about something more structural.
+
+**Idea: Train the classifier to output a "background" probability using a separate head or a different loss.**
+
+Instead of adding a 5th class (which didn't work in e002), use the existing 4-class model but modify the loss to penalize confident predictions on background boxes.
+
+For example, during training, for background boxes (if we include them), use a label-smoothing loss or a target of [0.25, 0.25, 0.25, 0.25] (uniform). This would train the model to be uncertain on background boxes.
+
+But we're not currently training on background boxes. The e005 experiment trained on detector boxes overlapping GT (no background). The e002 experiment trained on all detector boxes including background (5 classes) and it failed.
+
+What if we train on detector boxes (like e005) but for background boxes, use a soft target of [0.25, 0.25, 0.25, 0.25] instead of a hard background class? This way, the model stays 4-class but learns to be uncertain on background.
+
+Actually, this is similar to label smoothing. But label smoothing was probably already tried (the brief mentions class-weighted loss hurt, but label smoothing is different).
+
+Hmm, let me think about this differently.
+
+**Idea: Use the detector confidence to weight the training samples.**
+
+During training, weight each sample by the detector confidence. High-conf boxes are more reliable, so they should have more influence on the loss. This might help the model focus on the boxes that matter most for the final score.
+
+But this is a sampling/loss change, and the brief says those helped little.
+
+Let me go back to the scoring function. I think the key issue is that the classifier doesn't have a background concept, and this creates false positives.
+
+**Idea: Estimate a background probability from the classifier output and use it to adjust the score.**
+
+For each box, compute p_bg = 1 - max(p). This is the probability that the box is NOT the most likely class. Then adjust the score:
+
+score = conf * p[c] * (1 - p_bg) = conf * p[c] * max(p)
+
+Wait, that's conf * p[c] * max(p). For the top class, this is conf * max(p)^2. For other classes, it's conf * p[c] * max(p).
+
+For a true positive (top class, p=0.7): score = conf * 0.49
+For a background (p=[0.25,0.25,0.25,0.25]): score = conf * 0.0625
+Ratio: 7.84
+
+With raw product: ratio = 2.8. The adjusted score gives a much higher ratio, which should improve ranking.
+
+But for a wrong-class prediction (p[c]=0.1, max(p)=0.7): score = conf * 0.07
+For a background (p[c]=0.25, max(p)=0.25): score = conf * 0.0625
+
+These are close, which is fine.
+
+For a medium-confidence true positive (p[c]=0.4, max(p)=0.4): score = conf * 0.16
+For a background (p[c]=0.25, max(p)=0.25): score = conf * 0.0625
+Ratio: 2.56
+
+This seems reasonable. The score = conf * p[c] * max(p) effectively squares the confidence of the top class while keeping other classes proportional.
+
+Actually, this is similar to e004 (p^2) but applied differently. e004 used p[c]^2 for all classes. This approach uses p[c] * max(p), which is different.
+
+For the top class: p[c] * max(p) = max(p)^2 (same as p^2 for the top class)
+For other classes: p[c] * max(p) (different from p[c]^2)
+
+So for the top class, it's the same as e004. For other classes, it's different. Since e004 hurt, this might also hurt for the top class.
+
+Let me think about yet another approach.
+
+**Idea: Use a calibration step on the classifier probabilities.**
+
+After training, collect the classifier outputs on a validation set (or a held-out portion of training data) and fit a calibration model (e.g., temperature scaling or Platt scaling) to make the probabilities better calibrated. Then use the calibrated probabilities in the score.
+
+But we don't have a separate validation set. We could hold out a portion of the training data.
+
+Actually, this is getting too complicated. Let me focus on a simple, testable idea.
+
+**Idea: Use the logit difference (margin) for scoring instead of the softmax probability.**
+
+score = conf * exp(logit[c] - max(logit))
+
+This is the unnormalized softmax (without dividing by the sum). For the top class, this is exp(0) = 1. For other classes, it's exp(logit[c] - max_logit) < 1.
+
+For a confident prediction (logits [2, 0, 0, 0]): scores = [1, 0.135, 0.135, 0.135]
+For an uncertain prediction (logits [0.5, 0.5, 0.5, 0.5]): scores = [1, 1, 1, 1]
+
+The ratio for confident vs uncertain is the same as softmax (since the sum is the same for all classes in the uncertain case). So this doesn't change the ranking.
+
+Wait, that's not right. The sum for the confident case is 1 + 3*0.135 = 1.405. The sum for the uncertain case is 4. So the normalized scores are:
+Confident: [0.71, 0.096, 0.096, 0.096]
+Uncertain: [0.25, 0.25, 0.25, 0.25]
+
+Same as softmax! Because exp(logit[c] - max_logit) / sum(exp(logit[c'] - max_logit)) = softmax(logit)[c]. So this is identical to the current approach.
+
+OK so that doesn't help.
+
+**Idea: Use the raw logit (not softmax) for scoring.**
+
+score = conf * (logit[c] - min(logit)) / (max(logit) - min(logit) + eps)
+
+This normalizes the logits to [0, 1]. For a confident prediction (logits [2, 0, 0, 0]): scores = [1, 0, 0, 0]. For an uncertain prediction (logits [0.5, 0.5, 0.5, 0.5]): scores = [0.5, 0.5, 0.5, 0.5] (or [0, 0, 0, 0] if max=min).
+
+Hmm, this is very aggressive. For a confident prediction, only the top class gets a non-zero score. For an uncertain prediction, all classes get 0.5 (or 0).
+
+This might be too aggressive. Let me think about a softer version.
+
+score = conf * sigmoid(logit[c] - max(logit))
+
+For a confident prediction (logits [2, 0, 0, 0]): scores = [sigmoid(0), sigmoid(-2), sigmoid(-2), sigmoid(-2)] = [0.5, 0.119, 0.119, 0.119]
+For an uncertain prediction (logits [0.5, 0.5, 0.5, 0.5]): scores = [0.5, 0.5, 0.5, 0.5]
+
+The ratio for the top class: 0.5/0.5 = 1.0 (same as uncertain). This doesn't help.
+
+What about: score = conf * sigmoid(logit[c] - mean(logit))?
+
+For confident (logits [2, 0, 0, 0], mean=0.5): scores = [sigmoid(1.5), sigmoid(-0.5), sigmoid(-0.5), sigmoid(-0.5)] = [0.818, 0.378, 0.378, 0.378]
+For uncertain (logits [0.5, 0.5, 0.5, 0.5], mean=0.5): scores = [0.5, 0.5, 0.5, 0.5]
+
+Ratio for top class: 0.818/0.5 = 1.64. Better than 1.0 but still not great.
+
+I'm going in circles. Let me step back and think about what the most impactful change would be.
+
+The key facts:
+1. Single-class (detector conf only): 0.755
+2. 4-class (conf * p[c]): 0.631
+3. Ceiling (perfect classes): 0.758
+4. Classifier macro-F1: ~0.87
+
+The gap between 0.631 and 0.755 is 0.124. This is a large gap. The classifier is significantly hurting the score.
+
+Why? Because:
+a) The classifier assigns non-zero probability to all 4 classes for background boxes, creating false positives.
+b) The classifier is wrong 13% of the time, and when wrong, it boosts the wrong class.
+c) The classifier's probability calibration might be off.
+
+To close the gap, we need to either:
+1. Make the classifier better (higher accuracy, better calibration)
+2. Use the classifier more conservatively (rely more on detector conf)
+3. Add a background concept to the classifier
+
+Option 1: Better classifier. The current model is EfficientNet-B0 with two-crop input. We could try:
+- A larger model (but time budget is tight)
+- Better training (more epochs, different LR schedule)
+- Better data augmentation
+- Test-time augmentation
+
+Option 2: More conservative use. Instead of conf * p[c], use conf * (0.5 + 0.5 * p[c]) or conf * (1 + 0.5 * (p[c] - 0.25)). This keeps the detector ranking mostly intact.
+
+Option 3: Background concept. e002 tried this and failed. But maybe the failure was due to a bug or a specific implementation detail.
+
+Let me re-examine e002. It got 0.5172, which is way below even the one-step baseline. This suggests a fundamental problem, not just a tuning issue. What could go wrong with a 5-class model?
+
+If the model is trained with 5 classes (4 defects + background), the probabilities for the 4 defect classes sum to less than 1 (since background also gets some probability). The score formula conf * p[c] would give lower scores for all defect classes. If the background class gets a high probability for true defects (because the model is confused), the defect scores would be very low.
+
+Also, the IoU>0.5 threshold for matching detector boxes to GT might be too strict. Many detector boxes might not have IoU>0.5 with any GT, even if they're close. These would be labeled as background, but they might actually be true defects with slightly misplaced boxes. This would create noisy training labels.
+
+I think the 5-class approach is risky. Let me focus on option 2: a more conservative scoring function.
+
+**Hypothesis: Using a softer combination of detector confidence and classifier probability (score = conf * (0.5 + 0.5 * p[c])) will improve mAP by reducing the impact of the classifier's errors while still using it to re-rank within each class.**
+
+Wait, let me think about this more carefully.
+
+score = conf * (0.5 + 0.5 * p[c])
+
+For a true positive (p[c] = 0.7): score = conf * 0.85
+For a background (p[c] = 0.25): score = conf * 0.625
+For a wrong class (p[c] = 0.1): score = conf * 0.55
+
+The ratio (true/bg) = 0.85/0.625 = 1.36
+With raw product: 0.7/0.25 = 2.8
+
+The softer combination reduces the ratio, making the ranking less extreme. This means the detector conf plays a bigger role in the ranking.
+
+If the detector conf is well-calibrated (higher for true defects), this should help. If the detector conf is noisy, this might hurt.
+
+Given that single-class (conf only) gets 0.755, the detector conf is a good ranking signal. The classifier adds some useful information (it knows the class) but also adds noise (it's wrong 13% of the time and doesn't know about background).
+
+The optimal combination depends on the relative quality of the two signals. If the detector conf is better than the classifier (in terms of ranking true vs false), then we should weight the detector conf more heavily.
+
+score = conf * (alpha + (1-alpha) * p[c]) where alpha is a weight.
+
+alpha = 0: pure classifier (current, 0.631)
+alpha = 1: pure detector (0.755)
+alpha = 0.5: equal weight
+
+We want to find the alpha that maximizes mAP. Since we can't do a grid search (one idea per turn), let's try alpha = 0.5.
+
+But wait, this is a hyperparameter change. The brief says "Tuning hyperparameters alone helped little in earlier experiments; changes of method helped more."
+
+However, this isn't just a hyperparameter change - it's a change in the scoring methodology. The formula conf * p[c] vs conf * (0.5 + 0.5 * p[c]) is a different way of combining the two signals.
+
+Actually, I realize that conf * (0.5 + 0.5 * p[c]) = 0.5 * conf + 0.5 * conf * p[c]. This is a linear combination of the detector score and the current score. It's like blending the two approaches.
+
+Let me think about whether this would actually help. The mAP metric is based on ranking. For each class, we rank all predictions by score. The key question is: does the blended score rank true positives higher than false positives better than either the pure detector score or the pure classifier score?
+
+For the pure detector score, the ranking is based solely on conf. True positives and false positives are mixed based on conf. The AP is 0.755.
+
+For the pure classifier score (conf * p[c]), the ranking is based on both conf and p[c]. The classifier helps distinguish classes (a true pore gets high p[0]) but hurts the true/false distinction (background boxes get non-zero p[c]).
+
+For the blended score, the ranking is a compromise. The detector conf provides the base ranking, and the classifier probability adjusts it.
+
+I think the blended score could help if the classifier's class information is useful for the ranking within each class. For example, if a true pore has a slightly lower conf than a background box, but the classifier gives it a high p[0], the blended score might rank it higher.
+
+But if the classifier is wrong (13% of the time), it would rank the wrong class higher, which hurts.
+
+I'm not sure this will help. Let me think of a different approach.
+
+**Idea: Use the classifier to assign the top-1 class, and use the detector conf as the score.**
+
+For each box, determine the class using argmax(p). Then output one row per box with score = conf.
+
+This is like a two-stage approach: the classifier determines the class, and the detector conf determines the confidence. The score is just the detector conf, but the class is determined by the classifier.
+
+Wait, but this is essentially what the current approach does, except the current approach outputs 4 rows per box (one per class) while this would output 1 row per box.
+
+With 1 row per box:
+- True positive: the box is assigned the correct class (87% of the time) and scored by conf.
+- False positive (wrong class): the box is assigned the wrong class (13% of the time) and scored by conf.
+- False positive (background): the box is assigned some class (always, since there's no background class) and scored by conf.
+
+The AP for each class would be:
+- True positives: boxes with correct class assignment, ranked by conf.
+- False positives: boxes with wrong class assignment OR background boxes, ranked by conf.
+
+Compared to the current 4-row approach:
+- Current: each box contributes to 4 classes. A background box creates 4 false positives (one per class).
+- New: each box contributes to 1 class. A background box creates 1 false positive (for the assigned class).
+
+This reduces the number of false positives by 4x (approximately). This should improve AP.
+
+But the brief says "Several rows per box (one per class) are allowed and often help." So maybe the 4-row approach is better in some cases.
+
+Let me think about when 4 rows help. If a box is a true pore, the 4 rows are:
+- (pore, conf * 0.7): true positive
+- (deposit, conf * 0.1): false positive for deposit
+- (discontinuity, conf * 0.1): false positive for discontinuity
+- (stain, conf * 0.1): false positive for stain
+
+The false positives for other classes have low scores (conf * 0.1), so they rank low. They only hurt if there are many true positives with even lower scores.
+
+With 1 row:
+- (pore, conf): true positive
+
+The false positives for other classes are eliminated. This should help.
+
+But what about a box that's a true pore but the classifier is uncertain (p = [0.3, 0.3, 0.2, 0.2])? With 4 rows:
+- (pore, conf * 0.3): true positive (low score)
+- (deposit, conf * 0.3): false positive (same score as true positive!)
+- (discontinuity, conf * 0.2): false positive
+- (stain, conf * 0.2): false positive
+
+The deposit false positive has the same score as the pore true positive. This is bad for the ranking.
+
+With 1 row (top-1):
+- (pore, conf) or (deposit, conf): depends on which is higher. If pore, it's a true positive. If deposit, it's a false positive.
+
+In either case, it's one row. The score is conf, which is the same as the detector conf.
+
+I think the 1-row approach (top-1 class, score = conf) is worth trying. It's a significant change from the current 4-row approach.
+
+But wait, the score = conf is the same as the single-class approach (0.755). The difference is the class assignment. In the single-class approach, all boxes are the same class. In the top-1 approach, boxes are assigned to different classes.
+
+The mAP for the top-1 approach would be the average of 4 APs, where each AP is computed with the class-specific true/false assignments. This is different from the single-class AP.
+
+Let me estimate: if the classifier is 87% accurate, then 87% of true defects are assigned the correct class. The remaining 13% are assigned wrong classes. For each class, the true positives are the correctly assigned defects of that class, and the false positives include the wrongly assigned defects of other classes plus all background boxes.
+
+The AP for each class would be lower than the single-class AP because of the additional false positives (wrongly assigned defects). But it would be higher than the current 4-row approach because of fewer false positives (no low-score rows for wrong classes).
+
+I think this is worth trying. Let me formulate the hypothesis.
+
+**Hypothesis: Outputting only the top-1 class per box (with score = detector conf) will improve mAP by reducing the number of false positive rows (from 4 per box to 1 per box) while still using the classifier to assign the correct class.**
+
+The change:
+1. In the prediction loop, instead of outputting
+===== attempt 2 =====
+The user is asking me to propose the next experiment in the exact reply format. Let me think about what would be the best next idea.
+
+Looking at the history:
+- e000: baseline, 0.6311 mAP (5-seed)
+- e001: crashed (type bug)
+- e002: training on detector boxes with background class - 0.5172, rejected (much worse)
+- e003: low-res crops - 0.6251, rejected
+- e004: p² scoring - 0.6161, rejected
+- e005: training on detector boxes (IoU>0.5) without background - 0.6248, rejected
+
+So training on detector boxes has been tried twice (with and without background) and both were worse. Low-res was worse. p² scoring was worse.
+
+What hasn't been tried yet?
+- Architecture changes (different backbone)
+- More aggressive augmentation
+- Test-time augmentation
+- Different scoring (e.g., using background probability to suppress)
+- Ensembling
+- Different training strategy (more epochs, different LR schedule)
+- Using both high and low res (e003 tried this but was rejected)
+
+Wait, e003 was "including low-resolution training crops alongside high-resolution ones" and got 0.6251 vs 0.6311. That's close but rejected.
+
+Let me think about what's most promising:
+
+1. **Architecture**: The current model is EfficientNet-B0. Maybe a different backbone would help. But the brief says "Tuning hyperparameters alone helped little in earlier experiments; changes of method helped more." So maybe an architecture change is worth trying.
+
+2. **Test-time augmentation (TTA)**: At inference, we could use multiple augmentations (flips, etc.) and average. This is a "method" change.
+
+3. **Scoring with background suppression**: The classifier was trained only on defect boxes (no background class). But at test time, we could use the max probability to suppress uncertain predictions. E.g., score = conf * p_c * (p_c / max_p) or something. But e004 tried p² and it was worse.
+
+4. **More training**: The model trains for about 140 seconds (162-13=149s of training). Maybe we can squeeze more epochs in, or use a better schedule.
+
+5. **Two-crop with different contexts**: Maybe the 1.5x and 2.5x contexts aren't optimal.
+
+6. **Different model**: Try convnext_nano or regnety_016 or another backbone.
+
+7. **Ensemble**: Train two models and average. But time budget is tight.
+
+8. **Scoring: use max probability as a gate**: score = conf * p_c * max_p. This would suppress predictions where the model is uncertain (low max prob = likely background). This is different from p².
+
+Wait, let me reconsider. The key insight from the brief: "stage-1 boxes scored as a single class 'defect': 0.755 mAP@0.5" and "stage-1 boxes with perfect classes (ceiling for stage 2): 0.758 mAP@0.5". So the boxes are good, the problem is classification.
+
+The per-class AP: pore 0.506, deposit 0.630, discontinuity 0.780, stain 0.608. Pore is the weakest.
+
+Ideas that seem promising and haven't been tried:
+- **TTA at inference**: flip horizontally, vertically, and average. This is a method change, not hyperparameter tuning.
+- **Different backbone**: e.g., convnext_nano or efficientnet_b2.
+- **Score = conf * p_c * max(p)**: This uses the model's confidence (max prob) as a gate. If the model is uncertain (all probs similar), the score is low. This is different from p².
+
+Actually, let me think more carefully about scoring. Currently: score = conf * p_c. 
+
+The problem is that for background boxes, the classifier still assigns some probability to each class. If we use score = conf * p_c * max_p, then for a background box where p = [0.25, 0.25, 0.25, 0.25], max_p = 0.25, so scores are conf * 0.0625 for each class. For a true positive where p = [0.8, 0.1, 0.05, 0.05], max_p = 0.8, so score for the right class is conf * 0.64. This effectively amplifies confident predictions and suppresses uncertain ones.
+
+But wait, e004 tried p² (score = conf * p_c²) and it was worse (0.6161). The difference between p_c² and p_c * max_p:
+- p_c²: for the right class, score = conf * 0.64. For wrong classes, conf * 0.01.
+- p_c * max_p: for the right class, score = conf * 0.64. For wrong classes, conf * 0.08.
+
+So p_c * max_p is less aggressive in suppressing wrong classes but more aggressive in the overall ranking (since max_p is a global confidence). Actually, they're similar in effect for the right class but different for wrong classes.
+
+Hmm, but the issue is that mAP@0.5 cares about ranking: true detections should score higher than false ones. If a background box gets p = [0.3, 0.3, 0.2, 0.2], then with conf * p_c, the top score is conf * 0.3. With conf * p_c * max_p, it's conf * 0.09. With conf * p_c², it's conf * 0.09. So they're similar.
+
+Actually, I think a better approach might be to try a different architecture. Let me think about which one.
+
+The current model is EfficientNet-B0 with 160x160 input. The training takes about 140s for 421 steps. 
+
+Options:
+- convnext_nano: similar size, different architecture
+- efficientnet_b2: larger, might be too slow
+- regnety_016: very small, fast
+- resnet50: standard
+
+Actually, let me think about TTA. At inference, we currently do one forward pass per box (two crops). We could do:
+- Original
+- Horizontal flip
+- Vertical flip
+- Both flips
+
+And average the logits. This would be 4x the inference time. With 41879 detections and batch size 256, that's about 164 batches. Each batch takes maybe 0.1-0.2s on GPU. So 164 * 0.15 * 4 = about 100s. That might be too much given the 55s reserve.
+
+Actually, let me reconsider. The inference currently takes about 162-140 = 22s (roughly). With 4x TTA, it would be about 88s. That's within the 55s reserve... no, it's not. 88s > 55s.
+
+So TTA with 4 views would be too slow. Maybe 2 views (original + horizontal flip) would be about 44s, which is within budget.
+
+Actually, let me recalculate. The total time is 162s. Loading is 13s. Training is about 125s (from the log: epoch 4 ends at 125s). So inference + writing is about 37s. With 2x TTA, inference would be about 74s, total about 13+125+74 = 112s. That's within 162s (the original budget was probably 180s). Wait, the log says "162s total" and the budget is --seconds T. Let me check: the default is 180s. So 162s is within 180s. With 2x TTA, it would be about 13+125+74 = 112s... no wait, the inference time would double. Current inference is about 162-125 = 37s. With 2x, it would be 74s. Total: 13+125+74 = 112s. That's fine.
+
+But actually, I should be more careful. Let me re-examine the timing:
+- Loading: 13s
+- Training: 125s (5 epochs)
+- Inference + writing: 37s
+- Total: 162s
+
+With 2x TTA: inference would be about 74s, total about 112s. That's fine.
+
+But wait, I need to think about whether TTA would actually help. The model is a classifier on crops. TTA with flips would help if the model is sensitive to orientation. For weld defects, orientation might matter (welds are typically horizontal or vertical). But flips might actually hurt if the defects have a specific orientation.
+
+Hmm, I'm not sure TTA is the best choice. Let me think about other options.
+
+**Different backbone**: Let me try convnext_nano. It's a modern architecture that might generalize better. The training time should be similar to EfficientNet-B0.
+
+Actually, wait. Let me re-read the brief: "Tuning hyperparameters alone helped little in earlier experiments; changes of method helped more." This suggests that method changes are more promising.
+
+What method changes haven't been tried?
+1. TTA
+2. Different backbone (architecture change)
+3. Different scoring formula
+4. Training with different data (already tried: detector boxes, low-res)
+5. Different augmentation
+6. Ensemble
+
+Let me think about what's most likely to help given the per-class breakdown:
+- pore: 0.506 (weakest)
+- deposit: 0.630
+- discontinuity: 0.780 (strongest)
+- stain: 0.608
+
+The brief says "Pore and deposit are the weak classes; stain is often confused with deposit and background."
+
+So the main issues are:
+1. Pore detection is weak
+2. Stain is confused with deposit and background
+
+A different backbone might help with generalization. Let me try convnext_nano.
+
+Actually, I just realized: the brief says "architecture changes using the pretrained backbones listed below" are in scope. So trying a different backbone is explicitly in scope.
+
+Let me go with trying convnext_nano as the backbone. It's a modern architecture with similar capacity to EfficientNet-B0 but different inductive biases.
+
+Wait, but I should think about whether this is likely to help. The model is trained for only 5 epochs (421 steps). With a different backbone, the training dynamics might be different. But since we're using pretrained weights, it should be fine.
+
+Let me go with convnext_nano. The change is minimal: just change MODEL = "efficientnet_b0" to MODEL = "convnext_nano".
+
+Actually, let me reconsider. The time budget is tight. convnext_nano might be slower or faster than efficientnet_b0. Let me think... convnext_nano has about 50M parameters, similar to EfficientNet-B0 (about 40M). So training time should be similar.
+
+OK, let me go with this. The hypothesis is that a different backbone architecture (convnext_nano) with its different inductive biases (depthwise separable convolutions, layer normalization) will generalize better to the weld defect classification task, especially for the weak pore and stain classes.
+
+The edit is minimal: just change the MODEL constant.
+
+Let me write the reply:
+
+BASE: best
+CATEGORY: architecture
+HYPOTHESIS: Replacing EfficientNet-B0 with ConvNeXt-Nano, a modern backbone with depthwise-separable convolutions and layer normalization, will improve generalization especially for the weak pore and stain classes, since different inductive biases may better capture the local texture patterns of weld defects.
+
+The edit:
+```
+<<<<<<< SEARCH
+MODEL = "efficientnet_b0"
+=======
+MODEL = "convnext_nano"
+>>>>>>> REPLACE
+```
+
+This is a clean, focused change. Let me verify the SEARCH text appears exactly once in the file. Yes, "MODEL = "efficientnet_b0"" appears once in the settings section.
+
+This is a good experiment because:
+1. It's a method change (different architecture), not hyperparameter tuning
+2. It's explicitly in scope
+3. It's minimal and focused
+4. It's testable: if convnext_nano is better, we keep it; if not, we try another backbone

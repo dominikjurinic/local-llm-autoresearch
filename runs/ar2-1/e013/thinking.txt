@@ -1,0 +1,251 @@
+===== attempt 1 =====
+Let me analyze the current state and think about what to try next.
+
+Current best: e012, 5-seed val mAP@0.5 0.6373
+- Model: tf_efficientnetv2_b0, IMG_SIZE=160
+- Two-crop input (tight 1.5x + wide 2.5x)
+- TTA: horizontal flip
+- Score: detector conf × class probability
+- Per-class AP: pore 0.517, deposit 0.636, discontinuity 0.781, stain 0.616
+
+Key observations:
+1. Pore is the weakest class (0.517) and stain is second weakest (0.616)
+2. The ceiling with perfect classes is 0.758, so there's significant room for improvement in classification
+3. Training on detector boxes with background class (e001) hurt significantly (0.5512)
+4. Training on detector boxes without background (e004) was slightly worse (0.6234)
+5. TTA helped (e005)
+6. More training time helped (e008)
+7. Focal loss, label smoothing, max-prob suppression all hurt
+8. 224px timed out or didn't confirm
+9. tf_efficientnetv2_b0 was better than efficientnet_b0
+
+What hasn't been tried:
+- Different scoring strategies (e.g., using log-probabilities, temperature scaling)
+- Ensemble of two different architectures
+- Using both high and low res for training (e002 tried this but was rejected at 0.6209)
+- Different augmentation strategies
+- Training with mixup or cutmix
+- Using a larger model (convnext_nano, resnet50)
+- Different learning rate schedules
+- Using the detector confidence more cleverly in scoring
+- Training on detector boxes with proper IoU matching (e004 tried this but without background)
+- Temperature scaling at inference
+- Using both crops with different weights rather than averaging
+
+Let me think about what's most promising:
+
+1. **Scoring with temperature**: The current score is `conf * p[c]`. If we apply temperature scaling to the softmax (divide logits by T before softmax), we could make the distribution sharper or flatter. A T < 1 makes it sharper (more confident), T > 1 makes it flatter. This could help with ranking. But e009 tried multiplying by max prob and it didn't help.
+
+2. **Ensemble two models**: Train two different architectures (e.g., tf_efficientnetv2_b0 + convnext_nano or resnet50) and average their probabilities. This is a common way to improve. The time budget is 180s, and currently training takes ~130s. If we train two smaller models for less time each, we might get a better ensemble. But this is risky with the time budget.
+
+3. **Use detector confidence more cleverly**: Currently score = conf * p[c]. What if we use conf^alpha * p[c] with alpha < 1? This would make the detector confidence matter less and the classifier more. Or conf * p[c]^beta with beta > 1 to sharpen.
+
+4. **Train on low-res crops too**: e002 tried this and got 0.6209 (worse). So this doesn't help.
+
+5. **Different augmentation**: Currently we have flip + brightness. What about color jitter (hue, saturation)? Or random erasing?
+
+6. **Use both high and low res differently**: Instead of just high-res, what if we train on high-res but also use low-res as additional augmentation (randomly downsample high-res crops)?
+
+7. **Score = conf * p[c] / max(p)**: Normalize by max probability to make the distribution sum to 1 relative to the best class. Actually this is similar to what e009 tried.
+
+8. **Temperature scaling**: Apply temperature to logits before softmax. T=0.7 (sharper) or T=1.5 (flatter). This changes the relative scores between classes for the same box, affecting ranking.
+
+9. **Use log-softmax instead of softmax for scoring**: score = conf * log(p[c]) - this would be negative and not work well.
+
+10. **Score = conf * p[c] * (1 - p_bg)**: But we don't have a background class.
+
+Let me think about what's most likely to help:
+
+The per-class APs show pore (0.517) and stain (0.616) are weak. The issue is likely:
+- Pore: small, subtle features that are hard to distinguish from background or other defects
+- Stain: confused with deposit and background
+
+The model is trained on perfect boxes. At test time, it sees detector boxes that may be slightly off. The TTA helps with this.
+
+I think a promising direction is **temperature scaling at inference**. The idea: if we make the softmax sharper (T < 1), the top class gets a higher probability and others get lower. This could help with ranking because:
+- For a true detection, the correct class should be clearly the top → sharper distribution gives it even more score relative to others
+- For a false alarm, all classes might be roughly equal → sharper distribution doesn't help much, but the absolute scores are still low because conf is low
+
+Actually wait, temperature scaling doesn't change the ranking within a box (it just rescales). It changes the absolute values. Since we're comparing scores ACROSS boxes for mAP ranking, what matters is the relative scores between boxes.
+
+For box A (true pore): p = [0.7, 0.1, 0.1, 0.1], score_pore = conf_A * 0.7
+For box B (false alarm): p = [0.3, 0.3, 0.2, 0.2], score_pore = conf_B * 0.3
+
+With T=0.5: box A p = [0.9, 0.03, 0.03, 0.04], box B p = [0.5, 0.3, 0.1, 0.1]
+The ratio A/B for pore goes from 0.7/0.3 = 2.33 to 0.9/0.5 = 1.8. So sharpening actually REDUCES the separation for the correct class!
+
+With T=2: box A p = [0.55, 0.15, 0.15, 0.15], box B p = [0.35, 0.3, 0.2, 0.15]
+Ratio: 0.55/0.35 = 1.57 vs original 2.33. Flattening also reduces separation.
+
+Hmm, so temperature scaling might not help with cross-box ranking. It mainly affects within-box ranking (which class is predicted).
+
+Actually, let me reconsider. The key issue for mAP is:
+1. For each class, true detections should rank above false detections
+2. The score for a true detection of class c should be high
+3. The score for a false detection (or wrong class) should be low
+
+The current scoring is `conf * p[c]`. The detector conf already provides some signal about whether it's a real defect. The classifier p[c] provides the class assignment.
+
+What if the issue is that for false alarms, the classifier still gives reasonable probabilities (since it was never trained to say "not a defect")? In that case, the score for a false alarm might be conf * 0.3 (if it's the top class), which could compete with true detections that have conf * 0.6.
+
+One idea: use the entropy of the distribution as a confidence measure. If the distribution is very flat (high entropy), the model is uncertain → lower score. If it's peaked (low entropy), the model is confident → higher score.
+
+score = conf * p[c] * (1 - H(p)/log(4))
+
+where H(p) is the entropy. This would suppress scores for uncertain boxes.
+
+But e009 tried multiplying by max prob (which is related) and it didn't confirm. Let me think of something different.
+
+Actually, let me look at this from a different angle. The best approach might be to **train on detector boxes with proper IoU matching** but done differently from e004.
+
+e004 got 0.6234 (worse than 0.6373). e001 (with background) got 0.5512 (much worse).
+
+What if we train on detector boxes but WITHOUT adding a background class, and instead just use the matched class (or skip unmatched ones)? That's basically what e004 did.
+
+What about a hybrid: train mostly on true crops (as now) but add some detector boxes as additional training data? This could help with robustness to box misalignment without the negative effect of background.
+
+Actually, let me think about what else could help:
+
+**Idea: Use a second model (ensemble)**
+Train two models: tf_efficientnetv2_b0 and convnext_nano (or resnet50). Average their probabilities. This is a well-known technique that typically gives 1-3% improvement. The time budget is 180s, and currently we use ~130s for training + ~40s for inference. If we split training time between two models, each gets ~65s (about half the current training). The ensemble might still be better than one model trained for the full time.
+
+But this is risky - if each model is undertrained, the ensemble might not help.
+
+**Idea: Mixup/CutMix augmentation**
+During training, mix two random crops together. This is a strong regularizer that can improve generalization. It's easy to implement and doesn't require architectural changes.
+
+**Idea: Use the wide crop more**
+Currently both crops are averaged equally. What if we weight the wide crop more heavily? The wide crop gives context that might help distinguish stain (which needs surrounding context) from deposit.
+
+**Idea: Score using conf^0.5 * p[c]**
+Reducing the power of conf means the classifier has more influence on the final score. If the classifier is good at distinguishing classes but the detector conf is noisy, this could help.
+
+Actually, let me think about what's most likely to give a clear improvement:
+
+1. The model is at 0.6373, ceiling is 0.758. Gap is 0.12.
+2. Pore is weakest at 0.517.
+3. The model was trained on perfect boxes only.
+4. TTA helps (flip).
+5. Architecture matters (tf_efficientnetv2_b0 > efficientnet_b0).
+
+I think the most promising next step is to try **training with mixup** as a regularization technique. It's:
+- Easy to implement (a few lines of code)
+- Well-known to improve generalization
+- Doesn't change the architecture or data
+- Could help with the confusion between similar classes (pore/stain/deposit)
+- Low risk of breaking things
+
+The hypothesis: Mixup regularization will improve the model's ability to discriminate between visually similar defect types (pore, stain, deposit) by creating virtual training examples that are interpolations of different classes, leading to smoother decision boundaries and better generalization.
+
+Implementation: During training, with probability 0.5 (or always), mix two random samples: x = alpha * x1 + (1-alpha) * x2, y = alpha * y1 + (1-alpha) * y2, where alpha ~ Beta(0.4, 0.4). Use soft cross-entropy loss.
+
+Wait, but we have two views per sample. Mixup would need to mix both views together. Let me think...
+
+Actually, a simpler approach: just mix the input images (both views) and use soft labels. The loss becomes:
+loss = -(alpha * log_softmax(x)[y1] + (1-alpha) * log_softmax(x)[y2])
+
+Or equivalently, use the mixed label vector with cross-entropy.
+
+Let me implement this:
+
+```python
+# In the training loop:
+xt = xt.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+xw = xw.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+y = y.to(device, non_blocking=True)
+
+# Mixup
+if mixup_alpha > 0 and random.random() < 0.5:
+    lam = np.random.beta(mixup_alpha, mixup_alpha)
+    idx = torch.randperm(xt.size(0), device=device)
+    xt = lam * xt + (1 - lam) * xt[idx]
+    xw = lam * xw + (1 - lam) * xw[idx]
+    y_a, y_b = y, y[idx]
+    with torch.autocast(**amp):
+        logits = (model(xt) + model(xw)) / 2
+        loss = -lam * nn.functional.log_softmax(logits, 1).gather(1, y_a.unsqueeze(1)).squeeze(1) \
+               - (1-lam) * nn.functional.log_softmax(logits, 1).gather(1, y_b.unsqueeze(1)).squeeze(1)
+else:
+    with torch.autocast(**amp):
+        loss = crit((model(xt) + model(xw)) / 2, y)
+```
+
+This is clean and focused. Let me write the patch.
+
+Actually, I need to be careful. The current code uses `crit = nn.CrossEntropyLoss()` and then `loss = crit((model(xt) + model(xw)) / 2, y)`. For mixup, I need to replace this with the soft loss.
+
+Let me write the SEARCH/REPLACE blocks carefully.
+
+I'll add a MIXUP_ALPHA setting and modify the training loop.
+
+Let me look at the exact lines I need to change:
+
+1. Add MIXUP_ALPHA to settings
+2. Modify the training loop to include mixup
+
+For the settings, I'll add after WEIGHT_DECAY:
+```
+WEIGHT_DECAY = 0.05
+```
+becomes:
+```
+WEIGHT_DECAY = 0.05
+MIXUP_ALPHA = 0.4
+```
+
+For the training loop, the current code is:
+```python
+            xt = xt.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            xw = xw.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            y = y.to(device, non_blocking=True)
+            with torch.autocast(**amp):
+                loss = crit((model(xt) + model(xw)) / 2, y)
+```
+
+I'll replace with mixup logic.
+
+Let me be precise about the SEARCH text. Looking at the file:
+
+```
+            xt = xt.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            xw = xw.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            y = y.to(device, non_blocking=True)
+            with torch.autocast(**amp):
+                loss = crit((model(xt) + model(xw)) / 2, y)
+```
+
+This should appear exactly once. Let me verify by looking at the file... Yes, this is in the training loop and appears once.
+
+Now for the replacement:
+```python
+            xt = xt.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            xw = xw.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            y = y.to(device, non_blocking=True)
+            if MIXUP_ALPHA > 0:
+                lam = np.random.beta(MIXUP_ALPHA, MIXUP_ALPHA)
+                idx = torch.randperm(xt.size(0), device=device)
+                xt = lam * xt + (1 - lam) * xt[idx]
+                xw = lam * xw + (1 - lam) * xw[idx]
+                y_a, y_b = y, y[idx]
+                with torch.autocast(**amp):
+                    logits = (model(xt) + model(xw)) / 2
+                    logp = nn.functional.log_softmax(logits.float(), 1)
+                    loss = -lam * logp.gather(1, y_a.unsqueeze(1)).squeeze(1).mean() \
+                           - (1 - lam) * logp.gather(1, y_b.unsqueeze(1)).squeeze(1).mean()
+            else:
+                with torch.autocast(**amp):
+                    loss = crit((model(xt) + model(xw)) / 2, y)
+```
+
+Wait, I need to be careful with autocast. The log_softmax should be in float32 for numerical stability. Let me use `.float()` on the logits.
+
+Actually, looking more carefully, with bfloat16 autocast, the model outputs might be in bfloat16. Let me cast to float32 for the log_softmax:
+
+```python
+logits = (model(xt) + model(xw)) / 2
+logp = nn.functional.log_softmax(logits.float(), 1)
+```
+
+This should be fine.
+
+Let me finalize my patch.

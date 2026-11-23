@@ -1,0 +1,184 @@
+===== attempt 1 =====
+Let me think about where we are and what to do next.
+
+Current best: e012, 5-seed 0.6363. Three-view logit averaging (1.5x, 2.5x, 4x crops), EfficientNet-B0, 160px, ~285 steps in ~111s training, ~60s prediction (185s total).
+
+Diagnostics:
+- Class decision on overlapping boxes: pore 67% correct (18 pore→stain, 5 pore→deposit), deposit 75% (63 deposit→stain), discontinuity 94%, stain 89% (45 stain→deposit).
+- mAP if all boxes had correct class but kept my scores: 0.7400 (mine: 0.6363). So wrong classes cost 0.104.
+- Perfect-class ceiling: 0.758. So score vs detector-conf cost: 0.758 - 0.740 = 0.018.
+
+So the dominant error is class decision on detector boxes. The weak classes are pore (0.546), deposit (0.615), stain (0.606). Confusions: pore↔stain, deposit↔stain, stain↔deposit.
+
+History lessons:
+- data: 3 attempts, no new best (e001 crash, e002 rejected, e005 rejected). Marked EXHAUSTED?
+- augmentation: 1 attempt (e003 jitter) rejected.
+- architecture: 6 attempts, 1 new best (e012 third view), 2 unconfirmed (e004 shared backbone concat 0.6329, e008 size/aspect input 0.6279), 2 crash/timeout (e007, e015).
+- inference: 4 attempts, 0 new best, 2 timeout (e010, e014, e016 — actually 3 timeout/crash: e010 timeout, e014 timeout, e016 timeout). Marked EXHAUSTED?
+- optimisation: 1 attempt (e009 split LR) rejected badly (0.5854).
+- other: 1 (e014 timeout).
+
+Guide's plan:
+1. Consolidate: train on detector boxes from train split — already tried (e001 crash, e002 rejected). So drop? Guide says "if it fails twice, drop it". e001 crash + e002 rejected = 2 failures. So drop.
+2. Close the box-quality gap: simulate detector error (e003, e005 both rejected — 2 failed variants → per guide, move to next direction), weight/sample by box quality, combine views better (e004, e007, e013 tried — shared backbone concat unconfirmed, MLP combo crashed, learned logit weights rejected).
+3. Buy training steps: e006 (reserve 45) rejected, e010/e011 (precompute train crops) rejected (e011 0.6254), e016 (precompute eval crops) timeout.
+4. Fine-grained classes: after 2 and 3.
+
+Hmm. The guide says "two failed variants of a direction: move to the next direction."
+
+Let me think about what's fundamentally untried and could give ≥0.01.
+
+What the diagnostics say: wrong-class cost 0.104. Confusions are pore→stain (18), deposit→stain (63), stain→deposit (45). So the stain/deposit/pore triangle. Discontinuity is fine.
+
+Ideas not yet tried:
+
+1. **Training on detector boxes from train split** — tried, failed. Drop.
+
+2. **Box-error simulation** — e003, e005 failed. Drop per guide.
+
+3. **Better view combination** — e004 (concat + head, 0.6329 unconfirmed), e007 (MLP + add, crashed), e013 (learned logit weights, rejected). Hmm, 3 attempts. Effectively exhausted.
+
+4. **Buy training steps** — e006 rejected (reserve 45 — wait, that's weird. e006 lowered reserve to 45 and got 0.6253, rejected. But e016 lowered to 42 and precomputed eval crops and timed out. The timeout suggests prediction is actually slower than 37s? Let me check: e012's log: 285 steps at 125s, total 185s. So prediction+write = 60s. Hmm, e006's hypothesis said prediction is ~37s (125s→162s). But e012's log shows 185s total. Wait — e012 has 3 views, e006 was based on e000 (2 views). For 2 views, prediction was ~37s. For 3 views, prediction is ~60s. So e016's reserve of 42 was too small: 125s training + 60s prediction = 185 > 180. Actually e016 timed out at 195s. Precomputing eval crops saved some prediction time but... it was killed at 195s, so training must have run longer (reserve 42 → t_end = 138s, more steps) and prediction still took ~50s+.
+
+Key insight: with 3 views, prediction takes ~60s. To buy training steps, we need to cut prediction time. e016 tried precomputing eval crops but still timed out — probably because precomputation itself took ~13s (14s load → then precompute) and the training phase ran longer.
+
+Wait, let me recompute. e016: reserve 42, so t_end = T0 + 138. Training ran until 138s. Then prediction. Killed at 195s means prediction+write took >57s after precompute. Precompute of 41,879 boxes × 3 views at ~1.35ms/crop... e011's note said ~1.35ms/crop → 41879*3*1.35ms ≈ 170s?? No wait, e010 precomputed both train and eval crops and took ~129s total for 41,879+6,052 boxes. Hmm: (41879+6052)*3 views * t = 129s → t ≈ 129/(47931*3) ≈ 0.9ms/crop. So eval-only precompute ≈ 41879*3*0.9ms ≈ 113s. That alone blows the budget! That's why e016 timed out — precomputing eval crops is ~113s, not cheap. e011's hypothesis said "precompute only training crops costs ~16s" (6052*3*0.9 ≈ 16s ✓).
+
+So precomputing eval crops is out. Precomputing only training crops (e011) was rejected (0.6254, seed 0 vs best 0.6363 — but that was a single run; 0.6254 is ~0.011 below, could be within noise but rejected).
+
+Hmm, what about speeding up prediction another way? The prediction phase: 41,879 boxes × 3 views. Each view is a 160px crop through EfficientNet-B0. Inference at batch 256... 41879*3 = 125,637 forward passes. At 60s that's ~4.2k/s.
+
+Options to cut prediction cost:
+- Reduce views at inference: e.g., only 2 views (drop the 4x view). But e012's gain came "almost entirely from the pore class" from the third view. Dropping it loses the gain.
+- Batch size 256 → larger? Probably already saturated.
+- Prediction on CPU? No.
+- Reduce eval rows? No, all eval boxes need predictions.
+
+Actually wait — is prediction really 60s? e012 log: "done: 4 epochs, 285 steps, 55313 prediction rows, 185s total". Training ended at 125s (epoch 3 print was 125s). So prediction+write = 60s. And reserve is 55, so it's tight: 125 + 60 = 185 > 180-55=125... wait, t_end = deadline - 55 = 125s. Training stopped at 125s. Then prediction took 60s → 185s total. That's over the 180 budget?! But e012 is the confirmed best with 5 seeds, so it must have finished... 185s total > 180s budget? Hmm, "Killed after 195 s (budget 180 s)" was e016. e012's log says 185s total. If the budget is 180, e012 should have been killed too. Unless the harness kills at limit but the run prints "done" at 185s... that's contradictory. Maybe the budget for these runs is actually larger, or the kill happens at 180 but the print is... no, the print is the last line.
+
+Hmm, wait. Maybe --seconds is not 180 for all runs. The brief says "at the limit the run is killed and counted as failure". e016 was "killed after 195s (budget 180s)". e012 printed 185s total and was accepted 5 times. So either e012's actual budget was larger, or... actually maybe the harness gives more time for multi-seed confirmation runs? Or the budget is 180 but there's slack? Confusing. Actually maybe T0 is set at import time and --seconds is 180, but the harness's kill is at 180+something? e016 was killed at 195. If kill is at 195, then e012 at 185 survives. So effective kill ≈ 195s? The brief says "keep the whole run under ~165s" as a rule of thumb. e012 at 185s is over that rule of thumb but worked.
+
+Anyway: e016 (reserve 42 + eval precompute) timed out. The precompute itself is the killer (~113s). So precomputing eval crops is a dead end.
+
+What about precomputing only training crops (e011)? Rejected at 0.6254 seed 0. But that's a single seed; the best is 0.6363±0.003. 0.6254 is ~3.5σ below. Probably genuinely slightly worse, or the precompute changed the data pipeline in a bad way (e.g., persistent_workers with precomputed crops... or the precompute consumed 16s of training time, netting fewer steps). e011: precompute 16s, then training. Per-step savings from not doing PIL crop/resize in workers... but workers were already doing that in parallel (8 workers). If GPU was the bottleneck, precompute saves nothing. e011's result was rejected, so the GPU was likely the bottleneck and precompute just ate 16s.
+
+So "buy training steps" via precompute: dead. Via reserve: e006 rejected (but that was 2-view e000 base where prediction was 37s; reserve 45 → t_end=135, +10s training, result 0.6253 — worse than e000's 0.629? That's odd. More training should help... unless the extra steps at the end of the cosine schedule are at tiny LR and don't help, and the seed noise ate it. Rejected.)
+
+Hmm, what about reducing prediction cost to allow a smaller reserve? Prediction is 60s for 3 views. If we could do inference with 2 views... no.
+
+Actually, what about **halving the eval work at inference**: we don't need all 4 rows per box. The metric: per class, predictions are sorted by score. Writing all 4 rows per box is fine. But do we need to run the model on all 41,879 boxes? Yes, all eval boxes.
+
+Alternative: **faster inference via distillation to a smaller model**? Too complex in the budget.
+
+Let me think about the actual error structure and what could give ≥0.01.
+
+Diagnostics: wrong-class cost 0.104. Breakdown of misclassified overlapping boxes:
+- pore: 67 correct; 18→stain, 5→deposit, 1→disconti
+- deposit: 75 correct; 63→stain, 2→pore, 1→disconti
+- stain: 89 correct; 45→deposit, 9→pore, 8→disconti
+- discontinuity: 94 correct
+
+Total misclassified: 18+5+1 + 63+2+1 + 45+9+8 + 1+4+22 = ~181 out of ~1250.
+
+Biggest confusions: deposit→stain (63), stain→deposit (45), pore→stain (18).
+
+So the model confuses stain with deposit, and pore with stain. What distinguishes them? Stain (氧化/污渍?) vs deposit (焊渣/附着物) vs pore (气孔). Pore: small dark holes, often clustered. Deposit: raised material. Stain: discoloration on surface.
+
+What's untried that targets this?
+
+Ideas:
+
+A. **Multi-crop ensemble at inference (TTA)**: tried 8 times in earlier runs, no gain. Exhausted.
+
+B. **Different backbone**: earlier runs: EfficientNet-B2, ResNet-50, ensembles — no gain. e015 ConvNeXt-Nano timed out (probably 3-view inference too slow, or training slower). ConvNeXt-Nano at 160px... timed out. Risky.
+
+C. **Mixup/CutMix**: earlier runs: "training augmentation (rotation, mixup, stronger color or geometry)" 5 attempts, no gain. Exhausted.
+
+D. **Label smoothing**: not explicitly in the list! Let me check the families: "fewer or reweighted score rows" (16), "5th background class" (9), "detector boxes as training data" (6), "third wide view" (3), "low-res crops" (4), "bigger backbone" (8), "resolution/small boxes" (9), "TTA" (8), "longer training" (6), "class-balanced sampling" (4), "training augmentation" (5), "focal loss" (2), "box size/aspect input" (4). Label smoothing is not listed. But the background-reading note says label smoothing "can reduce the information in class probabilities that ranking metrics use". And our score is conf × p[c]; the ranking within a class is by p[c] (since conf is fixed per box). Label smoothing changes p values... it compresses probabilities toward 0.25, which changes the relative order of p[c] across boxes? No — label smoothing in cross-entropy is equivalent to interpolating the target with a uniform distribution; the effect on logits is to shrink them toward zero (like a regularizer). The order of p[c] across boxes for a fixed class c could change (boxes where c was the argmax with high confidence get compressed more). It's a small effect, probably <0.005. Not attractive.
+
+E. **Training on low-res images**: "low-res crops added to training" 4 attempts, no gain. Exhausted.
+
+F. **Box-quality weighting/sampling**: guide's direction 2b — "weight or sample training boxes by box quality". Untried! Wait, is it? The families list doesn't have box-quality weighting. "Class-balanced sampling or class-weighted loss" (4) is class-based, not box-quality. So box-quality sampling is untried. But what's the mechanism? Train with a mix of "clean" boxes (true boxes) and "noisy" boxes (simulated detector errors), with the noisy ones upweighted. e003/e005 tried simulating detector error (jitter) as augmentation — both rejected. Hmm, but e003's jitter was 50% probability with large shifts; e005 matched the measured distribution. Both rejected. So "make training boxes noisier" is a 2-failure direction → per guide, move on.
+
+G. **Combine views better**: 3 attempts (e004, e007, e013). e004 concat+head 0.6329 (unconfirmed, slightly below e012's 0.6363). e013 learned logit weights rejected. e007 crashed. So 2 real failures + 1 crash. Effectively exhausted.
+
+H. **Score formulation**: "fewer or reweighted score rows" 16 attempts, no gain. Exhausted.
+
+I. **Background class**: 9 attempts, no gain. Exhausted.
+
+J. **Detector boxes as training data**: 2 failures (crash + reject). Guide says drop. But wait — earlier 5-run history says "accepted twice (5-seed 0.6337 and 0.6342, ~+0.004)" in those runs. In tonight's run: e001 crash, e002 rejected (0.6282). So 2 failures → drop per guide.
+
+Hmm, so what's left? Let me think about what's fundamentally different.
+
+The guide's plan says: phase 2 (box-quality gap) directions: jitter simulation (2 failures → done), box-quality weighting (untried), better view combination (3 attempts → done). Phase 3 (buy steps): precompute (failures), reserve (failure). Phase 4: fine-grained classes via confusion matrix.
+
+So per the guide, the remaining untried directions are:
+1. Box-quality-weighted sampling (guide 2b) — but this is closely related to the failed jitter experiments. Is it "fundamentally different"? The failed experiments changed what jitter is applied; box-quality weighting would change the sampling distribution. Honestly, the mechanism is similar: expose the model to misplaced boxes. Both failed. I'd argue it's the same direction with 2 failures. But the guide explicitly lists it as a direction... "two failed variants of a direction: move to the next direction". The jitter experiments are the failed variants of "simulate detector error". Box-quality weighting is arguably a different variant (sampling vs augmentation). Hmm.
+
+2. Fine-grained classes (phase 4): "look for one change that helps the whole pore/deposit/stain confusion, not one class."
+
+What could help the pore/deposit/stain confusion?
+
+- **Higher resolution for the tight crop**: e014 tried 320px tight crop → timeout. Earlier runs: "resolution and small-box handling (224px, larger MIN_CROP...)" 9 attempts, no gain. Exhausted.
+
+- **Different normalization / color handling**: stain is a color/discoloration cue! Stain = discoloration. If we're normalizing with ImageNet mean/std, that's fine. But maybe the color channel matters more for stain vs deposit. Hmm, what about feeding raw color vs desaturated? Untried but speculative.
+
+- **Multi-scale feature fusion in the backbone**: untried. E.g., use the backbone's intermediate features. Complex.
+
+- **Training with more epochs via faster model**: e.g., EfficientNet-B0 → smaller/faster model for more steps? Earlier: "bigger or different backbone" no gain; but smaller backbone for more steps is different. convnext_atto/pico are tiny. But the background says "a smaller or faster model, lower resolution, or fewer views can beat a stronger but slower one". We have 285 steps; a much faster model could do ~2x steps. But model capacity might limit the fine-grained task. Risky, and "different backbone" family had 8 no-gain attempts (though those were bigger backbones). Smaller is untried. Hmm.
+
+- **Learning rate / schedule**: e009 (split LR) failed badly (0.5854 — probably a bug or the low backbone LR hurt). Other optimisation tweaks: LR 1e-3 → 2e-3? Untried! The "optimisation" category has only 1 attempt. Higher LR with more steps... but we're step-limited, not LR-limited. The loss is still dropping at the cut (0.242). More steps would help. To get more steps, we need faster per-step or more budget.
+
+Wait, actually, let me reconsider the step count. 285 steps × 64 = 18,240 samples = 3 epochs over 6,052 boxes. Loss 0.242 at the end. The model is undertrained. If we could get 500+ steps, that's a real gain.
+
+How to get more steps?
+1. Faster per step: per-step cost = 3 views × 160px EfficientNet-B0 forward+backward, batch 64. 285 steps in 111s → 0.39s/step → 6.1ms per view per sample. That's GPU-bound presumably.
+2. Reduce views to 2: ~33% fewer compute → ~430 steps. But the third view gave +0.005 (e012). 2 views at 430 steps vs 3 views at 285 steps — which wins? e000 (2 views, ~430 steps?) let me check: e000's log isn't shown but e006 (2 views, reserve 45) got 0.6253 seed 0. e012 (3 views, reserve 55) is 0.6363 5-seed. e000 scored 0.629-0.630 5-seed. So 3 views at 285 steps beat 2 views at ~430 steps by ~0.006. Interesting — so the third view is worth more than the ~145 extra steps. Hmm wait, e000's step count: 2 views, similar per-view cost. 111s for 3 views → 2 views would be ~74s for same steps → in 111s budget, ~430 steps. And e000 got 0.629. So yes, 3 views at 285 steps (0.6363) > 2 views at ~430 steps (0.629).
+
+So what about 3 views but smaller/faster per view? E.g., IMG_SIZE 160 → 128? Earlier runs: "resolution... (224px, larger MIN_CROP...)" 9 attempts no gain — that family was about larger resolution. Smaller (128) for more steps is arguably in that family ("resolution"). 9 attempts, no gain. Exhausted.
+
+3. **Fewer, bigger batches**: batch 64 → 128. Same compute per sample; steps halved in count but same samples/second. No gain in samples seen. No.
+
+4. **Mixed precision already on (bfloat16)**. Channels-last on.
+
+5. **Reduce prediction time to shrink reserve**: prediction is 60s, reserve is 55. If prediction could be ~30s, reserve could be 35, gaining 20s of training (~55 steps). How to halve prediction?
+   - Inference with 2 views instead of 3: saves 20s. But we showed 3 views > 2 views... but that comparison was at fixed step counts. Hmm, actually the cleanest test: the current best uses 3 views for both training and inference. What if we train with 3 views but infer with 2? Distribution mismatch (model saw 3 views during training; inference sees 2 — but each view is independent, so the model can handle any subset... the logit average over 2 views is just missing one term; the model was trained to average 3, so a 2-view average at inference is a slight mismatch but each view's logit is still meaningful). This is a "inference" change: drop the 4x view at inference only. Saves ~20s prediction → reserve 35 → +20s training (~55 steps). Net: lose the third view's contribution at inference (was worth +0.005 in e012 vs e000, but e000 had more steps...).
+
+   Hmm, this is getting complicated. Let me think about the cleanest, highest-EV experiment.
+
+Actually, wait. Let me reconsider. What about **training the model to output per-view logits and using a "soft" combination at inference**? Tried (e013, rejected).
+
+Let me look at the problem from the metric side again.
+
+mAP@0.5 = 0.6363. Perfect-class ceiling (stage-1 boxes, correct class, detector conf): 0.758. Class-agnostic: 0.755. If all boxes had correct class but my scores: 0.7400. So:
+- Wrong-class cost: 0.7400 - 0.6363 = 0.1037.
+- Score/ranking cost vs detector-conf: 0.758 - 0.740 = 0.018.
+
+The score cost: my score = conf × p[c]. The ceiling uses conf alone (all boxes class-correct, score=conf). Wait no — "stage-1 boxes scored as a single class 'defect': 0.755" and "perfect classes: 0.758". The 0.758 uses detector conf as score. My 0.740 uses conf × p[c] with correct class. So multiplying conf by p[c] (a per-box factor in [0,1]) costs 0.018 in ranking. That's because p[c] reorders boxes: a true box with low p[c] falls below a false alarm with high conf × p.
+
+Interesting: so the classifier's confidence is anti-correlated with correctness at the margin. If we used score = conf (ignoring p) with the argmax class... let me think: for each box, one row (argmax class, score=conf). That's in the "fewer or reweighted score rows" family (16 attempts, no gain; best 5-seed 0.627). Hmm, that family tried "argmax class only per box" — no gain. OK.
+
+So the 0.018 score cost is hard to recover (tried via row/score manipulation, failed). The 0.1037 wrong-class cost is the target.
+
+To cut wrong-class cost, the classifier must be better on detector boxes. The classifier is ~0.87 macro-F1 on perfect boxes (from the brief). On detector boxes it's clearly worse (per-class accuracy 67-94% on overlapping boxes, but that's argmax accuracy; the weighted misclassification is 181/~1250 ≈ 14.5%... wait, that gives macro accuracy: pore 67%, deposit 75%, stain 89%, disconti 94% → macro ~81%).
+
+So the classifier drops from ~87% F1 (perfect boxes) to ~81% (detector boxes) — a 6-point mismatch cost, plus the ranking effect.
+
+What's untried that could add ≥0.01?
+
+Let me brainstorm more:
+
+1. **Train on detector boxes (train split)**: 2 failures tonight. But earlier 5-run history: accepted twice with +0.004/+0.005. The guide says drop after 2 failures. e002 was 0.6282 seed 0 — that's ~0.008 below e000's 0.629-0.630, consistent with "no gain + noise". e001 crashed. So 2 failures → drop per guide. OK.
+
+2. **Box-error simulation**: e003 (0.6259), e005 (0.6275). Both ~0.003-0.005 below. 2 failures → drop.
+
+3. **Box-quality weighting/sampling**: untried. Mechanism: instead of (or in addition to) jittering, sample training boxes from a mixture: true boxes + detector boxes (train split) with weights... but that's #1 in disguise. Or: weight true boxes by how well a detector box overlaps them? Hmm. Honestly this feels like a third variant of the same failed direction. The guide lists it but I think it's low-EV.
+
+4. **Better view combination**: 3 attempts, done.
+
+5. **Buy steps**:
+   - Reserve tuning: e006 failed (but that was on e000 base). On e012 base, prediction is 60s, reserve 55 — actually the reserve looks right (60s prediction needs ~55-60s reserve; e012 finished at 185s, barely). Lowering reserve without cutting prediction = timeout (e016 proved: reserve 42 → killed at 195s).
+   - Cut prediction: drop a view at inference (saves ~20s) → reserve 35 → +20s training. This is a concrete, untried experiment! "Train 3 views, infer 2 views (drop the 4x wide view)".
+     Hypothesis: the 4x view's marginal value at inference (~+0.005 from e012, mostly pore) is less than the value of ~55 extra training steps (loss still dropping at 0.242). Also, the 4x view is the weakest view (most context, least object detail).
+     Expected: if steps are the binding constraint, +0.01; if the 4x view matters at inference, -0.005.
+     This is a clean, testable, low-risk experiment. And it directly tests "buy training steps" via a newThinking budget reached. Stop thinking now and write the reply in the required format.

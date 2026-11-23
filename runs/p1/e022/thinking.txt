@@ -1,0 +1,280 @@
+===== attempt 1 =====
+Let me carefully analyze the current state and the plan.
+
+Current best is e009 (5-seed val mAP@0.5 0.6359). The most recent experiment e021 crashed due to a dtype bug in SWA averaging (it tried to average integer tensors like `num_batches_tracked` in BatchNorm).
+
+The lead's plan:
+- BASE: last (build on e021, which has the SWA code)
+- CATEGORY: data
+- The idea: label filtering / cleaning — after initial training, identify training boxes where the model confidently disagrees with the label (top-1 != label AND margin > 0.25), remove them, then retrain for one epoch on the cleaned set, then apply SWA.
+
+Let me think about the time budget carefully.
+
+From the log of e009 seed-0:
+- Loading: 13s
+- epoch 0: 94 steps, ends at 72s (so ~59s for epoch 0)
+- epoch 1: 157 steps total, ends at 95s (so ~23s for the second epoch's 63 steps... wait let me recompute)
+
+Actually:
+- T0 = 0
+- Loading done at 13s
+- Training starts at t_start ≈ 13s (roughly, after model creation)
+- deadline = T0 + 180 = 180
+- RESERVE_S = 85, so t_end = 180 - 85 = 95s
+- budget = t_end - t_start = 95 - 13 = 82s
+
+Wait, but the log says "done: 2 epochs, 157 steps, 55620 prediction rows, 168s total". So training ended at 95s (t_end), then prediction took from 95s to 168s = 73s. That's a lot.
+
+Actually the epoch 1 line says "95s" which matches t_end = 95s. So training used exactly until 95s.
+
+So:
+- Load + model setup: ~13s
+- Training: 13s to 95s = 82s (157 steps)
+- Prediction: 95s to 168s = 73s
+- Total: 168s, within 180s.
+
+Now the plan wants to add a cleaning phase + retrain epoch + SWA. This is a LOT more work. Let me do the budget arithmetic as the plan suggests.
+
+The plan says:
+"Budget arithmetic: 1 initial epoch ~45s + cleaning forward pass ~50s + 1 retrain epoch ~40s + prediction ~70s ≈ 205s — use RESERVE_S=60 and train only the first epoch for 30s (or fewer steps) to keep total under 180s."
+
+Wait, this arithmetic is off. Let me recompute with the actual numbers.
+
+Actually the plan's numbers are estimates that don't match the real log. Let me use the real log:
+- Load: 13s
+- One full epoch (94 steps): ~59s (from 13s to 72s)
+- Prediction (41879 eval boxes, 4 views each): ~73s
+
+So prediction is the dominant cost at ~73s. That's fixed (we must predict on all eval boxes).
+
+If I want to add:
+- Initial training: some steps
+- Cleaning forward pass over all 6052 training boxes (4 views): this is like one epoch of forward = ~59s for 94 steps... but wait, a forward-only pass is faster than a full train step (no backward). Forward+backward is the 59s. Forward-only might be ~30s. Actually, let me think. The training step includes forward + backward + optimizer. A forward-only pass is roughly half or less. Let's say ~30s for the cleaning pass.
+- Retrain epoch on cleaned set: ~59s for a full epoch, but we might do fewer steps.
+- Prediction: ~73s (fixed)
+
+Total budget: 180s.
+Load: 13s
+Prediction: 73s
+That leaves 180 - 13 - 73 = 94s for training + cleaning + retrain + SWA.
+
+That's tight. The plan wants:
+- Initial training epoch: ~45s (but a full epoch is 59s)
+- Cleaning pass: ~50s (but forward-only is ~30s)
+- Retrain epoch: ~40s (full epoch 59s)
+
+That's 135s of training+cleaning, plus 13 load + 73 pred = 221s. Over budget.
+
+So the plan as written doesn't fit. The lead acknowledges this and says "use RESERVE_S=60 and train only the first epoch for 30s (or fewer steps) to keep total under 180s."
+
+Let me reconsider. I need to make this fit. Let me design a realistic budget:
+
+Fixed costs:
+- Load: 13s
+- Prediction: 73s
+
+Available for model training + cleaning: 180 - 13 - 73 = 94s.
+
+I need:
+1. Initial training (to get a model that can identify mislabeled boxes): let's do ~40s worth of steps.
+2. Cleaning forward pass over 6052 boxes: ~30s (forward only).
+3. Retrain on cleaned set: ~30s worth of steps.
+4. SWA: negligible (just averaging tensors).
+
+Total: 40 + 30 + 30 = 100s. Plus 13 + 73 = 186s. Slightly over.
+
+Hmm. Let me be more careful. I should use a time-based loop rather than fixed epochs, and check time before each phase. Let me structure it as:
+
+- Phase A: train until time reaches t_A (e.g., 45s from start of training).
+- Phase B: cleaning pass (forward only) over all training boxes.
+- Phase C: retrain on cleaned set until time reaches t_C.
+- Phase D: SWA averaging.
+- Phase E: prediction.
+
+But I need to reserve enough time for prediction. The safest approach: compute the prediction time empirically? No, that eats budget. Better: reserve a fixed amount for prediction based on the log (~73s). But the lead says RESERVE_S=60. Let me think about what's safe.
+
+Actually, the current RESERVE_S=85 and prediction took 73s. So 85 is a good reserve (73s actual + margin). If I keep RESERVE_S=85, then t_end = 180 - 85 = 95s. Training must finish by 95s. Load is 13s, so training+cleaning+retrain+SWA must fit in 95 - 13 = 82s.
+
+82s for: initial training + cleaning pass + retrain + SWA.
+
+Let me allocate:
+- Initial training: 30s (from 13s to 43s)
+- Cleaning pass: ~25s (forward only over 6052 boxes)
+- Retrain on cleaned: ~25s
+- SWA: ~1s
+Total: 30 + 25 + 25 + 1 = 81s. Fits in 82s. 
+
+But this is very tight. The cleaning pass timing is uncertain. Let me make the phases time-checked so that if things run long, we skip gracefully. Actually, the cleanest approach: use a single deadline for the end of training (t_end = deadline - RESERVE_S), and within that, do the phases with time checks.
+
+Let me restructure the training section:
+
+```python
+    # Train until the budget minus the reserve is used up: 5% warm-up, then cosine decay.
+    t_start = time.time()
+    t_end = deadline - RESERVE_S
+    budget = max(1.0, t_end - t_start)
+    steps, epoch, done = 0, 0, False
+    model.train()
+    ...
+```
+
+I need to:
+1. Train for a first portion (until some fraction of budget, say 40%).
+2. Do cleaning pass.
+3. Retrain on cleaned set for the rest.
+4. SWA.
+
+Let me think about how to implement the cleaning pass. I need a forward-only pass over all training boxes with the current model. I can create a new DataLoader (no shuffle, no drop_last) over the full crop set and iterate, computing softmax probs.
+
+Actually, I can reuse the existing `BoxDataset` with train=False to avoid jitter (deterministic crops for the cleaning decision). That's cleaner — the cleaning decision should be on the "canonical" crop, not a jittered one.
+
+Let me write a helper:
+
+```python
+    def forward_probs(dataset_rows, batch_size=256):
+        ds = BoxDataset(dataset_rows, images, False)
+        dl = torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=False,
+                                          num_workers=workers, pin_memory=True)
+        outs = []
+        with torch.no_grad(), torch.autocast(**amp):
+            for views, _ in dl:
+                views = [v.to(device).to(memory_format=torch.channels_last) for v in views]
+                outs.append(torch.softmax(model(views).float(), 1).cpu())
+        return torch.cat(outs).numpy()
+```
+
+Wait, but BoxDataset with train=False doesn't jitter, good. And it returns (views, cls). The cls is r.get("cls", -1) which for crops is the label.
+
+Then cleaning:
+```python
+    probs = forward_probs(crops)
+    top1 = probs.argmax(axis=1)
+    label = np.array([r["cls"] for r in crops])
+    p_label = probs[np.arange(len(crops)), label]
+    p_top1 = probs.max(axis=1)
+    margin = p_top1 - p_label
+    keep = (top1 == label) | (margin <= 0.25)
+    kept_rows = [r for r, k in zip(crops, keep) if k]
+```
+
+Wait, the condition: "Mark a box as inconsistent if top-1 != label AND margin = p(top-1) - p(label) > 0.25". So remove if (top1 != label) AND (margin > 0.25). Keep otherwise. So keep = ~( (top1 != label) & (margin > 0.25) ) = (top1 == label) | (margin <= 0.25). Yes.
+
+Then retrain on kept_rows. I need a new DataLoader over kept_rows with train=True.
+
+Now the SWA: the lead wants to collect snapshots during the retrain phase and average. But the plan says "collect weight snapshots at steps 20, 40, 60, 80 (skipping any non-float tensors to fix e021's dtype bug) plus final weights, average them per key, load into model."
+
+Actually, let me reconsider the SWA. The original e021 crashed because it averaged ALL tensors including integer ones (BatchNorm's running stats are float, but num_batches_tracked is Long). The fix: only average float tensors.
+
+Let me write a robust SWA:
+```python
+    def swa_average(states):
+        keys = states[0].keys()
+        avg = {}
+        for k in keys:
+            t = states[0][k]
+            if t.is_floating_point():
+                avg[k] = torch.stack([s[k] for s in states]).float().mean(0)
+            else:
+                avg[k] = t  # keep last (e.g., integer counters)
+        return avg
+```
+
+Wait, but the states are stored on CPU (from e021's code: `v.detach().cpu().clone()`). And they're the raw state_dict tensors. For a model on CUDA with bfloat16 autocast, the parameters are float32 (autocast doesn't change param dtype). So `v.detach().cpu().clone()` gives float32 for params. Good. For num_batches_tracked (Long), we skip averaging.
+
+Actually, let me simplify: I'll collect snapshots during the retrain phase, then average only float tensors.
+
+Now, how many snapshots? The retrain phase is ~25-30s, which is ~30-40 steps (at ~0.6s/step... wait, 94 steps in 59s = 0.63s/step). So ~25s = ~40 steps. Collecting every 20 steps gives ~2 snapshots. That's not a great SWA. Hmm.
+
+Actually, let me reconsider. The whole point of SWA is to average weights from the end of training when the loss is low and stable. With only ~40 steps in the retrain phase, SWA over those is marginal. But the lead explicitly wants it. Let me follow the plan but make it robust.
+
+Actually, wait. Let me reconsider the entire budget. The plan is ambitious and the budget is tight. Let me reconsider whether I should reduce the initial training to give more room.
+
+Actually, the key insight: the cleaning pass itself is expensive (~25-30s forward over 6052 boxes). And prediction is 73s. Load 13s. That's 13 + 30 + 73 = 116s of "fixed-ish" costs, leaving only ~64s for all training (initial + retrain). That's very tight.
+
+Let me reconsider: can I make the cleaning pass cheaper? The cleaning pass needs to classify all 6052 training boxes. That's unavoidable if we want to filter. But I could do it with a larger batch (256) and it's forward-only. Let me estimate: prediction does 41879 boxes in 73s = 0.00174s/box. Cleaning does 6052 boxes = 6052 * 0.00174 = 10.5s. Oh! That's much cheaper than I thought. Because prediction is 41879 boxes and takes 73s, so per-box is ~1.74ms. 6052 boxes = ~10.5s. 
+
+Wait let me recompute. 73s / 41879 boxes = 0.001743 s/box. 6052 boxes * 0.001743 = 10.55s. Yes, ~10.5s for the cleaning forward pass. 
+
+So the cleaning pass is cheap (~10s). Good.
+
+Now recompute budget:
+- Load: 13s
+- Initial training: X s
+- Cleaning pass: ~10s
+- Retrain: Y s
+- SWA: ~1s
+- Prediction: ~73s
+Total: 13 + X + 10 + Y + 1 + 73 = 97 + X + Y ≤ 180 → X + Y ≤ 83s.
+
+So I have 83s for initial training + retrain combined. 
+
+If I split evenly: X = 40s, Y = 40s. That's 80 steps total (0.63s/step → 40s = ~63 steps each). Hmm, that's a lot of steps.
+
+Actually, wait. Let me reconsider the step time. In e009, 94 steps in ~59s = 0.628s/step. So 40s = ~64 steps. 
+
+Let me allocate:
+- Initial training: 40s (~64 steps)
+- Cleaning: 10s
+- Retrain: 35s (~55 steps)
+- SWA: 1s
+Total training section: 40 + 10 + 35 + 1 = 86s. Plus load 13 = 99s. Plus prediction 73 = 172s. Under 180. 
+
+But this is tight. Let me be safe and use a time-based approach where I check the clock. Let me set:
+- RESERVE_S = 85 (same as before, prediction took 73s, so 85 is safe).
+- t_end = deadline - RESERVE_S = 95s.
+- Training section must finish by 95s. Load ends ~13s. So 82s for initial training + cleaning + retrain + SWA.
+
+I'll structure:
+- Phase A (initial train): train until time reaches t_A = t_start + 0.45 * (t_end - t_start) or a fixed fraction. Actually, let me use a fixed fraction of the available budget.
+
+Hmm, let me just use explicit time checkpoints relative to t_start:
+- avail = t_end - t_start (= 82s)
+- Phase A: train until t_start + 0.45*avail (= 13 + 37 = 50s)
+- Phase B: cleaning pass (10s) → ends ~60s
+- Phase C: retrain until t_end (= 95s) → 35s
+- Phase D: SWA (1s)
+- Prediction starts ~96s, ends ~169s. 
+
+That works. But I'm worried about the cleaning pass taking longer than 10s (e.g., if data loading is the bottleneck). Let me add a safety: after the cleaning pass, if time.time() > t_end - 20 (i.e., less than 20s left before t_end), skip the retrain and just do SWA on current weights. Actually, simpler: check time before retrain; if not enough time, skip retrain.
+
+Actually, let me reconsider. The lead's plan is specific. Let me follow it but with the budget fix. The lead said: "use RESERVE_S=60 and train only the first epoch for 30s (or fewer steps) to keep total under 180s."
+
+Hmm, RESERVE_S=60 means t_end = 180 - 60 = 120s. But prediction takes 73s! If prediction starts at 120s and takes 73s, it ends at 193s > 180s. That would time out. So RESERVE_S=60 is unsafe given prediction is 73s.
+
+Wait, unless the prediction is faster now? No, prediction is the same. So RESERVE_S must be ≥ ~75s to be safe. The current 85 is good. Let me keep RESERVE_S=85.
+
+Actually, let me reconsider. Maybe I'm overestimating prediction. Let me recompute from the log: "done: 2 epochs, 157 steps, 55620 prediction rows, 168s total". Training ended at 95s (t_end). So prediction + writing = 168 - 95 = 73s. Yes, 73s. So RESERVE_S=85 is the right choice (73 + 12 margin).
+
+So I'll keep RESERVE_S=85. The lead's "RESERVE_S=60" suggestion is wrong given the actual prediction time. I'll note this deviation.
+
+Now, let me reconsider the whole design to make it robust and fit.
+
+Let me reconsider: do I even need a full initial training epoch? The cleaning needs a model that's "good enough" to identify mislabeled boxes. If I train for ~40s (~64 steps), the model is reasonably trained (loss ~0.3). That should be enough to identify confident disagreements. Good.
+
+Let me now also reconsider: the retrain on the cleaned set. After removing mislabeled boxes, I retrain. But I should keep SWA over the retrain phase. Let me collect snapshots during retrain.
+
+Actually, let me reconsider whether SWA adds value here. With ~55 steps in retrain, SWA over maybe 2-3 snapshots is weak. But the lead wants it, and it's cheap. Let me include it but make it robust (skip non-float).
+
+Hmm, actually, let me reconsider the whole thing. The core idea is label cleaning. SWA is a secondary add-on from the crashed e021. The lead says "keep e021's crash fix — SWA averaging with dtype handling". So I should keep SWA (fixed) as part of the design.
+
+Let me now write the code.
+
+Let me look at the current e021 file structure. The e021 file is e009 + the SWA code. Let me reconstruct the relevant part of e021:
+
+```python
+    # Train until the budget minus the reserve is used up: 5% warm-up, then cosine decay.
+    t_start = time.time()
+    t_end = deadline - RESERVE_S
+    budget = max(1.0, t_end - t_start)
+    steps, epoch, done = 0, 0, False
+    swa_states = []  # SWA: collect weight snapshots during training
+    model.train()
+    while not done:
+        tot, nb = 0.0, 0
+        for views, y in dl_tr:
+            frac = min(1.0, (time.time() - t_start) / budget)
+            f = frac / 0.05 if frac < 0.05 else 0.5 * (1 + math.cos(math.pi * (frac - 0.05) / 0.95))
+            for pg in opt.param_groups:
+                pg["lr"] = LR * max(f, 1e-3)
+            views = [v.to(device, non_blocking=True).to(memory_format=torch.channels_last) for v in views]
+            y = y.to(device, non_blockingThinking budget reached. Stop thinking now and write the reply in the required format.

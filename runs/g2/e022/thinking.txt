@@ -1,0 +1,172 @@
+===== attempt 1 =====
+Let me analyze the situation.
+
+Current best: e012, 5-seed mean 0.6363. Three-view logit average (1.5x, 2.5x, 4x crops), EfficientNet-B0, 160px.
+
+Diagnostics:
+- Class confusion: pore 67% correct (18 pore→stain, 5 pore→deposit), deposit 75% (63 deposit→stain), discontinuity 94%, stain 89% (45 stain→deposit).
+- mAP if all boxes had correct class: 0.7400 vs my 0.6363. So wrong classes cost 0.104. Perfect-class ceiling is 0.758, so my scores cost about 0.018 relative to the detector's conf.
+- Main error: classification on detector boxes. Pore is the weakest class (AP 0.546). Stain/deposit confusion is large (63 deposit→stain, 45 stain→deposit, 18 pore→stain).
+
+History lessons:
+- Data (detector boxes from train split): e001 crashed, e002 rejected (0.6282), e020 rejected (0.6229). So 3 attempts, no confirmed improvement → exhausted per the guide.
+- Augmentation (box jitter simulating detector error): e003 rejected, e005 rejected. 2 attempts, no improvement.
+- Architecture: e004 shared backbone concat (0.6329 not confirmed), e007 crashed, e008 size input (0.6279 not confirmed), e012 3rd view (new best 0.6363), e013 learned view weights rejected, e021 crashed (shared backbone concat + 4x view).
+- Inference: e006 reserve rejected, e010 timeout, e011 rejected, e016 timeout, e017 timeout, e018 crashed, e019 rejected (dropping 4x view at inference → 0.6176, big drop — so the 4x view is important at inference; dropping it cost 0.019).
+- Optimisation: e009 split LR rejected (0.5854, big drop).
+
+So what's left?
+
+Guide plan:
+1. Consolidate: detector boxes from train split — but that's already been tried 3 times in this run (e001 crash, e002 rejected, e020 rejected). Per the guide, "if it fails twice, drop it." So drop.
+2. Close box quality gap: jitter simulation (e003, e005 tried, both rejected). Weight/sample by box quality — not tried. Combine views better (e004, e007, e021 tried; e021 crashed).
+3. Buy training steps: e010/e011 precompute crops (e011 rejected at 0.6254), e006 reserve rejected, e016 timeout. Hmm.
+4. Fine-grained classes after 2 and 3.
+
+Wait — e021 crashed. The crash was because `backbone.forward_features(xt)` returns (B, 1280, 1, 1) — 4D — not (B, 1280). Actually, for EfficientNet-B0 in timm, forward_features returns a 4D tensor (B, C, H, W) when the global pool isn't applied... actually in timm, `forward_features` returns the feature map before global pooling, shape (B, 1280, 5, 5) for 160px input? Let me think. EfficientNet-B0 at 160px: 160/32 = 5, so (B, 1280, 5, 5). The error says mat1 is 819200x5: 819200 = 64 * 1280 * 5 * 5? 64*1280*25 = 2,048,000. Hmm, no. 819200 = 256 * 3200? Let me compute: 819200 / 5 = 163840. 163840 / 1280 = 128. Hmm. Actually torch.cat([ft, fw], dim=1) with ft shape (B, 1280, 5, 5) gives (B, 2560, 5, 5), which when passed to Linear gets flattened to (B*5*5, 2560) = (64*25, 2560) = (1600, 2560). That doesn't match 819200 either.
+
+Wait, the error: mat1 and mat2 shapes cannot be multiplied (819200x5 and 2560x512). So mat1 is 819200 x 5. That means the input to head was flattened to (819200, 5). So ft was (B, C, H, W) and got flattened... 819200 = B * C * H * W. If B=64: C*H*W = 12800. Hmm, 12800 = 1280 * 10? So (64, 1280, 10, 1)? That doesn't make sense. Or B=128? Batch size 64... actually wait, maybe forward_features for efficientnet_b0 in timm with 160px input returns (B, 1280, 5, 5)? Then cat along dim=1 → (64, 2560, 5, 5) → Linear flattens to (64*25, 2560) = (1600, 2560). Error would be (1600x2560 and 2560x512) which would actually work. So that's not it.
+
+Hmm, 819200x5: last dim is 5. So the flattened tensor has 5 features? So ft shape was (B, 5, something) or (B, ..., 5)? If forward_features returned (B, 1280, 5, 5) and we did cat along dim=1... no.
+
+Actually wait — maybe in this timm version, `forward_features` on EfficientNet returns the output of the final conv block before pooling: shape (B, 1280, H, W). With input 160, H=W=5. cat([ft, fw], dim=1) → (B, 2560, 5, 5). Linear on 4D input: F.linear treats input as (..., in_features), so it needs last dim = 2560 but it's 5. Error message: mat1 (819200 x 5) and mat2 (2560 x 512). 819200 = 64 * 12800? Hmm 64*2560*5 = 819200. Yes! 64 * 2560 * 5 = 819,200. So input to Linear was (64, 2560, 5, 5) reshaped to (64*2560*5, 5)?? No wait — F.linear on (64, 2560, 5, 5): treats as (64*2560*5, 5)? No, F.linear reshapes input to (-1, in_features) where in_features is the last dim = 5. So mat1 = (819200, 5) — wait, 64*2560*5 = 819200, and last dim 5. Yes! That matches: mat1 (819200 x 5), mat2 (2560 x 512). So indeed forward_features returned 4D (B, 1280, 5, 5), cat along dim=1 gave (B, 2560, 5, 5), and Linear failed.
+
+Fix: apply global pooling. In timm, `model.forward_features` for efficientnet... actually there's a standard pattern: `features = model.forward_features(x)` then `x = model.global_pool(features)` then `x = model.head(x)`. Or use `model(x, features_only=True)`? In timm, `forward_features` on EfficientNet returns pre-pool features; you need `model.global_pool`. Or more simply: use `model(x, norm=True)`? Hmm.
+
+Simplest robust approach: define a feature extractor that does `model.forward_features` then `model.global_pool` (AdaptiveAvgPool2d(1) + flatten). EfficientNet in timm has a `global_pool` attribute (nn.AdaptiveAvgPool2d). So:
+
+```python
+def feats(m, x):
+    f = m.forward_features(x)
+    f = m.global_pool(f)
+    return f.flatten(1)
+```
+
+But wait — do I want to pursue this? e021 was a crash; the guide says "bugs: fix once; second failure: drop." e004 (shared backbone concat, 2 views) was "not confirmed" at 0.6329 — slightly below the then-best 0.629? Actually e004 was based on e000 (2 views), got 0.6345 at seed 0, 0.6329 at 5 seeds, not confirmed (below the then-best 0.629? no, 0.6329 > 0.629... hmm, "not confirmed" means the gain didn't exceed the uncertainty margin). e007 (shared backbone with MLP) crashed. e021 (shared backbone concat + 4x) crashed.
+
+So shared backbone concat: e004 not confirmed, e007 crash, e021 crash. Two crashes on this direction. Per the guide's rule "two failed variants of a direction: move to next direction." Hmm, but e021's crash is a fixable bug (missing global pool). The instructions say "if a run crashed or timed out, read the log and fix the cause" (rule 4). And "bugs: fix once; second failure: drop." e007 crashed — was that also a shape issue? e007: "each view's 1280-dim pooled features are each passed through a small 1280->128 MLP" — it crashed, probably same forward_features 4D issue. So this direction has 2 crashes. Fixing e021 would be the 3rd attempt at shared-backbone-concat. The guide says fix once, drop on 2nd failure. e004 (a proper run of this idea) was not confirmed. Hmm.
+
+But wait — e004 was based on e000 (2 views) and got 0.6329 at 5 seeds vs e000's 0.629-0.630. That's actually slightly above the starting point but not a confirmed gain over the then-best. And e012 (3-view logit average) is 0.6363. So shared backbone concat on 2 views was ~0.6329, below 3-view logit average's 0.6363. e021's idea was concat on tight+wide + 4x via backbone head. That's a mix. Given e004's result (0.6329 < 0.6363), the concat approach doesn't seem better than logit averaging. I'd say this direction is effectively exhausted/negative: e004 not confirmed (below current best), e007 crash, e021 crash. Following the guide, I should move on rather than fix e021.
+
+So what next? Let me think about what's actually most promising.
+
+Error decomposition:
+- My mAP: 0.6363.
+- If all boxes had correct class (keeping my scores): 0.7400. So wrong classes cost 0.1037.
+- Perfect-class ceiling (detector conf as score): 0.758. So my scores cost 0.018 relative to detector conf.
+
+So the dominant error is classification: 0.104. Confusion: pore is weakest (67% correct; 18 of 76 true pores on detector boxes → stain, 5 → deposit). Deposit: 63 of 268 → stain. Stain: 45 of 610 → deposit.
+
+Note: these counts are on boxes overlapping a true defect. Total: pore 76, deposit 268, discont 439, stain 610. Pore→stain 18, deposit→stain 63, stain→deposit 45, pore→deposit 5, stain→pore 9, discont→stain 22, etc.
+
+So the biggest single confusion is deposit→stain (63). Then stain→deposit (45), pore→stain (18).
+
+The stain/deposit confusion is the biggest cluster. What distinguishes stain from deposit? Stain is a discoloration (often larger, diffuse, grayish/brownish), deposit is extra material (brighter, raised). The wide context might help.
+
+Ideas not yet tried (outside the exhausted families):
+
+1. **Training on detector boxes from train split** — exhausted (3 attempts).
+2. **Jitter simulating detector error** — e003, e005 rejected. 2 attempts. Guide says 2 failed variants → move on.
+3. **Weight/sample by box quality** — not tried. But how would I weight? I'd need a proxy for box quality. Detector boxes from train split have known IoU with true boxes; I could use them directly with their actual (imperfect) geometry instead of jittering true boxes. That's basically idea 1 (exhausted). Or sample: train on true boxes + detector boxes... exhausted.
+4. **Shared backbone concat** — effectively exhausted (e004 not confirmed, 2 crashes).
+5. **Buy training steps** — e006 (reserve) rejected, e010/e011 (precompute) rejected/timeout, e016 timeout. Hmm, the inference category is flagged EXHAUSTED? (3+ ideas, no new best). But wait — the current run ends at 185s out of 180?? "done: ... 185s total" — wait, T is 180 but it says 185s total? Let me re-read.
+
+Log: "done: 4 epochs, 285 steps, 55313 prediction rows, 185s total". Hmm, that's over 180! But it didn't time out — e012 was confirmed at 5 seeds. Wait, maybe --seconds for the confirmed run was larger? The harness runs with --seconds T; the brief says T is total wall time. e012's log shows 185s total. If T were 180 it would have been killed. So maybe the harness gives more time for multi-seed runs? Or T=195? Hmm. e017's hypothesis says "run ends at ~195s" and e016 says "185s total, only ~5s under the kill point." So kill point is ~190s? e016: "the current run spends 14s loading + ~111s training + ~60s prediction (185s total, only ~5s under the kill point)." So kill point ≈ 190s. Interesting — so --seconds is probably 190 for these runs? Or the harness adds a small grace. Anyway: the budget is ~190s, current run uses 185s. Very tight.
+
+Actually wait, e017's hypothesis: "the log shows the 3-view prediction phase costs ~60s against a 55s reserve (run ends at ~195s)." Hmm, 185 vs 195 — whatever. Key point: we're at the edge of the budget. RESERVE_S=55, training ends at deadline-55. Prediction takes ~60s. So we're running ~5s over the reserve. It survived (185s total < kill point).
+
+So the budget is essentially fully used. Buying steps means cutting prediction time. Prediction: 41,879 eval boxes × 3 views = 125,637 crops, each 160px, through EfficientNet-B0. ~60s → ~0.48ms/crop on GPU... plus crop generation on CPU. e016 tried to speed up prediction and timed out (probably precompute took too long). e017 tried dropping 4x view at inference → timed out (crop generation still happened). e019 (fixed version) got 0.6176 — big drop, so 4x view at inference matters (+0.019).
+
+Hmm wait, e019 dropped 4x at inference and got 0.6176 vs e012's seed 0 0.6336. That's a 0.016 drop. So the 4x view contributes ~0.016-0.019 at inference. Important.
+
+6. **Fine-grained classes (stain/deposit/pore confusion)** — guide's step 4, "only after 2 and 3." Directions 2 and 3 are mostly exhausted. So now is the time for fine-grained class ideas.
+
+What untried ideas could broadly help stain/deposit/pore?
+
+a) **Color/texture emphasis**: stain is a color change; deposit is a brightness/texture change. Maybe train with color-preserving augmentation (we already do brightness 0.8-1.2). Hmm.
+
+b) **Higher resolution for tight crop** — e014 (320px tight crop as 4th view) timed out. Resolution family: "no gain: best 5-seed 0.634 (not confirmed); 2 crashes" from earlier runs. Plus e014 timeout. So resolution is exhausted.
+
+c) **More training data via low-res split**: TRAIN_ON = ("high",). crops.csv has res high/low. Earlier runs: "low-res crops added to training: no gain." Exhausted.
+
+d) **Ensemble of 2 models**: earlier runs "bigger or other backbones (2-3 model ensembles): no gain." Exhausted.
+
+e) **Snapshot ensemble / SWA**: not explicitly tried! The "longer training" family is no gain, but SWA (stochastic weight averaging) in the last portion of training is different: it averages weights over the tail of the trajectory, improving generalization without extra compute. Hmm, but is that "fundamentally different" from the longer training family? SWA is a variance-reduction technique. It's cheap: every N steps in the last part, average weights (or use torch.optim.SWALR + SWA). Could help calibration and generalization. But the effect is usually small (~0.001-0.005). Might be below the acceptance threshold.
+
+f) **Better use of detector conf in scoring**: score = conf * p. The gap between my score and perfect-class ceiling: 0.758 - 0.740 = 0.018. That's the "score" cost. One idea: instead of score = conf * p, use a score that better ranks true detections above false alarms. E.g., multiply by a learned function of box size/aspect? e008 tried size/aspect as model input (not confirmed). The "fewer or reweighted score rows" family is exhausted (16 attempts, no gain). Hmm, but that family was about rows per box (argmax only, temperature, etc.). Using box geometry to adjust score is... e008 was "box size and aspect ratio as extra model input" — that's model input, not score adjustment. Score adjustment by geometry is different but related. Risky.
+
+g) **Train the classifier to predict on detector-quality boxes from the EVAL split?** No — can't use eval labels.
+
+h) **Pseudo-labeling / self-training**: use the model's own confident predictions on train-split detector boxes as training data? The detector-boxes family is exhausted, but self-training with pseudo-labels is a different mechanism... though it's still "detector boxes as training data" in spirit. I'd call it exhausted.
+
+i) **Multi-crop context at different offsets**: e.g., also crop the box shifted to include more context asymmetrically? Hmm, that's a variant of the view family.
+
+j) **Input: raw box without resizing to square** — i.e., preserve aspect ratio with padding instead of squashing. The current make_crop resizes to a square canvas then bilinear to 160x160 — aspect is preserved (square canvas). OK.
+
+k) **Class-specific attention / auxiliary head**: e.g., train with an auxiliary "defect present" task? No.
+
+l) **Change the crop content: include a ring/overlay showing box boundary?** No.
+
+m) **Train with the exact detector box geometry from the train split but with the true class** — that's the exhausted family (e001/e002/e020).
+
+n) **Two-stage within stage 2: first binary defect-present, then class**? The 5th background class family is exhausted (9 attempts, no gain).
+
+o) **Use timm's efficientnet_b0 with `swapped`/different feature extraction for multi-scale features (FPN-like)**: combine features from multiple depths of the backbone. That's an architecture change. E.g., take features from stage 3, 4, 5 and concat. More computation. Hmm.
+
+p) **Train longer by making prediction cheaper: precompute eval crops once at start** — e016 tried and timed out (precompute of 41,879 boxes × 3 views took too long: e010 measured ~1.35ms/crop for 41,879 eval + 6,052 train ≈ 129s). e011 precomputed only train crops (16s) and was rejected (0.6254). So precompute-eval is too slow (129s). But wait — e016's timeout: what exactly did it do? "The prediction phase re-crops and resizes all 41,8..." (truncated). It timed out. Precomputing eval crops costs ~129s alone, leaving ~60s for training — too little. So that's out.
+
+q) **Reduce prediction cost by lowering eval batch overhead / using a faster crop**: e.g., vectorize crop generation with numpy slicing + torch resize instead of PIL? PIL resize is the bottleneck (~1.35ms/crop). Using torch's F.interpolate on CPU or GPU... actually, we could do the resize on GPU: load the image once as a tensor, crop with indexing, then F.interpolate on GPU. That would be much faster. But that's a big rewrite of the pipeline; crash risk. The inference category is flagged exhausted (4 crashes/timeouts). I'd avoid.
+
+r) **Fewer prediction rows**: MIN_SCORE=0.001, 55,313 rows written (41,879 boxes × 4 = 167,516 possible; 55k written). Rows per image max 300. If some images have >300 rows, the low-score ones get dropped anyway. Not a lever.
+
+s) **The biggest lever per the diagnostics: classification error 0.104.** The confusion matrix shows stain/deposit as the main confusion. What untried method targets fine-grained texture?
+
+- **CutMix/mixup**: "training augmentation (rotation, mixup, stronger color or geometry): no gain" — exhausted.
+- **Label smoothing**: not tried! "Label smoothing improves calibration in some settings but can reduce the information in class probabilities that ranking metrics use." Hmm — for mAP (ranking), label smoothing usually doesn't help; it can hurt. Risky.
+- **Mixing views within a batch (batch-level multi-crop)**: no.
+- **Higher context for stain**: stain is diffuse; 4x view helped (e012). What about an even wider view, 6x or 8x? That's a "3rd very wide view" family... the family was "3rd, very wide view (4x box)": accepted twice in earlier runs (+0.005, mostly pore). In this run, e012 added it and it became the new best. Adding a 4th even wider view (6x/8x) — would that help? Each extra view adds ~20s to prediction (per e012's note "adds ~20s per run, close to the time limit"). We're already at 185s/190s. Adding a view would time out unless we cut elsewhere. So no.
+
+t) **Use the wide view more cleverly for stain/deposit**: e.g., train the model with the wide view only for some classes? No, that's weird.
+
+u) **Train on low-res split images too** — exhausted (no gain).
+
+v) **Change what the classifier sees: add a difference image between tight and wide?** Too exotic.
+
+w) **Temperature/score calibration** — exhausted family.
+
+x) **Class-balanced sampling** — exhausted.
+
+y) **Different loss: e.g., cross-entropy with per-class temperature, or "soft" targets from the confusion structure**? Class-weighted loss hurt every time (known). Focal loss no gain.
+
+z) **Train the head with a larger LR / longer warmup** — optimisation category has 1 attempt (e009, rejected, big drop). Hmm, e009 was split LR (backbone 1e-4, head 1e-3) → 0.5854, big drop. That suggests uniform 1e-3 is fine.
+
+aa) **Increase batch size / change optimizer**: e.g., AdamW with lr 2e-3? The "tuning hyperparameters alone helped little" (known from brief). Avoid.
+
+bb) **Use regnety_016 or resnet26d** — backbone family exhausted (no gain, 8 attempts).
+
+cc) **Train with 2 views at higher effective resolution by using efficientnet_b2** — exhausted.
+
+dd) **Self-distillation / knowledge distillation from the 3-view ensemble to... itself?** No.
+
+ee) **Test-time: average over slight crops (TTA)** — TTA family exhausted (8 attempts, no gain).
+
+ff) **Use the detector conf as a training signal**: e.g., weight training boxes by the detector conf of the overlapping train-split detector box (high-conf detector boxes are "easier" / more representative). Hmm, that's "weight or sample training boxes by box quality" — guide direction 2, not tried! "Weight or sample training boxes by box quality so the model sees enough poorly-placed boxes."
+
+How to implement: for each true training box, find the overlapping train-split detector box (IoU > 0.5). Its conf is a proxy for "how confident the detector was" — but box quality (misplacement) is what we want. Actually, the guide's intent: the model should see poorly-placed boxes. We can't easily measure misplacement of true boxes (they're ground truth). But we can use the train-split detector boxes' offsets as jitter — that's e005 (rejected). Hmm.
+
+Alternatively: sample training boxes weighted by the detector conf of the matching detector box: low-conf detector boxes are more likely to be false alarms or misplaced → weight their true boxes more? That's a stretch.
+
+gg) **Use train-split detector boxes as training data with their actual geometry, but only the low-conf ones** (the hard ones)? That's a subset of the exhausted family. The family tried: full set (e001/e002), down-weighted (e020). Both rejected. I'd call any variant exhausted.
+
+hh) **Multi-label / ordinal structure**: stain and deposit are confused; pore and stain are confused. No obvious ordinal.
+
+ii) **Train with color jitter OFF and add saturation/contrast variations** — augmentation family exhausted.
+
+jj) **Input both views into the backbone at different stages (like a siamese with feature fusion)** — architecture family; e004/e007/e021 all crashed or not confirmed. 3 attempts. Exhausted per the guide (3+ attempts, no new best — well, e012 is a new best but that's the 3-view logit average, not the concat family).
+
+kk) **Reduce training cost to train longer**: the log shows epoch 3 loss 0.2421, still dropping. Steps: 285 in ~111s → ~0.39s/step. If we could halve step time, we'd get ~570 steps. How?
+- Batch size 64 → 128? With AMP bfloat16, EfficientNet-B0 at 160px × 3 views, batch 64... memory: 3 views × 64 × 3 × 160 × 160 × 2 bytes = 64*3*3*160*160*2 = ~31.4MB activations per view... batch 128 might fit. But does a bigger batch help? With the same wall time, bigger batch = fewer steps. Usually not better.
+- **Drop one view during training** (train on 2 views, keep 3 at inference)? e019 dropped 4x at inference (bad). Dropping at training is different... but e017's intent was to drop at inference. Training on fewer views = fewer steps per iteration → more steps. But the model would see a different distribution at inference. Hmm, actually e019 (drop 4x at inference) dropped 0.016. If we train without 4x and also don't use it at inference, we save ~20s prediction + ~33% training step time → ~20% more steps. But we lose the 4x view's benefit entirely. Net probably negative.
+- **Use a faster backbone for training but keep efficientnet_b0?** No.
+- **Channels-last + AMP already on.**
+- **Reduce crop generation cost**: the dataset generates 3 crops per box per step via PIL. That's on CPU in workersThinking budget reached. Stop thinking now and write the reply in the required format.

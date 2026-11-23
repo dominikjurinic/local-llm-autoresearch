@@ -1,0 +1,337 @@
+===== attempt 1 =====
+Let me carefully analyze the situation.
+
+**Current state:**
+- Best: e012, 5-seed mean 0.6363, seed std 0.0032. Three views (1.5x, 2.5x, 4x), logit average, EfficientNet-B0, 160px, trained on true boxes only.
+- Per-class AP: pore 0.546, deposit 0.615, discontinuity 0.778, stain 0.606.
+- Diagnostics: class decision on overlapping boxes: pore 67% right (18 of 67 true pores misclassified as stain), deposit 75% right (63 as stain), stain 89% right (45 as deposit). So the confusion is mainly stain↔(pore, deposit), and pore→stain.
+- mAP if all boxes had correct class but kept scores: 0.7400 vs our 0.6363. So wrong classes cost 0.1037. The remaining gap to the 0.758 ceiling is score-related (0.018).
+
+**What has been tried (28 experiments):**
+- Data: detector boxes from train split (e001 crash, e002 rejected 0.6282, e020 rejected 0.6229) — 3 attempts, no gain. Marked EXHAUSTED.
+- Augmentation: box-error simulation jitter (e003 rejected 0.6259, e005 rejected 0.6275) — 2 attempts, no gain.
+- Architecture: shared backbone concat (e004 not confirmed 0.6329), feature MLP (e007 crash), size/aspect input (e008 not confirmed 0.6279), 3-view 9-channel single pass (e024 not confirmed 0.6355), learned view weights (e013 rejected 0.6326), ConvNeXt-Nano (e015 timeout), shared backbone concat v2 (e021-23 crash).
+- Inference: reserve tuning (e006 rejected 0.6253), precompute crops (e010 timeout, e011 rejected 0.6254, e025 crash, e026 bug 0.0997), drop 4x at inference (e016 timeout, e017 timeout, e018 crash, e019 rejected 0.6176, e028 rejected 0.6178).
+- Optimisation: split LR (e009 rejected 0.5854), EMA/SWA (e027 crash).
+- Other: e014 (320px tight view) timeout.
+
+So what remains untried and promising?
+
+**Main observations:**
+
+1. The binding constraint is 180s. The current run uses 185s total (slightly over the 180s budget? Wait, "done: 4 epochs, 285 steps, 55313 prediction rows, 185s total" — hmm, but the budget is 180s. Actually T0 is when train.py starts, and the deadline is T0 + seconds. The log says 185s total... but the run completed. Wait, actually the harness kills at the limit. Let me re-read: "finish within --seconds of wall time". The seed-0 log shows 185s total. Hmm, but that's the best run that was accepted. Maybe the harness's --seconds is larger than 180? The brief says "The binding constraint is 180 s" in the research guide. But the log shows 185s total for the best run...
+
+Wait, let me re-read. The research guide says "The binding constraint is 180 s. Every second of training you gain is a free improvement". And "Re-check the time arithmetic for every change that adds work per box (views, resolution, model size, test-time augmentation). Keep the whole run under about 165 s."
+
+But the current best's log shows 185s total. That's contradictory. Unless the --seconds passed is actually larger. Hmm. Actually, maybe the harness passes --seconds 180 but the "185s total" includes... no, T0 is at the start of train.py.
+
+Actually wait — maybe the harness runs with a larger --seconds for the final evaluation, but the research guide says 180s. Or maybe the 185s is just slightly over and it's fine because the kill is at the limit but there's some slack. Actually, the e016 hypothesis says "the log shows prediction only takes ~37 s (125 s→162 s)" and "RESERVE_S=55 over-reserves". And e017 says "the 3-view prediction phase costs ~60 s against a 55 s reserve (run ends at ...)".
+
+Hmm, there's inconsistency in the logs. The current best (e012) log shows 185s total with RESERVE_S=55. Training ended at 125s (t_end = deadline - 55). If deadline = T0 + 180, then t_end = T0 + 125, which matches "epoch 3 ... 125s". Then prediction takes 125→185 = 60s, exceeding the 55s reserve by 5s, ending at 185s. But the harness didn't kill it? That's strange if the limit is 180s.
+
+Unless... the harness's --seconds is actually larger than 180 for these runs, OR the kill limit has some tolerance. Actually, re-reading: "At the limit the run is killed and counts as failed." If e012 ended at 185s and wasn't killed, then the limit must be > 185s. So maybe --seconds is not 180 but something larger.
+
+Hmm, but the research guide explicitly says 180s. Let me not overthink. The key point: the current best ends at 185s and was accepted, so the actual limit is at least ~185-190s. But several experiments that added prediction time timed out (e014, e015, e016, e017). So the limit is somewhere around 185-195s.
+
+Actually, the safest interpretation: the effective budget is tight, around 180-190s, and the current best is right at the edge (185s). Any change that adds prediction or training time risks timeout. Changes that reduce time (freeing training steps) are valuable.
+
+2. **The most reliable untried direction**: The research guide's plan says:
+   1. Consolidate (detector boxes from train split) — already tried 3x, exhausted.
+   2. Close the box-quality gap: simulate detector errors (tried e003, e005, no gain), weight/sample by box quality (untried!), combine views better (tried e004, e007, e008, e013, e021-24, mostly no gain).
+   3. Buy training steps (precompute crops — tried, mostly crashed/timeout; reserve tuning — tried).
+   4. Fine-grained classes (confusion matrix).
+
+3. **What's genuinely untried and could help broadly?**
+
+Let me think about the diagnostics more carefully:
+- pore 67% right, 18/71 misclassified as stain.
+- deposit 75% right, 63/270 misclassified as stain.
+- stain 89% right, 45/610 misclassified as deposit.
+- discontinuity 94% right.
+
+So the dominant confusion is stain vs (pore, deposit). Stain is the "catch-all" — both pore and deposit get misclassified as stain, and stain gets misclassified as deposit.
+
+The per-class AP: pore 0.546 (lowest), deposit 0.615, stain 0.606, discontinuity 0.778.
+
+Now, what could broadly help? The research guide says "Aim for changes that should move every class." And "Effects below ~0.005 cannot be told apart from noise."
+
+Let me think about what's fundamentally different from what's been tried.
+
+**Key insight about the score:** The diagnostic says "mAP@0.5 if every box had its correct class but kept your scores: 0.7400 (yours: 0.6363). The difference is what wrong classes cost; the remaining gap to the perfect-classes ceiling in the brief is what your scores cost compared with the detector's conf."
+
+So:
+- Wrong classes cost 0.7400 - 0.6363 = 0.1037.
+- Score/ranking cost: 0.758 (perfect classes ceiling) - 0.7400 = 0.018.
+
+So the big lever is the class decision (0.1037), not the scores (0.018). Good — focus on classification accuracy on detector boxes.
+
+Now, the class decision accuracy is limited by the classifier's ability to distinguish pore/deposit/stain. The crops are resized to 160px. The object fills the crop. Fine-grained texture matters.
+
+**What's untried that targets classification accuracy broadly?**
+
+Let me reconsider. The classifier is trained on TRUE boxes (hand-drawn, clean) but scored on DETECTOR boxes (misplaced, different size). This is the train/test mismatch. The guide says "Treat this as a train/test mismatch problem first."
+
+Tried for mismatch:
+- e003: box-error simulation jitter (shift center up to 0.45x long side, scale) — rejected.
+- e005: precompute real box-error distribution and jitter to match — rejected.
+- e001/e002/e020: add detector boxes from train split — no gain.
+
+So the mismatch direction has been tried multiple ways without gain. Hmm.
+
+Wait, but e003 and e005 were based on e000 (the two-crop baseline), not on e012 (the 3-view best). The current best is e012 which added the 4x view. Maybe the box-error simulation would work better on top of e012? But that's a stretch — the guide says "Do not repeat a family marked 'no gain' unless you can say what is fundamentally different."
+
+Actually, let me reconsider the whole thing. What has NOT been tried?
+
+Looking at the families:
+- data: exhausted
+- augmentation: 1 attempt (e003 was augmentation? No wait, e003 is "augmentation" category? Let me check. e003 category is "augmentation". e005 category is "data".)
+
+Wait the table:
+- e001 data (crash)
+- e002 data (rejected)
+- e003 augmentation (rejected)
+- e004 architecture
+- e005 data (rejected)
+- e006 inference
+- e007 architecture (crash)
+- e008 architecture
+- e009 optimisation
+- e010 inference (timeout)
+- e011 inference
+- e012 architecture (new best)
+- e013 architecture
+- e014 other (timeout)
+- e015 architecture (timeout)
+- e016 inference (timeout)
+- e017 inference (timeout)
+- e018 inference (crash)
+- e019 inference
+- e020 data
+- e021 architecture (crash)
+- e022 architecture (crash)
+- e023 architecture (crash)
+- e024 architecture
+- e025 inference (crash)
+- e026 inference (bug)
+- e027 optimisation (crash)
+- e028 inference
+
+Lessons by category:
+- data: 4 ideas, 3 ran, 0 new best, EXHAUSTED?
+- augmentation: 1 idea, 1 ran, 0 new best
+- architecture: 10 ideas, 5 ran, 1 new best, 3 close
+- inference: 10 ideas, 5 ran, 0 new best, 6 crash/timeout
+- optimisation: 2 ideas, 1 ran, 0 new best
+- other: 1 idea, 0 ran, 1 crash
+
+So augmentation has only 1 attempt. That's interesting. The "box-error simulation" was e003 (augmentation, rejected). But augmentation is NOT marked exhausted (only 1 attempt).
+
+Hmm, but the guide's plan step 2 lists "simulate detector errors on the true boxes during training" as a direction. e003 and e005 did that. Both no gain. So that specific sub-direction is tried.
+
+Let me think about what's genuinely new.
+
+**Idea: The classifier sees the crop resized to 160px. The object in a tight 1.5x crop fills most of the frame. But fine-grained texture (pore vs stain) might need higher resolution. e014 tried 320px tight crop but timed out.**
+
+But wait — the issue is that increasing resolution adds compute. e014 (320px) timed out. e015 (ConvNeXt-Nano) timed out. So bigger/slower things time out.
+
+**Idea: What about the number of training steps?** The log shows loss still falling at the cut (0.242 at step 285). More steps = better. But we're at the time limit. To get more steps, we need to either (a) speed up per-step, or (b) reduce prediction time.
+
+Prediction is 60s (125→185). Training is 111s (14→125). Loading is 14s.
+
+Actually, wait. Let me reconsider. The per-step cost is dominated by on-the-fly crop/resize in the data loader. e025/e026 tried precomputing crops but crashed/bugged. e010/e011 tried precompute but timeout/rejected.
+
+Hmm, precompute has been tried a lot and mostly failed. Let me not go there.
+
+**Let me reconsider the problem from a different angle.**
+
+The classifier is a 4-class softmax. The scores are conf * p[c]. The AP depends on the ORDER of predictions within each class. 
+
+Key realization: For a given eval box, we output 4 rows (one per class), each with score = conf * p[c]. The class with the highest p[c] gets the highest score. So the "chosen class" is argmax p[c], and its score is conf * p[argmax].
+
+Now, for mAP, within class c, we sort all boxes by their score_c = conf * p_c. A box is a hit for class c if it overlaps a true box of class c.
+
+The problem: a box that's actually a stain (true) but we predict as pore (p_pore > p_stain) will:
+- contribute to pore's prediction list (as a false positive for pore, since it's not a pore).
+- NOT contribute to stain's prediction list at all (because we only output the argmax? No wait, we output ALL 4 classes).
+
+Wait, we output all 4 rows per box. So the box appears in ALL 4 class lists, with different scores. For class c, its score is conf * p_c.
+
+So a stain box that we mispredict as pore:
+- In pore's list: score = conf * p_pore (high, since p_pore is argmax). It's a false positive for pore.
+- In stain's list: score = conf * p_stain (lower). It's a TRUE positive for stain (it overlaps a stain box). But its score is lower than the pore score.
+
+Hmm, so the box IS in the stain list, just with a lower score. So it's not "lost" — it's just ranked lower in the stain list.
+
+So the "wrong class" cost comes from: the box's stain score is lower than it should be (because p_stain < p_pore), so it's ranked lower in the stain list, hurting stain's AP. And it's ranked high in the pore list, hurting pore's AP (false positive).
+
+So to fix this, we want p_stain to be higher for stain boxes, and p_pore lower. That's exactly what better classification does.
+
+OK so the core issue really is classification accuracy, specifically the pore/deposit/stain confusion.
+
+**Now, what change could broadly improve pore/deposit/stain classification?**
+
+Let me think about the physical differences:
+- Pore: small holes/voids in the weld, dark spots.
+- Deposit: extra material, bright/raised.
+- Stain: discoloration, often darker or different color, larger area.
+- Discontinuity: gap/break in the weld.
+
+Stain is "often confused with deposit" (from the brief). And pore→stain confusion.
+
+The crops are grayscale-ish (RGB though). Color might matter for stain (discoloration). But the normalization uses ImageNet mean/std.
+
+Hmm. What's untried?
+
+Let me reconsider. The guide's plan step 2 says: "weight or sample training boxes by box quality, so the model sees enough poorly placed boxes." This is UNTRIED. But it's about box quality, and the mismatch direction has been tried.
+
+Actually, let me reconsider whether the mismatch is really the issue. The diagnostic shows class decision accuracy on overlapping boxes: pore 67%, deposit 75%, discontinuity 94%, stain 89%. These are on detector boxes that overlap true defects. If the classifier were perfect on clean boxes (macro-F1 ~0.87 from the brief), but only 67-75% on detector boxes, that's a big drop for pore/deposit. So mismatch IS a factor for pore/deposit.
+
+But e003/e005 (jitter to simulate mismatch) didn't help. Hmm. Why?
+
+Maybe because the jitter in e003/e005 was applied to the crop generation, but the crop is then resized to 160px, so a small jitter doesn't change the resized image much. Or maybe the jitter was too aggressive/too mild.
+
+Actually, wait. Let me reconsider. e003: "with probability 0.5 each box's center is shifted by up to ~0.45x its long side in a random direction and its size scaled." That's a big shift. e005: "jitter true boxes to match that [measured detector error] distribution."
+
+Both rejected. So simulating box error via crop jitter doesn't help. Interesting.
+
+Maybe the issue isn't box placement but something else. Let me reconsider.
+
+Actually, maybe the issue is that the detector boxes have different SIZES than the true boxes. The detector might draw boxes that are larger or smaller than the true defect. When we crop with context 1.5x/2.5x/4x of the box's long side, and the box is mis-sized, the crop shows the object at a different scale than during training (where we crop true boxes).
+
+But the crop is resized to 160px regardless. So the object fills a different fraction of the 160px frame. Hmm.
+
+Actually, here's a thought: the model is trained on crops of TRUE boxes. At test time, crops of DETECTOR boxes. If detector boxes are systematically larger than true boxes, then at test time the object appears smaller in the frame. The model might not be robust to the object appearing at a different scale within the frame.
+
+But again, e003/e005 tried scale jitter.
+
+Let me step back and think about what's genuinely different and high-value.
+
+**Alternative idea: The 4x view bought a pore gain in e012. What if we add even more context, or a different view, to help the stain/deposit confusion?**
+
+Actually, the guide says after 2 and 3, do fine-grained classes. But we're at experiment 28, so we're deep into the night. The guide says "Last 1.5 hours: no big swings. Only follow-ups on what worked tonight."
+
+Hmm, but we've had 28 experiments and the only new best is e012 (the 4x view). So "what worked tonight" is the 4x view. Follow-ups on it: e013 (learned weights, rejected), e024 (9-channel single pass, not confirmed 0.6355).
+
+Wait, e024 got 0.6355 5-seed, which is close to e012's 0.6363 but not confirmed as better. So the 9-channel single pass is marginally worse.
+
+Let me reconsider. What's the highest-value untried experiment?
+
+Let me reconsider the time budget issue. The current best ends at 185s. The prediction phase is 60s. If I could cut prediction time, I'd get more training steps.
+
+e017/e018/e019/e028 all tried to drop the 4x view at inference to save ~15-20s. e019 got 0.6176 (rejected, because dropping the 4x view at inference hurt — the 4x view is needed at inference for the pore gain). e028 got 0.6178 (rejected, same reason). So dropping the 4x view at inference HURTS. The 4x view is important at inference.
+
+So I can't drop the 4x view at inference.
+
+What else could cut prediction time? The prediction is 41879 boxes × 3 views = 125637 crops, each cropped+resized+forward. The forward is fast (EfficientNet-B0), but the crop/resize is slow.
+
+Hmm, precompute eval crops? e010 tried precomputing all crops (train+eval) and timed out (129s just for precompute). e011 precomputed only train crops (16s) but was rejected (0.6254, because it didn't help enough / the per-step crop is not the bottleneck?).
+
+Wait, e011: "Precomputing only the training crops costs ~16 s but removes the per-step PIL [crop/resize]." Result: 0.6254, rejected. So precomputing train crops saved time but the score dropped? That's odd. Maybe the precompute changed the augmentation (no per-step jitter?) or there was a subtle bug.
+
+Actually, if you precompute crops at the exact box position (no jitter), then you lose the geometric jitter augmentation. That could hurt. So precompute is tricky because it interacts with augmentation.
+
+Let me not go down the precompute path again — it's been tried 5+ times.
+
+**Let me reconsider the core classification problem with fresh eyes.**
+
+The confusion is pore↔stain and deposit↔stain. Stain is the middle. What visual feature distinguishes them?
+
+Idea: **Color.** Stain is a discoloration. Pore is a dark spot (void). Deposit is bright/raised material. If we use color information more effectively, we might separate them. The current model uses RGB with ImageNet normalization. Maybe the color channels are being washed out.
+
+But that's speculative and hard to target.
+
+Idea: **The crops are square and centered on the box. But the defect might be elongated (weld beads are linear). A square crop centered on the box might cut off part of the defect or include a lot of background. Maybe preserving aspect ratio or using a wider crop aligned with the weld direction would help.**
+
+But that's a big change and risky.
+
+Idea: **Test-time augmentation (flips).** The brief's "earlier runs" table says TTA (flips, extra views) was tried 8 times, no gain (best 0.631). So TTA is exhausted.
+
+Wait, that's from the FIVE EARLIER 5-hour runs, not tonight's 28 experiments. Let me re-read.
+
+"Five earlier 5-hour runs (90 ideas) started from this same train.py... Below is every idea family they tried."
+
+So the table of idea families (fewer score rows, 5th background class, detector boxes as training data, 3rd wide view, low-res crops, bigger backbone, resolution, TTA, longer training, class-balanced sampling, training augmentation, focal loss, box size/aspect) is from the FIVE EARLIER RUNS.
+
+Tonight's 28 experiments are separate. So TTA was tried in the earlier runs (8 times, no gain). So I should avoid TTA.
+
+OK so from the earlier runs, these are exhausted:
+- Score row manipulation (16 attempts)
+- 5th background class (9)
+- Detector boxes as training data (6, accepted twice ~+0.004 but small)
+- 3rd wide view (3, accepted twice +0.005, pore gain) ← this is e012's idea!
+- Low-res crops (4)
+- Bigger backbone (8)
+- Resolution/small-box (9)
+- TTA (8)
+- Longer training (6)
+- Class-balanced sampling/weighted loss (4)
+- Training augmentation (5)
+- Focal loss (2)
+- Box size/aspect input (4)
+
+And tonight's 28 experiments re-explored some of these on top of e012.
+
+So what's genuinely untried across BOTH the earlier runs AND tonight?
+
+Let me list what's been tried (earlier + tonight):
+- Score manipulation: exhausted
+- Background class: exhausted
+- Detector boxes as training: exhausted (small gain, not enough)
+- Extra wide view: done (e012)
+- Low-res crops: exhausted
+- Bigger backbone: exhausted
+- Resolution: exhausted
+- TTA: exhausted
+- Longer training: exhausted (but that's about reserve)
+- Class-balanced/weighted: exhausted
+- Training augmentation (rotation, mixup, color, geometry): exhausted
+- Focal loss: exhausted
+- Box size/aspect: exhausted (e008 tonight, not confirmed)
+
+Hmm, so a LOT is exhausted. What's left?
+
+Let me think about what's NOT in either list:
+1. **The specific way views are combined** — tried a lot (e004, e007, e008, e013, e021-24). Mostly no gain.
+2. **Optimizer/schedule** — e009 (split LR, rejected), e027 (EMA, crash). Not fully explored.
+3. **The loss function** — focal tried (exhausted). What about label smoothing? Or a different loss?
+4. **The input representation** — e.g., adding gradients/edges, or color transforms.
+5. **Data augmentation specific to the confusion** — e.g., color jitter to make stain/deposit more separable.
+
+Wait, "training augmentation" is exhausted (5 attempts in earlier runs: rotation, mixup, stronger color or geometry). So augmentation is largely done.
+
+Hmm. Let me reconsider.
+
+Actually, let me reconsider the "detector boxes as training data" idea. It was accepted twice in the earlier runs with ~+0.004 (small). Tonight e002 (0.6282) and e020 (0.6229) were rejected. So on top of e012, it doesn't help. Exhausted.
+
+Let me reconsider what the guide wants. The guide's plan:
+1. Consolidate (detector boxes) — done, exhausted.
+2. Close box-quality gap:
+   - simulate detector errors (e003, e005 — no gain)
+   - weight/sample by box quality (UNTRIED)
+   - combine views better (tried a lot, no gain)
+3. Buy training steps (precompute — tried a lot, failed; reserve — tried)
+4. Fine-grained classes (confusion matrix)
+
+So the guide's step 2 middle item "weight or sample training boxes by box quality" is untried. But it's in the "box-quality gap" direction which has had 2 failed sub-attempts (e003, e005). The guide says "Two failed variants of a direction: move to the next direction." So box-quality via jitter is done. Weighting by box quality is a different mechanism but same direction.
+
+Hmm, this is getting hard. Let me think about what's genuinely high-value and untried.
+
+**Let me reconsider the time budget more carefully, because "buying training steps" is described as "Every second of training you gain is a free improvement."**
+
+Current: 185s total. Loading 14s, training 111s (14→125), prediction 60s (125→185).
+
+The loss is still falling at the cut (0.242). More steps would help. But we're at the limit.
+
+Wait, is the limit really 180s? The current best ends at 185s and was accepted. So the limit is > 185s. Let me assume the limit is ~190-200s (the harness might pass --seconds 200 or so, or 180 with some tolerance).
+
+Actually, the research guide says 180s and "Keep the whole run under about 165 s." But the current best is 185s. This is contradictory. Let me look at the actual --seconds.
+
+Hmm, I don't know the exact --seconds. But the current best (185s) was accepted, and several runs that went to 195s timed out (e017 "killed at 195 s", e016, e014, e015). So the limit is between 185 and 195s. Let's say ~190s.
+
+So the current best (185s) has ~5s of headroom. That's very tight. Any change that adds time risks timeout. Changes that save time (and thus add training steps) are valuable but must not hurt the model.
+
+**Key idea: Can I make the model faster per step or faster at prediction, freeing up training time, WITHOUT hurting accuracy?**
+
+The per-step cost is crop/resize in the data loader. The prediction cost is crop/resize + forward for 41879×3 crops.
+
+What if I reduce the number of views at PREDICTION but keep them at TRAINING? No — e017/e019/e028 showed that dropping the 4x viewThinking budget reached. Stop thinking now and write the reply in the required format.

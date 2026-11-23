@@ -1,0 +1,300 @@
+===== attempt 1 =====
+Let me carefully analyze the task.
+
+The research lead has chosen a specific experiment:
+- BASE: best
+- CATEGORY: data
+- HYPOTHESIS: Use detector boxes from the train split as the primary training set (labelled by IoU with GT crops) instead of only the perfect GT boxes.
+
+Wait, let me re-read the plan:
+"2) Replace the BoxDataset training rows with this new list: [gt_box] ∪ [detector_proposal]. To keep it simple, generate a new "crops" list containing both the original GT rows (labelled, unchanged two-crop input) and the matched detector boxes (same label as their IoU-matched GT box)."
+
+So actually the plan says to ADD matched detector boxes to the GT boxes, not replace. Let me re-read:
+
+"1) In read_csv of dets.csv, take the "train" split rows (they carry no cls but overlap with crops.csv true defects). For each train-split detector box, compute IoU with all crops.csv boxes on the same image; if max IoU > 0.5 it is positive with that GT class, otherwise negative (background row for every class or keep it out of positives). Use a helper that maps box pairs by image."
+
+"2) Replace the BoxDataset training rows with this new list: [gt_box] ∪ [detector_proposal]. To keep it simple, generate a new "crops" list containing both the original GT rows (labelled, unchanged two-crop input) and the matched detector boxes (same label as their IoU-matched GT box)."
+
+So the training set becomes: original GT rows + detector boxes that have IoU > 0.5 with a GT box (labelled with that GT class). The negatives (detector boxes with no IoU > 0.5 match) are... "keep it out of positives" — so we just don't add them. Actually the plan says "otherwise negative (background row for every class or keep it out of positives)". Since we're keeping it simple, we just keep them out.
+
+Wait, but the hypothesis says "Training on the actual proposed boxes (labelled by IoU with GT) instead of the perfect crops should match the test distribution". But the plan says to ADD them to the GT boxes, not replace. Let me re-read the hypothesis:
+
+"Training on the actual proposed boxes (labelled by IoU with GT) instead of the perfect crops should match the test distribution"
+
+Hmm, "instead of" suggests replacing. But the plan says "generate a new 'crops' list containing both the original GT rows (labelled, unchanged two-crop input) and the matched detector boxes". So it's both.
+
+Actually, looking at the earlier research history:
+"| Detector boxes from the train split as extra training data (IoU > 0.5 with a true box, labelled with its class) | 6 | accepted twice (5-seed 0.6337 and 0.6342, about +0.004); rejected 3 times at seed 0 (0.626-0.628); 1 crash in the IoU code |"
+
+So this family has been tried before as "extra training data". The lead's hypothesis says "This differs from earlier attempts by using detector boxes as the primary training set rather than as a small auxiliary add-on".
+
+Wait, but the plan says to ADD them to the GT boxes, not make them primary. Let me re-read more carefully.
+
+Actually, I think there's some ambiguity. The hypothesis says "as the primary training set rather than as a small auxiliary add-on". But the plan says "generate a new 'crops' list containing both the original GT rows (labelled, unchanged two-crop input) and the matched detector boxes".
+
+Let me think about what makes sense. The key insight from the hypothesis is that the classifier is trained on perfect GT boxes but tested on detector boxes which may be offset/sized differently. The fix is to train on the detector boxes too.
+
+The plan says to add both. But the hypothesis frames it as "primary". Let me just implement what the plan says: add the matched detector boxes to the GT boxes.
+
+Actually, wait. Let me re-read the plan once more:
+
+"2) Replace the BoxDataset training rows with this new list: [gt_box] ∪ [detector_proposal]."
+
+The "Replace" here means replace the training rows with the union. So the new training set = GT boxes + matched detector boxes. That's what "both" means.
+
+So the implementation is:
+1. Read dets.csv, filter train split.
+2. For each train det box, compute IoU with all crops on same image. If max IoU > 0.5, it's positive with that GT class.
+3. Add these matched detector boxes to the crops list (as new rows with the GT class).
+4. Train on the combined list.
+
+Let me now think about the implementation details.
+
+Current code:
+```python
+crops = [r for r in read_csv(os.path.join(args.data, "crops.csv")) if r["res"] in TRAIN_ON]
+dets = read_csv(os.path.join(args.data, "dets.csv"))
+ev = [d for d in dets if d["split"] == "eval"]
+needed = {r["image"] for r in crops} | {d["image"] for d in ev}
+images = {p: np.asarray(Image.open(os.path.join(args.data, "images", p)).convert("RGB")) for p in needed}
+```
+
+So `crops` is the training list. I need to add the matched detector boxes to it.
+
+Let me write the IoU helper and the matching logic.
+
+First, I need to group crops by image. Then for each train det box, find the GT box with max IoU > 0.5.
+
+Let me write:
+
+```python
+def iou(a, b):
+    x1 = max(a["x1"], b["x1"]); y1 = max(a["y1"], b["y1"])
+    x2 = min(a["x2"], b["x2"]); y2 = min(a["y2"], b["y2"])
+    iw = max(0.0, x2 - x1); ih = max(0.0, y2 - y1)
+    inter = iw * ih
+    area_a = (a["x2"] - a["x1"]) * (a["y2"] - a["y1"])
+    area_b = (b["x2"] - b["x1"]) * (b["y2"] - b["y1"])
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+```
+
+Then:
+```python
+# group crops by image for IoU matching
+from collections import defaultdict
+crops_by_img = defaultdict(list)
+for r in crops:
+    crops_by_img[r["image"]].append(r)
+
+# add matched detector boxes (train split) as extra training rows
+train_dets = [d for d in dets if d["split"] == "train"]
+extra = []
+for d in train_dets:
+    best_iou, best_cls = 0.0, -1
+    for r in crops_by_img.get(d["image"], []):
+        v = iou(d, r)
+        if v > best_iou:
+            best_iou, best_cls = v, r["cls"]
+    if best_iou > 0.5:
+        nd = dict(d)
+        nd["cls"] = best_cls
+        extra.append(nd)
+crops = crops + extra
+```
+
+Wait, but I need to be careful. The `dets` rows have keys: det_id, split, image, x1, y1, x2, y2, img_w, img_h, conf. The `crops` rows have: id, res, image, x1, y1, x2, y2, img_w, img_h, cls.
+
+The BoxDataset uses `r["image"]`, `r["x1"]`, `r["y1"]`, `r["x2"]`, `r["y2"]`, and `r.get("cls", -1)`. So as long as the extra rows have image, x1, y1, x2, y2, cls, they'll work.
+
+The det rows have image, x1, y1, x2, y2, conf, det_id, split, img_w, img_h. So if I add cls, they'll work with BoxDataset.
+
+Now, one concern: the `needed` images set. The det train boxes are on training images, which are already in `needed` because crops are on training images. Actually, let me check: `needed = {r["image"] for r in crops} | {d["image"] for d in ev}`. The crops are on training images. The train det boxes are also on training images (same images as crops). So they should already be in `needed`. But to be safe, I should add the train det images to `needed` too. Actually, since train det boxes are on the same training images as crops, and crops are already in needed, it should be fine. But let me add it to be safe.
+
+Actually, wait. Let me reconsider. The crops.csv has "res" column with "high"/"low". The TRAIN_ON = ("high",). So crops are filtered to high res. The dets.csv train boxes — are they on high-res images? The dets.csv doesn't have a res column. Hmm.
+
+Actually, let me think about this. The crops.csv has both high and low res entries (presumably the same boxes at different resolutions). The dets.csv is the detector output. The detector was run on... which resolution? 
+
+The brief says "0.69 mAP@0.5 on high-res images". So the detector was run on high-res images. So the dets.csv boxes are on high-res images, same as the high-res crops.
+
+So the train det boxes are on the same images as the high-res crops. Good. So `needed` already includes them.
+
+But to be safe, I'll add the train det images to needed. Actually, let me just compute needed after building the full crops list (including extra). That way it's automatically correct.
+
+Let me restructure:
+
+```python
+crops = [r for r in read_csv(os.path.join(args.data, "crops.csv")) if r["res"] in TRAIN_ON]
+dets = read_csv(os.path.join(args.data, "dets.csv"))
+ev = [d for d in dets if d["split"] == "eval"]
+
+# add matched detector boxes (train split) as extra training rows
+crops_by_img = {}
+for r in crops:
+    crops_by_img.setdefault(r["image"], []).append(r)
+train_dets = [d for d in dets if d["split"] == "train"]
+extra = []
+for d in train_dets:
+    best_iou, best_cls = 0.0, -1
+    for r in crops_by_img.get(d["image"], []):
+        v = iou(d, r)
+        if v > best_iou:
+            best_iou, best_cls = v, r["cls"]
+    if best_iou > 0.5:
+        nd = dict(d)
+        nd["cls"] = best_cls
+        extra.append(nd)
+crops = crops + extra
+
+needed = {r["image"] for r in crops} | {d["image"] for d in ev}
+images = {p: np.asarray(Image.open(os.path.join(args.data, "images", p)).convert("RGB")) for p in needed}
+```
+
+This is clean. The `needed` now includes all images from the combined crops list, which includes the train det images.
+
+Now let me think about the time budget. Adding extra training rows means more data per epoch, but the number of steps is the same (time-based). Actually, the training loop is time-based: "Train until the budget minus the reserve is used up". So the number of steps is determined by time, not by data. Adding more data per epoch means fewer epochs, but the same total steps. So no time increase for training.
+
+Wait, but the data loading. The DataLoader loads batches. If there are more rows, each epoch takes longer, but the total number of steps is still limited by time. So the total training time is the same. Good.
+
+Actually, let me reconsider. The DataLoader with num_workers and persistent_workers. Adding more rows means the dataset is bigger. The DataLoader will iterate through more items per epoch. But since we break based on time, the total steps are the same. So no time issue.
+
+Actually, there's a subtle point: the DataLoader shuffles. With more rows, the shuffle is over more rows. But that's fine.
+
+Let me also consider: the extra detector boxes might be quite a lot. Let me estimate. The dets.csv has 41879 eval detections. The train split would have a similar number (maybe more, since training images). Actually, the total dets is split into train and eval. Let me not worry about the exact number. The key point is that the matched ones (IoU > 0.5) are a subset.
+
+Actually, wait. Let me reconsider whether adding a large number of detector boxes could be problematic. If there are, say, 20000 train det boxes and 10000 match, then the training set goes from 6052 to 16052 rows. That's a 2.6x increase. Each epoch would take 2.6x longer, but since we're time-limited, we'd just do fewer epochs. The total steps are the same. So it's fine.
+
+But there's a concern: the class balance. The detector boxes might be biased toward certain classes. But the plan says to keep it simple, so I'll just add them.
+
+Actually, let me reconsider the hypothesis once more. The lead says "This differs from earlier attempts by using detector boxes as the primary training set rather than as a small auxiliary add-on". 
+
+Hmm, but the plan says to ADD them to GT, not make them primary. Let me re-read the plan:
+
+"2) Replace the BoxDataset training rows with this new list: [gt_box] ∪ [detector_proposal]. To keep it simple, generate a new "crops" list containing both the original GT rows (labelled, unchanged two-crop input) and the matched detector boxes (same label as their IoU-matched GT box)."
+
+OK so the plan is clear: the new training list = GT rows + matched detector boxes. Both are included. The "primary" in the hypothesis might be loose language, or it might mean that the detector boxes are a substantial part of the training set (not a small add-on).
+
+Actually, I realize the distinction the lead is drawing: in earlier attempts, detector boxes were added as a "small auxiliary add-on" (maybe a small fraction). Here, we're adding all matched detector boxes, which could be a large fraction, making them "primary" in the sense that they're a major part of the training set.
+
+OK, I'll implement the plan as written: add all matched detector boxes to the GT boxes.
+
+Let me now write the SEARCH/REPLACE blocks.
+
+First, I need to add the `iou` function. Let me add it near the other helper functions.
+
+Let me look at the current structure:
+```python
+def read_csv(path):
+    ...
+
+def make_crop(img, r, context, train):
+    ...
+
+class BoxDataset(torch.utils.data.Dataset):
+    ...
+
+def main():
+    ...
+```
+
+I'll add the `iou` function after `read_csv` or before `make_crop`. Let me add it after `read_csv`.
+
+Actually, let me add it right before `make_crop`.
+
+Let me write the first block: add the iou function.
+
+```
+SEARCH:
+def make_crop(img, r, context, train):
+=======
+def iou(a, b):
+    x1 = max(a["x1"], b["x1"]); y1 = max(a["y1"], b["y1"])
+    x2 = min(a["x2"], b["x2"]); y2 = min(a["y2"], b["y2"])
+    inter = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    union = (a["x2"] - a["x1"]) * (a["y2"] - a["y1"]) + (b["x2"] - b["x1"]) * (b["y2"] - b["y1"]) - inter
+    return inter / union if union > 0 else 0.0
+
+
+def make_crop(img, r, context, train):
+>>>>>>>
+```
+
+Wait, I need to make sure the SEARCH text is exact. Let me copy the exact line:
+```
+def make_crop(img, r, context, train):
+```
+
+Yes, that's the line.
+
+Now the second block: modify the main() function to add the matched detector boxes.
+
+Current:
+```python
+    crops = [r for r in read_csv(os.path.join(args.data, "crops.csv")) if r["res"] in TRAIN_ON]
+    dets = read_csv(os.path.join(args.data, "dets.csv"))
+    ev = [d for d in dets if d["split"] == "eval"]
+    needed = {r["image"] for r in crops} | {d["image"] for d in ev}
+```
+
+New:
+```python
+    crops = [r for r in read_csv(os.path.join(args.data, "crops.csv")) if r["res"] in TRAIN_ON]
+    dets = read_csv(os.path.join(args.data, "dets.csv"))
+    ev = [d for d in dets if d["split"] == "eval"]
+    # add detector boxes (train split) that overlap a true box by IoU > 0.5 as extra training rows
+    crops_by_img = {}
+    for r in crops:
+        crops_by_img.setdefault(r["image"], []).append(r)
+    extra = []
+    for d in dets:
+        if d["split"] != "train":
+            continue
+        best_iou, best_cls = 0.0, -1
+        for r in crops_by_img.get(d["image"], []):
+            v = iou(d, r)
+            if v > best_iou:
+                best_iou, best_cls = v, r["cls"]
+        if best_iou > 0.5:
+            nd = dict(d)
+            nd["cls"] = best_cls
+            extra.append(nd)
+    crops = crops + extra
+    needed = {r["image"] for r in crops} | {d["image"] for d in ev}
+```
+
+Let me verify this is correct. The `dets` rows have all the needed keys (image, x1, y1, x2, y2). I add cls. Then BoxDataset will use r["image"], r["x1"], etc., and r.get("cls", -1). Good.
+
+Wait, but there's a subtle issue. The `crops` rows have a "res" key, but the det rows don't. Does BoxDataset use "res"? Let me check:
+
+```python
+def __getitem__(self, i):
+    r = self.rows[i]
+    img = self.images[r["image"]]
+    ...
+    for ctx in (TIGHT_CONTEXT, CONTEXT):
+        x = make_crop(img, r, ctx, self.train)
+    ...
+    return views[0], views[1], r.get("cls", -1)
+```
+
+`make_crop` uses `r["x1"]`, `r["y1"]`, `r["x2"]`, `r["y2"]`. It doesn't use "res". So the det rows (without "res") are fine.
+
+Good.
+
+Now, let me double check the `needed` computation. After adding extra, `crops` includes the det boxes. So `needed` includes all their images. Good.
+
+Let me also verify: the det boxes are on training images, which are the same as the crops images (high res). So the images are already loaded. But adding them to needed doesn't hurt.
+
+Now, let me reconsider the time budget. The plan says "same model, same resolution, same step count — no expected time increase". But adding more training rows means the DataLoader has more items. However, since training is time-limited, the total steps are the same. So the training time is the same. The only difference is that each epoch covers more data, so fewer epochs. That's fine.
+
+Actually, wait. There's a potential issue with the DataLoader. With persistent_workers and num_workers=8, loading a larger dataset might take slightly longer to initialize, but that's negligible.
+
+Let me also think about whether the extra detector boxes could cause the training to be dominated by them. If there are, say, 15000 extra detector boxes and 6052 GT boxes, the training set is 21052 rows. The detector boxes are 71% of the set. This could shift the training distribution significantly. But that's the point of the experiment — to match the test distribution.
+
+Hmm, but actually, I'm now worried that adding a large number of detector boxes (which are noisier) might hurt. But the plan is clear, and the hypothesis is that it should help by matching the test distribution. Let me implement it as written.
+
+Actually, let me reconsider. The earlier research history shows this family was "accepted twice (5-seed 0.6337 and 0.6342, about +0.004); rejected 3 times at seed 0 (0.626-0.628); 1 crash in the IoU code". So it's a mixed result. The lead wants to try it again but as the "primary" training set.
+
+But wait, the current best is 0.6288 (5-seed). The earlier accepted results were 0.6337 and 0.6342, which are higher than 0.6288. So if this works, it should beat the current best.
+
+Hmm, but the current best train.py is e000 which scores 0.6288. The earlier runs that got 0.6337 and 0.6342 were on the same base (e000). So adding detector boxes as extra training data got 0.6337-0.6342 in those runs. But the current best is 0.628Thinking budget reached. Stop thinking now and write the reply in the required format.

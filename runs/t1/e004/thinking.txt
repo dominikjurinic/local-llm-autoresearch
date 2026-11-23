@@ -1,0 +1,220 @@
+===== attempt 1 =====
+Let me carefully analyze the situation.
+
+Current best: e000, 5-seed val mAP@0.5 0.6288.
+
+The lead's plan is to implement a 2-model ensemble (N_MODELS=2) on top of the current best (e000). The e003 crash was on top of e002 (which had TIGHT_IMG_SIZE=224 and TIGHT_WEIGHT). The e003 crash was caused by:
+1. `l = torch.zeros_like(xt[:, 0:1])` — this creates a tensor of shape [batch, 1, 224, 224] (zeros_like of a cropped view), not [batch, 4]. Then adding logits of shape [batch, 4] fails. That's the actual bug: "The size of tensor a (224) must match the size of tensor b (4) at non-singleton dimension 3". So the accumulator was wrongly shaped.
+
+Wait, the lead's hypothesis says "This fixes the crash of e003 by removing the undefined TIGHT_WEIGHT". But the actual crash was the zeros_like shape bug, not TIGHT_WEIGHT. Actually TIGHT_WEIGHT was defined in e002 (it was in the diff context). Let me re-read.
+
+In the e003 diff, `TIGHT_WEIGHT` is used in the training loop: `loss = crit(TIGHT_WEIGHT * model(xt) + (1 - TIGHT_WEIGHT) * model(xw), y)`. This was defined in e002 (the base of e003). So TIGHT_WEIGHT was defined. The crash was the `torch.zeros_like(xt[:, 0:1])` shape mismatch.
+
+So the lead's hypothesis about "removing the undefined TIGHT_WEIGHT" is slightly wrong — the real bug is the accumulator shape. But since we're building on the best (e000), not on e002/e003, we don't have TIGHT_WEIGHT or TIGHT_IMG_SIZE at all. The current best uses `(model(xt) + model(xw)) / 2` for both training and inference.
+
+So I need to implement the ensemble on top of e000 (the current best). Let me be careful to build on e000 exactly.
+
+Let me re-read the current best train.py to understand the structure.
+
+Current best (e000):
+- MODEL = "efficientnet_b0"
+- IMG_SIZE = 160
+- CONTEXT = 2.5, TIGHT_CONTEXT = 1.5
+- BATCH_SIZE = 64, LR = 1e-3, WEIGHT_DECAY = 0.05
+- RESERVE_S = 55
+- MIN_SCORE = 0.001
+- BoxDataset returns views[0], views[1], cls. Both views are IMG_SIZE (160).
+- Training: `loss = crit((model(xt) + model(xw)) / 2, y)`
+- Inference: `probs.append(torch.softmax(((model(xt) + model(xw)) / 2).float(), 1).cpu())`
+- Single model, single training loop.
+
+Now I need to implement N_MODELS=2 ensemble. The key changes:
+1. Add N_MODELS = 2 constant.
+2. RESERVE_S: The lead says "fix RESERVE_S back to a safe margin (e.g. 60s)". Currently it's 55. With 2 models, prediction time doubles (2 forward passes per batch at inference). Let me estimate.
+
+Let me do the budget arithmetic.
+
+Total budget T = 180s (default --seconds). Actually the harness runs with --seconds T. The log shows total 162s for the best. Let me check: T0 + args.seconds. The log shows "done: ... 162s total". So the budget was likely 180s and it finished in 162s. RESERVE_S=55 means training ends at deadline - 55. If deadline = T0 + 180, then t_end = T0 + 125. Training ran from ~13s (after loading) to ~125s, that's ~112s of training = 433 steps. Then prediction from 125s to 162s = ~37s for prediction.
+
+Wait, let me recompute. Loading took 13s. t_start = time.time() after loading ≈ 13s. t_end = deadline - RESERVE_S = T0 + 180 - 55 = T0 + 125. So training budget = 125 - 13 = 112s. 433 steps in 112s ≈ 0.26s/step. Then prediction: from t_end (125s) to done (162s) = 37s. Prediction processes 41879 detections with batch 256 → 164 batches, each with 2 forward passes (xt, xw) = 328 forward passes. 37s / 164 ≈ 0.225s/batch.
+
+Now with 2 models:
+- Training: split the training budget into 2 sub-budgets. Each model trains for ~56s → ~216 steps each. Total steps same ~433.
+- Prediction: now 2 models × 2 views = 4 forward passes per batch. So prediction time roughly doubles: ~74s. That would exceed the reserve!
+
+Wait, let me reconsider. The reserve is meant to cover prediction + writing. Currently prediction takes ~37s and reserve is 55s. With 2 models, prediction takes ~74s. So I need RESERVE_S to be at least ~80-90s to be safe.
+
+But if I increase RESERVE_S, the training budget shrinks. Let me recompute.
+
+If RESERVE_S = 90: t_end = T0 + 180 - 90 = T0 + 90. Training budget = 90 - 13 = 77s → ~296 steps total, split into 2 models = ~148 steps each. That's fewer steps than before (433). Hmm.
+
+Actually wait. Let me reconsider the tradeoff. With 2 models, each model gets half the training time, so each model is trained for fewer steps. But we average 2 models. The question is whether 2×(half-trained) models beat 1×(fully-trained) model.
+
+Actually the lead's plan says: "Averaging two independently-trained models with different seeds reduces variance in the hard pore/deposit/stain cases without losing per-model training time (both use the same fast EfficientNet-B0)."
+
+Hmm, "without losing per-model training time" — but that's not quite right. If we split the budget, each model gets half the time. Unless... the idea is that the total number of steps stays the same (each model trains for half the time, so total steps = same as before). Actually total steps = 2 models × (half the steps) = same total steps as one full model. So per-model steps are halved, but we have 2 models.
+
+The ensemble benefit comes from diversity (different seeds → different initializations and data order). Even if each model is slightly undertrained, averaging can reduce variance.
+
+But there's a real risk: if each model is undertrained (only ~216 steps instead of 433), the ensemble might not help much. Let me think about what's realistic.
+
+Actually, let me reconsider. The key insight from the literature: ensembles help most when models are undertrained. Here each model has ~216 steps. The single model had 433 steps. So each ensemble member has half the steps. 
+
+Let me estimate the effect. The reference: one-step 4-class baseline 0.638. Current best 0.6288. So we're slightly below the one-step baseline. The ensemble might push us above.
+
+Actually, let me focus on implementing it correctly and safely within the time budget, since that's what the lead asked for. The lead explicitly said: "If a detail of the plan cannot work as written (time budget, tensor shapes, missing names), make the smallest fix that keeps the idea and say so at the end of the HYPOTHESIS."
+
+So I need to:
+1. Make the time budget work (RESERVE_S large enough for 2-model prediction).
+2. Fix the tensor shape bug (don't use zeros_like of a view; use a proper accumulator).
+3. Handle missing names (TIGHT_WEIGHT doesn't exist in e000; use the (model(xt)+model(xw))/2 form).
+
+Let me now design the implementation on top of e000.
+
+Let me re-read the e000 code carefully to plan the edits.
+
+```python
+MODEL = "efficientnet_b0"
+PRETRAINED = True
+IMG_SIZE = 160
+CONTEXT = 2.5           # wide crop: side = CONTEXT * long side of the box
+TIGHT_CONTEXT = 1.5     # tight crop
+MIN_CROP = 16
+TRAIN_ON = ("high",)    # resolutions of crops.csv used for training
+BATCH_SIZE = 64
+LR = 1e-3
+WEIGHT_DECAY = 0.05
+RESERVE_S = 55          # seconds kept free for prediction and writing
+MIN_SCORE = 0.001       # rows below this score are not written
+MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+```
+
+I'll add N_MODELS = 2 and change RESERVE_S.
+
+Now the training section:
+
+```python
+    g = torch.Generator().manual_seed(args.seed)
+    dl_tr = torch.utils.data.DataLoader(BoxDataset(crops, images, True), batch_size=BATCH_SIZE, shuffle=True,
+                                        num_workers=workers, pin_memory=True, drop_last=True,
+                                        persistent_workers=True, generator=g, worker_init_fn=worker_init)
+    dl_ev = torch.utils.data.DataLoader(BoxDataset(ev, images, False), batch_size=256, shuffle=False,
+                                        num_workers=workers, pin_memory=True)
+
+    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
+    model = model.to(device).to(memory_format=torch.channels_last)
+    crit = nn.CrossEntropyLoss()
+    opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    amp = dict(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda")
+
+    # Train until the budget minus the reserve is used up: 5% warm-up, then cosine decay.
+    t_start = time.time()
+    t_end = deadline - RESERVE_S
+    budget = max(1.0, t_end - t_start)
+    steps, epoch, done = 0, 0, False
+    model.train()
+    while not done:
+        tot, nb = 0.0, 0
+        for xt, xw, y in dl_tr:
+            frac = min(1.0, (time.time() - t_start) / budget)
+            f = frac / 0.05 if frac < 0.05 else 0.5 * (1 + math.cos(math.pi * (frac - 0.05) / 0.95))
+            for pg in opt.param_groups:
+                pg["lr"] = LR * max(f, 1e-3)
+            xt = xt.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            xw = xw.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            y = y.to(device, non_blocking=True)
+            with torch.autocast(**amp):
+                loss = crit((model(xt) + model(xw)) / 2, y)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+            tot += loss.item(); nb += 1; steps += 1
+            if time.time() >= t_end:
+                done = True
+                break
+        print(f"epoch {epoch}: loss {tot / max(nb, 1):.4f}, {steps} steps, {time.time() - T0:.0f}s", flush=True)
+        epoch += 1
+
+    # Classify every eval detection; one prediction per class with score = detector conf x class probability.
+    model.eval()
+    probs = []
+    with torch.no_grad(), torch.autocast(**amp):
+        for xt, xw, _ in dl_ev:
+            xt = xt.to(device).to(memory_format=torch.channels_last)
+            xw = xw.to(device).to(memory_format=torch.channels_last)
+            probs.append(torch.softmax(((model(xt) + model(xw)) / 2).float(), 1).cpu())
+    probs = torch.cat(probs).numpy()
+```
+
+Now I need to restructure this into a per-model loop. Let me design it.
+
+Key considerations:
+- The dataloader `dl_tr` should be recreated per model with a different seed (for diversity in data order). Actually, for ensemble diversity, we want different random seeds per model. The e003 approach re-seeded and recreated the dataloader per model. That's good.
+- Actually, do we need to recreate the dataloader? The diversity comes from (a) different weight initialization (torch.manual_seed before create_model) and (b) different data order. Both help. Let me recreate the dataloader per model with a different generator seed, and re-seed torch before create_model.
+
+Wait, but there's a subtlety with persistent_workers and recreating dataloaders. Creating a new DataLoader each model with persistent_workers=True should be fine. But it's a bit wasteful. Actually, for simplicity and correctness, let me follow the e003 structure but fix the bugs.
+
+Let me think about whether to recreate the dataloader. The main source of diversity is the weight initialization. Data order diversity is secondary. But to be safe and match the "independently seeded models" idea, I'll re-seed everything per model and recreate the dataloader.
+
+Actually, let me reconsider. Recreating the dataloader with num_workers=8 and persistent_workers=True 2 times adds some overhead (spawning workers). But it's small. The e003 did this. Let me keep it but be careful.
+
+Hmm, actually there's a concern: persistent_workers=True keeps workers alive. When we create a new DataLoader, the old workers should be garbage collected. But there might be a delay. To be safe, I could create the dataloader once and just re-seed the generator... but the generator is tied to the DataLoader. Actually you can set the generator's seed? No, torch.Generator has manual_seed but once consumed by the DataLoader... Actually the DataLoader uses the generator to shuffle. If I want a different shuffle order, I need a new generator or a new DataLoader.
+
+Let me just recreate the DataLoader per model. It's the cleanest.
+
+Actually, let me reconsider the whole thing. Let me think about the time budget more carefully and whether 2 models is even a good idea, but the lead has decided, so I'll implement it as asked, making minimal fixes.
+
+Let me reconsider the time budget. This is critical because if it times out, the run fails.
+
+Let me estimate step time. From the log: 433 steps in ~112s (from 13s to 125s). Wait, let me recompute from the log:
+- Loading: 13s
+- epoch 0: 94 steps at 59s → so from 13s to 59s = 46s for 94 steps ≈ 0.49s/step (includes warmup, first epoch slower due to worker spin-up)
+- epoch 1: 188 steps at 77s → from 59s to 77s = 18s for 94 steps ≈ 0.19s/step
+- epoch 2: 282 steps at 95s → 18s for 94 steps
+- epoch 3: 376 steps at 114s → 19s for 94 steps
+- epoch 4: 433 steps at 125s → 11s for 57 steps
+- done at 162s
+
+So steady-state step time ≈ 0.19s/step. Total training from 13s to ~125s (t_end). Actually t_end = T0 + 180 - 55 = T0 + 125. Training ended when time.time() >= t_end, which was at 125s. Then prediction 125s to 162s = 37s.
+
+So:
+- Steady step time: ~0.19s/step
+- Prediction (1 model, 2 views): 37s for 164 batches.
+
+Now with 2 models:
+- If RESERVE_S stays 55: t_end = T0 + 125. Training budget = 125 - 13 = 112s. Split into 2 models = 56s each. At 0.19s/step, that's ~295 steps per model, but the first epoch of each model is slower. Total steps ~570 (with slow first epochs, maybe ~500). Hmm, actually more total steps than before because... no wait. Before: 112s → 433 steps. Now: 112s split into 2 models. Each model's first epoch is slow (worker spin-up ~0.49s/step for first 94 steps). So model 0: first 94 steps at 0.49s = 46s, then remaining 10s at 0.19s = 53 steps → ~147 steps. Model 1: its dataloader has persistent_workers but it's a new dataloader so workers respawn → first 94 steps at 0.49s = 46s, then 10s → ~147 steps. Total ~294 steps. That's FEWER total steps than before (433)! Because of the double worker spin-up.
+
+Hmm wait, but persistent_workers=True means workers persist across epochs within a dataloader. But when we create a NEW dataloader for model 1, the workers are new. So model 1's first epoch is slow again.
+
+Actually, this is a problem. The worker spin-up cost is paid twice. Let me reconsider.
+
+Actually, let me reconsider whether to recreate the dataloader. If I DON'T recreate it (reuse the same dataloader for both models), then:
+- Model 0 trains on the dataloader (workers spin up once, first epoch slow).
+- Model 1 trains on the SAME dataloader. But the dataloader's shuffle is deterministic given the generator. If I don't re-seed, model 1 sees the same data order as model 0. That reduces diversity but avoids double spin-up.
+
+Hmm. But actually, the dataloader with shuffle=True and a fixed generator g: each epoch reshuffles based on g's state. So model 0's epochs consume g's sequence, and model 1's epochs continue from where g left off. So model 1 sees different data order than model 0 (different epochs of the same shuffled sequence). That's actually fine for diversity! And no double worker spin-up.
+
+Wait, but if I re-seed torch.manual_seed per model, that doesn't affect the dataloader's generator g (which is a separate Generator). So the dataloader's shuffle continues. Good.
+
+But there's another subtlety: the augmentation randomness. In BoxDataset.__getitem__, it uses random.random() and random.uniform(). These use the global random module, seeded via worker_init_fn with torch.initial_seed(). The workers are persistent, so their random state persists. So model 1 gets different augmentation than model 0 (different random state). Good for diversity.
+
+So actually, I can reuse the same dataloader for both models, and just re-seed torch (for weight init) before each create_model. This avoids double worker spin-up and gives diversity through (a) different weight init and (b) continued data order + different augmentation state.
+
+But wait, there's a catch: if I reuse the dataloader, model 0 trains for ~56s consuming some epochs, then model 1 trains for ~56s continuing. The LR schedule: I compute frac based on per-model time. Let me handle the LR schedule per model.
+
+Actually, let me reconsider. The cleanest approach that matches e003's intent (independently seeded models) but avoids the double spin-up: reuse the dataloader, re-seed torch per model for weight init.
+
+Hmm, but actually, does reusing the dataloader cause issues? The dataloader is an iterator that can be iterated multiple times (each `for` loop creates a new iterator). With shuffle=True, each new iterator reshuffles. So model 0's `while not done: for ... in dl_tr` loop: the outer `while` iterates epochs, and each epoch is a `for` over dl_tr (new iterator each epoch, reshuffled). Then model 1 does the same. So the shuffle sequence continues. Fine.
+
+OK here's my plan. Let me keep it simple and robust:
+
+1. Add N_MODELS = 2, change RESERVE_S to a safe value.
+2. Create dl_tr once (with generator g seeded by args.seed).
+3. Loop over m in range(N_MODELS):
+   a. Re-seed: random.seed, np.random.seed, torch.manual_seed with args.seed + 101*m (for weight init diversity).
+   b. create_model, to device.
+   c. optimizer.
+   d. Train for sub-budget [m_start, m_end] with per-model LR schedule.
+   e. model.eval(), append to models list.
+4. Inference: for each batch, sum (model(xtThinking budget reached. Stop thinking now and write the reply in the required format.

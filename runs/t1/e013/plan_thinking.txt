@@ -1,0 +1,293 @@
+Let me analyze the situation carefully.
+
+Current best: e008, 5-seed val mAP@0.5 0.6327.
+
+Key diagnostics on current best (e008):
+- Class chosen on detector boxes that overlap true defect by IoU > 0.5:
+  - true pore: 62% right
+  - true deposit: 77% right
+  - true discontinuity: 96% right
+  - true stain: 89% right
+- By size: small 80%, medium 91%, large 92%
+- mAP@0.5 if every box had its correct class but kept your scores: 0.7433 (current: 0.6327). So wrong-class assignments cost ~0.11 mAP.
+- The remaining gap to the perfect-classes ceiling (0.758): what our scores cost compared with the detector's conf.
+
+The dominant error is clearly wrong class assignment on overlapping boxes (~0.11 mAP), especially:
+- pore: only 62% right (38 errors)
+- deposit: 77% right (23 errors) 
+- stain: 89% right (11 errors)
+
+Wait, let me think about the numbers more carefully. The confusion matrix shows:
+- true pore: 47 correct, 7 deposit, 1 discontinuity, 20 stain, 1 no row → 76 total, 62% right
+- true deposit: 3 pore, 210 correct, 3 discontinuity, 55 stain, 1 no row → 272 total, 77% right
+- true discontinuity: 1 pore, 2 deposit, 441 correct, 17 stain, 0 no row → 461 total, 96% right
+- true stain: 13 pore, 42 deposit, 9 discontinuity, 547 correct, 3 no row → 614 total, 89% right
+
+So the biggest contributors to wrong-class error are:
+- deposit misclassified as stain (55 cases): this is a big one! Deposit and stain confusion.
+- stain misclassified as deposit (42 cases)
+- pore misclassified as stain (20 cases)
+- pore misclassified as deposit (7 cases)
+
+The history shows that the "third, very wide view (4x the box)" was accepted twice with +0.005 gain from the pore class only. The e012 timeout tried to increase IMG_SIZE to 224 but timed out.
+
+Let me think about what's left. The main remaining error is wrong-class assignment on overlapping boxes:
+- pore/deposit/stain confusion is the core issue
+- The known reference: "Pore and deposit are the weak classes; stain is often confused with deposit."
+- Known from brief: "A crop classifier given perfect boxes reaches macro-F1 ~0.87 with the starting recipe (two-crop input). Pore and deposit are the weak classes; stain is often confused with deposit."
+
+Wait, but that's with *perfect* boxes! The reference says a crop classifier given *perfect boxes* reaches macro-F1 ~0.87. So even with perfect boxes, it's only 0.87 macro-F1. That suggests there's fundamental class overlap (pore vs deposit, stain vs deposit).
+
+The key question: what can we change to improve the classification of these hard cases?
+
+Known directions tried and failed:
+- Bigger backbone (no gain)
+- Higher resolution (timeout, and e002 "not confirmed" with 224px tight crop)
+- Training on detector boxes (accepted twice, small +0.004 gain)
+- Third wide view (accepted twice, +0.005, mostly pore)
+- Class-balanced sampling / class-weighted loss (no gain)
+- Focal loss (no gain)
+- Training augmentation (no gain)
+- TTA (no gain)
+- Longer training (no gain)
+- Box size/aspect as extra input (never properly tested)
+
+What hasn't been tried? Let me think about what's fundamentally different.
+
+The key insight from the diagnostics: the error is in class assignment on boxes that overlap true defects. The current model uses two crops (1.5x tight + 2.5x wide) with per-class adaptive fusion via learnable weights.
+
+One idea: the known ceiling is 0.758 (perfect classes + detector conf scores). We're at 0.6327. The wrong-class loss is ~0.11 mAP. But actually, let me reconsider - "mAP@0.5 if every box had its correct class but kept your scores: 0.7433". So the wrong-class part costs 0.7433 - 0.6327 = 0.111 mAP. And the "remaining gap to the perfect-classes ceiling" is 0.758 - 0.7433 = 0.015, which is what our *scores* cost (ranking).
+
+So the main target is the wrong-class assignment (~0.11 mAP potential). The reference says perfect classes gives 0.758, and our score ordering gives 0.7433 even with perfect classes - so ~0.015 is lost due to score ranking. So we should focus on improving class accuracy.
+
+Now, what's the most promising direction? Let me think about the specific confusion patterns:
+- deposit vs stain (both directions): 55 + 42 = 97 cases. This is the big one.
+- pore vs stain: 20 cases (pore→stain).
+- pore → deposit: 7
+
+The brief says "stain is often confused with deposit". And "Pore and deposit are the weak classes."
+
+Idea: The two crops might not be capturing the right information. The tight crop (1.5x) has the defect filling most of the frame but loses context; the wide crop (2.5x) has more context but the defect is smaller. For pore vs deposit vs stain, the distinguishing features are:
+- Pore: small dark spot, texture detail
+- Deposit: raised material, texture
+- Stain: discoloration, might need to see surrounding bead geometry
+
+Actually, one thing I notice: the model uses EfficientNet-B0 at 160x160. The background reading mentions "Fixing the train-test resolution discrepancy" - pretrained models work best near their training resolution. EfficientNet-B0 is trained at 224x224 typically. So 160x160 might be suboptimal.
+
+But e012 tried 224 and it timed out. Let me think about the time budget:
+- Current run: 162s total for e008 with 160px. 
+- e012 at 224px: killed after 195s (budget 180s), with only 336 steps vs 441 steps for e008.
+
+So 224px costs about 17% more time per step. That's not too bad actually - we could reduce the reserve or accept fewer steps. But the gain would need to be confirmed.
+
+Alternative: what about using a different model family that's faster? Like convnext_atto/nano/pico or mobilenetv3_large_100? The available pre-trained models are: convnext_atto, convnext_nano, convnext_pico, efficientnet_b0, efficientnet_b2, mobilenetv3_large_100, regnety_016, resnet18, resnet26d, resnet34, resnet50, tf_efficientnetv2_b0.
+
+Hmm, but the history says "Bigger or other backbone (EfficientNet-B2, ResNet-50, 2-3 model ensembles): no gain: best 5-seed 0.636 (not confirmed)". So bigger backbones didn't help much.
+
+What about a fundamentally different idea? Let me think...
+
+The most important remaining error is deposit↔stain confusion (97 cases) and pore→stain (20 cases). 
+
+A key insight: the two-stage setup means stage 1 detector boxes have varying quality. The diagnostic shows that per-box adaptive fusion (e011, rejected) tried to use box geometry.
+
+Wait - what about training data augmentation with *hard negatives*? Or better yet, what about using a different training strategy for the classifier - like using harder crops that specifically target the confusion classes?
+
+Actually, let me reconsider. The brief says: "A crop classifier given perfect boxes reaches macro-F1 ~0.87 with the starting recipe (two-crop input)." This is with *perfect* boxes. So even the ideal scenario has 13% macro-F1 error rate. But our current setup gets the equivalent of maybe... Let me think. We're at 0.6327 mAP vs 0.7433 if classes were perfect. So we lose 15% relative to perfect classes on the overlap set.
+
+Hmm, what's actually limiting? The known ceiling for perfect boxes + our score ranking is 0.7433 (from the diagnostic "mAP@0.5 if every box had its correct class but kept your scores"). Wait, that says 0.7433 with our scores but perfect classes. And the reference number says stage-1 boxes with perfect classes = 0.758. So there's a gap of 0.758 - 0.7433 = 0.015 from our score ranking vs perfect confidence.
+
+So the total error budget:
+- Perfect class + perfect scores: 0.758 (ceiling)
+- Perfect class + our scores: 0.7433 (-0.015 from score ranking)
+- Our class + our scores: 0.6327 (-0.111 from wrong classes)
+
+So the dominant error is indeed wrong class assignment (~0.11 mAP).
+
+Now, what could fix this? The known hard pairs are deposit↔stain and pore→stain. These need *context* or *texture* that the current two-crop setup might not capture well enough.
+
+Idea: The e008 model uses per-class adaptive fusion (learnable 4 weights for sigmoid). But this is a fixed global weighting. What if we let the model learn per-instance fusion? That's like e011 which used box geometry, and it was rejected. 
+
+Alternative idea: Instead of two crops with a fusion weight, what about three crops at different scales? The "third wide view" (4x) was accepted twice (+0.005, mostly pore). But that's close to the time limit.
+
+What about a completely different approach to the class decision: use the *detector* features instead of the crop classifier? No, we can't access stage-1 features easily.
+
+Wait, here's another idea worth considering: **ensemble**. The brief mentions "Averaging the predictions of several independently trained models is one of the most reliable ways to improve accuracy." But history says e004 (two models ensemble) was rejected at seed 0 (0.5704 - that looks like a bug).
+
+Hmm, let me think about what's *fundamentally* different from past experiments and could plausibly gain 0.01+.
+
+Actually, let me reconsider the time budget more carefully. The current best (e008) finishes at ~162s. The budget is 180s with RESERVE_S=55. So we have room. 
+
+One thing I haven't seen tried: **test-time resolution scaling / multi-scale inference**. No wait, TTA was tried and failed.
+
+What about **using the detector conf more cleverly**? We've seen that conf × p works. But what if the ranking is off? The diagnostic shows mAP 0.7433 with perfect classes and our scores vs 0.758 ceiling. So there's only 0.015 to gain from score ranking. The 0.11 from class assignment dominates.
+
+Let me focus on class assignment improvements. 
+
+Idea: **Different training data composition**. Currently trains on all crops.csv boxes (6052). What if we oversample the hard classes (pore, deposit, stain) or specifically target the confusion pairs? But "Class-balanced sampling or class-weighted loss" was tried and failed (4 attempts).
+
+Idea: **Use a different backbone family that's faster but similar accuracy**, allowing higher resolution. For example, convnext_atto or mobilenetv3_large_100 at 224px. But the history says bigger backbones didn't help much.
+
+Idea: **Multi-view at inference (TTA)** - tried and failed (8 attempts, best 5-seed 0.631).
+
+Idea: **Different loss for imbalanced classes** - focal loss, class weights tried, no gain.
+
+Hmm, what about **training the classifier on a different task**? Like, instead of predicting the class from crops, predict it from the box plus context? 
+
+Wait, here's an important thought: The history says "Training on detector boxes as extra training data (IoU > 0.5 with a true box, labelled with its class)" was accepted twice (+0.004). This is interesting - it suggests domain shift matters: detector boxes differ from GT boxes. What if we combine this with the *perfect classes* idea? The current best trains only on crops.csv GT boxes.
+
+Actually, let me reconsider what's different. The diagnostic shows that the "wrong-class loss ≈ 0.11 mAP" is concentrated on:
+- deposit↔stain (the big one)
+- pore→stain
+
+The known reference says "stain is often confused with deposit". 
+
+Hmm, what if we add *even more* wide context? The history accepted "third, very wide view (4x the box)" twice. But e012's timeout suggests resolution is expensive. What if we increase the wide crop context from 2.5x to something larger? Or what if we use a different strategy for the wide crop - like a full-image crop instead of a box crop?
+
+Actually, here's a thought: **the detector conf and class probability might need calibration**. But that only affects 0.015 mAP at most.
+
+Let me think about this differently. What is *unique* about what we can do? We have a fixed stage-1 detector with boxes and conf. The stage-2 classifier predicts classes. 
+
+One idea that hasn't been tried: **ensemble of two crops with different resolutions or different models**. But ensemble was rejected (e004, likely bug).
+
+Another untried idea: **use the box's spatial position within the image as a feature**. Stains might be at edges? Pores in the middle? This is a "box attribute" idea but e011 tried box geometry via MLP and was rejected. Actually wait - e011 was "Per-box adaptive fusion of tight/wide logits, driven by box geometry (log w, log h, aspect) via a small MLP". That's different from using box position as an input feature to the classifier.
+
+Hmm, let me think about what could give a big gain on deposit↔stain confusion specifically. 
+
+The most promising untried direction I can see: **hard negative mining / targeted training on confusion pairs**. The idea is that deposit and stain are visually similar; the model needs more examples of *both* together to learn the boundary. We could oversample boxes where the crop classifier is uncertain, or where the ground truth is one of these classes. But class-weighted sampling was tried...
+
+Actually wait. Let me re-read: "Class-balanced sampling or class-weighted loss | 4 | no gain: seed 0 from 0.613 to 0.629". This means they tried oversampling/weighting for the *rare* classes. But maybe the issue isn't rarity but similarity. 
+
+What about a **contrastive learning approach** or **margin-based loss**? Not in the history.
+
+OK let me think about a different angle entirely. What if the problem is that we're classifying at a *fixed resolution* of 160x160 for all crops, and the effective resolution differs? The tight crop (1.5x) gives the defect more pixels; the wide crop (2.5x) gives less. But both are resized to 160x160. 
+
+Actually - here's a thought: **what if we use multiple resolutions**? Like, process each box at its natural resolution? No, that would be very slow.
+
+What about this: the most obvious untried direction given the constraints and the data is to **train on detector boxes from the train split AND the eval split** - no wait, we can't use eval labels.
+
+Let me reconsider. The key diagnostic: "mAP@0.5 if every box had its correct class but kept your scores: 0.7433". This tells us that the *ranking* of our scores is nearly optimal (only 0.015 loss vs perfect). So we should focus on class accuracy.
+
+The known hard pairs: deposit↔stain, pore→stain. These need better feature discrimination. 
+
+New idea: **ensemble the two crops differently** - instead of logit fusion with a learnable weight per class, what about using *both* crops' outputs as inputs to a small MLP? No, that's basically e011-ish.
+
+Actually, let me think about this from the "what's fundamentally different" angle:
+
+One thing that hasn't been tried at all in this history: **changing the number of predictions per box** (e.g., using a margin-based ranking where we output multiple classes with different scores). But the scoring rules say one or more rows per eval box are allowed, and only top-300 per image count. So extra rows could help! 
+
+Wait - that's interesting. Currently each eval box gets 4 rows (one per class), but only rows with score > MIN_SCORE are written. What if we add *more* rows per box with different score formulations? But the history says "Fewer or re-weighted score rows: only the argmax class per box, dropping non-argmax rows, ranking by margin or entropy, softmax temperature, other conf x p rules | 16 | no gain". So scoring variations were all tried.
+
+OK so the dominant error is definitively class accuracy on the overlap set. The untried directions for improving class accuracy:
+1. Better training data (different composition) - partially tried
+2. Better model/inference architecture - many tried
+3. Different loss/regularization - some tried
+4. **Different inference strategy**: e.g., use multiple *independent* models and average their predictions
+
+Wait, ensemble was in the history: "Bigger or other backbone (EfficientNet-B2, ResNet-50, 2-3 model ensembles) | 8 | no gain". So ensemble was tried. And e004 was a two-model ensemble (rejected, likely bug).
+
+Hmm, what about **test-time augmentation of the classifier crops**? Like flipping/rotating the crop and averaging? That's TTA which was tried (no gain). But wait - TTA in history was "Test-time augmentation (flips, extra views at inference) | 8 | no gain: best 5-seed 0.631; 8 views timed out". So flipping at test time didn't help. That's interesting because for the *classifier* part, flips are symmetry-invariant... but for the two-stage system, flipping a crop might change the classification boundary slightly. Actually no, if the model is trained with flips, it should be invariant.
+
+Let me think about what could REALLY work here. The problem is: deposit vs stain confusion. These are visually similar in a tight crop. What information distinguishes them? Stain might be a discoloration of the surrounding material; deposit might be excess material. The *context* around the defect (the bead geometry, the surrounding region) might be key. 
+
+What if we use a **larger context crop**? Like 3x or 4x instead of 2.5x? The history says "Third, very wide view (4x the box)" was accepted twice (+0.005, mostly pore). So wider context *did* help, but only for pore.
+
+Wait, actually, let me reconsider the numbers from the brief:
+- stage-1 boxes with perfect classes (ceiling): 0.758
+- stage-1 boxes scored as a single class 'defect': 0.755
+
+So even scoring everything as one class gives 0.755! That's very close to 0.758. This is interesting - it means the *detector* ranking (conf) is nearly optimal, and merging classes barely hurts. The loss is purely in the *class assignment* of overlapping boxes.
+
+Now here's a crucial thought: what if we could improve class accuracy by **using a different model for specific subsets of boxes**? For example, a "deposit vs stain" classifier as an additional head? But that's complex.
+
+Actually, let me think about the most promising untried idea more carefully: **ensemble with different seeds/models** was in the history but "no gain: best 5-seed 0.636 (not confirmed)". Hmm, but 0.636 is actually higher than 0.6327! Just not confirmed.
+
+Wait - I should focus on what's *fundamentally* different from past experiments and could give 0.01+ gain. Let me reconsider.
+
+The brief says: "Ideas that change what the model sees or learns from usually matter more than turning one more knob."
+
+What if we change what the model *sees*? The current two-crop approach uses tight (1.5x) + wide (2.5x). What if we add a *medium* crop (2.0x) as well? That's 3 crops, which was partially tried with 4x but not exactly this.
+
+Actually, here's a really different idea: **use the full image as context**. Instead of cropping around the box, what if for some boxes we use the full image or a larger region? No, that's too slow.
+
+OK let me think about this from yet another angle. The known reference "A crop classifier given perfect boxes reaches macro-F1 ~0.87". So with perfect boxes and a good classifier, we get 0.87 macro-F1. Our current system gets something worse because of wrong class assignments (the confusion matrix shows ~77-96% accuracy on the overlap set, with pores at 62%).
+
+The question is: what's limiting? Is it the model capacity? The resolution? The training data?
+
+Given that EfficientNet-B0 at 160x160 is a reasonable model, and the training data is fixed (6052 boxes), the most promising untried direction might be **improving the effective resolution per box**. 
+
+Here's the idea: **per-box adaptive resolution**. Currently all crops are resized to 160x160. But small boxes have tiny defects; a 160x160 crop of a small defect's 1.5x region still has few pixels. What if we increase IMG_SIZE for small boxes? Or use a two-scale approach where small boxes get higher resolution?
+
+Actually wait - this is related to e012 (IMG_SIZE=224, timeout) and e007 (resolution ideas, not confirmed). But the specific idea of *per-box adaptive resolution* hasn't been tried. However, it's complex and might be slow.
+
+Hmm, let me think about a simpler, more promising idea: **multi-resolution training**. Train with crops at multiple resolutions (e.g., some batches at 160, some at 224)? No, that doesn't help inference.
+
+What about this: **use the "efficientnet_v2" family?** tf_efficientnetv2_b0 is available. EfficientNetV2 is specifically designed for faster training at various resolutions and might be a better fit for fine-tuning. But would it give a big gain? Uncertain.
+
+Let me step back and think about what's the *single most important* thing we can do. The error is concentrated on:
+1. deposit↔stain (97 cases) - by far the biggest
+2. pore→stain (20 cases)
+
+For #1, the distinguishing feature between deposit and stain is subtle. Stain is discoloration without raised material; deposit is excess material. In a tight crop of 1.5x, both look like texture variations on the bead surface. The *context* - whether the region has surrounding raised material or not - might be the key.
+
+What if we **add a "bead boundary" crop**? Or what if we make the wide crop *much* wider (e.g., 6x) to capture the full bead geometry? But that was partially tried with 4x.
+
+Hmm, actually, let me reconsider the "third, very wide view (4x)" result: accepted twice with +0.005, gain almost entirely from pore. So 4x helped pore but not deposit/stain. That's interesting - it suggests the wide context helps small objects (pore) see more of their environment, but for deposit/stain, the context isn't the issue.
+
+Wait, actually maybe I should think about whether *pore* is actually the biggest remaining issue in terms of mAP contribution. Let me look at the confusion matrix again:
+- true pore: 76 boxes, 47 correct (62%) → 29 errors
+- true deposit: 272 boxes, 210 correct (77%) → 62 errors  
+- true discontinuity: 461 boxes, 441 correct (96%) → 20 errors
+- true stain: 614 boxes, 547 correct (89%) → 67 errors
+
+The number of errors is highest for deposit (62) and stain (67), then pore (29). But mAP impact depends on the class balance. The mAP@0.5 loss per class:
+- discontinuity: only 20 errors, 461 boxes → high accuracy
+- stain: 67 errors out of 614 → 89% 
+- deposit: 62 errors out of 272 → 77%
+- pore: 29 errors out of 76 → 62%
+
+Pore has the highest error *rate* but fewest boxes. Stain has the most boxes. So both matter.
+
+OK, I need to decide on a single direction. Let me think about what's most likely to work given the constraints.
+
+**Idea: Two-class "hard" classifier ensemble.** 
+
+Actually no, let me think simpler. The fundamental limitation is that we have 6052 training boxes and the model needs to distinguish 4 classes with heavy confusion between some pairs. The most effective way to improve class accuracy might be to **train a better classifier using a different backbone at a higher resolution**, but e012 timed out at 224px.
+
+Wait - what about **using tf_efficientnetv2_b0** (available in the pre-trained list) or **convnext_atto/nano/pico**? These are faster than EfficientNet-B0 and might allow 224px resolution within the budget. Actually, convnext models at small sizes should be very fast. And a smaller model at higher resolution might actually beat a bigger model at lower resolution? No wait - e006 tried "stronger backbone at fixed effective resolution" (ResNet-50?) and no gain.
+
+Hmm, let me think about the time budget more carefully:
+- e008 at 160px: ~441 steps, total 162s
+- e012 at 224px: ~336 steps, killed at 195s (only 336 steps completed)
+
+The extra time per step at 224 is significant (~47% slower). With RESERVE_S=55 and budget 180s, we need to stay under 125s of training. e012 did 336 steps in 125s (336/376... wait the log shows "epoch 3: loss 0.2366, 336 steps, 125s" which means after 336 steps it was at 125s). So training at 224px takes about 0.37s/step vs 0.28s/step at 160px. That's a 30% increase in step time.
+
+So what if we use a faster model at 224px? Like **convnext_atto** or **mobilenetv3_large_100**? 
+
+Actually, wait. Let me reconsider the whole approach. Let me think about what's most likely to give a *confirmed* gain of 0.01+.
+
+The accepted ideas from history:
+- detector boxes as extra training data: +0.004 (5-seed)
+- third wide view (4x): +0.005 (5-seed, mostly pore)
+- e008's per-class adaptive fusion: +0.0027 over base
+
+These are all small gains. The biggest confirmed gain is from changing the *architecture* of how crops are combined (e008: +0.0027).
+
+Hmm wait, actually e008's gain was 0.6327 vs e000's 0.629-0.630 - that's only about +0.003. And the accepted ideas gave +0.004 to +0.005. So we're in a regime of very small gains.
+
+But the *potential* is much higher: wrong-class assignment costs 0.11 mAP! The question is whether any single change can capture more than a fraction of that.
+
+Let me think about what could plausibly capture 0.01+:
+- Better classification on the hard pairs (deposit/stain, pore/stain) - this is the biggest remaining error
+- A model or training change that specifically targets these classes
+
+I think the most promising untried direction, given all constraints, is: **use a wider context crop as the primary/only crop for large boxes and use multiple resolutions**... no.
+
+OK here's another thought. Let me reconsider the idea of "using detector boxes as training data". This was accepted twice (+0.004). The idea is that the model needs to see the *distribution* of detector boxes, not just GT boxes. But this was already tried and gave a small gain. What if we combine it with something?
+
+Actually, I just realized something important from the history: "Training on detector boxes as extra training data (IoU > 0.5 with a true box, labelled with its class)" - this means the model trains on *perfect* classes for those boxes too. So that's not really addressing the wrong-class error; it's adding more training data.
+
+Let me focus. The most important untried idea that targets the dominant error (wrong class assignment ~0.11 mAP):
+
+**Idea: Multi-scale ensemble at inference.** Instead of a single model with two crops, use *multiple independent models* (different seeds) and average their probabilities. But history says "2-3 model ensembles" gave no gain (though 0.636 was close). Hmm.
+
+**Idea: Use different crop scales for theThinking budget reached. Stop thinking now and write the reply in the required format.

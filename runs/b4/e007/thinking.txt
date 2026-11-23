@@ -1,0 +1,261 @@
+===== attempt 1 =====
+Let me think carefully about this.
+
+Current state:
+- Best: e000, 5-seed mean 0.6297
+- Per-class: pore 0.504, deposit 0.626, discontinuity 0.780, stain 0.609
+- Ceiling (stage-1 boxes with perfect classes): 0.758
+- One-step baseline to beat: 0.638
+- Class-agnostic score: 0.755
+
+History:
+- e001: crashed (data)
+- e002: 0.5541 (fixed crash, rejected)
+- e003: 4-view TTA (inference) → 0.6301, not confirmed
+- e004: scoring change (top-1 per box instead of 4 rows) → 0.5689, rejected
+- e005: architecture swap (convnext?) → 0.6240, rejected
+- e006: train on both resolutions → 0.6225, rejected
+
+So 6 experiments, no confirmed gain. The best is still e000.
+
+Let me think about what the actual problem is.
+
+Key insight from the reference numbers:
+- Stage-1 boxes with perfect classes: 0.758
+- Stage-1 boxes scored as single class 'defect': 0.755
+- Our current: 0.6297
+
+The gap between 0.6297 and 0.758 is ~0.13. This is a ranking/class-decision problem.
+
+Now, the critical realization: **mAP@0.5 is computed per class and averaged. For one class, all predictions of that class are sorted by score; a prediction is a hit if it overlaps an unmatched true box of that class by IoU > 0.5. AP depends only on this ORDER.**
+
+Wait, but the key subtlety: the hit set for each class is determined by stage-1 boxes (which boxes overlap which true boxes). Since we emit 4 rows per box (one per class), the set of boxes that can be a "hit" for class c is all stage-1 boxes that overlap a true box of class c. That's fixed by stage 1.
+
+Actually wait. Let me reconsider. The ceiling "d2_boxes_perfect_classes_val_map50: 0.758" — every detector box that overlaps a true defect gets the correct class; every other box is KEPT as class 0 with its detector conf.
+
+So in the ceiling, each box gets exactly ONE class (the true class if it overlaps a true box, else class 0). And the score is the detector conf.
+
+In our current approach, each box gets 4 rows (one per class) with score = conf * p_c.
+
+Here's the crucial difference: in the ceiling, each box appears in exactly ONE class's ranked list. In our approach, each box appears in ALL FOUR classes' ranked lists.
+
+Now, for a given class c, the AP depends on the ordering of all predictions of class c. A prediction is a hit if it overlaps an unmatched true box of class c.
+
+In the ceiling, the predictions of class c are: all boxes that overlap a true c-box (scored by conf) PLUS all false-alarm boxes that were assigned class 0 (if c=0). Wait no. Let me re-read.
+
+"d2_boxes_perfect_classes_val_map50: a ceiling. Every detector box that overlaps a true defect (IoU > 0.5) gets the correct class; every other box (false alarms) is KEPT, as class 0, with its detector conf."
+
+So:
+- Boxes overlapping a true box of class c → class c, score = conf
+- Boxes NOT overlapping any true box → class 0, score = conf
+
+So for class c (c != 0): predictions = all boxes overlapping a true c-box. These are all "true" in the sense they overlap a true c box. Wait, but there could be multiple boxes overlapping the same true box, or a box overlapping a true box but it's actually a false alarm in the sense... no, if it overlaps a true box by IoU>0.5, it's a valid detection.
+
+Hmm, actually the number of predictions of class c in the ceiling = number of boxes overlapping a true c-box. And ALL of them are hits (they overlap a true c box). But the AP depends on the ordering AND on the total number of true boxes of class c (for the precision denominator).
+
+Wait, AP = area under precision-recall curve. For class c, we have N_c predictions (sorted by score) and T_c true boxes. As we go down the ranked list, we mark hits. Precision at each step = (cumulative hits) / (step index). AP = sum of precision at each hit times the change in recall.
+
+If ALL predictions are hits (as in the ceiling for class c, since every prediction of class c overlaps a true c box), then... no wait, that's not right either. A box overlapping a true c box is a hit, but there might be more boxes than true boxes. E.g., if there are 100 boxes overlapping true c boxes but only 50 true c boxes, then only 50 can be hits (each true box matched at most once). So the ordering matters: the top 50 (by score) get to be hits.
+
+Actually, in the ceiling, the score is the detector conf. So the ordering is by conf. The boxes with highest conf that overlap true c boxes get matched first.
+
+In our approach, the score is conf * p_c. So the ordering is by conf * p_c. This is DIFFERENT from conf.
+
+So the question is: does ordering by conf*p_c give better or worse AP than ordering by conf?
+
+The ceiling uses conf (since perfect classes, all boxes overlapping true c boxes are class c, scored by conf). And that gives 0.758.
+
+Our approach orders by conf * p_c. This could be worse if p_c is noisy — it reorders the list in a way that doesn't necessarily put true detections higher.
+
+Hmm, this is a key insight. Let me think about what the OPTIMAL ordering for class c would be.
+
+For class c, we want to order the predictions so that true detections (boxes overlapping true c boxes) come first. The "true" signal is: does this box overlap a true c box? We don't know that at test time, but the classifier gives p_c as an estimate.
+
+Actually, the ideal would be: for each box, we'd want to know (a) is it a true detection at all (overlaps any true box), and (b) if so, which class. The detector conf tells us (a) roughly. The classifier p_c tells us (b).
+
+But here's the thing: the ceiling assumes we KNOW (b) perfectly (perfect classes) and uses conf for ordering. So the ceiling's ordering for class c is: all boxes overlapping true c boxes, ordered by conf.
+
+Our approach: all boxes, class c row scored by conf * p_c. The boxes overlapping true c boxes have some p_c (hopefully high), and the boxes NOT overlapping true c boxes have some p_c (hopefully low). So conf * p_c should put true c detections higher than false alarms... but it also reorders the true c detections among themselves by p_c, which is noise.
+
+Wait, but actually the reordering among true c detections: if two boxes both overlap true c boxes, their relative order by conf*p_c vs conf depends on their p_c values. Since p_c is noisy, this reordering is basically random with respect to whether they're "better" detections. But they're ALL hits anyway (both overlap true c boxes), so reordering among hits doesn't change AP! Because AP only cares about the precision at each step, and if all top-K are hits, precision is 1.0 for those.
+
+Hold on. Let me reconsider. For class c, the predictions sorted by score. A prediction is a hit if it overlaps an UNMATCHED true c box. So if I have predictions [A, B, C] all overlapping true c boxes (and there are 3 true c boxes), then all 3 are hits regardless of order. Precision = 1, 1, 1. AP contribution is full.
+
+But if I have predictions [A, B, C, D] where A, B, C overlap true c boxes and D does not (false alarm), and there are 3 true c boxes: then the order matters. If order is [A, B, C, D], precision = 1, 1, 1, 0.75. If order is [D, A, B, C], precision = 0, 1, 2/3, 1. The AP is different!
+
+So the key is: we want true c detections (boxes overlapping true c boxes) to rank ABOVE false alarms (boxes not overlapping any true box, or overlapping a true box of a DIFFERENT class).
+
+In the ceiling, for class c, the false alarms are NOT in class c's list (they're in class 0's list). So class c's list is pure hits (up to the number of true boxes). That's why the ceiling is high.
+
+In our approach, for class c, the list includes ALL boxes (each box has a class-c row). So false alarms ARE in class c's list, scored by conf * p_c. We want these to rank low.
+
+So the question is whether conf * p_c ranks false alarms lower than true c detections. p_c should be high for true c detections and low for false alarms (ideally). But p_c is noisy (macro-F1 0.87).
+
+Now, here's a thought: what if we could better separate "is this a true detection" from "which class"?
+
+Actually, let me reconsider the whole structure. The metric is per-class AP. For class c:
+- Hits: boxes overlapping true c boxes (up to T_c of them)
+- False positives: everything else in class c's ranked list
+
+The number of false positives in class c's list = (total boxes) - (boxes overlapping true c boxes). This is HUGE because total boxes = 41879 and true c boxes are maybe a few hundred.
+
+Wait, that means for each class, the ranked list has ~41879 entries, of which only ~T_c are hits. So precision is very low overall, but AP is dominated by the top of the list.
+
+Hmm wait, but that's not quite right either. Let me reconsider. Actually the number of predictions per class in our scheme = number of eval boxes = 41879 (one row per class per box). And the number of true boxes of class c = T_c (small). So the ranked list is 41879 long with only T_c hits.
+
+The AP is the area under the PR curve. With 41879 predictions and T_c hits, the PR curve is mostly at precision ~0 except near the top where the hits are. So AP is essentially determined by how many of the top predictions are hits and how early the last hit appears.
+
+Actually, the standard AP (11-point or area) — with so many false positives, the recall can only go up to 1.0 (all T_c true boxes found) but precision drops as 1/rank. So AP ≈ (sum over hits of precision_at_that_rank) / T_c roughly, but really it's the integral.
+
+The key point: to maximize AP for class c, we want the T_c true c detections to be as high as possible in the ranking, i.e., we want to rank them ABOVE as many false alarms as possible.
+
+The false alarms in class c's list are: (1) boxes not overlapping any true box, (2) boxes overlapping true boxes of other classes. Both have a class-c score of conf * p_c. We want these low.
+
+The true c detections have class-c score conf * p_c, where p_c should be high.
+
+So the ranking quality depends on p_c being a good discriminator between "true c detection" and "not a true c detection."
+
+Now, the classifier's job is to predict the class given the box. But there's a subtlety: the classifier is trained on TRUE boxes (from crops.csv), so it only ever sees boxes that ARE true detections. It never sees false alarms during training! So when we give it a false alarm at test time, it still outputs some class probabilities (it has to pick a class), and p_c might not be low for the "wrong" class.
+
+Actually, the classifier is a 4-class softmax. For a false alarm, it outputs 4 probabilities summing to 1. The "correct" behavior would be to output low confidence overall (but softmax always sums to 1, so it can't express "I'm not sure this is a defect at all"). 
+
+Hmm, this is a fundamental issue. The classifier can't distinguish "true detection" from "false alarm" because it was only trained on true detections. It always assigns some class with probability summing to 1.
+
+So the signal for "is this a true detection" comes ONLY from the detector conf. And the signal for "which class" comes from p_c.
+
+Given that, the score conf * p_c combines both: conf says "probably a true detection," p_c says "probably class c."
+
+Now, the ceiling (0.758) uses conf for ordering (perfect classes). Our approach uses conf * p_c. The difference is the p_c factor reordering.
+
+Let me think about whether we can do better. 
+
+Idea: What if the issue is that p_c is too noisy and the reordering it causes hurts more than it helps? In that case, we'd want to reduce the influence of p_c, i.e., use a score closer to conf. But then we're not using the class info at all, which would give the class-agnostic score (0.755)... no wait.
+
+Hold on. Let me reconsider. If we emit 4 rows per box with score = conf (same for all classes), then each class's list is ALL boxes ordered by conf. For class c, the hits are the boxes overlapping true c boxes, ordered by conf. That's EXACTLY the ceiling's ordering for class c! Because the ceiling orders class c's true detections by conf, and here we also order by conf (with false alarms interleaved, but false alarms in the ceiling are in class 0, not class c).
+
+Wait, no. In the ceiling, class c's list = only boxes overlapping true c boxes (for c != 0). In the "score = conf for all 4 classes" scheme, class c's list = ALL boxes. These are different!
+
+In the ceiling, class c's list has only T_c-ish entries (the true c detections), all hits. So precision stays high. In the "conf for all classes" scheme, class c's list has 41879 entries, most false positives. So precision drops fast.
+
+So the ceiling is much better because it doesn't inject false positives into each class's list.
+
+AH, this is the key insight I missed. The ceiling assigns each box to exactly ONE class (the true class, or class 0 for false alarms). So each class's list contains only relevant boxes. Our scheme assigns each box to ALL classes, injecting false positives into every class's list.
+
+So the problem is NOT (only) the ranking within a class. The problem is that we're injecting ~41000 false positives into each class's list, whereas the ceiling injects only the false alarms into class 0.
+
+Wait, but e004 tried "top-1 per box" (each box gets only its best class) and got 0.5689, which is WORSE than 0.6297. That's surprising. Let me think about why.
+
+If each box gets only its top-1 class, then each class's list contains only the boxes where that class was the top-1. This is like the ceiling but with the class assignment being the classifier's top-1 (noisy) instead of perfect. 
+
+Hmm, but 0.5689 < 0.6297. So top-1 per box is worse than 4 rows per box. Why?
+
+Let me think. With 4 rows per box, each class's list has all boxes. With top-1 per box, each class's list has only ~1/4 of the boxes (those where it's top-1). 
+
+For class c, in the 4-row scheme: list = all 41879 boxes, hits = boxes overlapping true c boxes (scored by conf*p_c). In the top-1 scheme: list = boxes where c is top-1 (~10000 boxes), hits = boxes overlapping true c boxes AND where c is top-1.
+
+The top-1 scheme has fewer false positives per class, which should be good. But it also potentially drops some true c detections (those where c is NOT top-1, i.e., the classifier picked a different class). Those dropped true detections reduce recall.
+
+So there's a tradeoff: 4 rows = high recall (all true c detections present) but many false positives; top-1 = fewer false positives but lower recall (some true c detections dropped).
+
+The result 0.5689 (top-1) < 0.6297 (4 rows) suggests that the recall loss from top-1 dominates. That makes sense: the classifier has F1 0.87, so ~13% of true boxes get the wrong top-1 class. Dropping 13% of true detections per class is a big recall hit.
+
+OK so where does that leave us? The 4-row scheme keeps all true detections but injects false positives. The false positives in class c's list are scored by conf * p_c. To maximize AP, we want these false positives ranked BELOW the true c detections.
+
+The true c detections have score conf * p_c with p_c hopefully high. The false positives have score conf * p_c with p_c hopefully low. So the discriminator is p_c. If p_c is a good discriminator, false positives rank low and AP is high.
+
+So the quality of AP for class c depends on how well p_c separates "true c detection" from "false positive." 
+
+Given the classifier's F1 is 0.87 (on true boxes), p_c is decent but noisy. The weak classes are pore (0.504 AP) and stain (0.609 AP).
+
+Now, what can we do to improve?
+
+Option A: Improve the classifier (higher F1). This would make p_c a better discriminator. But e005 (architecture swap) and e006 (more data) didn't help. The "Lessons" say data is EXHAUSTED (3 ideas, no new best). Architecture: 1 idea, no new best.
+
+Option B: Change the scoring to better use p_c. E.g., instead of conf * p_c, use something that better separates true detections from false positives. 
+
+Wait, here's an idea. The problem is that p_c for a false positive is not low enough. Because the classifier was trained only on true boxes, it always outputs a confident-ish distribution. For a false positive, the "true" answer is "none of the above," but the classifier can't say that. So p_c for false positives is spread across classes, each maybe 0.2-0.5.
+
+What if we use a score that penalizes low overall confidence? Like, use p_c * (max_p) or p_c^2 or something that makes the score lower when the distribution is flat?
+
+Actually, the score for class c is what matters for class c's ranking. If we want false positives to rank low in class c's list, we want their class-c score low. A false positive has p_c ~ 0.25 (flat). A true c detection has p_c ~ 0.7. So conf * p_c already gives 0.7*conf vs 0.25*conf. That's a 3x separation. 
+
+But maybe we can sharpen it: use conf * p_c^k for k > 1. This makes high p_c even higher and low p_c even lower. E.g., p_c^2: 0.49 vs 0.06, an 8x separation. This could push false positives lower in the ranking.
+
+But wait, does this change the ORDER in a way that helps? For class c, we want true c detections (high p_c) above false positives (low p_c). Using p_c^k sharpens this. But it also reorders true c detections among themselves by p_c^k vs p_c — but that doesn't matter (all hits). And it reorders false positives among themselves — doesn't matter (all false). What matters is the boundary between true c detections and false positives. p_c^k sharpens the boundary. So it should help!
+
+But there's a catch: this is a monotone transform of p_c, and conf is fixed. So score = conf * p_c^k is a monotone function of (conf, p_c). For a fixed conf, higher p_c → higher score. The reordering is: within same conf, higher p_c ranks higher. This is the same relative order as p_c (monotone). Wait, no. p_c^k is monotone in p_c, so for fixed conf, the order by p_c^k is the same as by p_c. So it doesn't change the order at all for fixed conf!
+
+Hmm. But conf varies. So the order is by conf * p_c^k. This is NOT the same order as conf * p_c in general, because the conf and p_c factors interact. E.g., box A: conf=0.5, p_c=0.9 → score 0.5*0.9=0.45, or 0.5*0.81=0.405. Box B: conf=0.9, p_c=0.5 → score 0.9*0.5=0.45, or 0.9*0.25=0.225. With k=1, A and B tie (0.45). With k=2, A (0.405) > B (0.225). So k changes the order when conf and p_c trade off.
+
+So the question is: is a box with (conf=0.9, p_c=0.5) a true c detection or a false positive? conf=0.9 suggests true detection, p_c=0.5 suggests uncertain class. A box with (conf=0.5, p_c=0.9) — conf=0.5 (medium detection), p_c=0.9 (confident class c). 
+
+For class c's AP, we care: is this box overlapping a true c box? The (conf=0.9, p_c=0.5) box is likely a true detection but maybe not class c (could be another class). The (conf=0.5, p_c=0.9) box is likely a true c detection. So for class c, we'd want the (0.5, 0.9) box to rank above the (0.9, 0.5) box. With k=1 they tie; with k=2, (0.5,0.9) ranks above. So k=2 helps class c!
+
+But wait, this is a per-class score. If I use k=2 for all classes, then for class c the score is conf * p_c^2. This sharpens the preference for high p_c, which is good for separating true c detections from false positives in class c's list.
+
+Hmm, but actually there's a subtlety. Let me reconsider whether this is a real effect or just noise. The metric says "Any change that keeps the order of a class's predictions (for example multiplying all its scores by a constant, or a monotone function of the score) leaves its AP unchanged." So I need to make sure my change actually changes the order.
+
+score = conf * p_c^k. For different boxes, this changes the order vs conf * p_c (as shown above). So it does change the order. Good.
+
+But is the effect large enough (0.01+)? Hard to say. Let me think about the magnitude.
+
+Actually, let me reconsider the whole thing. Maybe there's a more impactful change.
+
+Let me reconsider the reference numbers:
+- 0.638: one-step 4-class (baseline to beat)
+- 0.758: ceiling (perfect classes, conf ordering, each box one class)
+- 0.755: class-agnostic (single class 'defect')
+- 0.6297: current (4 rows per box, conf * p_c)
+
+The class-agnostic score is 0.755. That's when all boxes are one class 'defect' and scored by conf. So if defect types didn't matter, we'd get 0.755. The ceiling (perfect classes) is 0.758, barely higher. So the class-agnostic is almost as good as perfect classes!
+
+This means: the "is it a defect" ranking (conf) is already nearly optimal. The 4-class task is only slightly harder than the 1-class task. So the ranking by conf is good; the issue is purely the class assignment.
+
+Wait, but our 4-class score is 0.6297, way below 0.755. So when we split into 4 classes, we lose 0.755 - 0.6297 = 0.125. This loss is because:
+1. Each class's list now has false positives from other classes (the boxes that are true detections of class d != c but appear in class c's list).
+2. The class-c score conf * p_c doesn't perfectly rank true c detections above true d detections.
+
+In the class-agnostic case, there's only ONE class, so all boxes are in one list, ordered by conf, and all true detections are hits. No cross-class false positives. That's why it's 0.755.
+
+In the 4-class case, a box that's a true deposit detection appears in the pore list (as a false positive) AND the deposit list (as a hit). So it's a false positive for pore. This cross-contamination is the source of the 0.125 loss.
+
+So the key is: for each class c, we want the true c detections to rank above the true-d detections (d != c) and the false alarms. The score conf * p_c does this via p_c. The quality depends on p_c's ability to separate classes.
+
+Given stain is confused with deposit (from the background), and pore/deposit are weak, the cross-contamination between these classes is the main loss.
+
+So improving p_c's class separation would help. But the classifier is the bottleneck and we've tried architecture and data changes without success.
+
+Alternative: what if we change the scoring to be more aggressive in separating classes? Like the p_c^k idea, or using a margin.
+
+Actually, let me reconsider. Let me think about what score function best separates "true c detection" from "everything else" for class c.
+
+The ideal score for class c would be: high if the box overlaps a true c box, low otherwise. We approximate this with conf * p_c. conf captures "true detection," p_c captures "class c."
+
+But there's a correlation issue: conf and p_c are both derived from the same image region. A false alarm might have high conf (detector is wrong) but the classifier might still assign it a class. 
+
+Hmm, let me think differently. What if the problem is that we're using the SAME conf for all classes, and conf is a good "true detection" signal, but the p_c is what varies? 
+
+Actually, you know what, let me reconsider the p_c^k idea more carefully, because I think it's actually a solid, targeted, cheap experiment.
+
+Current score: s_c = conf * p_c.
+Proposed: s_c = conf * p_c^k, with k > 1 (say k=2 or k=3).
+
+Effect: For class c, this sharpens the ranking so that boxes with high p_c rank higher relative to boxes with low p_c, especially when conf is high. This should push cross-class true detections (which have moderate p_c for class c) and false alarms (low p_c for class c) lower in class c's list, improving AP for class c.
+
+Wait, but I need to double check: does this change the order in a way the metric respects? Yes, as I showed, it changes the order when conf and p_c trade off. And it's not a monotone function of the old score (conf * p_c), because... let me check. Is conf * p_c^2 a monotone function of conf * p_c? No! Because conf * p_c^2 = (conf * p_c) * p_c, and p_c is not determined by conf * p_c. So it's not a monotone function of the old score. Good, it changes the order.
+
+But hold on, the metric note says "a monotone function of the score" leaves AP unchanged. My new score is NOT a monotone function of the old score, so it CAN change AP. Good.
+
+Now, is the expected gain 0.01+? Let me estimate. The weak classes are pore (0.504) and stain (0.609). If sharpening p_c helps these by, say, 0.02-0.05 each, and the others stay similar, the average could gain 0.01-0.02. Plausible but uncertain.
+
+Actually, wait. Let me reconsider. There's a risk: p_c^k might hurt if p_c is miscalibrated in a way that the sharpening amplifies errors. E.g., if a true c detection has p_c = 0.6 but a false alarm has p_c = 0.4, then p_c^2 gives 0.36 vs 0.16 (helps), but if a true c detection has p_c = 0.5 and a false alarm has p_c = 0.45, then p_c^2 gives 0.25 vs 0.20 (barely helps). The sharpening helps when the separation in p_c is meaningful.
+
+Alternatively, I could think about whether there's a more fundamental fix.
+
+Let me reconsider the "each box one class" (top-1) approach that gave 0.5689. It was worse. But what about a hybrid: emit the top-1 class row with a high score, AND emit the other classes with low scores? No, that's basically the 4-row scheme.
+
+What about: emit all 4 rows, but with scores that are more sharply separated? That's the p_c^k idea.
+
+Alternatively: what about using the classifier's confidence (max p) as a "true detection" signal in addition to conf? Like score_c = conf * p_c * max_p? This would make false positives (which have low max_p, flat distribution) rank even lower. But max_p is the same for all classes of a box, so it's a per-box multiplier. For class c, score = conf * p_c * max_p. Since max_p >= p_c, this is conf * p_c * max_p >= conf * p_c. It sharpens the separation between confident boxes (high max_p) and flat boxes (low max_p). 
+
+Hmm, but conf * p_c * max_p = conf * p_c * max(p). For a true c detection, p_c is high and max_p is high (≈ p_c). So score ≈ confThinking budget reached. Stop thinking now and write the reply in the required format.

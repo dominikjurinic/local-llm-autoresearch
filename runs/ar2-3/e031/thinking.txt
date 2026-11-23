@@ -1,0 +1,319 @@
+===== attempt 1 =====
+Let me analyze the current state and think about what to try next.
+
+Current best: e016, 5-seed val mAP@0.5 = 0.6337
+- Per-class: pore 0.524, deposit 0.626, discontinuity 0.779, stain 0.606
+- The ceiling (stage-1 boxes with perfect classes) is 0.758
+- The one-step baseline is 0.638
+
+Looking at the experiment history, many things have been tried:
+- Background class (e025): 0.6233, rejected
+- Training on detector boxes (e002, e005, e015): rejected
+- Various scoring changes (e004, e008, e014, e022, e023): rejected
+- Augmentation: MixUp (e007) not confirmed, cutout (e026) rejected, rotation (e027) rejected
+- Architecture: ConvNeXt-Nano (e006) crashed, tf_efficientnetv2_b0 (e021) rejected, ResNet-50 (e028) rejected
+- Optimization: SGD (e020) rejected, LR floor (e030) rejected, reserve change (e019) rejected, resolution 128 (e029) rejected
+- Data: low-res crops (e003, e024) rejected, oversampling 3x (e018) rejected
+- Inference: TTA flip (e013) was the first improvement
+- Sampling: 2x oversample weak classes (e016) is current best
+- Loss: label smoothing (e010) not confirmed, focal (e012) rejected
+
+What hasn't been tried yet:
+1. Ensemble of two different architectures (e.g., EfficientNet-B0 + ConvNeXt-Nano or ResNet-18)
+2. Different image sizes - tried 128 (worse) and 224 (timeout)
+3. Training for longer with a smaller model (convnext_atto, convnext_pico, resnet18, resnet34)
+4. Using the detector confidence more cleverly
+5. Multi-scale TTA (different crop sizes at test time)
+6. Training on both high and low res (e003 was rejected but maybe with different approach)
+7. Different backbone: regnety_016, mobilenetv3_large_100, resnet26d, convnext_atto, convnext_pico
+8. A two-crop approach with different contexts
+9. Using the detector confidence as an additional input feature
+10. Training with a longer warmup or different schedule
+
+Let me think about what's most promising:
+
+The key insight from the brief: "stage-1 boxes with perfect classes (ceiling for stage 2): 0.758 mAP@0.5" and "stage-1 boxes scored as a single class 'defect': 0.755 mAP@0.5". Our current score is 0.6337. The gap to ceiling is 0.758 - 0.6337 = 0.124.
+
+The per-class breakdown shows pore (0.524) and stain (0.606) are weak. Deposit (0.626) is also below average.
+
+Looking at what's been tried and what hasn't:
+
+1. **Ensemble**: We haven't tried ensembling two different architectures. The brief mentions "ensembling within the time budget" as an in-scope idea. We could train two smaller models (e.g., convnext_atto + efficientnet_b0) and average their probabilities. Or train the same model with different seeds... but we only get one seed per run. Actually, we could train two different architectures in the same run and average.
+
+2. **convnext_atto**: Very small model, could train for much longer. But e006 with convnext_nano crashed (suspicious bug). Let me think about what might have gone wrong.
+
+3. **Using detector conf as input**: We could concatenate the detector confidence as an extra channel or use it to modulate the crop.
+
+4. **Different approach to the two-crop**: Instead of averaging logits, use a late-fusion network that takes both crops as input.
+
+5. **Training with more epochs on a smaller model**: convnext_atto or resnet18 would be much faster per step, allowing many more epochs.
+
+6. **Multi-scale TTA**: At test time, evaluate at multiple crop sizes and average.
+
+Let me think about the ensemble idea more carefully. The time budget is 180s, with 65s reserve. So ~115s for training. Currently we get 387 steps in ~115s (about 0.3s/step). If we train two models, we'd get ~193 steps each. That's a lot less training per model.
+
+But wait - we could train a smaller model. convnext_atto is very small (about 1.8M params vs efficientnet_b0's 4M). It would be much faster per step. We could train convnext_atto for the full budget and get many more steps.
+
+Actually, let me reconsider. The most impactful untried idea might be:
+
+**Ensemble of two models with different architectures, each trained for half the budget.** The hypothesis is that different architectures make different errors, and averaging their probabilities reduces variance and improves both classification accuracy and ranking.
+
+But actually, looking at the time constraints more carefully:
+- 180s total
+- 65s reserve for prediction
+- ~115s for training
+- Currently: 387 steps in 115s
+
+If we train two models for 57s each, we'd get ~193 steps each. That's significantly less training. The loss was still dropping (0.62 → 0.31 → 0.24), so undertrained.
+
+Alternative: Train one model for the full budget but use a smaller/faster architecture that allows more steps.
+
+Let me think about **convnext_atto** specifically:
+- Very small (1.8M params)
+- Should be much faster per step
+- Could potentially train for 5-10x more steps
+- But it's a weaker model, so more steps might not compensate
+
+Actually, let me reconsider the problem. The key issue is:
+1. Pore (0.524) and stain (0.606) are weak
+2. The model is undertrained (loss still dropping)
+3. Many scoring changes have been tried and rejected
+
+What about **using a different image size that fits the budget better**? We tried 128 (worse) and 224 (timeout). What about 192? That's 1.44x the pixels of 160, so ~1.44x slower per step. We'd get ~268 steps instead of 387. That's probably not enough of a gain.
+
+What about **batch size**? Currently 64. If we increase to 128, we get fewer steps but each step is more stable. But with AdamW, this might not help much.
+
+Let me think about **test-time augmentation** more. Currently we do h-flip (4 forward passes: original, h-flip for tight; original, h-flip for wide). What about also doing a small random shift or scale at test time? That would increase the number of forward passes though.
+
+Actually, what about **using the detector confidence as a feature**? The detector confidence encodes how "defect-like" the box is. We could:
+- Use it to weight the training samples
+- Add it as an extra input channel
+- Use it to modulate the final score in a non-linear way
+
+Wait, I already tried conf² (e022) and conf × p² (e004) and those were rejected. What about using conf to select which boxes to trust more?
+
+Let me think about a different angle. The brief says "Several rows per box (one per class) are allowed and often help." We're already outputting 4 rows per box. What if we also output a "background" row with a score? No, that doesn't make sense for mAP.
+
+Actually, re-reading: "Per image at most the 300 highest-scoring rows count." So if we have too many rows, the lower-scoring ones get cut. With 41879 eval detections and 4 rows each = 167516 rows, but per image only 300 count. So the ranking within each image matters a lot.
+
+What about **outputting more rows per box with different scores**? For example, for each box, output the top-2 classes with their scores, but also output a "soft" version where all 4 classes get their probability but scaled differently. Actually, we're already doing 4 rows per box.
+
+Let me think about what's fundamentally different we could try:
+
+**Idea: Train on detector boxes with IoU-based soft labels instead of hard labels.**
+- For each detector box in training, compute IoU with each GT box
+- If max IoU > 0.5, use that class
+- If max IoU < 0.5, label as background
+- But also use the IoU value to weight the loss (higher IoU = more confident label)
+
+Wait, e002 and e005 tried training on detector boxes and they were rejected. e025 tried adding a background class and was rejected. So this direction seems exhausted.
+
+**Idea: Two-stage training - first train on GT boxes, then fine-tune on detector boxes.**
+This is different from just adding detector boxes to the training set. The first stage learns the classes, the second stage adapts to the detector's box placement. But this is complex and might not fit in the time budget.
+
+**Idea: Use timm's feature extraction to get intermediate features and train a smaller classifier on top.**
+This would be faster per step since the backbone is frozen. But we'd lose the benefit of fine-tuning the backbone.
+
+**Idea: Train with a longer warmup.**
+Currently 5% warmup. What about 20%? This might help with training stability.
+
+**Idea: Use a different optimizer - LAMB or RAdam.**
+Not available in standard PyTorch.
+
+**Idea: Gradient accumulation.**
+Train with batch size 32 but accumulate gradients over 2 steps to effectively get batch size 64 with the same memory. This doesn't really change anything.
+
+**Idea: Use the wide crop as the primary input and the tight crop as a correction.**
+Instead of averaging, use the wide crop's prediction as the base and the tight crop to adjust.
+
+Actually, let me reconsider the **ensemble** idea but with a twist: **train the same architecture but with different input resolutions**. For example, train one model at 160px and another at 128px. The 128px model trains faster (more steps) but sees less detail. Averaging them might help.
+
+But wait, e029 showed that 128px alone is worse (0.6177). The issue is that the 128px model is undertrained relative to what it needs.
+
+Let me think about **what specifically makes pore and stain hard**:
+- Pore: small holes in the weld. They're small, so the tight crop might not capture enough context. The wide crop helps but the pore is a small fraction of the crop.
+- Stain: often confused with deposit and background. It's a surface discoloration that can look like a deposit or just a shadow.
+
+For pore, maybe we need a **multi-scale approach**: evaluate at multiple crop sizes and combine. The tight crop (1.5x) might miss the pore if it's small, while the wide crop (2.5x) has too much background.
+
+For stain, the issue is confusion with deposit and background. More context might help, but e009 (3.5x context) was "not confirmed" (0.6342 seed-0, 0.6309 5-seed).
+
+**Idea: Train with a different augmentation strategy specifically for the weak classes.**
+For pore: add more scale variation (the pore might be at different scales)
+For stain: add color jitter (stain is a color/appearance change)
+
+But this is complex and might not fit in one focused change.
+
+**Idea: Use a different loss function - specifically, a margin-based loss or contrastive loss.**
+Focal loss was rejected (e012). Label smoothing was not confirmed (e010). What about **cross-entropy with temperature scaling**? Divide the logits by a temperature before softmax. This is similar to label smoothing but applied at inference time.
+
+Actually, temperature scaling at inference time is interesting. If we divide the logits by T > 1, the probabilities become more uniform, which would suppress the non-top classes more. But e004 (p²) and e008 (p × max_p) were rejected, which are similar in effect.
+
+**Idea: Use a different backbone that's specifically good at fine-grained classification.**
+We've tried: efficientnet_b0 (current), convnext_nano (crashed), tf_efficientnetv2_b0 (rejected), resnet50 (rejected).
+Not tried: convnext_atto, convnext_pico, efficientnet_b2, mobilenetv3_large_100, regnety_016, resnet18, resnet26d, resnet34.
+
+**convnext_atto** is very small (1.8M params) and should be fast. **regnety_016** is also small. **efficientnet_b2** is larger than b0.
+
+What about **resnet26d**? It's a small ResNet with depthwise separable convolutions, similar to MobileNet but in the ResNet family. It might have different inductive biases.
+
+Actually, I think the most promising untried idea is:
+
+**Ensemble of two models: EfficientNet-B0 (current) + a second model, each trained for half the budget.**
+
+The hypothesis: different architectures make different errors, and averaging their class probabilities reduces variance, improving both classification accuracy (especially for the weak pore/stain classes) and the ranking of true detections above false alarms.
+
+But the concern is that each model gets half the training time, and they're both undertrained. The loss was still dropping at the end of training.
+
+Alternative: **Train one model for the full budget but use a smaller/faster architecture.** If we use convnext_atto (1.8M params vs 4M for efficientnet_b0), each step is ~2x faster, so we get ~774 steps instead of 387. The model is smaller and weaker, but the extra training might compensate.
+
+Actually, let me look at this from a different angle. What if the issue isn't the model capacity or training, but the **input representation**?
+
+**Idea: Instead of two separate crops (tight + wide), use a single crop with the box boundary drawn on it.**
+The box boundary tells the model exactly where the defect is supposed to be. This is a common technique in object detection (e.g., drawing the bounding box on the image before classification).
+
+But this would be a significant code change and might not fit in one focused edit.
+
+**Idea: Use the aspect ratio of the box as an additional feature.**
+Weld defects have characteristic aspect ratios. Pores are roughly circular, deposits are elongated along the weld, etc. We could add the aspect ratio as a feature to the classifier.
+
+But this requires changing the network architecture to accept an extra input, which is complex.
+
+Let me focus on something simpler and more likely to work:
+
+**Idea: Increase the training data by using both high and low resolution crops, but only for the weak classes (pore and stain).**
+
+Wait, e024 tried exactly this and got 0.6187 (rejected). So that's out.
+
+**Idea: Use a different warmup schedule - linear warmup for 10% of steps instead of 5%.**
+
+This is a small change but might help training stability. The current warmup is 5% (about 19 steps out of 387). A 10% warmup (about 39 steps) might help the optimizer settle before the LR starts decaying.
+
+Actually, this is a very small change and unlikely to make a difference of more than 0.005.
+
+**Idea: Use a different number of workers or batch size to get more steps.**
+
+Currently: batch_size=64, 8 workers. What if we use batch_size=32 with 8 workers? We'd get twice as many steps (774 instead of 387). The effective batch size is smaller, but with AdamW, this might be fine. The loss might be noisier but we get more updates.
+
+Wait, but the time per step might not halve because of the overhead of data loading. With persistent_workers and pin_memory, the data loading should be efficient. Let me think...
+
+Actually, with batch_size=64 and 8 workers, each worker loads 8 images per batch. With batch_size=32, each worker loads 4 images. The GPU computation is halved, but the data loading overhead is similar. So we might get ~1.5x more steps, not 2x.
+
+This is worth trying. The hypothesis: more training steps (smaller batch size) will improve the undertrained model, especially for the weak classes.
+
+But wait, e029 tried reducing resolution to 128 to get more steps and it was rejected (0.6177). The issue there was that the model saw less detail, not that it was undertrained. With batch_size=32, the model sees the same detail but fewer images per step.
+
+Hmm, but the total number of images seen per epoch is the same (9084). With batch_size=32, each epoch has 283 steps instead of 141. So in the same time, we'd do ~1.5x more epochs.
+
+Let me estimate: currently 141 steps/epoch, 3 epochs in 115s. With batch_size=32, 283 steps/epoch. If each step is ~0.5x the time (due to smaller GPU batch), we'd get ~2x more steps, so ~4.5 epochs. That's a meaningful increase.
+
+Actually, I'm not sure the step time halves. The GPU is probably not the bottleneck - data loading might be. Let me just try it.
+
+**Decision: Try batch_size=32 to get more training steps.**
+
+Hypothesis: The classifier is undertrained (loss still dropping after 3 epochs); halving the batch size from 64 to 32 approximately doubles the number of gradient updates per epoch, allowing more training within the same wall-clock budget and improving per-class accuracy, especially for the weak pore and stain classes.
+
+This is a focused, single-parameter change. Let me write the edit.
+
+Wait, I should also consider: with batch_size=32 and drop_last=True, the last batch of each epoch is dropped. With 9084 samples and batch_size=32, that's 283.875 batches, so 283 batches (dropping 28 samples). With batch_size=64, that's 141.9 batches, so 141 batches (dropping 60 samples). The dropped samples are a smaller fraction with batch_size=32, which is slightly better.
+
+Also, I should consider whether the DataLoader with 8 workers and batch_size=32 is efficient. Each worker would load 4 images per batch. This should be fine.
+
+Let me write the edit:
+
+```
+BATCH_SIZE = 64
+```
+→
+```
+BATCH_SIZE = 32
+```
+
+This is a one-line change. Clean and focused.
+
+Actually wait, let me reconsider. Is there a better idea?
+
+Looking at the per-class scores again: pore 0.524, deposit 0.626, discontinuity 0.779, stain 0.606.
+
+The gap between discontinuity (0.779) and pore (0.524) is huge. What makes discontinuity easy? It's probably a very distinctive visual pattern (a gap or break in the weld bead). Pore is small holes - harder to see, especially at 160px. Stain is a color change - also subtle.
+
+What if we **increase the image size just for the tight crop**? The tight crop is where the defect is most visible. If we make the tight crop 224px instead of 160px, the pore would be more visible. But this would slow down training.
+
+Actually, we could use different sizes for the two crops: tight at 224px, wide at 160px. The tight crop is the one that matters most for classification. But this would require changing the model to accept different-sized inputs for the two views, which is complex.
+
+Alternatively, we could just increase IMG_SIZE to 192 (a modest increase from 160). The compute increase is (192/160)² = 1.44x, so we'd get ~268 steps instead of 387. That's 30% fewer steps. Combined with batch_size=32, we might get ~400+ steps at 192px.
+
+But this is two changes at once, violating the "one idea per turn" rule.
+
+Let me stick with the batch_size=32 change. It's clean, focused, and tests a clear hypothesis.
+
+Actually, I want to reconsider one more time. Let me look at what's been tried:
+
+Scoring changes (all rejected or not confirmed):
+- p² (e004): 0.6161
+- p × max_p (e008): 0.6265
+- top-1 only (e014): 0.5916
+- conf² (e022): 0.6113
+- p²/max_p (e023): 0.6080
+
+All scoring changes made things worse. This suggests the current scoring (conf × p) is already near-optimal, or that the issue is in the probabilities themselves, not how they're combined with conf.
+
+Data changes:
+- Detector boxes with background (e002): 0.5172
+- Low-res crops (e003): 0.6251
+- Detector boxes IoU>0.5 (e005): 0.6248
+- Detector boxes added (e015): 0.6285
+- Low-res for weak classes (e024): 0.6187
+- Background class (e025): 0.6233
+
+All data changes made things worse. The GT boxes seem to be a better training set than detector boxes.
+
+Augmentation:
+- MixUp (e007): 0.6292 (not confirmed)
+- Jitter increase (e011): 0.6294 (not confirmed)
+- Cutout (e026): 0.6064
+- Rotation (e027): 0.6323
+
+Mostly worse or not confirmed.
+
+Architecture:
+- ConvNeXt-Nano (e006): crashed
+- tf_efficientnetv2_b0 (e021): 0.6259
+- ResNet-50 (e028): 0.6256
+
+Worse.
+
+Optimization:
+- Reserve 50s (e019): 0.6291
+- SGD (e020): 0.6242
+- LR floor 0.1 (e030): 0.6224
+- Resolution 128 (e029): 0.6177
+
+Worse.
+
+Loss:
+- Label smoothing (e010): 0.6254
+- Focal loss (e012): 0.6209
+
+Worse.
+
+Inference:
+- TTA h-flip (e013): 0.6314 (was the first improvement)
+
+The only things that helped were:
+1. TTA h-flip (e013): +0.005 over e000
+2. 2x oversample weak classes (e016): +0.002 over e013
+
+Everything else has been rejected. We're in a local optimum.
+
+Given this, the batch_size=32 change is a reasonable next step. It's the most straightforward way to get more training without changing the model, data, or scoring.
+
+But I'm also thinking: what if the issue is that we're not training long enough? The loss went from 0.62 to 0.31 to 0.24 over 3 epochs. It's clearly still dropping. If we could train for 5-6 epochs instead of 3, the model might be significantly better.
+
+With batch_size=32, we'd get ~1.5-2x more steps. That's 4.5-6 epochs. This could be a meaningful improvement.
+
+Let me go with batch_size=32.
+
+One more thought: should I also reduce the number of workers? With batch_size=32, 8 workers might be overkill. But reducing workers would slow down data loading. Let's keep 8 workers.
+
+Final decision: Change BATCH_SIZE from 64 to 32.

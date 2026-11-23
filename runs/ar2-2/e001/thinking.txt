@@ -1,0 +1,416 @@
+===== attempt 1 =====
+Let me analyze the situation:
+
+1. Current best: 0.6280 mAP@0.5 (5-seed mean)
+2. Baseline to beat: 0.638 mAP@0.5 (one-step 4-class detector)
+3. Ceiling: 0.758 mAP@0.5 (stage-1 boxes with perfect classes)
+4. Single-class ceiling: 0.755 mAP@0.5
+
+Key observations:
+- The current system trains on "true training boxes" (perfect boxes from crops.csv), not on detector boxes
+- The classifier has no notion of "background" - it's a 4-class classifier
+- Score = detector conf × class probability
+- Per-class AP: pore 0.497, deposit 0.628, discontinuity 0.780, stain 0.607
+- Pore and deposit are weak classes
+- Stain is often confused with deposit and background
+
+The most impactful change I can make first is probably to train on detector boxes (from dets.csv split "train") with a background class. This would:
+1. Give the classifier a "not a defect" notion
+2. Make it robust to box misplacement (since detector boxes are slightly misplaced)
+3. Allow the background probability to be used in scoring to suppress false alarms
+
+This is the biggest methodological change available. The brief says:
+- "train the classifier on detector boxes from the training images (dets.csv split 'train'), labelled by overlap with the true boxes in crops.csv, including a 'background' class for false alarms"
+
+Let me think about how to implement this:
+
+1. Load dets.csv where split == "train"
+2. For each detector box, check if it overlaps (IoU >= 0.5) with any true box in crops.csv
+3. If it overlaps, label = the class of the true box; if not, label = 4 (background)
+4. Train a 5-class classifier (4 defect classes + 1 background)
+5. At prediction time, score = detector conf × class probability (for the 4 defect classes), and use background probability to suppress
+
+Wait, but the scoring is mAP@0.5. Let me think about what "overlap" means here. The detector boxes are class-agnostic, so they might overlap with a true defect box or not. If they overlap (IoU >= 0.5), they're a true detection of that class. If not, they're a false alarm (background).
+
+Actually, let me reconsider. The IoU threshold for matching is 0.5 (since mAP@0.5). So a detector box that has IoU >= 0.5 with a true box of class c is a true detection of class c. Otherwise it's a false alarm.
+
+But wait - what about boxes that overlap multiple true boxes? I'll take the one with highest IoU.
+
+Let me think about the scoring. Currently: score = detector_conf × class_prob. With a background class, I could do:
+- score = detector_conf × class_prob / (1 + background_prob) or
+- score = detector_conf × class_prob × (1 - background_prob) or
+- score = detector_conf × class_prob / (sum of all probs) which is just class_prob since they sum to 1
+
+Actually, the simplest approach: just train a 5-class model and use the 4 defect class probabilities directly. The background class will naturally reduce the defect probabilities when the box is background. The score would still be detector_conf × class_prob for each of the 4 classes.
+
+But actually, a more principled approach: the probability of "defect of class c" vs "background" is what matters. If we have 5-class softmax, the probability of class c already accounts for background. So score = conf × p_c should work.
+
+Let me also think about training data. The detector boxes on training images - how many are there? And what's the class distribution?
+
+Let me write the code:
+
+1. Load dets.csv, filter for split == "train"
+2. Load crops.csv (all resolutions for matching? or just high?)
+3. For each det box, compute IoU with all crop boxes on the same image
+4. If max IoU >= 0.5, label = that crop's class; else label = 4 (background)
+5. Train 5-class model
+6. At prediction, output 4 rows per eval box with score = conf × p_c for c in 0..3
+
+Wait, but I also need to handle the case where a detector box might overlap with multiple true boxes. I'll use the one with highest IoU.
+
+Also, I should consider: should I use crops of all resolutions for matching, or just high-res? I think all resolutions make sense for matching since the detector boxes are on the actual images.
+
+Let me also think about whether to keep the two-crop approach or simplify. I'll keep it for now since it's working.
+
+One important consideration: the training data will now be detector boxes (which are slightly misplaced) rather than perfect boxes. This means the crops will look slightly different (the defect might be partially outside the crop). This is actually good for robustness.
+
+Let me also think about the class distribution. If there are many background boxes, the model might be biased toward background. But since we're using cross-entropy loss (not class-weighted), and the brief says class-weighted loss hurt, I'll stick with plain CE.
+
+Actually wait - the brief says "Class-weighted loss hurt classification every time it was tried." So I should NOT use class weights.
+
+Let me also think about whether to include the original crops.csv boxes in training as well. I think for this first experiment, I'll just use detector boxes. This is the cleanest test of the hypothesis.
+
+Let me think about the implementation:
+
+```python
+# After loading dets and crops:
+train_dets = [d for d in dets if d["split"] == "train"]
+
+# Build index of crops by image
+from collections import defaultdict
+crops_by_image = defaultdict(list)
+for r in crops:  # use all crops for matching, not just TRAIN_ON
+    crops_by_image[r["image"]].append(r)
+
+# Label each train det
+def iou(r1, r2):
+    x1 = max(r1["x1"], r2["x1"])
+    y1 = max(r1["y1"], r2["y1"])
+    x2 = min(r1["x2"], r2["x2"])
+    y2 = min(r1["y2"], r2["y2"])
+    inter = max(0, x2 - x1) * max(0, y2 - y1)
+    area1 = (r1["x2"] - r1["x1"]) * (r1["y2"] - r1["y1"])
+    area2 = (r2["x2"] - r2["x1"]) * (r2["y2"] - r1["y1"])  # BUG: should be r2["y2"] - r2["y1"]
+    return inter / (area1 + area2 - inter)
+```
+
+Let me be more careful:
+
+```python
+def iou(r1, r2):
+    x1 = max(r1["x1"], r2["x1"])
+    y1 = max(r1["y1"], r2["y1"])
+    x2 = min(r1["x2"], r2["x2"])
+    y2 = min(r1["y2"], r2["y2"])
+    inter = max(0, x2 - x1) * max(0, y2 - y1)
+    area1 = (r1["x2"] - r1["x1"]) * (r1["y2"] - r1["y1"])
+    area2 = (r2["x2"] - r2["x1"]) * (r2["y2"] - r2["y1"])
+    union = area1 + area2 - inter
+    return inter / union if union > 0 else 0
+```
+
+For each train det, find the crop on the same image with max IoU. If max IoU >= 0.5, label = that crop's class. Else label = 4.
+
+Now, the dataset needs to handle 5 classes. The model needs num_classes=5.
+
+At prediction time, I output 4 rows per eval box (classes 0-3) with score = conf × p_c.
+
+Actually, should I also consider whether to output rows for background? No, because the output format expects cls 0-3. Background is just used internally to reduce the defect probabilities.
+
+Let me also think about whether to use all crops (high + low) for matching. The dets.csv boxes are on the actual images, so I should match against all crops on that image regardless of resolution. Let me use all crops.
+
+Wait, but the current TRAIN_ON is ("high",) - meaning only high-res crops are used for training. For matching detector boxes to true boxes, I should use all crops (both high and low res) since the detector boxes are on the actual images.
+
+Let me restructure:
+- `all_crops` = all rows from crops.csv (for matching)
+- `train_dets` = dets where split == "train"
+- For each train_det, find best matching crop in all_crops on same image
+- If IoU >= 0.5, label = crop.cls; else label = 4
+
+For the dataset, I'll use the same two-crop approach but now training on detector boxes.
+
+Let me also think about the number of training samples. The log says "train 6052 boxes" for the current approach (high-res crops). The detector boxes on training images might be a different number. Let me not worry about that - the code will handle it.
+
+One more thought: should I also add the original perfect boxes to the training set? I think for this first experiment, I'll keep it clean and just use detector boxes. If it works, I can try mixing later.
+
+Let me now write the actual code changes:
+
+1. Change MODEL to still be efficientnet_b0 (keep architecture same for this experiment)
+2. Change num_classes to 5
+3. Load all crops for matching
+4. Label train dets
+5. Use train_dets as training data
+6. Keep two-crop approach
+7. At prediction, output 4 rows per eval box
+
+Actually, I realize I need to be careful. The current code loads `crops` filtered by TRAIN_ON. I need to:
+- Load ALL crops for matching
+- Use train_dets (det boxes on train images) as training data
+- The training data is now det boxes, not crop boxes
+
+Let me write the full replacement. The key changes are:
+
+1. After loading crops and dets, create labeled training data from train dets
+2. Change model to 5 classes
+3. Use the labeled train dets as training data
+4. At prediction, only output classes 0-3
+
+Let me also think about whether the jitter in make_crop is still appropriate. Since we're now training on detector boxes (which are already slightly misplaced), additional jitter might still help with robustness. I'll keep it.
+
+Let me write the code now. I need to be careful with the SEARCH/REPLACE blocks.
+
+Key sections to change:
+1. The training data preparation (after loading crops and dets)
+2. The model creation (num_classes=5)
+3. The dataset (handle cls=4 for background, and the label)
+4. The prediction output (only 4 classes)
+
+Let me trace through the code more carefully:
+
+Current flow:
+1. Load crops (filtered by TRAIN_ON) → used as training data
+2. Load dets → split into ev (eval)
+3. Load images
+4. Create BoxDataset with crops for training
+5. Create BoxDataset with ev for eval
+6. Create model with num_classes=4
+7. Train
+8. Predict: for each eval box, output 4 rows with score = conf × p_c
+
+New flow:
+1. Load ALL crops (for matching)
+2. Load dets → split into train_dets and ev
+3. Label train_dets by IoU matching with crops
+4. Load images
+5. Create BoxDataset with train_dets for training
+6. Create BoxDataset with ev for eval
+7. Create model with num_classes=5
+8. Train
+9. Predict: for each eval box, output 4 rows with score = conf × p_c (p_c from 5-class softmax)
+
+Let me write the SEARCH/REPLACE blocks:
+
+Block 1: Change the data loading and training data preparation
+Block 2: Change model to 5 classes
+Block 3: Change prediction to handle 5-class output
+
+Actually, let me look at the code more carefully to identify exact lines to replace.
+
+The current code after loading:
+```python
+    crops = [r for r in read_csv(os.path.join(args.data, "crops.csv")) if r["res"] in TRAIN_ON]
+    dets = read_csv(os.path.join(args.data, "dets.csv"))
+    ev = [d for d in dets if d["split"] == "eval"]
+    needed = {r["image"] for r in crops} | {d["image"] for d in ev}
+    images = {p: np.asarray(Image.open(os.path.join(args.data, "images", p)).convert("RGB")) for p in needed}
+    print(f"train {len(crops)} boxes, eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
+```
+
+I need to replace this with:
+```python
+    all_crops = read_csv(os.path.join(args.data, "crops.csv"))
+    dets = read_csv(os.path.join(args.data, "dets.csv"))
+    train_dets = [d for d in dets if d["split"] == "train"]
+    ev = [d for d in dets if d["split"] == "eval"]
+    # Label train dets by IoU matching with true crops
+    from collections import defaultdict
+    crops_by_img = defaultdict(list)
+    for r in all_crops:
+        crops_by_img[r["image"]].append(r)
+    def iou(a, b):
+        x1, y1 = max(a["x1"], b["x1"]), max(a["y1"], b["y1"])
+        x2, y2 = min(a["x2"], b["x2"]), min(a["y2"], b["y2"])
+        inter = max(0, x2 - x1) * max(0, y2 - y1)
+        union = (a["x2"]-a["x1"])*(a["y2"]-a["y1"]) + (b["x2"]-b["x1"])*(b["y2"]-b["y1"]) - inter
+        return inter / union if union > 0 else 0.0
+    for d in train_dets:
+        best_iou, best_cls = 0.0, 4
+        for c in crops_by_img.get(d["image"], []):
+            v = iou(d, c)
+            if v > best_iou:
+                best_iou, best_cls = v, c["cls"]
+        d["cls"] = best_cls if best_iou >= 0.5 else 4
+    n_bg = sum(1 for d in train_dets if d["cls"] == 4)
+    needed = {d["image"] for d in train_dets} | {d["image"] for d in ev}
+    images = {p: np.asarray(Image.open(os.path.join(args.data, "images", p)).convert("RGB")) for p in needed}
+    print(f"train {len(train_dets)} det boxes ({n_bg} bg), eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
+```
+
+Wait, but the `from collections import defaultdict` should be at the top. Let me add it to imports.
+
+Actually, I can just use a regular dict with setdefault to avoid the import. Or I can add the import at the top.
+
+Let me add `from collections import defaultdict` to the imports section.
+
+Now for the dataset, the current BoxDataset uses `r.get("cls", -1)` for the label. Since train_dets now have "cls" set (0-4), this should work. But for eval, the dets don't have "cls", so it returns -1. That's fine since we don't use the label for eval.
+
+Wait, actually the eval dets don't have "cls" field. Let me check... The dets.csv has columns: det_id, split, image, x1, y1, x2, y2, img_w, img_h, conf. No cls. So `r.get("cls", -1)` returns -1 for eval. Good.
+
+For train_dets, I'm setting d["cls"] = 0-4. So `r.get("cls", -1)` returns the correct label. Good.
+
+Now the model: change num_classes=4 to num_classes=5.
+
+For prediction: the model outputs 5 logits. I take softmax over 5 classes. Then for each eval box, I output 4 rows (classes 0-3) with score = conf × p_c.
+
+Let me also think about whether I should adjust the scoring. Currently it's conf × p_c. With a background class, p_c will naturally be lower for background boxes. So the scoring should work as-is.
+
+Actually, let me think more carefully. If a box is background, the 5-class softmax will put most probability on class 4 (background). So p_0 through p_3 will be small. The score = conf × p_c will be small. Good.
+
+If a box is a true defect of class c, p_c will be high and p_4 will be low. Score = conf × p_c will be high. Good.
+
+This seems reasonable. Let me proceed.
+
+One more thing: the BatchDataset currently creates two views (tight and wide). The label is `r.get("cls", -1)`. For train_dets, cls is 0-4. For eval, cls is -1 (not used). This should work fine.
+
+Let me also consider: should I use all crops (high + low) for matching? Yes, because the detector boxes are on the actual images, and the true boxes exist in both high and low res. I should match against all of them.
+
+Actually wait - the crops.csv has both high and low res boxes. Are they the same boxes at different resolutions? Or different boxes? I think they're the same physical boxes but the images are at different resolutions. The x1,y1,x2,y2 would be in the image coordinate system. So a high-res box and a low-res box of the same defect would have different pixel coordinates.
+
+Hmm, but the dets.csv boxes are on specific images. The crops.csv also has specific images. So I should match by image name. If the same image appears in both high and low res, the detector box on that image should match the crop on that image.
+
+Actually, I think the "res" column in crops.csv indicates the resolution of the image, not the box. So for a given image, there might be one crop entry (either high or low res). The detector boxes in dets.csv are on specific images too.
+
+Let me just match by image name and IoU. That should work regardless of resolution.
+
+OK let me finalize my changes. Let me write the SEARCH/REPLACE blocks carefully.
+
+Block 1: Add defaultdict import
+```
+SEARCH: import random
+=======
+import random
+from collections import defaultdict
+>>>>>>> REPLACE
+```
+
+Block 2: Replace data loading and training data preparation
+```
+SEARCH:
+    crops = [r for r in read_csv(os.path.join(args.data, "crops.csv")) if r["res"] in TRAIN_ON]
+    dets = read_csv(os.path.join(args.data, "dets.csv"))
+    ev = [d for d in dets if d["split"] == "eval"]
+    needed = {r["image"] for r in crops} | {d["image"] for d in ev}
+    images = {p: np.asarray(Image.open(os.path.join(args.data, "images", p)).convert("RGB")) for p in needed}
+    print(f"train {len(crops)} boxes, eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
+=======
+    all_crops = read_csv(os.path.join(args.data, "crops.csv"))
+    dets = read_csv(os.path.join(args.data, "dets.csv"))
+    train_dets = [d for d in dets if d["split"] == "train"]
+    ev = [d for d in dets if d["split"] == "eval"]
+    crops_by_img = defaultdict(list)
+    for r in all_crops:
+        crops_by_img[r["image"]].append(r)
+    def iou(a, b):
+        x1, y1 = max(a["x1"], b["x1"]), max(a["y1"], b["y1"])
+        x2, y2 = min(a["x2"], b["x2"]), min(a["y2"], b["y2"])
+        inter = max(0, x2 - x1) * max(0, y2 - y1)
+        union = (a["x2"]-a["x1"])*(a["y2"]-a["y1"]) + (b["x2"]-b["x1"])*(b["y2"]-b["y1"]) - inter
+        return inter / union if union > 0 else 0.0
+    for d in train_dets:
+        best_iou, best_cls = 0.0, 4
+        for c in crops_by_img.get(d["image"], []):
+            v = iou(d, c)
+            if v > best_iou:
+                best_iou, best_cls = v, c["cls"]
+        d["cls"] = best_cls if best_iou >= 0.5 else 4
+    n_bg = sum(1 for d in train_dets if d["cls"] == 4)
+    needed = {d["image"] for d in train_dets} | {d["image"] for d in ev}
+    images = {p: np.asarray(Image.open(os.path.join(args.data, "images", p)).convert("RGB")) for p in needed}
+    print(f"train {len(train_dets)} det boxes ({n_bg} bg), eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
+>>>>>>> REPLACE
+```
+
+Block 3: Change dataset to use train_dets
+```
+SEARCH:
+    dl_tr = torch.utils.data.DataLoader(BoxDataset(crops, images, True), batch_size=BATCH_SIZE, shuffle=True,
+=======
+    dl_tr = torch.utils.data.DataLoader(BoxDataset(train_dets, images, True), batch_size=BATCH_SIZE, shuffle=True,
+>>>>>>> REPLACE
+```
+
+Block 4: Change model to 5 classes
+```
+SEARCH:
+    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
+=======
+    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=5)
+>>>>>>> REPLACE
+```
+
+Block 5: Change prediction to handle 5-class output
+```
+SEARCH:
+    for d, p in zip(ev, probs):
+            for c in range(4):
+                s = d["conf"] * float(p[c])
+                if s > MIN_SCORE:
+                    w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+=======
+    for d, p in zip(ev, probs):
+            for c in range(4):
+                s = d["conf"] * float(p[c])
+                if s > MIN_SCORE:
+                    w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+>>>>>>> REPLACE
+```
+
+Wait, block 5 doesn't actually change anything because the prediction code already outputs 4 rows per box. The 5-class model just means the softmax has 5 entries, but we only use the first 4. So no change needed in the prediction code.
+
+Actually, let me double-check. The current prediction code:
+```python
+    probs = torch.cat(probs).numpy()
+    os.makedirs(args.out, exist_ok=True)
+    n = 0
+    with open(os.path.join(args.out, "preds.csv"), "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["det_id", "cls", "score"])
+        for d, p in zip(ev, probs):
+            for c in range(4):
+                s = d["conf"] * float(p[c])
+                if s > MIN_SCORE:
+                    w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+
+With a 5-class model, `p` will have 5 elements. We only use `p[0]` through `p[3]`. That's correct. No change needed.
+
+So I only need blocks 1-4. Let me verify each SEARCH block appears exactly once in the file.
+
+Block 1: `import random` - appears once in the imports. ✓
+Block 2: The data loading block - appears once. ✓
+Block 3: The DataLoader line - appears once. ✓
+Block 4: The model creation line - appears once. ✓
+
+Let me also think about potential issues:
+1. The train_dets might have a different number of boxes than the original crops. The DataLoader uses drop_last=True, so this should be fine.
+2. The IoU matching might be slow if there are many crops per image. But it should be manageable.
+3. The background class (4) might be very common, which could make the model biased toward background. But since we're not using class weights (and the brief says it hurt), this should be OK.
+
+Actually, I'm a bit worried about the class distribution. If 50% of detector boxes are background, the model might be too conservative. But let's see what happens.
+
+Let me also think about whether I should adjust the scoring. Currently: score = conf × p_c. With background, for a true defect, p_c might be lower (since some probability goes to background). But conf should be higher for true defects. So the product should still work.
+
+For a false alarm (background), conf might be moderate but p_c will be low (since p_4 is high). So the score will be low. Good.
+
+I think this is a solid first experiment. Let me finalize.
+
+Wait, one more thing: I should make sure the `TRAIN_ON` variable is no longer used for filtering, but I should keep it in the settings for reference. Actually, it's no longer used since I'm using train_dets instead of crops. Let me just leave it as is - it won't cause any issues since it's just a variable that's not referenced anymore.
+
+Actually, looking at the code again, `TRAIN_ON` is only used in the line I'm replacing:
+```python
+    crops = [r for r in read_csv(os.path.join(args.data, "crops.csv")) if r["res"] in TRAIN_ON]
+```
+
+After my change, TRAIN_ON is not used. That's fine, it's just a dead variable.
+
+Let me also consider: should I remove the `TRAIN_ON` setting? No, I'll leave it for now. It's not harmful.
+
+One more consideration: the `needed` set for images. Previously it was `{r["image"] for r in crops} | {d["image"] for d in ev}`. Now it's `{d["image"] for d in train_dets} | {d["image"] for d in ev}`. This should be the same set of images (since train_dets are on training images, same as crops). Actually, it might be slightly different if some training images have crops but no detector boxes, or vice versa. But since we're only training on train_dets, we only need images that have train_dets or eval dets. This is correct.
+
+OK, I'm confident in my changes. Let me write them up.
+
+Actually, I want to reconsider one thing. The hypothesis should be clear:
+
+Hypothesis: Training the classifier on detector boxes (with a background class for false alarms) rather than perfect ground-truth boxes will improve mAP because (a) the classifier will learn to be robust to the slight box misplacement of the detector, and (b) the background class will suppress false alarms through lower defect probabilities, improving the ranking of true vs false detections.
+
+This is a good, testable hypothesis. Let me finalize.

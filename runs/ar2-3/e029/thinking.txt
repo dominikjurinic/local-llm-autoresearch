@@ -1,0 +1,550 @@
+===== attempt 1 =====
+Let me analyze the situation carefully.
+
+Current best: e016, 5-seed val mAP@0.5 = 0.6337
+
+Key observations:
+1. The baseline one-step 4-class detector gets 0.638 mAP@0.5
+2. Stage-1 boxes with perfect classes (ceiling) = 0.758
+3. Stage-1 boxes scored as single class = 0.755
+4. Current best is 0.6337, below the one-step baseline of 0.638
+
+Per-class AP: pore 0.524, deposit 0.626, discontinuity 0.779, stain 0.606
+
+What's been tried and failed:
+- Training on detector boxes with background class (e002, e005, e015, e025) - all rejected
+- Low-res crops (e003, e024) - rejected
+- Various scoring changes (e004, e008, e014, e022, e023) - all rejected
+- Architecture changes (e006 crashed, e017 timeout, e021 tf_efficientnetv2_b0 rejected, e028 resnet50 rejected)
+- Augmentation: MixUp (e007 not confirmed), random erasing (e026 rejected), rotation (e027 rejected)
+- Loss: label smoothing (e010 not confirmed), focal loss (e012 rejected), class-weighted loss (hurt)
+- Sampling: 2x oversample pore/stain (e016 new best), 3x oversample (e018 rejected)
+- Inference: TTA with hflip (e013 new best)
+- Optimisation: more training time (e019 rejected), SGD (e020 rejected)
+- Context: wider context (e009 not confirmed)
+- Jitter: more jitter (e011 not confirmed)
+
+The current best (e016) uses:
+- EfficientNet-B0, 160px
+- Two-crop (1.5x tight + 2.5x wide)
+- TTA: horizontal flip at inference
+- 2x oversampling of pore and stain
+- Trained on GT crops only (high-res)
+- Score = conf × p[c]
+- AdamW lr=1e-3, wd=0.05
+- 65s reserve
+
+What haven't been tried yet?
+
+Looking at the ideas in scope:
+- "train the classifier on detector boxes from the training images (dets.csv split "train"), labelled by overlap with the true boxes in crops.csv, including a "background" class for false alarms" - tried multiple times, all failed
+- "combine detector conf and classifier probabilities differently" - tried several, all failed
+- "robustness to box misplacement (jitter matching the detector's errors)" - tried (e011), not confirmed
+- "use of low-res training crops, test-time augmentation, ensembling within the time budget" - TTA tried, low-res tried
+- "architecture changes using the pretrained backbones listed below" - tried several
+
+Let me think about what else could help...
+
+Key insight: The current system gets 0.6337, which is below the one-step baseline of 0.638. The ceiling is 0.758. The gap between current and ceiling is large (0.125).
+
+What's the bottleneck? The per-class APs are:
+- pore: 0.524 (weakest)
+- stain: 0.606
+- deposit: 0.626
+- discontinuity: 0.779
+
+Pore and stain are the weak classes. The classifier with perfect boxes gets macro-F1 ~0.87, so the classification itself is decent but not great for pore/stain.
+
+Let me think about what could actually move the needle:
+
+1. **Ensembling**: The time budget is 180s. Currently training takes ~157s. Could we train two smaller models and ensemble them? Or train one model for less time and use the remaining time for a second model? Actually, the time budget is tight - 180s total with 65s reserve means ~115s for training. Training 3 epochs takes ~115s. So we can't really fit two models.
+
+Wait, actually let me re-read: "T is the total wall-clock budget (loading, training, prediction). At the limit the run is killed and counts as failed. Keep a safety margin."
+
+The current run takes 157s out of 180s. The reserve is 65s but prediction only takes ~42s. So there's some slack. But training two models would likely not fit.
+
+2. **Different approach to the two-crop architecture**: Currently both crops go through the same model and logits are averaged. What if we use a different combination? Or what if the tight crop is more important for pore (small features) and the wide crop for stain (context)?
+
+3. **Training strategy**: The model is undertrained (loss still falling). But e019 (more training time) was rejected. So maybe the issue isn't just more training.
+
+4. **Image size**: e017 (224px) timed out. What about 192px? That might be a middle ground. Actually, let me think... at 160px, training takes ~115s for 3 epochs. At 192px, it would be (192/160)^2 = 1.44x more compute, so ~165s for 3 epochs, plus 42s prediction = 207s. That would timeout. What about 176px? (176/160)^2 = 1.21x, so ~139s training + 42s = 181s. Still too tight. 170px? (170/160)^2 = 1.128, ~130s + 42s = 172s. That might work with a safety margin.
+
+Actually wait, the prediction time also scales with image size. At 160px, prediction takes 42s. At 170px, it would be ~47s. So total would be ~130 + 47 = 177s. Very tight.
+
+Hmm, but actually the training time per step also depends on batch processing. Let me think differently.
+
+5. **What about using a lighter model to allow more training?** The current model is EfficientNet-B0. What about convnext_atto or convnext_pico? These are much smaller and faster, allowing more training steps. But they're also less accurate. The question is whether more training steps on a smaller model beats fewer steps on a larger model.
+
+Actually, e006 (convnext_nano) got 0.2901 which was "suspicious (likely bug)". So maybe there was a bug with convnext. Let me not go there.
+
+6. **What about the scoring?** All scoring changes have failed. The current score = conf × p[c] seems to be the best.
+
+7. **What about the number of rows per box?** Currently all 4 classes are output. e014 (top-1 only) was rejected. What about outputting only classes where p[c] > some threshold? Or outputting 2 rows per box (top-2)?
+
+Actually, let me think about this more carefully. The mAP@0.5 scoring: for each class, it computes AP over all predictions of that class. A wrong-class prediction is a false positive for that class. So outputting all 4 classes means each box contributes 3 false positives (for the 3 non-correct classes). But the ranking matters - if the correct class has a high score and the wrong classes have low scores, the AP isn't hurt much.
+
+The current approach outputs all 4 classes with score = conf × p[c]. Since p is a probability distribution, the scores sum to conf. The correct class gets the highest score (usually), and the wrong classes get lower scores. This seems reasonable.
+
+8. **What about using the detector confidence differently?** The detector conf is class-agnostic. Maybe we should use it as a gate: only output predictions for boxes with conf > some threshold? But this has been implicitly tried through the scoring (low conf → low score → ranked lower).
+
+9. **What about a two-stage approach within stage 2?** First classify as "defect type" vs "background", then classify the type? This is essentially the background class idea which has been tried and failed.
+
+10. **What about using both high and low res crops for inference?** The training uses high-res only. What if at inference we use both? No, the eval boxes are on the same images, so the resolution is fixed.
+
+11. **What about the batch size?** Currently 64. Could a larger batch (128) with a higher LR help? Or a smaller batch for more gradient noise?
+
+12. **What about using the wide crop only?** The tight crop (1.5x) might be too tight for some defects and the wide crop (2.5x) might be better for all. Or vice versa. What if we use two tight crops (1.5x and 2.0x) instead of tight+wide?
+
+Actually, let me reconsider. The current setup uses 1.5x and 2.5x. What about 2.0x and 3.0x? Or 1.5x and 2.0x?
+
+13. **What about training with a different number of crops?** Instead of 2 crops, use 3 crops (1.5x, 2.0x, 2.5x)? This would give more views but also triple the compute per sample.
+
+14. **What about the learning rate schedule?** Currently 5% warmup then cosine. What about a different schedule?
+
+15. **What about data augmentation at inference?** Currently only hflip. What about vertical flip? Or both?
+
+Wait, actually the current TTA is: model(xt) + model(xt.flip(3)) + model(xw) + model(xw.flip(3)) / 4. That's original + hflip for both crops. What about adding vflip? That would be 8 forward passes instead of 4. At 42s for 4 passes, 8 passes would be ~84s. Total would be ~115 + 84 = 199s. Too much.
+
+What about just adding vflip to one crop? That would be 6 passes, ~63s. Total ~178s. Very tight.
+
+16. **What about using a different backbone that's faster?** mobilenetv3_large_100 is faster than efficientnet_b0. If we can train for more steps...
+
+Actually, let me look at this from a different angle. The key weakness is pore (0.524) and stain (0.606). 
+
+For pore: these are small holes in the weld. The tight crop (1.5x) should capture them well. The issue might be that pores are small and easy to miss or confuse with other things.
+
+For stain: these are often confused with deposit and background. The wide crop (2.5x) should help with context.
+
+What if we use a different context ratio specifically for the weak classes? No, that would require class-conditional processing which complicates things.
+
+17. **What about using the image patch around the box at a fixed scale rather than relative to box size?** The current approach scales the crop to the box size. For very small boxes (pores), this might zoom in too much. For very large boxes, it might zoom out too much. A fixed-size crop (e.g., always 160px in the original image) might be more consistent.
+
+Actually, this is an interesting idea. Currently, the crop size is proportional to the box size. For a pore (small box), the crop is small and gets upscaled to 160px. For a large defect, the crop is large and gets downscaled. This means the effective resolution of the input varies a lot.
+
+What if we use a minimum crop size? Like, always at least 64px in the original image? This would prevent extreme upscaling of small boxes.
+
+Wait, MIN_CROP is already 16. What if we increase it to 32 or 48?
+
+Actually, let me think about this differently. The make_crop function creates a crop of size `side = max(max(box_w, box_h) * context, MIN_CROP)` and then resizes to IMG_SIZE. So for a pore with a 10px box and context 1.5, the crop is 15px, resized to 160px. That's a 10x upscale, which is a lot of interpolation.
+
+For a deposit with a 50px box and context 1.5, the crop is 75px, resized to 160px. That's a 2x upscale.
+
+So pores get much more aggressive upscaling than deposits. This could hurt pore classification because the upscaling introduces artifacts.
+
+What if we increase MIN_CROP to, say, 48? Then pores would get a 48px crop (3x upscale instead of 10x), which would be less distorted. But this also means we're including more context that might not be relevant.
+
+Hmm, but this is a data/augmentation change. Let me think about whether this is the right direction.
+
+Actually, I think a more impactful change might be to try a different approach to the weak classes. Let me think about what specifically makes pore and stain hard:
+
+- Pore: small, dark holes. Easy to miss if the crop is too large. Easy to confuse with other small dark features.
+- Stain: irregular, often at the edge of the weld. Confused with deposit (similar color) and background.
+
+For stain, the key distinguishing feature might be the context - stain tends to be at the edge of the weld bead, while deposit is on the bead. So the wide crop is important for stain.
+
+For pore, the key feature is the small dark hole. The tight crop should be sufficient.
+
+What if we weight the two crops differently? Currently they're averaged equally. What if the tight crop gets more weight for pore-like features and the wide crop gets more weight for stain-like features? But we don't know the class at inference time...
+
+Actually, we could learn the weights. Instead of (logits_tight + logits_wide) / 2, we could use a learned combination. But this adds complexity.
+
+Let me think about simpler changes...
+
+18. **What about using a different normalization?** The current normalization uses ImageNet mean/std. But weld images might have different statistics. What if we compute the mean/std from the training data?
+
+Actually, this is a good idea. The weld images are likely not ImageNet-like. Using ImageNet normalization might not be optimal. Let me check what the images look like... I can't see them, but the docstring mentions "real robotic weld beads" which are likely metallic/gray with some color variation.
+
+Computing the mean/std from the training crops would be a simple change:
+- Load all training crops
+- Compute the mean and std per channel
+- Use those for normalization
+
+This is a data/augmentation change and could help if the ImageNet normalization is suboptimal.
+
+Wait, but the pretrained model expects ImageNet normalization. If we change the normalization, the pretrained features might not work as well. However, since we're fine-tuning, the model should adapt.
+
+Actually, this is a reasonable experiment. Let me think about whether it's likely to help...
+
+The weld images are likely in a different domain than ImageNet. The mean pixel value might be different (weld images might be darker or lighter). The std might also be different. Using the wrong normalization could hurt performance.
+
+But there's a risk: if the pretrained features rely on ImageNet normalization, changing it could hurt. However, since we're fine-tuning for a few epochs, the model should adapt.
+
+Let me consider another angle: what about the training data itself?
+
+19. **What about using the eval boxes for training?** No, that's not allowed - we can't use eval labels.
+
+20. **What about using a different loss function?** All loss changes have been tried and failed. Cross-entropy is the way to go.
+
+21. **What about the number of classes?** Currently 4 classes. What about merging pore and stain (the two weak classes)? No, that would be a different problem.
+
+22. **What about using a Siamese approach?** Compare the box crop to a reference? Too complex for the time budget.
+
+23. **What about using the detector confidence as a training signal?** During training, we could use the detector confidence as a soft label or as a weighting. But the training data is GT crops, not detector boxes, so this doesn't directly apply.
+
+24. **What about multi-scale training?** Train the model at multiple input sizes and average the predictions? This is like TTA but with different scales.
+
+25. **What about using a crop that includes the full weld bead?** Instead of cropping around the box, use a larger context that shows the full bead. This could help with stain (which is at the edge) and deposit (which is on the bead).
+
+Actually, this is similar to the wide crop idea (e009 tried 3.5x and it was "not confirmed"). So wider context has been tried.
+
+Let me focus on what's most likely to help given the constraints:
+
+The current score is 0.6337, below the one-step baseline of 0.638. The ceiling is 0.758. We need to improve the classifier.
+
+Key observations:
+- The classifier with perfect boxes gets macro-F1 ~0.87
+- Pore and stain are the weak classes
+- The model is undertrained (loss still falling)
+- All scoring changes have failed
+- All architecture changes have failed (except TTA)
+- All data changes have failed (except 2x oversampling)
+- Augmentation changes have mostly failed
+
+What hasn't been tried:
+1. Computing image-specific normalization (mean/std from training data)
+2. Different crop sizes (e.g., 128 instead of 160)
+3. Different batch sizes
+4. Using a lighter model for more training
+5. Different learning rates
+6. Using both crops in a different way (e.g., concatenation instead of averaging)
+7. Using a global average pooling layer differently
+8. Training for exactly 2 epochs (less training, more prediction time)
+9. Using a different optimizer (e.g., Adam instead of AdamW)
+10. Using gradient accumulation
+
+Let me think about which of these is most likely to help...
+
+Actually, I just realized something. The current model uses two forward passes (tight + wide) and averages the logits. What if instead of averaging logits, we concatenate the features before the classification head? This would allow the model to learn a better combination of the two views.
+
+But this requires modifying the model architecture, which is more complex.
+
+Let me think about a simpler change...
+
+What about the learning rate? Currently 1e-3 with AdamW. What about 5e-4 or 2e-3?
+
+Actually, e020 tried SGD with LR=0.01 and it was rejected. But what about a different AdamW LR?
+
+Let me look at the training dynamics:
+- epoch 0: loss 0.6211
+- epoch 1: loss 0.3060
+- epoch 2: loss 0.2449
+
+The loss is still falling. With 3 epochs, the model might not be fully converged. But e019 (more training time) was rejected. So maybe the issue isn't just more training.
+
+Wait, e019 was "cutting the reserve to 50s buys ~20% more training steps" and it was rejected. So more training didn't help. This suggests the model is not just undertrained - there's something else limiting performance.
+
+What if the model is overfitting to the training distribution? The training uses GT crops, but the eval uses detector crops (slightly misplaced). This distribution gap could be the issue.
+
+But e005 (training on detector boxes) was rejected. And e015 (adding detector boxes to GT) was also rejected.
+
+Hmm. Let me think about this differently.
+
+What if the issue is that the model is too complex for the training data? 6052 GT crops for a 4-class problem. EfficientNet-B0 has 4M parameters. That's a lot of parameters for 6K samples.
+
+What if a simpler model would generalize better? convnext_pico or convnext_atto are much smaller. But e006 (convnext_nano) had a bug. Let me try convnext_pico.
+
+Actually, wait. Let me re-read the e006 result: "0.2901, suspicious (likely bug)". So there was a bug. The convnext models might work fine if the bug is fixed. But I don't know what the bug was.
+
+Let me think about another approach: what about using a different input size?
+
+Currently IMG_SIZE = 160. What about 128? This would be faster, allowing more training steps. And the weld defects might not need 160px resolution.
+
+At 128px, the compute per step is (128/160)^2 = 0.64x. So training would be ~74s for 3 epochs (instead of 115s). Prediction would be ~27s (instead of 42s). Total: ~101s + loading (13s) = ~114s. That leaves plenty of room.
+
+But would 128px hurt classification accuracy? For small pores, 128px might not have enough resolution. But the crop is already upscaled from a small region, so the effective resolution is the same regardless of IMG_SIZE.
+
+Actually, the effective resolution is determined by the crop size in the original image, not by IMG_SIZE. A 15px crop resized to 160px has the same information as a 15px crop resized to 128px. The difference is in the interpolation quality and the receptive field of the network.
+
+So changing IMG_SIZE from 160 to 128 would:
+- Reduce compute (faster training and prediction)
+- Slightly reduce the receptive field (but the network is the same)
+- Allow more training steps in the same time
+
+This is a reasonable experiment. Let me go with this.
+
+Actually wait, I should think about whether 128px would hurt. The EfficientNet-B0 was pretrained at 224px. Using 160px is already a reduction. Using 128px is a bigger reduction. The pretrained features might not work as well at 128px.
+
+But since we're fine-tuning, the model should adapt. And the extra training steps might compensate.
+
+Let me calculate more carefully:
+- Current: 3 epochs, 115s training, 42s prediction, 13s loading = 170s total
+- At 128px: training per step is (128/160)^2 = 0.64x. So 3 epochs would be ~74s. But we have the same time budget (115s for training). So we could do ~115/74 * 3 ≈ 4.7 epochs. Let's say 4 epochs.
+- Prediction at 128px: 42 * 0.64 ≈ 27s
+- Total: 13 + 115 + 27 = 155s. Well within budget.
+
+So at 128px, we'd get ~4 epochs instead of 3. That's 33% more training.
+
+But would the lower resolution hurt? For the weak pore class, the pore might be only a few pixels in the original image. At 160px, a 15px crop becomes 160px (10x upscale). At 128px, it becomes 128px (8.5x upscale). The difference is small.
+
+For larger defects, the crop is already large enough that the downsampling to 160 vs 128 doesn't matter much.
+
+I think 128px is worth trying. But let me also consider 144px as a middle ground.
+
+At 144px: (144/160)^2 = 0.81x. Training: 115 * 0.81 ≈ 93s for 3 epochs, so ~115/93 * 3 ≈ 3.7 epochs. Let's say 3 epochs (same as now) but faster. Or 4 epochs in the same time.
+
+Actually, the number of steps per epoch is fixed (it depends on the dataset size and batch size, not the image size). So the time per step changes, but the number of steps per epoch is the same.
+
+Current: 141 steps/epoch (from the log: epoch 0 has 141 steps).
+At 128px: each step is 0.64x faster. So 141 steps takes 68 * 0.64 ≈ 44s. 3 epochs: 132s. Wait, that's more than 115s.
+
+Let me recalculate. From the log:
+- epoch 0: 141 steps, 68s (from 13s to 68s, so 55s for epoch 0? No, the 68s is cumulative from T0)
+
+Actually, the log says:
+- train: 13s
+- epoch 0: 68s (cumulative)
+- epoch 1: 95s (cumulative)
+- epoch 2: 115s (cumulative)
+- done: 157s (cumulative)
+
+So:
+- Loading: 13s
+- Epoch 0: 68-13 = 55s
+- Epoch 1: 95-68 = 27s
+- Epoch 2: 115-95 = 20s
+- Prediction: 157-115 = 42s
+
+Wait, that doesn't make sense. Epoch 0 takes 55s but epoch 1 takes 27s? That's because epoch 0 includes the DataLoader warmup (loading images into memory, etc.).
+
+Actually, the images are loaded into memory at the start (13s). So the DataLoader should be fast. The difference in epoch times might be due to the cosine LR schedule (lower LR in later epochs → less compute? No, the compute is the same).
+
+Actually, I think the timing is:
+- T0 to 13s: loading
+- 13s to 68s: epoch 0 (55s)
+- 68s to 95s: epoch 1 (27s)
+- 95s to 115s: epoch 2 (20s)
+- 115s to 157s: prediction (42s)
+
+The decreasing epoch times are suspicious. Maybe the DataLoader with persistent_workers is getting faster? Or maybe the first epoch includes some JIT compilation or memory allocation overhead.
+
+In any case, the total training time is 115-13 = 102s for 3 epochs (387 steps).
+
+At 128px, each step would be ~0.64x faster. So 387 steps would take ~102 * 0.64 ≈ 65s. That leaves 115-65 = 50s for more training. At 0.64x speed, that's 50/0.64 * (387/102) ≈ 235 more steps, or about 1.7 more epochs. So total ~4.7 epochs.
+
+But wait, the time budget for training is deadline - RESERVE_S - t_start. The reserve is 65s. The total budget is 180s. So training gets 180 - 65 = 115s (minus the loading time of 13s, so ~102s).
+
+At 128px, 102s of training would give ~102/65 * 387 ≈ 605 steps, or ~4.3 epochs.
+
+And prediction at 128px would be ~42 * 0.64 ≈ 27s. Total: 13 + 102 + 27 = 142s. Well within 180s.
+
+So at 128px, we'd get ~4.3 epochs instead of 3. That's 43% more training.
+
+But the question is: does the lower resolution hurt more than the extra training helps?
+
+I think this is worth trying. Let me go with IMG_SIZE = 128.
+
+Actually, wait. Let me reconsider. The EfficientNet-B0 has a fixed architecture. The input size affects the spatial dimensions of the feature maps. At 224px (pretrained size), the feature map is 7x7. At 160px, it's 5x5. At 128px, it's 4x4. At 128px, the spatial information is more compressed, which could hurt for small defects like pores.
+
+But since we're fine-tuning, the model should adapt. And the extra training might help.
+
+Let me go with IMG_SIZE = 128.
+
+Hmm, actually, let me think about another option: what about using a different model that's faster?
+
+mobilenetv3_large_100 is a MobileNet model, which is much faster than EfficientNet-B0. If we use it, we could train for many more steps.
+
+But MobileNet models are generally less accurate than EfficientNet. The question is whether the speed advantage (more training) compensates for the accuracy disadvantage.
+
+Let me estimate: MobileNetV3-Large is about 2x faster than EfficientNet-B0. So at the same time budget, we'd get ~2x more training steps. But the model is less accurate.
+
+This is a risky experiment. Let me stick with IMG_SIZE = 128 for now.
+
+Actually, I just thought of another idea: what about using a different batch size?
+
+Currently BATCH_SIZE = 64. What about 128? A larger batch would:
+- Reduce the number of steps per epoch (fewer, but each step processes more data)
+- Allow a higher LR (but we're already at 1e-3)
+- Reduce gradient noise (which could help or hurt)
+
+With BATCH_SIZE = 128, the number of steps per epoch would be ~70 (half of 141). The time per step would be ~2x longer (processing 2x more data). So the time per epoch would be roughly the same.
+
+This probably won't help much. Let me not go there.
+
+Let me go with IMG_SIZE = 128. It's a simple change, and the hypothesis is clear: lower resolution allows more training steps, which should improve classification accuracy, especially for the weak classes.
+
+Wait, actually I want to reconsider. Let me look at the per-class APs again:
+- pore: 0.524
+- stain: 0.606
+- deposit: 0.626
+- discontinuity: 0.779
+
+The gap between discontinuity (0.779) and the others is large. Discontinuity is the easiest class. Pore is the hardest.
+
+For pore, the key challenge is that pores are small. If we reduce the input size, the pores become even smaller in the input. This could hurt pore classification.
+
+For stain, the key challenge is confusion with deposit and background. The context (wide crop) is important. Reducing the input size might reduce the context information.
+
+So reducing IMG_SIZE might hurt the weak classes specifically. This is a risk.
+
+Let me think of a different experiment...
+
+What about using a different context ratio? Currently TIGHT_CONTEXT = 1.5 and CONTEXT = 2.5. What if we use TIGHT_CONTEXT = 1.2 and CONTEXT = 2.0? A tighter crop for the tight view and a less wide crop for the wide view.
+
+The rationale: a tighter crop (1.2x) would focus more on the defect itself, which is good for pore. A less wide crop (2.0x) would still provide context but less background, which might help with stain (less confusion with background).
+
+But this is a data/augmentation change, and e009 (wider context) was "not confirmed". So context changes might not help.
+
+Let me think about what else...
+
+What about using a different number of training samples? Currently, we use all 6052 GT crops (with 2x oversampling of pore and stain, giving 9084 samples). What if we use only a subset? For example, randomly sample 5000 crops per epoch?
+
+This is like a form of regularization. But it's unlikely to help.
+
+What about using a different augmentation? The current augmentation is:
+- Random horizontal flip (50%)
+- Random vertical flip (50%)
+- Random brightness (0.8-1.2)
+- Geometric jitter (±10% center, 0.85-1.2x size)
+
+What about adding random contrast? Or random saturation?
+
+Actually, for weld images, the color is relatively consistent (metallic). Random contrast might help with lighting variations.
+
+But e026 (random erasing) and e027 (rotation) were both rejected. So augmentation changes are risky.
+
+Let me go back to the IMG_SIZE idea. Even though it might hurt the weak classes, the extra training might help overall. And it's a simple, testable change.
+
+Actually, let me think about this from a different angle. What's the most impactful change we can make?
+
+The current score is 0.6337. The ceiling is 0.758. The gap is 0.125. This is a large gap, suggesting that the classifier is making many errors.
+
+The classifier with perfect boxes gets macro-F1 ~0.87. So even with perfect boxes, the classifier gets 13% of its predictions wrong. This means the classification itself is the bottleneck, not the box quality.
+
+To improve the classifier, we need to:
+1. Make it more accurate (better training, better architecture, better data)
+2. Make it more robust (better augmentation, better regularization)
+3. Make it better calibrated (better scoring)
+
+We've tried many of these. What's left?
+
+One thing I notice: the current model uses the same EfficientNet-B0 for both crops and averages the logits. This is a simple combination. What if we use a learned combination?
+
+For example, instead of (logits_tight + logits_wide) / 2, we could use:
+- logits_tight * w1 + logits_wide * w2, where w1 and w2 are learned
+
+Or even better: concatenate the features from both crops and pass through a small classifier head.
+
+But this requires modifying the model architecture, which is more complex.
+
+Actually, here's a simpler idea: what if we train two separate models (one for the tight crop, one for the wide crop) and combine their predictions? This would allow each model to specialize.
+
+But training two models would take 2x the time, which we don't have.
+
+What about training one model on the tight crop only, and using the wide crop only for inference? No, that doesn't make sense.
+
+Let me think about the scoring again. The current score is conf × p[c]. All scoring changes have failed. But what about a more complex scoring?
+
+For example: score = conf × p[c] × (1 - p[bg]), where p[bg] is the probability of a "background" class. But we don't have a background class (e025 was rejected).
+
+What about: score = conf × p[c] / (sum of p for all classes)? That's just p[c], which is what we already have (since p is a probability distribution).
+
+What about: score = conf × p[c] × max(p)? This was tried in e008 and rejected.
+
+I'm running out of ideas for scoring. Let me go back to the IMG_SIZE idea.
+
+Actually, let me try a completely different approach: what about using a different pretrained model?
+
+The available models are:
+- convnext_atto, convnext_nano, convnext_pico
+- efficientnet_b0, efficientnet_b2
+- mobilenetv3_large_100
+- regnety_016
+- resnet18, resnet26d, resnet34, resnet50
+- tf_efficientnetv2_b0
+
+We've tried:
+- efficientnet_b0 (current)
+- convnext_nano (e006, bug)
+- tf_efficientnetv2_b0 (e021, rejected)
+- resnet50 (e028, rejected)
+
+Not tried:
+- efficientnet_b2 (larger than b0)
+- convnext_atto, convnext_pico (smaller)
+- mobilenetv3_large_100
+- regnety_016
+- resnet18, resnet26d, resnet34
+
+efficientnet_b2 is larger than b0. It would be slower but more accurate. However, it might not fit in the time budget.
+
+Let me estimate: EfficientNet-B2 is about 1.5x slower than B0. So training would take ~150s (instead of 102s), which is over the 115s budget. So B2 won't work.
+
+What about resnet34? It's smaller than resnet50 and might be faster. But it's a different architecture (ResNet vs EfficientNet).
+
+Actually, let me try a different approach. What about using the model's features at an intermediate layer instead of the final logits? For example, use the features before the global average pooling and apply a custom classifier head.
+
+But this requires modifying the model, which is complex.
+
+OK let me just go with a focused, testable experiment. Let me think about what's most likely to move the needle.
+
+The key insight from the data: the model is undertrained (loss still falling) but more training didn't help (e019). This suggests that the issue isn't just the number of training steps - it's something about the training process itself.
+
+What if the issue is the learning rate? The current LR is 1e-3 with AdamW. What if a lower LR (5e-4) or higher LR (2e-3) would help?
+
+With a lower LR, the model would converge more slowly but might reach a better minimum. With a higher LR, it would converge faster but might overshoot.
+
+Given that the loss is still falling after 3 epochs, a slightly higher LR might help the model converge faster. But e020 (SGD with LR=0.01) was rejected, so a very high LR doesn't work.
+
+What about LR = 2e-3? This is a modest increase. Let me try this.
+
+Actually, wait. The LR schedule is: 5% warmup, then cosine decay. The peak LR is 1e-3. If I change it to 2e-3, the peak LR doubles. This might cause instability in the early epochs.
+
+Let me try LR = 5e-4 instead. A lower LR might help the model converge more smoothly.
+
+Hmm, but the loss is still falling, which suggests the model isn't fully converged. A lower LR would slow down convergence further.
+
+I think the most promising experiment is to try a different input size. Let me go with IMG_SIZE = 128.
+
+Hypothesis: Reducing the input size from 160 to 128 will allow ~40% more training steps in the same time budget, which should improve classification accuracy and mAP, especially for the weak pore and stain classes.
+
+Let me write the change.
+
+Actually, I want to reconsider one more time. Let me look at the time budget more carefully.
+
+Current timing:
+- Loading: 13s
+- Training (3 epochs, 387 steps): 102s
+- Prediction: 42s
+- Total: 157s
+- Budget: 180s
+- Reserve: 65s (but prediction only takes 42s, so actual reserve is 38s)
+
+At IMG_SIZE = 128:
+- Loading: 13s (same)
+- Training: each step is (128/160)^2 = 0.64x faster. So 387 steps would take 102 * 0.64 ≈ 65s. But we have 115s for training (180 - 65). So we can do 115/65 * 387 ≈ 684 steps, or ~4.9 epochs.
+- Prediction: 42 * 0.64 ≈ 27s
+- Total: 13 + 115 + 27 = 155s. Well within budget.
+
+So at 128px, we'd get ~4.9 epochs instead of 3. That's 63% more training.
+
+This is a significant increase in training. The question is whether the lower resolution hurts more than the extra training helps.
+
+I'll go with IMG_SIZE = 128.
+
+Wait, one more consideration: the MIN_CROP is 16. At 128px, a 16px crop is resized to 128px (8x upscale). At 160px, it's 10x upscale. The difference is small.
+
+For a typical pore box (say 10px), the crop at 1.5x context is 15px. At 128px, this is 8.5x upscale. At 160px, it's 10.7x upscale. Again, small difference.
+
+For a typical deposit box (say 40px), the crop at 1.5x context is 60px. At 128px, this is 2.1x upscale. At 160px, it's 2.7x upscale. The difference is more noticeable but still small.
+
+I think 128px should be fine. Let me go with it.
+
+Final decision: IMG_SIZE = 128.
+
+Let me write the SEARCH/REPLACE block.
+
+The line to change is:
+```
+IMG_SIZE = 160
+```
+
+Change to:
+```
+IMG_SIZE = 128
+```
+
+That's the only change needed. The rest of the code should work the same.
+
+Let me verify: the make_crop function resizes to (IMG_SIZE, IMG_SIZE), so it will resize to 128x128. The model expects 128x128 input. The normalization is the same. Everything else is the same.
+
+Yes, this is a clean, focused change. Let me go with it.

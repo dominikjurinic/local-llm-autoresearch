@@ -1,0 +1,329 @@
+===== attempt 1 =====
+Let me analyze the situation carefully.
+
+**Current state:**
+- Best: e000, 5-seed mean 0.6288 (seed-0: 0.6288, std 0.0049)
+- Baseline to beat: one-step 4-class detector = 0.638 mAP@0.5
+- Ceiling (stage-1 boxes with perfect classes): 0.758
+- Stage-1 boxes scored as single class: 0.755
+- Per-class AP: pore 0.502, deposit 0.624, discontinuity 0.780, stain 0.609
+
+**What we know:**
+- The two-stage system currently scores 0.6288, BELOW the one-step baseline of 0.638.
+- The ceiling is 0.758, so there's a lot of room.
+- The class-agnostic score is 0.755, meaning the detector boxes are good but the class assignment is what's dragging us down.
+- Pore (0.502) and stain (0.609) are the weakest classes.
+- The crop classifier with perfect boxes reaches macro-F1 ~0.87, so classification is decent but not perfect.
+
+**Experiment history:**
+- e001 (data): Train on detector boxes instead of GT boxes → 0.6264, rejected. This makes sense: the detector boxes are noisier than GT boxes, so training on them is worse.
+- e002 (data): Include low-res crops → 0.6296 seed-0, 0.6261 5-seed, not confirmed. Slightly worse.
+- e003 (data): Add background class → 0.5935, rejected. The background class hurt performance significantly.
+
+**Lessons:**
+- Data category is EXHAUSTED (3 ideas, no new best).
+- All three data experiments failed.
+
+**Where is the error?**
+
+Let me think about this carefully. The current system:
+1. Gets detector boxes (stage 1)
+2. Classifies each box into 4 classes using a crop classifier
+3. Score = detector conf × class probability
+
+The per-class APs: pore 0.502, deposit 0.624, discontinuity 0.780, stain 0.609.
+
+The class-agnostic score is 0.755. This means if we just said "defect" for everything, we'd get 0.755. The 4-class score is 0.6288. So the class assignment is costing us about 0.126 mAP.
+
+The ceiling with perfect classes is 0.758. So if we had perfect classes, we'd be at 0.758. We're at 0.6288, so we're losing about 0.129 from perfect classes.
+
+The key insight: the score is `detector_conf × class_probability`. The class probability comes from the crop classifier. If the classifier is uncertain, the scores get diluted. But more importantly, the ORDER of predictions within each class matters for mAP.
+
+Wait, let me re-read the scoring. For mAP@0.5, predictions of each class are sorted by score. A prediction is a hit if it overlaps an unmatched true box of that class by IoU > 0.5. AP depends only on this ORDER.
+
+So the score determines the order. The current score is `detector_conf × class_probability`. 
+
+Key insight: the detector conf is the same for all classes of a given box. So the ordering within a class is determined by `detector_conf × class_probability`. But the detector conf varies across boxes. 
+
+Actually, let me think about what would help:
+
+1. **Better classification**: If the classifier assigns the correct class more often, then the right class gets a higher score and the wrong classes get lower scores. This directly improves mAP.
+
+2. **Better scoring**: The current scoring multiplies detector conf by class probability. Maybe we should use a different scoring strategy.
+
+Let me think about what's fundamentally different to try.
+
+The data category is exhausted. Let me think about other categories:
+- **architecture**: Change the model. Currently EfficientNet-B0. Could try a different architecture.
+- **augmentation**: Change augmentation. Currently has geometric jitter, flips, brightness.
+- **loss**: Change the loss function. Currently CrossEntropyLoss.
+- **sampling**: Change how training samples are sampled.
+- **optimisation**: Change optimizer, learning rate, etc.
+- **inference**: Change test-time strategy (TTA, etc.)
+- **scoring**: Change how scores are computed.
+
+Let me think about what's most likely to help.
+
+The per-class APs show pore (0.502) and stain (0.609) are weak. The known confusion is stain↔deposit and pore being weak.
+
+**Idea 1: Better model architecture**
+The current model is EfficientNet-B0 with 160px input. The crops are small (defect boxes in weld images). Maybe a different architecture would help. But the model is already pretrained, so the main question is whether the classification head is good enough.
+
+Actually, wait. The model takes TWO crops (tight 1.5x and wide 2.5x) and averages the logits. This is a specific design choice. Maybe we should experiment with the architecture of how we combine these.
+
+**Idea 2: Scoring strategy**
+Currently: score = detector_conf × class_probability.
+
+The class probability is a softmax over 4 classes. If the classifier is uncertain (e.g., 0.25 each), then all classes get the same score = detector_conf × 0.25. This means the ordering within a class is purely by detector_conf.
+
+But here's the thing: for mAP, what matters is the ORDER of predictions within each class. If a box is truly a pore but the classifier says 0.4 pore, 0.3 deposit, 0.2 stain, 0.1 discontinuity, then:
+- Pore score: conf × 0.4
+- Deposit score: conf × 0.3
+- Stain score: conf × 0.2
+- Discontinuity score: conf × 0.1
+
+The pore prediction is ranked higher than the deposit prediction for this box. Good.
+
+But if the classifier is wrong (says 0.4 deposit, 0.3 pore for a true pore), then the deposit prediction is ranked higher. This could cause the pore to be "used up" by a false deposit prediction first, or the pore prediction to be ranked lower.
+
+Actually, I think the key issue is: the classifier's probability is used both for (a) deciding which class to assign and (b) ranking. These are coupled. 
+
+**Idea 3: Use the classifier probability more aggressively**
+What if we use a temperature-scaled softmax? Lower temperature → more peaked probabilities → the top class gets a much higher score relative to others. This would make the classifier's "decision" more decisive.
+
+Actually, this is interesting. If we use temperature < 1 (sharper softmax), the top class gets a higher probability and the others get lower. This would:
+- Boost the score of the predicted class
+- Reduce the score of non-predicted classes
+- This should improve precision for the predicted class
+
+But it could hurt recall if the predicted class is wrong (the true class gets an even lower score).
+
+Hmm, but the metric says: "Any change that keeps the order of a class's predictions (for example multiplying all its scores by a constant, or a monotone function of the score) leaves its AP unchanged."
+
+So if I apply a monotone transformation to ALL scores of a class, AP doesn't change. But temperature scaling changes the RELATIVE scores across classes for the same box. It doesn't change the order within a class (since for a given box, the relative ordering of its 4 class scores is preserved by temperature scaling... wait, no. Temperature scaling changes the softmax, which changes the relative probabilities. Let me think again.
+
+For a box with logits [l0, l1, l2, l3], the softmax at temperature T is:
+p_c = exp(l_c / T) / sum(exp(l_c' / T))
+
+As T → 0, the max logit dominates. As T → ∞, all probabilities → 0.25.
+
+The score for class c is conf × p_c(T). The ORDER of predictions within class c across all boxes depends on conf × p_c(T) for each box.
+
+If I change T, I change p_c(T) for each box. This changes the relative ranking of boxes within class c. So it DOES change AP.
+
+Specifically, with lower T (sharper), boxes where class c is the top prediction get a higher p_c, and boxes where class c is not the top get a lower p_c. This should help: true class c boxes (where c is likely the top prediction) get boosted, and false boxes get suppressed.
+
+This seems like a promising and simple change. Let me think about whether it's likely to help.
+
+Actually, wait. The current score is conf × p_c where p_c is the standard softmax (T=1). If I use T=0.5 (sharper), then for a box where the classifier is confident about class c, p_c goes up (good). For a box where the classifier is uncertain, p_c stays around 0.25 (neutral). For a box where the classifier is confident about a different class, p_c goes down (good - suppresses false positives).
+
+This should improve precision without hurting recall much. The expected gain could be meaningful.
+
+But wait, is this just a re-scoring that the metric ignores? No, because it changes the relative ordering of boxes within a class. A box that's a true pore with high pore probability gets boosted relative to a box that's a false alarm with moderate pore probability.
+
+Let me estimate the effect. The current per-class APs:
+- pore 0.502
+- deposit 0.624
+- discontinuity 0.780
+- stain 0.609
+
+If sharpening helps the weak classes (pore, stain) more than the strong class (discontinuity), the average could go up by 0.01-0.03.
+
+This is a "scoring" category change. It's simple, low-risk, and targets the ranking of predictions.
+
+**Idea 4: Ensemble / TTA at inference**
+Currently no TTA. We could add flip augmentation at test time (average predictions with and without horizontal flip). This would improve classification accuracy. But it doubles inference time.
+
+Current inference: 41879 detections, 2 views each = 83758 forward passes. At the current speed, inference takes about 162-125 = 37 seconds (from the log: training ends at 125s, total is 162s, so inference + writing = 37s).
+
+With 2x TTA (horizontal flip), it would be ~74s for inference. Total would be ~125 + 74 = 199s. The budget is 180s. That's over budget!
+
+Wait, let me re-check. The log says:
+- epoch 4 ends at 125s
+- total is 162s
+- So inference + writing = 37s
+
+With TTA (2x), inference would be ~74s, total ~199s. Over the 180s budget. Not feasible without reducing training time.
+
+Unless I reduce RESERVE_S or training time. But that's risky.
+
+Actually, let me reconsider. The TTA would be: for each box, compute predictions with and without horizontal flip, average the logits. This doubles the number of forward passes.
+
+Current: 41879 boxes × 2 views = 83758 forward passes in 37s → ~0.44ms per forward pass (batched).
+With TTA: 41879 × 2 views × 2 flips = 167516 forward passes → ~74s.
+Total: 125 + 74 = 199s. Over budget.
+
+Not feasible. Skip this.
+
+**Idea 5: Better training - more epochs**
+Currently 5 epochs, 433 steps. The loss is still decreasing (0.2189 at epoch 4). Maybe more training would help. But the budget is fixed at 180s, and training takes 125s. If I reduce RESERVE_S from 55 to 30, I get 25s more for training. That's about 2-3 more epochs.
+
+But this is a minor optimization and the effect is likely small (< 0.003).
+
+**Idea 6: Different loss function**
+The known result is that class-weighted loss hurt every time. So that's out.
+
+What about label smoothing? CrossEntropyLoss with label_smoothing=0.1. This could regularize the classifier and make it less overconfident. But it might also make the probabilities less peaked, which could hurt the scoring.
+
+Hmm, actually label smoothing would make the probabilities less peaked, which is the opposite of what I want for scoring. So probably not helpful.
+
+**Idea 7: Architecture change - use a different model**
+The current model is EfficientNet-B0. What about trying a different architecture? The available pretrained models include convnext, efficientnet, mobilenetv3, regnety, resnet.
+
+But changing the model is a big change and might not help if the bottleneck is the classification task itself, not the backbone.
+
+Actually, let me think about what's really the bottleneck. The crop classifier with perfect boxes reaches macro-F1 ~0.87. That's decent but not great. The weak classes are pore and deposit.
+
+What if the issue is that the crop is not informative enough? The tight crop is 1.5x the box, and the wide crop is 2.5x. Maybe a different context would help.
+
+But that's an "augmentation" or "data" change, and data is exhausted.
+
+Wait, the "data" category is about what data we train on, not about how we crop. The cropping is part of the "architecture" or "inference" strategy.
+
+Actually, let me re-read the categories:
+- data: what training data to use
+- augmentation: how to augment training data
+- architecture: model architecture
+- loss: loss function
+- sampling: how to sample training data
+- optimisation: optimizer, LR, etc.
+- inference: test-time strategy
+- scoring: how to compute final scores
+
+The cropping (context size) could be considered "architecture" (how the model sees the input) or "inference" (how we process at test time).
+
+**Idea 8: Sharpen the softmax (temperature scaling)**
+This is my strongest candidate. It's a "scoring" change. Simple, low-risk, targets the ranking.
+
+Let me think about the implementation:
+- Currently: `probs = torch.softmax(logits, 1)`
+- Change to: `probs = torch.softmax(logits / T, 1)` where T < 1
+
+The score is still `conf × p_c`. But p_c is now sharper.
+
+What temperature? T=0.5 is a reasonable starting point. T=0.3 would be even sharper.
+
+Actually, let me think about this more carefully. The softmax temperature affects the probability distribution. With T=1 (current), a logit difference of 1 gives a probability ratio of e^1 ≈ 2.7. With T=0.5, the ratio is e^2 ≈ 7.4. With T=0.3, the ratio is e^(1/0.3) ≈ e^3.33 ≈ 28.
+
+The question is: how confident is the classifier? If the logits are typically in the range [-2, 2], then:
+- T=1: probabilities range from ~0.1 to ~0.7
+- T=0.5: probabilities range from ~0.01 to ~0.95
+- T=0.3: probabilities range from ~0.001 to ~0.999
+
+For mAP, what matters is the ORDER. With sharper probabilities, the top class for each box gets a much higher score, and the others get much lower. This should:
+1. Boost true detections (where the correct class is the top prediction)
+2. Suppress false positives (where the wrong class is the top prediction, so the true class gets a very low score)
+
+This should improve precision. The risk is if the classifier is often wrong (top prediction is wrong), then the true class gets an even lower score, hurting recall.
+
+Given that macro-F1 is ~0.87, the classifier is right most of the time. So sharpening should help more than hurt.
+
+Expected gain: 0.01-0.03 mAP. This is above the noise threshold of 0.003.
+
+Let me go with this.
+
+Actually, wait. Let me reconsider. The score is `conf × p_c`. The `conf` is the detector confidence, which is the same for all 4 classes of a box. So the ordering within a class c across boxes is determined by `conf_i × p_c(i)` for box i.
+
+If I sharpen the softmax, for boxes where class c is the top prediction, p_c(i) goes up. For boxes where class c is not the top, p_c(i) goes down. This changes the relative ordering.
+
+Specifically, a box that's a true pore with high detector conf and high pore probability will get a much higher score. A box that's a false alarm with moderate detector conf but low pore probability will get a much lower score. This should improve the precision of the pore class.
+
+I think this is a good experiment. Let me write it up.
+
+Actually, I want to double-check: is this a "scoring" change or an "inference" change? The softmax is part of the inference pipeline, but the effect is on the scoring. I'll call it "scoring" since it changes how the final scores are computed.
+
+Let me write the code change:
+
+Current code:
+```python
+    probs = torch.cat(probs).numpy()
+```
+
+Wait, the probs are computed in the inference loop:
+```python
+    with torch.no_grad(), torch.autocast(**amp):
+        for xt, xw, _ in dl_ev:
+            xt = xt.to(device).to(memory_format=torch.channels_last)
+            xw = xw.to(device).to(memory_format=torch.channels_last)
+            probs.append(torch.softmax(((model(xt) + model(xw)) / 2).float(), 1).cpu())
+    probs = torch.cat(probs).numpy()
+```
+
+I need to change the softmax to use a temperature. The logits are `((model(xt) + model(xw)) / 2)`. I need to divide by T before softmax.
+
+Change:
+```python
+            probs.append(torch.softmax(((model(xt) + model(xw)) / 2).float(), 1).cpu())
+```
+to:
+```python
+            logits = ((model(xt) + model(xw)) / 2).float()
+            probs.append(torch.softmax(logits / TAU, 1).cpu())
+```
+
+And add `TAU = 0.5` as a setting.
+
+Wait, but I should also consider: does the temperature affect the training? No, it's only applied at inference. The training uses CrossEntropyLoss which is equivalent to softmax with T=1 + cross-entropy. So training is unaffected.
+
+Let me finalize the experiment:
+
+**HYPOTHESIS**: Sharpen the class probability distribution at inference by dividing logits by a temperature TAU=0.5 before softmax. This makes the top-predicted class get a much higher score and non-top classes get much lower scores, improving the ranking of true detections above false alarms within each class. Since the classifier is correct ~87% of the time, sharpening should boost precision more than it hurts recall, targeting the ranking error that causes the 0.6288 vs 0.755 class-agnostic gap. Expected gain 0.01-0.03 mAP.
+
+This differs from earlier experiments because it doesn't change the training data, model, or loss—it only changes how the final scores are computed, which directly affects the mAP ranking.
+
+Let me write the SEARCH/REPLACE blocks.
+
+I need to:
+1. Add TAU = 0.5 to the settings
+2. Change the softmax in the inference loop
+
+Let me find the exact lines.
+
+Settings section:
+```python
+MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+```
+
+I'll add TAU after STD.
+
+Inference loop:
+```python
+            probs.append(torch.softmax(((model(xt) + model(xw)) / 2).float(), 1).cpu())
+```
+
+Change to:
+```python
+            logits = ((model(xt) + model(xw)) / 2).float()
+            probs.append(torch.softmax(logits / TAU, 1).cpu())
+```
+
+Let me verify the SEARCH texts are unique in the file.
+
+"STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)" - this appears once.
+
+"            probs.append(torch.softmax(((model(xt) + model(xw)) / 2).float(), 1).cpu())" - this appears once.
+
+Good. Let me write the reply.
+
+Wait, I should also consider: is TAU=0.5 the right value? Let me think...
+
+The classifier's macro-F1 is ~0.87. This means it's correct ~87% of the time. The confusion is mainly stain↔deposit and pore being weak.
+
+With TAU=0.5, the probability of the top class roughly doubles relative to the second class (in log space, the difference doubles). This is a moderate sharpening.
+
+With TAU=0.3, it's more aggressive. I'll start with 0.5 as a reasonable first step.
+
+Actually, I realize I should think about whether this could backfire. If the classifier is wrong for a box (top prediction is wrong), then with TAU=0.5, the true class gets an even lower probability, and the score drops further. This hurts recall for that box.
+
+But since the classifier is right 87% of the time, the net effect should be positive. The 87% of boxes where the top prediction is correct get boosted, and the 13% where it's wrong get penalized. The boost to the 87% should outweigh the penalty to the 13%.
+
+I'm fairly confident this will help. Let me go with TAU=0.5.
+
+One more thought: should I also consider using the logit of the top class directly as the score, rather than the probability? No, that would be a bigger change and harder to reason about. The temperature-scaled softmax is a clean, interpretable change.
+
+Let me finalize.
+
+Actually, I want to reconsider the category. The change is in the inference/scoring pipeline. The softmax temperature is applied at inference time. I'll call it "scoring" since it changes how the final scores are derived from the model outputs.
+
+Let me write the final reply.

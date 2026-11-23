@@ -1,0 +1,1439 @@
+===== attempt 1 =====
+Let me analyze the situation carefully.
+
+Current best: e016 with 5-seed val mAP@0.5 = 0.6337
+Per-class: pore 0.524, deposit 0.626, discontinuity 0.779, stain 0.606
+
+Let me think about what hasn't been tried and what might help:
+
+1. **Training on detector boxes with background class** (e002, e025) - tried and rejected
+2. **Low-res crops** (e003, e024) - tried and rejected
+3. **Score modifications** (e004, e008, e014, e022, e023) - all rejected
+4. **Architecture changes** (e006, e021) - rejected
+5. **MixUp** (e007) - not confirmed (0.6292)
+6. **Label smoothing** (e010) - not confirmed (0.6254)
+7. **TTA with flip** (e013) - became the best
+8. **Oversampling weak classes** (e016) - became the best
+9. **Jitter increase** (e011) - not confirmed (0.6294)
+10. **Focal loss** (e012) - rejected
+11. **Context increase** (e009) - not confirmed (0.6309)
+12. **More training time** (e019) - rejected
+13. **SGD** (e020) - rejected
+14. **Random erasing** (e026) - rejected (0.6064)
+15. **3x oversampling** (e018) - rejected
+16. **Top-1 only** (e014) - rejected
+17. **Adding detector boxes to training** (e015) - rejected
+18. **224x224** (e017) - timeout
+
+What's left to try?
+
+Key observations:
+- The ceiling is 0.758 (perfect classes on stage-1 boxes), current is 0.6337
+- Single class "defect" scores 0.755, so the detector boxes are good
+- The problem is classification accuracy and ranking
+- Pore (0.524) and stain (0.606) are weak
+- The classifier was trained on perfect boxes, not detector boxes
+- Class-weighted loss hurt every time
+- Tuning hyperparameters alone helped little; changes of method helped more
+
+Ideas not yet tried:
+1. **Training on detector boxes from train split with proper IoU matching** - e002 crashed, e005 tried IoU>0.5 overlap but got 0.6248 (rejected). e015 tried adding detector boxes to GT set, got 0.6285 (rejected). e025 tried adding background class, got 0.6233 (rejected).
+
+2. **Using the detector confidence as a training signal** - maybe weight training samples by detector confidence?
+
+3. **Different TTA** - currently using h-flip. What about vertical flip? Both flips? The current TTA averages over original and h-flipped for both tight and wide crops.
+
+4. **Ensembling multiple models** - train two different architectures and average?
+
+5. **Larger image size** - e017 timed out at 224. Maybe 192?
+
+6. **Different backbone** - regnety_016, resnet50, etc. haven't been tried (e006 tried convnext_nano but crashed, e021 tried tf_efficientnetv2_b0 and was rejected)
+
+7. **Training on both tight and wide crops separately** - instead of averaging logits, use two separate classifiers?
+
+8. **Using the detector confidence in training** - weight the loss by detector confidence for detector boxes?
+
+9. **Different scoring: using conf * p[c] but with a threshold on conf** - filter out very low confidence boxes?
+
+10. **Multi-scale TTA** - evaluate at multiple scales?
+
+11. **Training with the actual detector boxes (not GT) but using GT labels** - this was tried in e005 (0.6248) and e015 (0.6285), both rejected.
+
+12. **Using both high and low res for training** - e003 tried this (0.6251, rejected), e024 tried low-res only for weak classes (0.6187, rejected).
+
+13. **Different augmentation** - color jitter, rotation?
+
+14. **Using the wide crop only** (drop tight) or **tight only** (drop wide)?
+
+15. **Training for longer with a lower LR** - maybe the model needs more epochs?
+
+16. **Using a different loss for the two views** - maybe the wide crop is more important for context?
+
+17. **Score calibration** - the relationship between conf and p might not be multiplicative. Maybe use conf^a * p^b for some a, b?
+
+Wait, let me reconsider. The key insight from the research brief:
+- "stage-1 boxes scored as a single class 'defect': 0.755 mAP@0.5"
+- This means if we just say "defect" for everything, we get 0.755
+- The 4-class baseline is 0.638
+- Our current is 0.6337
+
+So the problem is: when we assign a specific class, we sometimes get the wrong class, and this hurts mAP. The ranking within each class also matters.
+
+Key idea: **What if we use the detector confidence to modulate the score differently?**
+
+Actually, let me think about what's really going on. The mAP@0.5 is computed per class. For each class, we need:
+1. Correct class assignment on boxes that overlap a true defect of that class
+2. Good ranking: true detections should score higher than false ones
+
+The current score is conf * p[c]. The problem with false alarms (background boxes) is that they get non-zero p[c] for all classes, and if conf is high, they can rank above true detections.
+
+One idea I haven't seen tried: **Use the entropy of the classifier output as a penalty**. If the classifier is uncertain (high entropy), reduce the score. This is different from squaring p or using max(p).
+
+Actually wait, e008 tried conf × p[c] × max(p) and got 0.6265 (rejected). That's similar to an entropy-based penalty.
+
+Let me think about what else...
+
+**Idea: Train on detector boxes with a soft background signal**
+
+Instead of a hard background class, what if we use the detector confidence as a soft signal? Boxes with low detector conf are more likely background. But this was somewhat tried in e025.
+
+**Idea: Use a different backbone that's faster, allowing more training**
+
+The current model is EfficientNet-B0. What about regnety_016 which is smaller and faster? Or resnet18? If we can train for more steps, maybe that helps.
+
+Actually, e019 tried cutting the reserve to get more training steps and it was rejected (0.6291). So more training steps with the same model doesn't help much.
+
+**Idea: Two-model ensemble**
+
+Train two different models (e.g., EfficientNet-B0 and ResNet18) and average their probabilities. This could help with generalization. But it might be too slow.
+
+Let me check timing: current run takes ~157s for 3 epochs. If we train two models, we'd need to split the time. Each model would get ~1.5 epochs, which might not be enough.
+
+**Idea: Use the detector confidence as a training weight**
+
+When training on GT boxes, weight the loss by the detector confidence of the corresponding detector box (if one exists). This would make the model focus more on boxes that the detector is confident about, which are more likely to be real defects.
+
+Actually, this is interesting but complex to implement.
+
+**Idea: Different TTA - add vertical flip**
+
+Currently we do h-flip TTA. What if we also do v-flip? The weld beads might have different appearances when flipped vertically. Let me check: the current TTA does:
+```python
+logits = (model(xt) + model(xt.flip(3)) + model(xw) + model(xw.flip(3))) / 4
+```
+This averages over original and h-flipped for both tight and wide crops. Adding v-flip would make it:
+```python
+logits = (model(xt) + model(xt.flip(3)) + model(xt.flip(2)) + model(xt.flip(2,3)) + model(xw) + model(xw.flip(3)) + model(xw.flip(2)) + model(xw.flip(2,3))) / 8
+```
+
+This doubles the inference time for TTA but might improve accuracy. The current inference takes about 42s (65s reserve - ~23s for other stuff). With 4x TTA it would be ~84s, which might be tight but doable.
+
+Actually wait, let me re-read the timing. The total is 157s. Training takes about 115s (from the log: epoch 2 ends at 115s). Then prediction takes the rest. 157 - 115 = 42s for prediction. With 4x TTA (8 forward passes instead of 4), prediction would be ~84s. Total would be ~199s. The budget is 180s (default). That's a problem.
+
+But wait, the --seconds parameter is passed by the harness. The default is 180 but it could be different. Let me re-read: "T is the total wall-clock budget (loading, training, prediction)."
+
+The current run uses 157s out of presumably 180s. If I add v-flip TTA, prediction would take ~84s instead of ~42s, making total ~199s. That would timeout.
+
+Unless I reduce the reserve. But e019 showed that cutting the reserve (and thus getting more training) didn't help.
+
+Hmm, but what if I reduce the number of training epochs slightly to make room for 4x TTA? That's a tradeoff.
+
+Actually, let me reconsider. The current TTA is 4 forward passes (xt, xt.flip(3), xw, xw.flip(3)). Adding v-flip makes it 8 forward passes. That doubles inference time.
+
+Alternative: use only 2 TTA passes (original + h-flip) but on a single crop (either tight or wide instead of both). But that would lose information.
+
+**Idea: Use a faster model to allow 4x TTA**
+
+If I use a smaller/faster model like regnety_016 or resnet18, I could afford 4x TTA (8 forward passes) and still have time for training.
+
+But e006 (convnext_nano) crashed, and e021 (tf_efficientnetv2_b0) was rejected. Let me try regnety_016.
+
+Actually, the issue with e006 was a crash, not a bad result. And e021 was a different model in the same family. Let me think about what model to use.
+
+regnety_016 is a very small model (1.6M params) that's fast. It might not be as accurate as EfficientNet-B0, but with 4x TTA it could be competitive.
+
+Actually, I think a better idea is:
+
+**Idea: Use the detector confidence to filter/score predictions differently**
+
+What if instead of score = conf * p[c], we use score = conf * p[c] * (1 - p_bg) where p_bg is estimated somehow?
+
+But we don't have a background class in the current model.
+
+**Idea: Train with a background class but use detector boxes for background**
+
+This was tried in e025 (0.6233, rejected) and e002 (crashed, then 0.5172 rejected). So this direction seems dead.
+
+**Idea: Use the wide crop context more effectively**
+
+The wide crop (2.5x) gives context. What if I increase it to 3.5x? e009 tried this and got 0.6342 (not confirmed, 5-seed 0.6309). So it was borderline.
+
+**Idea: Use a different scoring function**
+
+What about score = conf * p[c] * (p[c] / sum(p)) ... wait, that's just conf * p[c] since sum(p) = 1.
+
+What about using the log-odds? score = conf * sigmoid(logit[c] - max_logit)?
+
+Actually, let me think about this differently. The key problem is:
+1. Pore and stain are weak
+2. Stain is confused with deposit and background
+3. The ranking of true vs false detections matters
+
+**Idea: Per-class score calibration**
+
+Different classes might have different optimal score scales. What if I multiply each class's score by a learned or fixed weight? For example, pore predictions might need to be boosted relative to deposit predictions.
+
+But this is essentially class-weighted scoring, which is similar to class-weighted loss (which hurt).
+
+**Idea: Train with the actual detector box coordinates for the overlapping boxes**
+
+Wait, this was tried in e005 (0.6248) and e015 (0.6285). Both rejected.
+
+**Idea: Use both high and low res crops but with different weighting**
+
+e003 tried including low-res (0.6251, rejected). e024 tried low-res only for weak classes (0.6187, rejected).
+
+**Idea: Use a different augmentation - color jitter**
+
+The current augmentation is: random flip (h, v), brightness (0.8-1.2), geometric jitter (±10% center, 0.85-1.2x size), and in e026 random erasing (which hurt).
+
+What about color jitter (hue, saturation, contrast)? Weld images might have color variations that the model should be robust to.
+
+Actually, let me think about what's most likely to help. The per-class scores are:
+- pore: 0.524
+- deposit: 0.626
+- discontinuity: 0.779
+- stain: 0.606
+
+Pore is the weakest. What makes pore hard? It's small holes in the weld. The detector might miss some, and the classifier might confuse them with background or other defects.
+
+Stain is confused with deposit and background. This suggests that the visual appearance of stain overlaps with deposit.
+
+**Idea: Use a larger crop for pore specifically**
+
+No, that's too complex and class-specific.
+
+**Idea: Use the detector confidence as a feature in the classifier**
+
+Instead of just using the image crop, also feed the detector confidence as an additional input. This way, the classifier can learn to be more conservative for low-confidence detections.
+
+This is an interesting idea. I could add the detector confidence as an additional channel (4th channel) to the input image. The model would need to be modified to accept 4 channels.
+
+But this requires modifying the model architecture, which is complex.
+
+**Idea: Use a two-stage scoring where the first stage is a simple "defect vs background" classifier and the second stage is the 4-class classifier**
+
+This is similar to the background class idea (e025, rejected).
+
+**Idea: Use test-time training / self-training**
+
+Use the model's predictions on training detector boxes to create pseudo-labels, then retrain. This is complex and might not fit in the time budget.
+
+**Idea: Use a different optimizer schedule**
+
+The current schedule is 5% warmup + cosine decay. What about a different schedule?
+
+Actually, let me look at this from a different angle. The research brief says:
+- "Tuning hyperparameters alone helped little in earlier experiments; changes of method helped more."
+- "Class-weighted loss hurt classification every time it was tried."
+
+So I should focus on method changes, not hyperparameter tuning.
+
+**Idea: Use the detector confidence to weight the training loss**
+
+When training on GT boxes, find the corresponding detector box (by IoU) and use its confidence as a weight in the loss. High-confidence detector boxes get higher loss weight, making the model focus on detections the detector is confident about.
+
+This is a method change, not a hyperparameter change. Let me think about whether this makes sense.
+
+If the detector is confident about a box, it's more likely a real defect. So the classifier should be more accurate on those. By weighting the loss by detector confidence, we make the model prioritize getting those right.
+
+But wait, the GT boxes and detector boxes don't perfectly align. A GT box might have a detector box with low confidence (missed detection) or high confidence (good detection). The classifier is trained on GT boxes, so it doesn't see the detector's confidence.
+
+Actually, this is a good idea. Let me think about how to implement it:
+1. For each GT crop, find the best-matching detector box (by IoU)
+2. Use the detector box's confidence as a weight in the loss
+3. GT boxes without a matching detector box get a default weight (e.g., 0.5)
+
+This would make the model focus on the cases where the detector is confident, which are the cases that matter most for mAP.
+
+But implementing this requires matching GT boxes to detector boxes, which adds complexity.
+
+**Idea: Use a simpler approach - just use the detector confidence in the score**
+
+Wait, we already do this: score = conf * p[c].
+
+**Idea: Use a power of the detector confidence**
+
+e022 tried conf² * p[c] and got 0.6113 (rejected). So squaring conf hurt.
+
+**Idea: Use a different combination of conf and p**
+
+What about score = (conf + p[c]) / 2 * p[c]? Or score = conf * p[c] / (conf + 1 - p[c])?
+
+These are getting too speculative. Let me think about what's most likely to work.
+
+**Let me reconsider the problem from first principles:**
+
+mAP@0.5 per class = AP = area under precision-recall curve.
+
+For each class c:
+- True positives: predictions with class c that overlap (IoU > 0.5) a GT box of class c
+- False positives: predictions with class c that don't overlap a GT box of class c
+
+AP depends on:
+1. How many TPs we get (recall)
+2. How well we rank TPs above FPs (precision at each recall level)
+
+Current issues:
+- Pore: 0.524 AP - low recall and/or poor ranking
+- Stain: 0.606 AP - confused with deposit and background
+
+The key insight from the brief: "stage-1 boxes scored as a single class 'defect': 0.755 mAP@0.5". This means the detector boxes are good (0.755 when all are the same class). The 4-class baseline is 0.638. So the classification is what's dragging us down.
+
+If we could perfectly classify, we'd get 0.758 (ceiling). Current is 0.6337. The gap is 0.124.
+
+The per-class breakdown shows pore (0.524) and stain (0.606) are the main drags. Discontinuity is good (0.779).
+
+**What if I try a different approach to the weak classes?**
+
+Idea: **Use a class-specific crop context**
+
+For pore (small holes), a tight crop might be better. For stain (which needs context to distinguish from deposit), a wider crop might be better.
+
+But this requires class-specific processing, which is complex.
+
+**Idea: Use a different model for the weak classes**
+
+Train a separate classifier for pore and stain, and use it for those classes. But this is complex and might not fit in the time budget.
+
+**Let me think about what's practical and likely to help:**
+
+1. The model is undertrained (loss still falling). But e019 showed more training doesn't help.
+2. The model is trained on GT boxes, not detector boxes. e005 and e015 showed this doesn't help much.
+3. Background class doesn't help (e025).
+4. Score modifications mostly don't help.
+5. TTA with h-flip helped (e013).
+
+What about **adding v-flip to TTA**? This is a small change that could help. The concern is inference time.
+
+Current TTA: 4 forward passes (xt, xt_hflip, xw, xw_hflip)
+With v-flip: 8 forward passes (xt, xt_hflip, xt_vflip, xt_hvflip, xw, xw_hflip, xw_vflip, xw_hvflip)
+
+Inference time would double. Current inference is ~42s, so it would be ~84s. Total would be ~115s (training) + 84s (inference) = ~199s. This exceeds the 180s budget.
+
+Unless I reduce training time. But e019 showed that reducing reserve (increasing training) didn't help.
+
+What if I use a faster model? regnety_016 is very fast. Let me estimate:
+- EfficientNet-B0: ~1M params, forward pass ~1ms per image on GPU
+- regnety_016: ~1.6M params, forward pass ~0.5ms per image on GPU
+
+Actually, I don't know the exact speeds. But regnety_016 is described as "016" meaning 1.6M params, which is smaller than EfficientNet-B0 (~4M params). So it should be faster.
+
+If regnety_016 is 2x faster, then 8 forward passes would take ~42s (same as current 4 forward passes). Total would be ~115s + 42s = ~157s, which fits.
+
+But will regnety_016 be as accurate as EfficientNet-B0? It's a smaller model, so probably not. But with 4x TTA, it might be competitive.
+
+Actually, let me reconsider. The e006 crash was with convnext_nano, which is also a small model. The crash was likely a bug, not a fundamental issue.
+
+Let me try a different approach: **Use a faster model (regnety_016) with 4x TTA (h-flip + v-flip)**.
+
+Hypothesis: Using a smaller, faster backbone (regnety_016) allows 4x test-time augmentation (horizontal + vertical flip) within the time budget, which should improve classification accuracy (especially for weak pore and stain classes) more than the speed loss from the smaller model.
+
+Wait, but I need to be careful. The e006 crash was with convnext_nano. Let me make sure regnety_016 works with timm.
+
+Actually, let me reconsider the whole approach. Let me look at what's been tried and what's left:
+
+Tried and rejected:
+- Background class (e002, e025)
+- Low-res crops (e003, e024)
+- Score modifications (e004, e008, e014, e022, e023)
+- Architecture changes (e006 crashed, e021)
+- MixUp (e007) - borderline
+- Label smoothing (e010) - borderline
+- Jitter increase (e011) - borderline
+- Focal loss (e012)
+- Context increase (e009) - borderline
+- TTA h-flip (e013) - helped
+- Top-1 only (e014)
+- Adding detector boxes (e015)
+- 3x oversampling (e018)
+- More training (e019)
+- SGD (e020)
+- Random erasing (e026)
+
+Not tried:
+- v-flip TTA (combined with h-flip)
+- Color jitter augmentation
+- Rotation augmentation
+- Different backbones (regnety_016, resnet18, resnet34, resnet50, mobilenetv3_large_100)
+- Different image sizes (192, 208)
+- Ensemble of two models
+- Training with detector confidence weighting
+- Using the wide crop only or tight crop only
+- Different loss functions (beyond focal, label smoothing)
+- Different LR schedules
+- Warmup without cosine
+- Step LR schedule
+
+Let me think about which of these is most likely to help and is practical.
+
+**v-flip TTA**: This is a simple change but requires more inference time. If I can fit it in the budget, it should help.
+
+**Color jitter**: Weld images might have color variations. Adding color jitter (hue, saturation, contrast) to training could help generalization. This is a simple change to the augmentation pipeline.
+
+**Different backbone**: regnety_016 is fast and might work well. But it's a different family.
+
+**Ensemble**: Train two models and average. Complex but potentially powerful.
+
+Let me go with **color jitter augmentation**. It's a method change (not hyperparameter tuning), it's simple to implement, and it addresses a potential gap in the current augmentation (which only does brightness, not full color jitter).
+
+Actually wait, the current brightness augmentation (0.8-1.2) is a form of color jitter (contrast). But it doesn't include hue or saturation changes.
+
+Weld images are typically grayscale or near-grayscale (the defects are variations in the weld bead). So hue and saturation might not be very relevant. Color jitter might not help much.
+
+Let me reconsider.
+
+**What about using a different image size?**
+
+e017 tried 224x224 and timed out. What about 192x192? This is a modest increase from 160x160 (44% more pixels). It might help with small features (pore) without timing out.
+
+But this is a hyperparameter change, and the brief says "Tuning hyperparameters alone helped little in earlier experiments."
+
+**What about a method change: using the detector confidence as a training signal?**
+
+Here's a concrete idea: When training on GT boxes, for each GT box, find the best-matching detector box (by IoU > 0.3) and use its confidence as a weight in the loss. This way, the model focuses on the cases where the detector is confident, which are the cases that matter most for mAP.
+
+Implementation:
+1. Load dets.csv train split
+2. For each GT crop, find the detector box with the highest IoU
+3. Use the detector confidence as a weight (clipped to [0.1, 1.0])
+4. Modify the loss to use these weights
+
+This is a method change, not a hyperparameter change. It should be in scope.
+
+But implementing IoU matching between GT crops and detector boxes adds complexity. Let me think about how to do it efficiently.
+
+Actually, the GT crops have image, x1, y1, x2, y2. The detector boxes also have image, x1, y1, x2, y2, conf. I can match them by image and compute IoU.
+
+For 6052 GT boxes and some number of detector boxes (maybe ~50k?), the matching would be O(N*M) which could be slow. But I can group by image first.
+
+Let me estimate: 1022 images, ~6052 GT boxes, so ~6 GT boxes per image. Detector boxes: 41879 eval + some train. If train has similar density, maybe ~500 detector boxes per image. So per image, 6 * 500 = 3000 IoU computations. Total: 1022 * 3000 = 3M IoU computations. This should be fast enough.
+
+Actually, I can use numpy for vectorized IoU computation.
+
+Let me draft the implementation:
+
+```python
+def compute_iou(box1, box2):
+    """box1: (N, 4), box2: (M, 4), both [x1, y1, x2, y2]"""
+    # ... vectorized IoU computation
+```
+
+Then for each GT box, find the detector box with the highest IoU and use its confidence.
+
+This is a good idea. Let me think about whether it's likely to help.
+
+The hypothesis: By weighting the training loss by detector confidence, the model focuses on the cases where the detector is confident (likely real defects), improving classification accuracy on the cases that matter most for mAP.
+
+This is a method change (using detector confidence as a training signal), not a hyperparameter change. It's in scope.
+
+Let me implement this.
+
+Actually, wait. Let me reconsider. The GT boxes are the ground truth. The detector boxes are the model's predictions. If I weight the GT training by detector confidence, I'm essentially saying "train harder on the cases the detector is confident about." But the detector might be confidently wrong (false alarms with high confidence). In that case, the GT box wouldn't match any detector box (or would match a low-IoU one), so it would get a low weight.
+
+Actually, the matching is: for each GT box, find the detector box with the highest IoU. If IoU > threshold (say 0.3), use the detector confidence as weight. Otherwise, use a default weight (say 0.5).
+
+This means:
+- GT boxes with a confident matching detector box: high weight
+- GT boxes with a low-confidence matching detector box: low weight
+- GT boxes without a matching detector box: default weight
+
+This makes sense: the model should focus on the cases where the detector is likely to produce a detection (high confidence), because those are the cases that will appear in the eval set.
+
+Let me implement this.
+
+Actually, I realize there's a subtlety. The GT boxes and detector boxes are on the same images (train split). The detector boxes are the stage-1 detector's output on training images. The GT boxes are the ground truth.
+
+For each GT box, I want to find the detector box that best overlaps it. If the detector found a box there with high confidence, the model should learn to classify that region well. If the detector didn't find a box there (or found one with low confidence), the model doesn't need to be as accurate there (because the detector won't produce a prediction for that region in the eval set).
+
+This is a good idea. Let me implement it.
+
+Here's my plan:
+1. Load dets.csv train split
+2. For each GT crop, find the best-matching detector box (by IoU)
+3. Use the detector confidence as a weight in the loss (with a floor of 0.1)
+4. Modify the CrossEntropyLoss to use these weights
+
+Implementation details:
+- Group detector boxes by image
+- For each GT box, compute IoU with all detector boxes on the same image
+- Find the max IoU and corresponding confidence
+- Store the weight in the dataset
+
+Let me write the code.
+
+```python
+def match_det_conf(crops, dets_train):
+    """For each GT crop, find the best-matching detector box and return its confidence."""
+    # Group detector boxes by image
+    det_by_img = {}
+    for d in dets_train:
+        det_by_img.setdefault(d["image"], []).append(d)
+    
+    weights = []
+    for c in crops:
+        img = c["image"]
+        if img not in det_by_img:
+            weights.append(0.5)
+            continue
+        # Compute IoU with all detector boxes on this image
+        best_iou = 0
+        best_conf = 0.5
+        cx1, cy1, cx2, cy2 = c["x1"], c["y1"], c["x2"], c["y2"]
+        for d in det_by_img[img]:
+            dx1, dy1, dx2, dy2 = d["x1"], d["y1"], d["x2"], d["y2"]
+            ix1, iy1 = max(cx1, dx1), max(cy1, dy1)
+            ix2, iy2 = min(cx2, dx2), min(cy2, dy2)
+            inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+            area_c = (cx2 - cx1) * (cy2 - cy1)
+            area_d = (dx2 - dx1) * (dy2 - dy1)
+            union = area_c + area_d - inter
+            iou = inter / union if union > 0 else 0
+            if iou > best_iou:
+                best_iou = iou
+                best_conf = d["conf"]
+        # Use confidence as weight, with a floor
+        w = max(0.1, best_conf) if best_iou > 0.3 else 0.5
+        weights.append(w)
+    return weights
+```
+
+Then in the dataset, I store the weight and return it alongside the label.
+
+In the training loop, I use a weighted CrossEntropyLoss:
+```python
+crit = nn.CrossEntropyLoss(weight=None, reduction='none')
+# In the training loop:
+loss = crit(logits, y)  # (batch,)
+loss = (loss * weights).mean()
+```
+
+Wait, but the current model uses two views (tight and wide) and averages the logits. The loss is computed on the averaged logits. So the weight should apply to the final loss.
+
+Let me modify the training loop:
+```python
+with torch.autocast(**amp):
+    logits = (model(xt) + model(xw)) / 2
+    loss_per_sample = crit(logits, y, reduction='none')
+    loss = (loss_per_sample * w).mean()
+```
+
+Where w is the batch of weights.
+
+This looks good. Let me write the full implementation.
+
+Actually, I need to be careful about the oversampling. The current code does:
+```python
+train_rows = list(crops) + [c for c in crops if c["cls"] in (0, 3)]
+```
+
+So the weak classes are duplicated. The weights should be assigned to the original crops, and the duplicated rows should get the same weight.
+
+Let me restructure:
+1. Compute weights for all crops
+2. Create train_rows with the weights
+3. Use the weights in the loss
+
+Here's my revised plan:
+
+```python
+# After loading crops and dets:
+dets_train = [d for d in dets if d["split"] == "train"]
+weights = match_det_conf(crops, dets_train)  # list of floats, same length as crops
+
+# Create train_rows with weights
+train_rows = []
+for i, c in enumerate(crops):
+    train_rows.append((c, weights[i]))
+for i, c in enumerate(crops):
+    if c["cls"] in (0, 3):
+        train_rows.append((c, weights[i]))
+```
+
+Then in the dataset, I unpack the (crop, weight) tuples.
+
+Actually, this is getting complex. Let me simplify by storing the weight in the crop dict:
+
+```python
+for i, c in enumerate(crops):
+    c["det_weight"] = weights[i]
+
+train_rows = list(crops) + [c for c in crops if c["cls"] in (0, 3)]
+```
+
+Then in the dataset, I return the weight:
+```python
+return views[0], views[1], r.get("cls", -1), r.get("det_weight", 0.5)
+```
+
+And in the training loop:
+```python
+for xt, xw, y, w in dl_tr:
+    ...
+    with torch.autocast(**amp):
+        logits = (model(xt) + model(xw)) / 2
+        loss_per_sample = crit(logits, y, reduction='none')
+        loss = (loss_per_sample * w.to(device)).mean()
+```
+
+This should work. Let me write the full code.
+
+Wait, I also need to handle the case where the detector boxes are on different images than the GT crops. The dets.csv has both "train" and "eval" splits. I only want the "train" split for matching.
+
+Also, I need to make sure the IoU computation is correct. The boxes are in pixel coordinates [x1, y1, x2, y2].
+
+Let me also think about the performance. The matching loop is O(N_gt * N_det_per_image). With ~6 GT boxes per image and ~500 detector boxes per image, that's ~3000 IoU computations per image, ~3M total. This should take a few seconds in Python, which is fine.
+
+Actually, I can vectorize this with numpy for speed. But 3M simple operations in Python might take ~10 seconds. Let me use numpy to be safe.
+
+Actually, let me just use a simple Python loop. 3M iterations with simple arithmetic should take ~5-10 seconds. The total time budget is 180s, and the current run takes 157s. Adding 10 seconds for matching should be fine.
+
+Let me write the code now.
+
+One more consideration: the `match_det_conf` function needs to be called before creating the DataLoader. And the weights need to be in the dataset.
+
+Let me also think about whether this idea is likely to help. The hypothesis is:
+
+"Weighting the training loss by detector confidence will improve mAP by making the classifier focus on the cases where the stage-1 detector is confident (likely real defects), improving classification accuracy on the predictions that actually appear in the eval set."
+
+This is a method change (using detector confidence as a training signal), not a hyperparameter change. It's in scope.
+
+I think this is a good idea. Let me implement it.
+
+Actually, let me reconsider one more time. The current training uses GT boxes. The detector boxes are the stage-1 detector's output. If the detector is confident about a box, it's more likely a real defect. By weighting the training loss by detector confidence, we make the model focus on the cases where the detector is likely to produce a prediction.
+
+But there's a risk: if the detector is confidently wrong (high-confidence false alarm), the corresponding GT box (if any) would get a high weight, but the model would be trained to classify it as a defect (which is correct, since it's a GT box). The issue is that the detector's confidence doesn't directly tell us whether the GT box is easy or hard to classify.
+
+Hmm, actually the weighting is:
+- GT box with high-confidence detector match: high weight → model learns this case well
+- GT box with low-confidence detector match: low weight → model learns this case less
+- GT box with no detector match: default weight → model learns this case normally
+
+The idea is that in the eval set, the detector will produce high-confidence predictions for real defects and low-confidence predictions for false alarms. By training harder on the high-confidence cases, the model should be more accurate on the cases that matter most.
+
+I think this is a reasonable hypothesis. Let me implement it.
+
+Let me also consider: what if I use the detector confidence as a weight in a different way? For example, instead of weighting the loss, I could use it to filter the training set (only train on GT boxes with matching detector boxes). But this would reduce the training set size, which might hurt.
+
+I'll go with the weighted loss approach.
+
+Let me write the code now.
+
+Here's my implementation plan:
+
+1. Add a function `match_det_conf(crops, dets_train)` that returns a list of weights
+2. Modify the dataset to return the weight
+3. Modify the training loop to use weighted loss
+4. Keep everything else the same
+
+Let me write the SEARCH/REPLACE blocks.
+
+First, I need to add the `match_det_conf` function. I'll add it after the `make_crop` function.
+
+Second, I need to modify the `BoxDataset.__getitem__` to return the weight.
+
+Third, I need to modify the training loop to use weighted loss.
+
+Fourth, I need to modify the main function to compute the weights and pass them to the dataset.
+
+Let me write the code:
+
+```python
+def match_det_conf(crops, dets_train):
+    """For each GT crop, find the best-matching detector box and return its confidence as a weight."""
+    det_by_img = {}
+    for d in dets_train:
+        det_by_img.setdefault(d["image"], []).append(d)
+    weights = []
+    for c in crops:
+        img = c["image"]
+        if img not in det_by_img:
+            weights.append(0.5)
+            continue
+        cx1, cy1, cx2, cy2 = c["x1"], c["y1"], c["x2"], c["y2"]
+        area_c = max(1e-6, (cx2 - cx1) * (cy2 - cy1))
+        best_iou, best_conf = 0.0, 0.5
+        for d in det_by_img[img]:
+            dx1, dy1, dx2, dy2 = d["x1"], d["y1"], d["x2"], d["y2"]
+            ix1, iy1 = max(cx1, dx1), max(cy1, dy1)
+            ix2, iy2 = min(cx2, dx2), min(cy2, dy2)
+            inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+            area_d = max(1e-6, (dx2 - dx1) * (dy2 - dy1))
+            iou = inter / (area_c + area_d - inter)
+            if iou > best_iou:
+                best_iou, best_conf = iou, d["conf"]
+        weights.append(max(0.1, best_conf) if best_iou > 0.3 else 0.5)
+    return weights
+```
+
+Now let me think about the SEARCH/REPLACE blocks.
+
+Block 1: Add `match_det_conf` function after `make_crop`.
+
+SEARCH:
+```
+    return np.asarray(Image.fromarray(canvas).resize((IMG_SIZE, IMG_SIZE), Image.BILINEAR), dtype=np.float32) / 255.0
+
+
+class BoxDataset(torch.utils.data.Dataset):
+```
+
+REPLACE:
+```
+    return np.asarray(Image.fromarray(canvas).resize((IMG_SIZE, IMG_SIZE), Image.BILINEAR), dtype=np.float32) / 255.0
+
+
+def match_det_conf(crops, dets_train):
+    """For each GT crop, find the best-matching detector box and return its confidence as a weight."""
+    det_by_img = {}
+    for d in dets_train:
+        det_by_img.setdefault(d["image"], []).append(d)
+    weights = []
+    for c in crops:
+        img = c["image"]
+        if img not in det_by_img:
+            weights.append(0.5)
+            continue
+        cx1, cy1, cx2, cy2 = c["x1"], c["y1"], c["x2"], c["y2"]
+        area_c = max(1e-6, (cx2 - cx1) * (cy2 - cy1))
+        best_iou, best_conf = 0.0, 0.5
+        for d in det_by_img[img]:
+            dx1, dy1, dx2, dy2 = d["x1"], d["y1"], d["x2"], d["y2"]
+            ix1, iy1 = max(cx1, dx1), max(cy1, dy1)
+            ix2, iy2 = min(cx2, dx2), min(cy2, dy2)
+            inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+            area_d = max(1e-6, (dx2 - dx1) * (dy2 - dy1))
+            iou = inter / (area_c + area_d - inter)
+            if iou > best_iou:
+                best_iou, best_conf = iou, d["conf"]
+        weights.append(max(0.1, best_conf) if best_iou > 0.3 else 0.5)
+    return weights
+
+
+class BoxDataset(torch.utils.data.Dataset):
+```
+
+Block 2: Modify `BoxDataset.__getitem__` to return the weight.
+
+SEARCH:
+```
+        return views[0], views[1], r.get("cls", -1)
+```
+
+REPLACE:
+```
+        return views[0], views[1], r.get("cls", -1), r.get("det_weight", 0.5)
+```
+
+Block 3: Modify the main function to compute weights and pass them to crops.
+
+SEARCH:
+```
+    crops = [r for r in read_csv(os.path.join(args.data, "crops.csv")) if r["res"] in TRAIN_ON]
+    train_rows = list(crops) + [c for c in crops if c["cls"] in (0, 3)]  # 2x oversample weak pore/stain
+```
+
+REPLACE:
+```
+    crops = [r for r in read_csv(os.path.join(args.data, "crops.csv")) if r["res"] in TRAIN_ON]
+    dets_train = [d for d in dets if d["split"] == "train"]
+    det_weights = match_det_conf(crops, dets_train)
+    for i, c in enumerate(crops):
+        c["det_weight"] = det_weights[i]
+    train_rows = list(crops) + [c for c in crops if c["cls"] in (0, 3)]  # 2x oversample weak pore/stain
+```
+
+Wait, but `dets` is loaded after `crops`. Let me check the order in the current code:
+
+```python
+crops = [r for r in read_csv(os.path.join(args.data, "crops.csv")) if r["res"] in TRAIN_ON]
+train_rows = list(crops) + [c for c in crops if c["cls"] in (0, 3)]  # 2x oversample weak pore/stain
+dets = read_csv(os.path.join(args.data, "dets.csv"))
+ev = [d for d in dets if d["split"] == "eval"]
+```
+
+So `dets` is loaded after `crops` and `train_rows`. I need to move the `dets` loading before the weight computation, or compute the weights after loading `dets`.
+
+Let me restructure:
+
+```python
+crops = [r for r in read_csv(os.path.join(args.data, "crops.csv")) if r["res"] in TRAIN_ON]
+dets = read_csv(os.path.join(args.data, "dets.csv"))
+dets_train = [d for d in dets if d["split"] == "train"]
+det_weights = match_det_conf(crops, dets_train)
+for i, c in enumerate(crops):
+    c["det_weight"] = det_weights[i]
+train_rows = list(crops) + [c for c in crops if c["cls"] in (0, 3)]  # 2x oversample weak pore/stain
+ev = [d for d in dets if d["split"] == "eval"]
+```
+
+Block 4: Modify the training loop to use weighted loss.
+
+SEARCH:
+```
+        for xt, xw, y in dl_tr:
+```
+
+REPLACE:
+```
+        for xt, xw, y, w in dl_tr:
+```
+
+And:
+
+SEARCH:
+```
+            with torch.autocast(**amp):
+                loss = crit((model(xt) + model(xw)) / 2, y)
+```
+
+REPLACE:
+```
+            w = w.to(device, non_blocking=True)
+            with torch.autocast(**amp):
+                logits = (model(xt) + model(xw)) / 2
+                loss = (crit(logits, y, reduction="none") * w).mean()
+```
+
+Wait, I need to check if `crit` is defined as `nn.CrossEntropyLoss()` which has `reduction='mean'` by default. I need to pass `reduction='none'` to get per-sample losses.
+
+Actually, `nn.CrossEntropyLoss()` has a `reduction` parameter. I can either:
+1. Create a new loss function with `reduction='none'`
+2. Pass `reduction='none'` as a keyword argument
+
+Let me use option 2:
+```python
+loss = (crit(logits, y, reduction="none") * w).mean()
+```
+
+Wait, but `crit` is `nn.CrossEntropyLoss()`. The `reduction` parameter is a constructor argument, not a forward argument. Let me check...
+
+Actually, in PyTorch, `nn.CrossEntropyLoss` does accept `reduction` as a forward argument in recent versions. But to be safe, let me create a separate loss function:
+
+```python
+crit = nn.CrossEntropyLoss()
+crit_none = nn.CrossEntropyLoss(reduction="none")
+```
+
+Then use `crit_none` in the training loop.
+
+Actually, let me just modify the `crit` definition:
+
+SEARCH:
+```
+    crit = nn.CrossEntropyLoss()
+```
+
+REPLACE:
+```
+    crit = nn.CrossEntropyLoss(reduction="none")
+```
+
+And in the training loop:
+```python
+loss = (crit(logits, y) * w).mean()
+```
+
+This should work.
+
+Let me also update the print statement to show the weight info.
+
+Actually, let me keep it simple and not change the print statement.
+
+Let me finalize the SEARCH/REPLACE blocks.
+
+Wait, I need to double-check: does the eval DataLoader also need to be updated? The eval dataset also uses `BoxDataset`, but with `train=False`. The `__getitem__` returns 4 values now (including weight). But the eval loop only uses `xt, xw, _`:
+
+```python
+for xt, xw, _ in dl_ev:
+```
+
+This would fail because there are now 4 values. I need to update this to:
+```python
+for xt, xw, _, _ in dl_ev:
+```
+
+Let me add this fix.
+
+SEARCH:
+```
+        for xt, xw, _ in dl_ev:
+```
+
+REPLACE:
+```
+        for xt, xw, _, _ in dl_ev:
+```
+
+OK, let me put all the blocks together.
+
+Actually, let me reconsider the whole approach. The weighted loss idea is interesting, but I'm not sure it will help. Let me think about alternatives.
+
+Alternative 1: **Use the detector confidence to filter the training set**
+Only train on GT boxes that have a matching detector box (IoU > 0.3). This reduces the training set but focuses on relevant cases.
+
+Alternative 2: **Use the detector confidence as an additional input feature**
+Add the detector confidence as a 4th channel to the input image. The model would need to accept 4 channels.
+
+Alternative 3: **Use the detector confidence in the score (not training)**
+We already do this: score = conf * p[c].
+
+I think the weighted loss approach (my original idea) is the most promising. Let me go with it.
+
+Let me also consider: what if the detector confidence is not a good proxy for "is this a real defect"? In that case, the weighting might hurt. But the hypothesis is that it should help, and we'll test it.
+
+Let me finalize the code.
+
+One more thing: I should make sure the weight computation is fast enough. Let me estimate:
+- ~6052 GT crops
+- ~500 detector boxes per image (rough estimate)
+- ~1022 images
+- Per image: ~6 GT boxes * ~500 detector boxes = ~3000 IoU computations
+- Total: ~1022 * 3000 = ~3M IoU computations
+- Each computation: ~10 Python operations
+- Total: ~30M operations
+- In Python: ~10-30 seconds
+
+This might be too slow. Let me use numpy for vectorized computation.
+
+Actually, let me think about this more carefully. The total number of detector boxes in the train split is unknown. Let me assume it's similar to the eval split (41879 boxes). If there are ~1022 images and 41879 eval boxes, that's ~41 detector boxes per image for eval. The train split might have a similar density, so ~41 * 1022 = ~42k detector boxes in train.
+
+Per image: ~6 GT boxes * ~41 detector boxes = ~246 IoU computations
+Total: ~1022 * 
+===== attempt 2 =====
+I need to look at the current best train.py (e016) and propose a next experiment. Let me think about what to try.
+
+Current best: e016, 5-seed val mAP@0.5 0.6337
+Per-class: pore 0.524, deposit 0.626, discontinuity 0.779, stain 0.606
+
+What's been tried and rejected:
+- background class (e025, e002) — rejected
+- low-res crops (e003, e024) — rejected
+- score = conf × p² (e004) — rejected
+- conf × p × max(p) (e008) — rejected
+- conf² × p (e022) — rejected
+- conf × p²/max(p) (e023) — rejected
+- top-1 only (e014) — rejected
+- MixUp (e007) — not confirmed
+- label smoothing (e010) — not confirmed
+- focal loss (e012) — rejected
+- class-weighted loss — hurt
+- oversampling 3x (e018) — rejected
+- SGD (e020) — rejected
+- tf_efficientnetv2_b0 (e021) — rejected
+- ConvNeXt (e006) — crashed/bug
+- random erasing (e026) — rejected
+- more jitter (e011) — not confirmed
+- wider context 3.5 (e009) — not confirmed
+- 224 input (e017) — timeout
+- more training time (e019) — rejected
+- detector boxes in training (e005, e015) — rejected
+
+What's worked:
+- TTA horizontal flip (e013) — new best
+- oversampling weak classes 2x (e016) — new best
+
+Ideas not yet tried:
+1. Ensembling within time budget — e.g., train two models with different seeds and average? But time budget is tight.
+2. Using both tight and wide crops differently — maybe weighted average?
+3. Different backbone: resnet50, regnety_016, mobilenetv3_large_100, efficientnet_b2, convnext_atto/nano/pico, resnet18/26d/34
+4. Test-time augmentation beyond hflip: e.g., vertical flip, or multi-scale?
+5. Score calibration: using a different function
+6. Training longer with a smaller model (convnext_atto or pico) to fit more epochs
+7. Using low-res test-time? No.
+8. Different: the wide crop is 2.5x, tight is 1.5x. Maybe the two views should be combined differently — e.g., max instead of average?
+9. Maybe using the detector conf in a smarter way — e.g., score = conf^0.5 × p?
+10. Maybe training with both high and low res but only for certain classes?
+
+Let me think about what's most promising. The per-class numbers show pore (0.524) and stain (0.606) are weak. Deposit is 0.626.
+
+Key insight from the brief: "stain is often confused with deposit and background." And "Pore and deposit are the weak classes" (in the crop classifier with perfect boxes).
+
+Wait, the brief says "Pore and deposit are the weak classes; stain is often confused with deposit and background." But the per-class val AP shows pore 0.524, deposit 0.626, stain 0.606. So pore is weakest, then stain, then deposit.
+
+Let me think about ensembling. The time budget is 180s. Currently: 13s loading, ~144s training (3 epochs), ~42s prediction. Total 157s. Reserve is 65s.
+
+If I train two smaller models and ensemble, I could potentially get a diversity benefit. But that's complex and risky.
+
+Actually, let me reconsider. A clean, focused idea: **ensemble two models trained with different random seeds / augmentations, averaging their probabilities.** But the time budget...
+
+Actually, a simpler and well-motivated idea: **use a different backbone that's lighter so we can train more epochs.** But e021 (tf_efficientnetv2_b0) was rejected, and convnext was buggy.
+
+Let me think about the scoring more. The mAP rewards ranking. The score is conf × p[c]. 
+
+One idea not tried: **use the geometric mean or a different combination of the two crop views.** Currently logits are averaged. What if we use the max of the two views' class probabilities? Or what if the tight crop is more reliable for pore (small holes) and wide crop for stain (context)?
+
+Actually, a cleaner idea: **weight the two crop views differently.** The tight crop (1.5x) captures the defect itself, the wide crop (2.5x) captures context. For classification, maybe the tight crop is more discriminative. Currently they're equally weighted.
+
+Hmm, but that's a bit of a shot in the dark.
+
+Let me think about what's most likely to help given the evidence:
+- Method changes helped more than hyperparameters.
+- TTA hflip helped.
+- Oversampling weak classes helped.
+
+TTA hflip worked. What about a different TTA? The current TTA averages over original and hflip for both crops (4 forward passes). What if I add more TTA views? But that increases prediction time.
+
+Actually, let me reconsider ensembling more carefully. The seed-to-seed noise is ±0.005 to 0.01. A single-seed gain smaller than that is noise. So I need a change that's likely to give >0.01 gain.
+
+Ensembling two independently-trained models typically gives a solid, consistent gain. The question is time budget.
+
+Current time: 13s load + 144s train + 42s predict = 157s. Budget 180s, reserve 65s (so train until 115s... wait, t_end = deadline - RESERVE_S = 180-65 = 115s. But the log shows training ended at 115s (epoch 2 at 115s) and prediction took until 157s. So prediction is 157-115 = 42s. That's under the 65s reserve. Good.)
+
+If I want to train two models, I'd need to split the training time. E.g., train model A for ~70s, model B for ~70s, then predict with both (42s × 2 = 84s?). That's 13 + 70 + 70 + 84 = 237s > 180s. Too much.
+
+Unless I make prediction faster. Prediction is 41879 eval boxes with 4 forward passes each (hflip TTA) = ~167k forward passes. That's the bottleneck.
+
+Hmm. What if I reduce TTA to just the two crops without hflip during prediction? That halves prediction time. But TTA hflip helped...
+
+Actually, let me reconsider. Maybe a cleaner single-model idea.
+
+Let me think about the **score function** again. Many scoring changes were rejected, but they all made things worse. The current conf × p[c] seems near-optimal for scoring.
+
+What about **calibrating the classifier's confidence**? The classifier trained on perfect boxes has no notion of background, so it's overconfident on false alarms. e025 (background class) was rejected. e008 (× max p) rejected.
+
+What about **temperature scaling** on the classifier output? i.e., divide logits by a temperature T > 1 to make probabilities softer, which would suppress overconfident false alarms. This is different from the rejected ideas because it's a learned/empirical temperature applied uniformly. Actually, this is similar to label smoothing in effect but at inference. Let me think...
+
+Actually temperature scaling at inference: p' = softmax(logits / T). With T > 1, all probabilities move toward 0.25 (uniform), which reduces the max probability and makes the ranking flatter. This could hurt the ranking (true vs false). Hmm, it's a shot in the dark.
+
+Let me think about a **data** idea that's different. The brief says "use of low-res training crops" is in scope. e003 (all low-res) and e024 (low-res for weak classes) were rejected. So low-res doesn't help.
+
+What about **test-time augmentation with more views**? Let me reconsider the time budget for prediction.
+
+Actually, here's a cleaner idea that builds on what worked (TTA): **add vertical flip to TTA** in addition to horizontal flip. Weld beads are often horizontal lines, so vertical flip might be less valid than horizontal. Hmm, risky.
+
+Let me reconsider. The most reliable source of gains is usually **a better model / ensemble** or **better data**. 
+
+Given time constraints, let me think about **training a lighter model for more epochs**. convnext_atto is very small. But convnext had a bug (e006). The bug was probably in how the model was created or something. Actually e006 got 0.29 which is "suspicious (likely bug)". 
+
+Hmm, let me look at what could be a clean architecture change. resnet50 is a solid, well-tested backbone. It's heavier than efficientnet_b0 though, so fewer epochs.
+
+Actually, let me reconsider the **two-crop combination**. What if instead of averaging the two crops' logits, I train them as a multi-crop input where the model sees both? No, that changes the architecture.
+
+Let me think differently. What's the single most promising, low-risk, high-reward change?
+
+Given:
+- TTA hflip worked (+0.007 or so, single seed 0.6392 vs base... wait base e013's parent was e010? No. Let me re-read. e013 base is e000, seed-0 0.6392, 5-seed 0.6314, new best. Then e016 base e013, 5-seed 0.6337, new best.)
+
+So e013 (TTA hflip) 5-seed 0.6314, e016 (oversample) 5-seed 0.6337.
+
+The current best is 0.6337. The ceiling is 0.758. There's a lot of room, but the gains have been small.
+
+Let me think about **ensembling via two crops as two separate models**. No.
+
+OK here's a clean idea: **Train the classifier on detector boxes from training (dets.csv train) with a background class, but this time do it properly.** Wait, e002, e005, e015, e025 all tried variants of using detector boxes / background class and were rejected. So that direction is exhausted.
+
+Let me reconsider. What about **a different combination of detector conf and classifier prob that hasn't been tried**? Tried: p², p×maxp, conf², p²/maxp. All rejected. What about **p^0.5** (square root, which boosts low probabilities, making ranking less aggressive)? Or **conf × p / (something)**?
+
+Hmm, these are all shots in the dark and scoring changes have all failed.
+
+Let me think about **the input resolution**. e017 (224) timed out. What about **192**? That's between 160 and 224. It would give more detail than 160 (helping pore) without timing out. But it increases both training and prediction time. Risky for timeout.
+
+Actually, let me reconsider the timeout. e017 at 224 timed out. 224/160 = 1.4x, so pixels = 1.96x. Prediction would be ~1.96x slower: 42s → 82s. Training: 144s → 282s. Total way over. So 224 times out. 192/160 = 1.2x, pixels = 1.44x. Prediction 42→60s, training 144→207s. Total 13+207+60 = 280s > 180s. Still times out. So higher resolution is out unless I cut training.
+
+What if I use higher resolution but a lighter model? Too complex.
+
+Let me step back and think about **what method change is most likely to give a real gain**.
+
+The brief explicitly lists "ensembling within the time budget" as an in-scope idea. And ensembling is one of the most reliable ways to gain. The challenge is time.
+
+To fit an ensemble, I need to cut prediction time. The prediction is 4 forward passes per box (2 crops × 2 flips). If I drop the hflip TTA for prediction (2 forward passes), prediction halves to ~21s. Then I have room for 2 models.
+
+But wait, TTA hflip helped. If I drop it, I lose that. But if I ensemble 2 models each without TTA, the ensemble diversity might compensate.
+
+Alternatively: keep TTA but make models lighter.
+
+This is getting complex. Let me think about a simpler ensemble: **train the same model twice with different seeds and average probabilities.** To fit in time, I'd reduce epochs per model.
+
+Actually, here's a cleaner framing. Let me reduce the reserve and prediction cost, and train 2 models.
+
+Hmm, but this is a big change and risky. The rules say "one idea per turn, keep the edit focused."
+
+Let me reconsider a **simpler, focused** idea.
+
+What about **using the detector confidence to weight training**? No, that's for scoring.
+
+Let me reconsider the **weak classes** and **data**. The oversampling of pore/stain 2x helped (e016). 3x hurt (e018). What about **oversampling deposit too**? No, deposit isn't the weakest.
+
+Actually, let me reconsider: maybe the issue is that the model needs **more training** but with a **better optimizer schedule**. e019 (more training time) was rejected, e020 (SGD) rejected. So optimization is somewhat exhausted.
+
+Let me think about **augmentation** again. e007 MixUp rejected, e026 random erasing rejected. What about **color jitter / more aggressive brightness**? The current brightness is uniform(0.8, 1.2). What about adding **random rotation** (small, ±15°)? Weld beads have orientation, so rotation might not be physically valid. Risky.
+
+What about **cutout with a different scale**? e026 used n=2, scale (0.05, 0.25). Rejected.
+
+Hmm. Let me think about **the wide crop context** again. e009 (3.5x) was "not confirmed" (0.6309, close). What about a **smaller** context, like 2.0x? Or what about **asymmetric** — different contexts?
+
+Actually, let me reconsider the whole thing. Let me look at what's genuinely untried and methodologically sound:
+
+1. **Ensemble of 2 models** — in scope, reliable gain, but time-constrained.
+2. **Different backbone (resnet50)** — untried, but heavier.
+3. **Multi-scale TTA** — untried, but time-constrained.
+
+Given the rules emphasize focus and the time budget, and given that ensembling is explicitly in scope and is the most reliable gain source, let me design a **time-feasible ensemble**.
+
+Let me compute the time budget carefully for a 2-model ensemble:
+- Load: 13s
+- Reserve for prediction: need to fit 2 models' predictions.
+
+Current prediction (1 model, 4 passes/box): 42s for 41879 boxes.
+Per box per pass: 42s / (41879 × 4) = 42/167516 = 0.00025s.
+For 2 models with 4 passes each: 2 × 42 = 84s.
+For 2 models with 2 passes each (no hflip): 2 × 21 = 42s.
+
+If I do 2 models with hflip (4 passes each): prediction = 84s. Load 13s. Remaining for training: 180 - 13 - 84 = 83s. Split between 2 models: ~41s each. Currently 1 model trains 144s for 3 epochs. 41s would be ~1 epoch. That's undertrained.
+
+If I do 2 models without hflip (2 passes each): prediction = 42s. Load 13s. Remaining for training: 180 - 13 - 42 = 125s. Split: ~62s each. ~1.3 epochs each. Better but still undertrained.
+
+Hmm. The problem is the prediction cost with 41879 eval boxes is huge.
+
+What if I reduce the number of eval boxes I predict on? No, I need all of them.
+
+What if I batch prediction more efficiently? It's already batched at 256.
+
+What if I use a **lighter model** for the ensemble? A lighter model trains faster AND predicts faster. E.g., convnext_atto or efficientnet... no efficientnet_b0 is already light.
+
+Actually, let me reconsider. What if I ensemble by **averaging the two crop views differently** — no, that's not an ensemble.
+
+Let me reconsider the **time budget for a single model with a better method**. 
+
+Actually, you know what, let me reconsider **higher input resolution with reduced training**. The pore class is weak (0.524) and pore = small holes = needs resolution. e017 (224) timed out. But what if I use 192 and cut training time / reserve?
+
+At 192: pixels 1.44x. Prediction 42 → 60s. If I keep reserve at 65s, t_end = 115s, training = 115-13 = 102s (was 144s at 160... wait at 160 training was 144s? No. Let me recompute. Log: load 13s, epoch0 at 68s, epoch1 at 95s, epoch2 at 115s, done at 157s. So training ran from 13s to 115s = 102s (3 epochs, 387 steps). Prediction 115s to 157s = 42s. Reserve 65s, t_end = 180-65 = 115s. Yes training ended exactly at t_end=115s. Good.)
+
+So at 160: training 102s (3 epochs), prediction 42s.
+At 192: training would be ~102 × 1.44 = 147s (but limited to t_end=115s, so ~2 epochs), prediction ~60s (under 65s reserve, OK). Total = 13 + 102 (capped at 115) ... wait training is capped at t_end=115s regardless. So training = 102s worth of work but at 192 each step is 1.44x slower, so in 102s I get 102/1.44 = 71s worth of 160-steps = ~2 epochs. Prediction 60s. Total = 13 + 102 + 60 = 175s < 180s. Cuts it close but fits!
+
+Hmm wait, but the reserve is 65s and prediction at 192 is 60s, that's within reserve. And t_end = 115s. Training runs until 115s. So total = 115 (train end) + 60 (predict) = 175s + 13 load = wait, the 13s load is before training. Let me recompute timeline:
+- T0 = 0
+- Load: 0 to 13s
+- Training: 13s to t_end. t_end = deadline - RESERVE = 180 - 65 = 115s. So training 13s to 115s = 102s of training.
+- Prediction: 115s to 115+60 = 175s.
+- Total 175s < 180s. 
+
+But this is tight (5s margin). The rules say "keep a safety margin." 5s is thin. Also, at 192 the model gets fewer epochs (~2 vs 3), which might hurt. Net effect unclear.
+
+This is risky. Let me not do resolution.
+
+Let me reconsider. I think the **cleanest high-value idea** that's in scope and methodologically sound is **ensembling**, but I need to make it time-feasible.
+
+Alternative ensemble approach that's cheap: **ensemble the two crop views as if they were two models.** No.
+
+Actually, here's a thought: what if I **train one model but predict with TTA that includes a second scale**? The current TTA is hflip. What if I add **a slight scale variation** (e.g., crop at 1.4x and 1.6x for tight)? That's more TTA views = more prediction time.
+
+I keep hitting the prediction time wall.
+
+Let me reconsider: is there a way to **speed up prediction**? 
+- Use a smaller IMG_SIZE for prediction? No, must match training.
+- Use torch.compile? Might help but risky/complex.
+- Reduce batch overhead? Already batched.
+- Use fewer TTA passes: drop hflip → 2 passes instead of 4. Halves prediction to 21s.
+
+If I drop hflip, prediction = 21s, freeing up 21s. But hflip helped.
+
+OK let me think about this more cleverly. What if I **ensemble 2 models, each predicted with 2 passes (no hflip)**? 
+- Prediction: 2 models × 21s = 42s.
+- Training: 2 models. Available training time = 180 - 13 - 42 = 125s, minus safety margin. Say 120s, split 60s each.
+- At 160, 60s of training = ~1.15 epochs each. Undertrained.
+
+vs current single model: 102s training (3 epochs) + 42s prediction (4 passes).
+
+The tradeoff: 2 undertrained models (each ~1.15 epochs) vs 1 well-trained model (3 epochs). Unclear which wins. Ensembles of undertrained models can still win due to diversity, but it's a gamble.
+
+Hmm, this is too uncertain and complex for a focused edit.
+
+Let me step back and pick a **single, clean, focused, likely-to-help** change.
+
+Given the evidence that **method changes help more than hyperparameters**, and that the weak classes are pore and stain, and that **stain is confused with deposit and background**, let me think about what specifically distinguishes stain.
+
+Actually, let me reconsider the **two-crop weighting**. The tight crop (1.5x) shows the defect core; the wide crop (2.5x) shows context. For stain (which needs context to distinguish from deposit/background), the wide crop is more important. For pore (small hole), the tight crop is more important. Currently both are equally weighted (logits averaged).
+
+What if I **weight the wide crop more** in the average? E.g., logits = (model(xt) + 2*model(xw)) / 3? This would emphasize context, potentially helping stain. But it might hurt pore. Shot in the dark.
+
+Alternatively, what if the two crops are **concatenated** as a 6-channel input? That changes the architecture (need to modify the model's first conv). Complex.
+
+Let me reconsider. I think I'm overcomplicating. Let me look at the **most reliable** untried idea.
+
+Actually, re-reading the brief: "use of low-res training crops, test-time augmentation, ensembling within the time budget." TTA is done (hflip). Ensembling is the big one.
+
+Let me reconsider the time budget for ensembling more carefully, because I think it IS feasible if I'm clever.
+
+Key realization: **I can train 2 models sequentially, and the ensemble is just averaging their softmax outputs.** The main cost is prediction (41879 boxes × passes × models).
+
+To make it feasible, I'll **drop hflip TTA** (which I'll argue the ensemble compensates for) and use **2 passes per model** (tight + wide, no flip). 
+
+Prediction: 2 models × 2 passes × 41879 boxes. At 160, per box per pass = 0.00025s. So 2×2×41879×0.00025 = 41.9s. Plus overhead. ~42s.
+
+Training: 2 models. Available = 180 - 13 (load) - 42 (predict) - safety(10) = 115s. Split 57s each. ~1.05 epochs each at 160.
+
+Hmm, 1 epoch each is quite undertrained. The current 3-epoch model has loss 0.24. A 1-epoch model has loss ~0.31. Two 1-epoch models averaged... the ensemble might not beat the 3-epoch single model.
+
+This is too risky. Let me abandon the 2-model ensemble.
+
+**Alternative: ensemble via TTA on a single well-trained model, but with more views.** The current model is well-trained (3 epochs). If I add TTA views, I get ensemble-like diversity from a single model without retraining.
+
+Current TTA: 4 views (tight, tight_hflip, wide, wide_hflip). 
+Add: vertical flip? → 8 views. Prediction doubles to 84s. Over budget (reserve 65s).
+
+Add: a scale variation? More views.
+
+The prediction time wall again.
+
+OK, what if I **reduce the reserve** to fit more TTA? e019 (reduce reserve to 50s) was rejected, but that was for training time, not TTA. If I reduce reserve to 50s, t_end = 130s, training = 117s (~3.5 epochs), prediction budget = 50s. Current prediction 42s fits in 50s. Adding one more TTA view (e.g., vflip) → 84s, doesn't fit in 50s.
+
+Hmm.
+
+Let me reconsider. The prediction is the bottleneck no matter what. 41879 boxes is a lot.
+
+Wait — can I **downsample the eval boxes for prediction**? No, I must predict all.
+
+Can I **predict in a smaller image**? The crop is resized to IMG_SIZE=160. If I use 128 for prediction... but must match training (160). Actually, does it have to match? The model was trained at 160. Predicting at 128 would be out-of-distribution. Bad idea.
+
+OK, I'm now fairly convinced the time budget fundamentally limits ensembling and heavy TTA. Let me pick a **single-model method change** that's clean and likely to help.
+
+Let me reconsider the **backbone**. Untried good options: resnet50, regnety_016, efficientnet_b2, convnext_atto/nano/pico, mobilenetv3_large_100, resnet18/26d/34.
+
+e021 (tf_efficientnetv2_b0) rejected. e006 (convnext_nano) buggy. 
+
+**regnety_016** is a RegNet (resnet-like with different channel widths), pretrained, fairly light. It's a different inductive bias from EfficientNet. Could help. But it's a shot in the dark, and architecture changes have been mostly rejected/buggy.
+
+**resnet50** is heavier, fewer epochs. Probably not.
+
+Hmm.
+
+Let me reconsider **data** once more. The oversampling of pore/stain 2x helped. What about **oversampling based on the detector's error distribution**? Too complex.
+
+What about **using the detector confidence to filter/augment training**? No.
+
+Let me reconsider the **scoring** with a fresh eye. The score is conf × p[c]. mAP@0.5 rewards: (a) right class on overlapping boxes, (b) good ranking (true > false). 
+
+The classifier has no background notion, so false alarms get non-trivial p[c]. The detector conf is a proxy for "is this a real defect" — false alarms have low conf. So conf × p[c] already partially handles the ranking via conf.
+
+What if I **sharpen** the ranking by using conf more aggressively? e022 (conf²) was rejected. What about **conf^0.5** (softening conf, trusting the classifier more)? That would boost low-conf boxes, potentially adding false positives. Probably bad.
+
+What about **score = conf × p[c] × (p[c] - 0.25)**? This makes the score negative for below-uniform probability, effectively suppressing uncertain predictions. Hmm, but scores must be comparable; negative scores might be fine (they'd rank low). Actually this is like a "confidence above baseline" measure. But it changes the scale a lot. Risky.
+
+I think scoring is exhausted (5 rejections).
+
+Let me reconsider **augmentation** with a different type. Tried: MixUp, random erasing, jitter, brightness, flips. What about **Gaussian blur** (simulating the low-res / detection blur)? Or **random affine** (small rotation + shear)? 
+
+Weld beads: a small rotation might be physically plausible (the bead can be at any angle). Actually the crops are square and centered on the box, so a small rotation of the crop is a valid augmentation (the defect can be oriented any way). Let me think... a stain or pore doesn't have a fixed orientation relative to the image. So small random rotation (±15°) is a valid augmentation. This is different from what's been tried (only flips, brightness, jitter, mixup, erasing).
+
+Hypothesis: small random rotation augmentation will improve generalization on the weak pore and stain classes by adding orientation diversity, since defects don't have a fixed image orientation.
+
+This is a clean, focused, untried augmentation. Let me go with it. It's low-risk (just adds a transform in training), doesn't affect prediction time, and is methodologically sound.
+
+Wait, but is rotation valid? The weld bead runs across the image (usually horizontally in these datasets). If I rotate the crop, the bead orientation changes. But the defect (pore/stain) appearance is roughly orientation-invariant. The context (bead pattern) would rotate, but that's fine as augmentation. Small rotation (±15°) should be safe.
+
+Actually, let me reconsider whether rotation could hurt. If the model relies on the bead being horizontal (e.g., stain runs along the bead), rotating would break that. But stain is "often confused with deposit and background" — maybe it's a blob, not a line. Pore is a hole (orientation-invariant). Deposit is a bump. So rotation should be mostly safe and add useful diversity.
+
+Let me implement small random rotation in make_crop or in the dataset. The cleanest place: in the dataset's __getitem__, after creating the crop, apply a random rotation during training.
+
+Actually, make_crop already does jitter (center shift, size change). I can add rotation there, or in the dataset. Let me add it in the dataset where fh/fv/bright are computed, applying a PIL rotate.
+
+Let me write it. In BoxDataset.__getitem__, for training, I'll add a random angle and rotate each view.
+
+Current code:
+```python
+        fh, fv, bright = random.random() < 0.5, random.random() < 0.5, random.uniform(0.8, 1.2)
+        views = []
+        for ctx in (TIGHT_CONTEXT, CONTEXT):
+            x = make_crop(img, r, ctx, self.train)
+            if fh:
+                x = x[:, ::-1]
+            if fv:
+                x = x[::-1, :]
+            if self.train:
+                x = np.clip(x * bright, 0, 1)
+            x = (x - MEAN) / STD
+            views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))
+```
+
+I'll add rotation. Let me add an angle variable and rotate using PIL.
+
+```python
+        fh, fv, bright = random.random() < 0.5, random.random() < 0.5, random.uniform(0.8, 1.2)
+        angle = random.uniform(-15, 15) if self.train else 0.0
+        views = []
+        for ctx in (TIGHT_CONTEXT, CONTEXT):
+            x = make_crop(img, r, ctx, self.train)
+            if fh:
+                x = x[:, ::-1]
+            if fv:
+                x = x[::-1, :]
+            if self.train:
+                x = np.clip(x * bright, 0, 1)
+                if angle:
+                    x = np.asarray(Image.fromarray((x * 255).round().astype(np.uint8)).rotate(angle, fillcolor=(114, 114, 114)), dtype=np.float32) / 255.0
+            x = (x - MEAN) / STD
+            views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))
+```
+
+Wait, x at this point is float in [0,1] (after make_crop which returns /255, then brightness clip). To rotate with PIL, I need uint8. Let me convert. The fillcolor should match the padding gray (114). 
+
+Actually, the crop already has gray padding (114) from make_crop. After brightness, the padding becomes 114*bright. When I rotate, the corners would show the rotated padding. Using fillcolor=(114,114,114) is fine.
+
+Hmm, but converting to uint8 and back loses a bit of precision. That's fine for augmentation.
+
+Let me simplify: rotate before brightness, or just do it cleanly. Let me apply rotation right after make_crop (before flips/bright), using the uint8 conversion. Actually the order doesn't matter much. Let me keep it simple and apply after bright.
+
+Let me reconsider the precision: x is float [0,1]. (x*255).round().astype(uint8) → PIL rotate → /255 → float [0,1]. Good.
+
+Actually, I realize I should double check: does rotating introduce the gray fill at corners in a way that's consistent with training? Yes, fillcolor=(114,114,114) matches the existing padding. Good.
+
+Let me also make sure the angle is applied to both views (tight and wide) consistently — yes, it's computed once outside the loop. Good, both views rotate by the same angle, preserving the relationship.
+
+This is a clean, focused change. Let me also consider: should I make rotation probability-based (e.g., 50% of the time)? Applying it always with a small angle is fine. Let me apply always with angle in [-15,15]. Actually, to be safe and not over-rotate, let me use a smaller range or probability. Let me use angle = random.uniform(-12, 12) always. That's mild.
+
+Hmm, let me reconsider the magnitude. ±15° might be too much for the context (bead pattern). Let me use ±10°. Actually, for adding orientation diversity, ±15° is reasonable and common in object detection augmentation. Let me go with ±15°.
+
+Wait, I want to be careful. Let me reconsider if this is the best use of a turn. The per-class weakness is pore (0.524). Pores are small holes — rotation-invariant, so rotation augmentation directly helps the model not rely on orientation. Stain — blob-like, rotation-invariant. So rotation should help both weak classes. Good hypothesis.
+
+Let me also double-check I'm not breaking the contract. The change is only in training augmentation. Prediction unchanged. Time budget: rotation adds a tiny overhead per training sample (PIL rotate on 160×160). Negligible. No timeout risk. Seed: uses random.uniform, seeded. Good.
+
+Let me write the SEARCH/REPLACE. I need to copy the exact lines from the current file.
+
+The exact block in the file:
+```python
+        fh, fv, bright = random.random() < 0.5, random.random() < 0.5, random.uniform(0.8, 1.2)
+        views = []
+        for ctx in (TIGHT_CONTEXT, CONTEXT):
+            x = make_crop(img, r, ctx, self.train)
+            if fh:
+                x = x[:, ::-1]
+            if fv:
+                x = x[::-1, :]
+            if self.train:
+                x = np.clip(x * bright, 0, 1)
+            x = (x - MEAN) / STD
+            views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))
+```
+
+Let me verify this appears exactly once. Yes, it's in BoxDataset.__getitem__.
+
+Now the replacement:
+```python
+        fh, fv, bright = random.random() < 0.5, random.random() < 0.5, random.uniform(0.8, 1.2)
+        angle = random.uniform(-15, 15) if self.train else 0.0
+        views = []
+        for ctx in (TIGHT_CONTEXT, CONTEXT):
+            x = make_crop(img, r, ctx, self.train)
+            if fh:
+                x = x[:, ::-1]
+            if fv:
+                x = x[::-1, :]
+            if self.train:
+                x = np.clip(x * bright, 0, 1)
+                if angle:
+                    x = np.asarray(Image.fromarray(np.round(x * 255).astype(np.uint8)).rotate(angle, fillcolor=(114, 114, 114)), dtype=np.float32) / 255.0
+            x = (x - MEAN) / STD
+            views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))
+```
+
+This is focused on the one idea (rotation augmentation).
+
+Let me reconsider the fillcolor type. PIL's rotate fillcolor for an RGB image should be a tuple of 3 ints. (114,114,114) is fine.
+
+One concern: `Image.fromarray(np.round(x*255).astype(np.uint8))` — x is shape (160,160,3) float. np.round(x*255) → float, .astype(uint8) → uint8 array. Image.fromarray → RGB PIL image. .rotate(angle, fillcolor=...) → PIL image. np.asarray(..., dtype=float32)/255 → float [0,1]. Good.
+
+Wait, x*255 could be up to 255.0, round → 255, uint8 OK. Could be slightly above 255 after clip? No, x is clipped to [0,1] before, so x*255 in [0,255]. round → [0,255]. Good.
+
+Let me finalize. Category: augmentation.
+
+Let me write the hypothesis concisely.
+
+HYPOTHESIS: Pore and stain defects have no fixed image orientation, but the current training only uses flips/brightness, so the model may overfit to the bead's typical horizontal orientation; adding small random rotation (±15°) to the crops should improve generalization on these weak classes.
+
+That's good. Let me make sure the reply format is exact and I only include the required fields plus the SEARCH/REPLACE block.
+
+Let me double check the SEARCH text is copied exactly. Looking at the file:
+
+```
+    def __getitem__(self, i):
+        r = self.rows[i]
+        img = self.images[r["image"]]
+        fh = fv = False
+        bright = 1.0
+        if self.train:  # same flips and brightness for both views
+            fh, fv, bright = random.random() < 0.5, random.random() < 0.5, random.uniform(0.8, 1.2)
+        views = []
+        for ctx in (TIGHT_CONTEXT, CONTEXT):
+            x = make_crop(img, r, ctx, self.train)
+            if fh:
+                x = x[:, ::-1]
+            if fv:
+                x = x[::-1, :]
+            if self.train:
+                x = np.clip(x * bright, 0, 1)
+            x = (x - MEAN) / STD
+            views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))
+        return views[0], views[1], r.get("cls", -1)
+```
+
+So the line is:
+`            fh, fv, bright = random.random() < 0.5, random.random() < 0.5, random.uniform(0.8, 1.2)`
+with 12 spaces indent (inside the `if self.train:` which is inside __getitem__ which is inside class). Let me count: `    def __getitem__` = 4 spaces. Body = 8 spaces. `if self.train:` = 8 spaces. Inside if = 12 spaces. Yes, 12 spaces.
+
+I'll include the block from `fh, fv, bright = ...` through `views.append(...)`. Let me make the SEARCH start at the `fh, fv, bright` line to be safe and unique.
+
+Actually, to be safe and minimal, let me SEARCH a smaller unique chunk. The line `fh, fv, bright = random.random() < 0.5, random.random() < 0.5, random.uniform(0.8, 1.2)` is unique. And the block through views.append is unique. Let me include the whole block to insert the angle line and the rotation.
+
+Let me write it carefully with exact indentation.
+
+SEARCH:
+```
+        if self.train:  # same flips and brightness for both views
+            fh, fv, bright = random.random() < 0.5, random.random() < 0.5, random.uniform(0.8, 1.2)
+        views = []
+        for ctx in (TIGHT_CONTEXT, CONTEXT):
+            x = make_crop(img, r, ctx, self.train)
+            if fh:
+                x = x[:, ::-1]
+            if fv:
+                x = x[::-1, :]
+            if self.train:
+                x = np.clip(x * bright, 0, 1)
+            x = (x - MEAN) / STD
+            views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))
+```
+
+REPLACE:
+```
+        if self.train:  # same flips, brightness and rotation for both views
+            fh, fv, bright = random.random() < 0.5, random.random() < 0.5, random.uniform(0.8, 1.2)
+            angle = random.uniform(-15, 15)
+        else:
+            angle = 0.0
+        views = []
+        for ctx in (TIGHT_CONTEXT, CONTEXT):
+            x = make_crop(img, r, ctx, self.train)
+            if fh:
+                x = x[:, ::-1]
+            if fv:
+                x = x[::-1, :]
+            if self.train:
+                x = np.clip(x * bright, 0, 1)
+                if angle:
+                    x = np.asarray(Image.fromarray(np.round(x * 255).astype(np.uint8)).rotate(angle, fillcolor=(114, 114, 114)), dtype=np.float32) / 255.0
+            x = (x - MEAN) / STD
+            views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))
+```
+
+This is clean. The `else: angle = 0.0` handles eval (no rotation). Good.
+
+Let me verify the indentation of the original `if self.train:  # same flips and brightness for both views` — it's at 8 spaces (body of __getitem__). Yes.
+
+I'm confident. Let me write the final reply.
+
+One more check: the comment change "same flips and brightness for both views" → "same flips, brightness and rotation for both views". That's fine, it's part of the SEARCH/REPLACE.
+
+Let me finalize.

@@ -1,0 +1,369 @@
+===== attempt 1 =====
+Let me analyze the situation carefully.
+
+**Current state:**
+- Best: e000, 5-seed val mAP@0.5 = 0.6318
+- Per-class AP: pore 0.478, deposit 0.649, discontinuity 0.789, stain 0.610
+- Ceiling with perfect classes: 0.7530 (so 0.12 gap from class errors)
+- Stage-1 alone (class-agnostic): 0.755
+- One-step baseline: 0.638
+
+**Key diagnostic info:**
+- On boxes overlapping true defects: pore 60% right, deposit 77% right, discontinuity 97% right, stain 86% right
+- Pore is the weakest class, mostly confused with stain
+- Stain confused with deposit (31 stain→deposit vs 288 stain→stain)
+- Deposit confused with stain (27 deposit→stain)
+- Small defects: 77% right class; large: 94% right class
+
+**Experiment history analysis:**
+- e001 (data): 0.6326 seed 0, 0.6354 5-seed — not confirmed. This was about training on detector boxes (IoU > 0.5 with true box).
+- e002 (architecture): crashed — box geometry as extra input
+- e003 (architecture): crashed — fixed e002's crash but still crashed
+- e004 (data): 0.6244 — rejected. Replaced 1.5x tight crop with something else.
+- e005 (architecture): 0.6251 — rejected. 6-channel input (concatenated crops).
+- e006 (data): crashed — third 4x wide view. The crash was because the dataset returns 3 views but the training loop only unpacks 2 (xt, xw, y) — wait, no, looking at the diff, it seems the dataset was changed to return 3 views but the training loop was also changed. Let me re-read.
+
+Actually looking at the e006 diff more carefully:
+- The dataset `__getitem__` was changed to loop over 3 contexts: `for ctx in (TIGHT_CONTEXT, CONTEXT, WIDE2_CONTEXT)`
+- But the return statement wasn't shown in the diff. The original returns `views[0], views[1], r.get("cls", -1)` — with 3 views it would need to return `views[0], views[1], views[2], r.get("cls", -1)`.
+- The training loop was changed to `for xt, xw, x2, y in dl_tr:` and uses `model(x2)`
+- But the error is `UnboundLocalError: cannot access local variable 'x2'` at line 169
+
+Wait, the diff shows the training loop was changed to include x2. But the error says x2 is not bound. This means the dataset's `__getitem__` still only returns 2 views + label (3 items), so when the training loop tries to unpack `for xt, xw, x2, y in dl_tr:`, it would get a different error (too many values to unpack). 
+
+Actually wait — looking more carefully at the diff, the `__getitem__` method's `for ctx in` loop was changed to include WIDE2_CONTEXT, but the return statement `return views[0], views[1], r.get("cls", -1)` was NOT changed. So it still returns 3 items (2 views + label), but the training loop expects 4 items (3 views + label). This would cause a "not enough values to unpack" error, not an UnboundLocalError.
+
+Hmm, but the actual error is UnboundLocalError for x2. Let me re-read the diff...
+
+The diff shows:
+```
+-        for xt, xw, _ in dl_ev:
++        for xt, xw, x2, _ in dl_ev:
+```
+
+But the training loop change shows:
+```
+             xt = xt.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+             xw = xw.to(device, non_blocking=True).to(memory_format=torch.channels_last)
++            x2 = x2.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+```
+
+Wait, but the for loop in training was NOT shown as changed in the diff. Let me look again...
+
+The diff for the training loop:
+```
+             xt = xt.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+             xw = xw.to(device, non_blocking=True).to(memory_format=torch.channels_last)
++            x2 = x2.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+             y = y.to(device, non_blocking=True)
+```
+
+So the training loop's `for` statement was NOT changed — it still says `for xt, xw, y in dl_tr:`. But then `x2` is referenced inside the loop body, which causes the UnboundLocalError because x2 was never assigned (the for loop only unpacks 3 variables).
+
+So the bug is: the training loop's for statement wasn't updated to unpack x2, but x2 is referenced in the loop body.
+
+Now, the question is: should I fix e006 (BASE: last) or go with a different approach?
+
+**What e006 was trying to do:** Add a third, very wide (4x) context view. From the earlier runs history, this idea was "accepted twice (5-seed 0.6342 both, +0.005), gain almost entirely from the pore class; once rejected (0.633). Adds ~20 s per run, close to the time limit."
+
+So the 4x view helped in earlier runs (+0.005, mostly pore). But it's close to the time limit. The crash in e006 is a simple bug — the for loop wasn't updated.
+
+However, I need to think about whether fixing e006 is the best use of a run. The 4x view added ~20s per run. Current run takes 162s out of 180s. Adding a third view would add roughly 50% more forward passes (3 views instead of 2), so training time would increase by ~50%. Currently training takes about 112s (162-13-55 reserve ≈ 94s for training... wait let me recalculate).
+
+Actually: total 162s, loading 13s, reserve 55s. So training + prediction ≈ 162 - 13 = 149s. Prediction with 41879 detections at batch 256 = 164 batches × 2 views. Training: 433 steps in about 112s (from 13s to 125s). 
+
+With 3 views: training would be ~1.5× slower per step, so maybe 168s for training alone. That's way over budget. Wait, but the earlier runs that tried the 4x view "adds ~20 s per run, close to the time limit." So it was manageable. Let me think about why.
+
+Actually, the 4x view in earlier runs was added as a third view alongside 1.5x and 2.5x. The current code already has 2 views (1.5x and 2.5x). Adding a 3rd (4x) would make 3 views. Each view is a separate forward pass. So 3 forward passes instead of 2 = 50% more compute per step.
+
+Current: 433 steps in ~112s → ~0.26s/step
+With 3 views: ~0.39s/step → in 112s budget, ~287 steps
+
+That's a significant reduction in training. But the earlier runs showed it was "close to the time limit" and added ~20s. So maybe it was manageable with a slightly smaller reserve or the timing worked out.
+
+But wait — e006 already changed RESERVE_S to 65 (from 55). So the training budget would be 180 - 13 - 65 = 102s. With 3 views at ~0.39s/step, that's ~261 steps. That's a lot fewer steps than the current 433.
+
+Hmm, this is a tradeoff: more context per sample but fewer total steps. The earlier runs showed it helped (+0.005) despite fewer steps, suggesting the context information is valuable.
+
+But I'm not sure fixing e006 is the best experiment. Let me think about what else could help.
+
+**Where is the error?**
+- Pore AP 0.478 is the weakest. 60% right class on overlapping boxes.
+- Stain AP 0.610. 86% right but 31 confused with deposit.
+- Deposit AP 0.649. 77% right, 27 confused with stain.
+- Discontinuity AP 0.789. 97% right.
+
+The biggest gap is pore (0.478) and stain (0.610). Pore is confused with stain (12 out of 41 pore boxes → stain). Stain is confused with deposit (31 out of 329 stain boxes → deposit).
+
+**What families have been tried and exhausted?**
+From the earlier 5-run history:
+- Score row manipulation: EXHAUSTED (16 attempts, no gain)
+- Background class: EXHAUSTED (9 attempts, no gain)
+- Detector boxes as training data: got +0.004 (accepted twice)
+- 4x wide view: +0.005 (accepted twice, mostly pore)
+- Low-res crops: EXHAUSTED (4 attempts, no gain)
+- Bigger backbone/ensembles: EXHAUSTED (8 attempts, no gain)
+- Resolution/small-box: EXHAUSTED (9 attempts, no gain)
+- TTA: EXHAUSTED (8 attempts, no gain)
+- Longer training: EXHAUSTED (6 attempts, no gain)
+- Class-balanced sampling/weighted loss: EXHAUSTED (4 attempts, no gain)
+- Training augmentation: EXHAUSTED (5 attempts, no gain)
+- Focal loss: EXHAUSTED (2 attempts, no gain)
+- Box geometry as input: never properly tested (crashes)
+
+From this run:
+- e001 (detector boxes as training data): 0.6354 5-seed, not confirmed
+- e002/e003 (box geometry): crashed twice
+- e004 (replaced tight crop): rejected
+- e005 (6-channel concat): rejected
+- e006 (4x view): crashed
+
+**What hasn't been tried?**
+Looking at the families:
+1. Box geometry as input — never properly tested (2 crashes). This could be fundamentally different because it gives the model information about the box size/aspect ratio that pixels alone don't convey. Pores are typically small and round; deposits are larger and more irregular. This could help distinguish pore from stain.
+
+2. The 4x view — crashed in e006 due to a bug. In earlier runs it helped +0.005.
+
+3. Training on both high and low resolution images (TRAIN_ON currently only uses "high").
+
+4. Different learning rate / optimizer schedule.
+
+5. Using the detector confidence as a training signal or input.
+
+6. Multi-crop with different aspect ratios.
+
+7. Training the classifier to directly predict the class AND a "defect-ness" score (but background class was exhausted).
+
+Let me think about what's most promising:
+
+**Option A: Fix e006 (4x wide view)**
+- Pro: Proven to help +0.005 in earlier runs, mostly pore (our weakest class)
+- Con: Close to time limit, fewer training steps. The crash is a simple bug.
+- The fix: change the training loop's for statement to unpack x2, and make sure the dataset returns 3 views.
+
+Wait, I need to check: does the dataset's `__getitem__` return 3 views in e006? The diff shows the `for ctx in` loop was changed to include WIDE2_CONTEXT, but the return statement is not shown. In the original code:
+```python
+        return views[0], views[1], r.get("cls", -1)
+```
+With 3 views in the list, this would still return only 2 views + label. So the fix needs to also change the return to `views[0], views[1], views[2], r.get("cls", -1)`.
+
+And the training loop needs `for xt, xw, x2, y in dl_tr:`.
+
+And the eval loop needs `for xt, xw, x2, _ in dl_ev:`.
+
+Let me check the e006 diff again:
+- Training loop: the for statement is NOT changed (still `for xt, xw, y in dl_tr:`), but x2 is referenced in the body → crash
+- Eval loop: changed to `for xt, xw, x2, _ in dl_ev:` ✓
+- Dataset return: NOT shown in diff, so probably still `return views[0], views[1], r.get("cls", -1)` → only 2 views returned
+
+So the fix needs:
+1. Dataset: `return views[0], views[1], views[2], r.get("cls", -1)`
+2. Training loop: `for xt, xw, x2, y in dl_tr:`
+
+**Option B: Box geometry as input (retry with proper fix)**
+- The idea: pass box width, height, aspect ratio, area as additional features to the classifier.
+- Why it could help: pores are small, round; deposits are larger, more elongated. The pixel crop at 160×160 might not preserve enough size information (everything gets resized to 160×160). Giving the model the actual box dimensions could help distinguish pore from stain (which are the main confusion).
+- Previous attempts crashed due to a scoping bug (defined in main(), referenced in worker).
+- How to fix: define the geometry normalization constants at module level, or pass them through the dataset.
+
+Actually, let me think about this more carefully. The box geometry idea has crashed twice. The third time's the charm? But I need to make sure it's done right.
+
+The approach: for each crop, compute the box's width, height, aspect ratio (w/h), and area (w*h) relative to the image. Normalize these with fixed statistics (or compute from training data). Concatenate these as extra input features to the model.
+
+But how to add them to a CNN? Options:
+1. Add them as extra channels (4 extra channels to the 3-channel image → 7-channel input). This requires modifying the first conv layer.
+2. Add them as a separate MLP head that's concatenated with the CNN features.
+3. Use them to modulate the features (FiLM-style).
+
+Option 1 is simplest but requires changing the first conv layer's in_channels.
+Option 2 is clean: CNN features + MLP(geom_features) → combined → classifier head.
+
+Actually, the simplest approach: create a small MLP that takes the 4 geometry features and produces a vector, then concatenate with the CNN's penultimate features before the classifier head.
+
+But wait — timm models have a specific architecture. To concatenate features, I'd need to:
+1. Remove the classifier head
+2. Get the feature vector (e.g., 1280-dim for EfficientNet-B0)
+3. Create a new head: concat([cnn_feat, mlp(geom)]) → Linear → 4 classes
+
+This is doable but adds complexity. Let me think about whether this is worth it.
+
+The key question: does box geometry actually carry useful class information? 
+- Pores: small, roughly circular
+- Deposits: larger, irregular
+- Discontinuities: elongated (along the weld bead)
+- Stains: variable
+
+If the detector boxes are reasonably accurate, then yes, the box dimensions should correlate with class. The fact that small defects have 77% right class vs 94% for large suggests size matters.
+
+But the crop is already centered on the box and sized proportionally to the box. So the model can see the object's extent within the crop. However, the absolute size (in pixels of the original image) is lost when everything is resized to 160×160. A 10px pore and a 100px pore both become 160×160 crops.
+
+So giving the model the actual box dimensions (in image pixels) provides information that the pixels alone don't have. This is fundamentally different from the pixel-based approaches.
+
+**Option C: Train on both high and low resolution**
+- Currently TRAIN_ON = ("high",). Using both might help with domain diversity.
+- But the earlier runs tried "low-resolution crops added to training" and found no gain (4 attempts, best 0.629).
+- So this is likely exhausted.
+
+**Option D: Different approach to the pore/stain confusion**
+- Pore is confused with stain (12/41). Stain is confused with deposit (31/329).
+- The pore→stain confusion: pores are small circular holes; stains are surface discolorations. In a crop, a pore might look like a dark spot, and a stain might also look like a dark region.
+- The stain→deposit confusion: stains and deposits can look similar in texture.
+- What if we use a different input representation that emphasizes texture/frequency? E.g., gradient features or multi-scale features?
+- This is getting too speculative.
+
+**Decision:**
+
+I think the best option is **Option A: Fix e006 (4x wide view)** because:
+1. It's a proven idea (+0.005 in earlier runs, mostly pore)
+2. The crash is a trivial bug (missing unpack in for loop, missing views[2] in return)
+3. Pore is our weakest class (AP 0.478), and the 4x view helped pore specifically
+4. It's a quick, safe fix
+
+The alternative (box geometry) is more speculative and has crashed twice. Even if it works, the gain might be small.
+
+Let me now write the fix for e006.
+
+Looking at the e006 code (best + diff):
+
+The dataset `__getitem__` currently (after e006's change to the for loop but not the return):
+```python
+        views = []
+        for ctx in (TIGHT_CONTEXT, CONTEXT, WIDE2_CONTEXT):
+            x = make_crop(img, r, ctx, self.train)
+            if fh:
+                x = x[:, ::-1]
+            if fv:
+                x = x[::-1, :]
+            if self.train:
+                x = np.clip(x * bright, 0, 1)
+            x = (x - MEAN) / STD
+            views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))
+        return views[0], views[1], r.get("cls", -1)
+```
+
+Needs to become:
+```python
+        return views[0], views[1], views[2], r.get("cls", -1)
+```
+
+The training loop (after e006's change):
+```python
+        for xt, xw, y in dl_tr:
+            ...
+            xt = xt.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            xw = xw.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            x2 = x2.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            y = y.to(device, non_blocking=True)
+            with torch.autocast(**amp):
+                loss = crit((model(xt) + model(xw) + model(x2)) / 3, y)
+```
+
+Needs to become:
+```python
+        for xt, xw, x2, y in dl_tr:
+```
+
+The eval loop (already changed in e006):
+```python
+        for xt, xw, x2, _ in dl_ev:
+```
+This is already correct.
+
+So I need two SEARCH/REPLACE blocks:
+1. Fix the return statement in `__getitem__`
+2. Fix the for loop in training
+
+Let me write these precisely.
+
+For block 1, the SEARCH text (from e006's file, which is best + the diff):
+```
+        return views[0], views[1], r.get("cls", -1)
+```
+REPLACE:
+```
+        return views[0], views[1], views[2], r.get("cls", -1)
+```
+
+For block 2, the SEARCH text:
+```
+        for xt, xw, y in dl_tr:
+```
+REPLACE:
+```
+        for xt, xw, x2, y in dl_tr:
+```
+
+Wait, but I need to make sure these SEARCH texts appear exactly once in the file. Let me check.
+
+`return views[0], views[1], r.get("cls", -1)` — this appears once in the file (in `__getitem__`).
+
+`for xt, xw, y in dl_tr:` — this appears once in the file (in the training loop).
+
+Good. Let me also double-check the eval loop. In e006, it was changed to:
+```
+        for xt, xw, x2, _ in dl_ev:
+```
+This should already be correct since the dataset will now return 4 items.
+
+Let me also verify: the eval loop body in e006:
+```python
+            xt = xt.to(device).to(memory_format=torch.channels_last)
+            xw = xw.to(device).to(memory_format=torch.channels_last)
+            x2 = x2.to(device).to(memory_format=torch.channels_last)
+            probs.append(torch.softmax(((model(xt) + model(xw) + model(x2)) / 3).float(), 1).cpu())
+```
+This looks correct.
+
+Now, about timing: with 3 views, each step does 3 forward passes + 3 backward passes (well, 1 backward through the sum). Actually, the loss is `crit((model(xt) + model(xw) + model(x2)) / 3, y)`, so the backward pass goes through all 3 forward passes. So it's 3× the compute per step.
+
+Current: 433 steps in ~112s → 0.259s/step
+With 3 views: ~0.777s/step
+Training budget: 180 - 13 (loading) - 65 (reserve) = 102s
+Steps: 102 / 0.777 ≈ 131 steps
+
+That's a lot fewer steps (131 vs 433). But the earlier runs showed the 4x view helped despite fewer steps, suggesting the context information is worth more than the extra steps.
+
+Actually wait, let me reconsider. The earlier runs that tried the 4x view "adds ~20 s per run, close to the time limit." If it only adds 20s, then the step time increase is less than 50%. Maybe the 4x view is smaller in compute because... no, it's the same model, same resolution. Each view is a full forward pass.
+
+Hmm, maybe the earlier runs had a different base (fewer views or different model). Or maybe the timing was different. Let me not overthink this — the e006 code already has RESERVE_S = 65, which should be enough for prediction.
+
+Actually, prediction time: 41879 detections / 256 batch = 164 batches. With 3 views per batch, that's 3× the forward passes. Current prediction: 162 - 125 (end of training) - 13 (loading) ≈ 24s for prediction + writing. With 3 views: ~36s. Plus 65s reserve... that should be fine.
+
+Wait, let me recalculate. Total budget: 180s. Loading: 13s. Reserve: 65s. Training budget: 180 - 13 - 65 = 102s.
+
+With 3 views at ~0.78s/step: 102/0.78 ≈ 131 steps.
+Prediction: 164 batches × 3 views × ~0.05s/view ≈ 25s (rough estimate).
+Total: 13 + 102 + 25 = 140s. Well within 180s.
+
+Actually, I'm not sure about the per-view time. Let me estimate from the current run:
+- Current: 2 views, 433 steps in 112s → 0.259s/step → 0.13s/view
+- With 3 views: 0.39s/step
+- In 102s: 261 steps
+
+That's more reasonable. 261 steps vs 433 current. Still fewer, but the context should help.
+
+OK, I'm going with fixing e006. Let me write the reply.
+
+BASE: last (to fix e006)
+CATEGORY: data (adding a third view is a data/input change)
+
+Actually, is it "data" or "architecture"? The 4x view changes what the model sees (input), so it's more like "data" or "augmentation". In the earlier runs, it was categorized as... let me check. The earlier runs table says "Third, very wide view (4x the box) next to the 1.5x and 2.5x crops, logits averaged" under... it's not in the table directly. But in this run, e006 was categorized as "data". So I'll use "data".
+
+HYPOTHESIS: Fix the crash in e006 (the 4x wide context view) by correcting the dataset return and training loop unpacking. The 4x view provides broader context that helps distinguish pore from stain (pore AP 0.478, 60% right class), and earlier runs confirmed a +0.005 gain from this view, almost entirely from pore. The crash was purely a bug (missing views[2] in the return, missing x2 in the for-loop unpack), not a method failure.
+
+Let me write the SEARCH/REPLACE blocks carefully.
+
+Block 1: Fix the return in __getitem__
+SEARCH: `        return views[0], views[1], r.get("cls", -1)`
+REPLACE: `        return views[0], views[1], views[2], r.get("cls", -1)`
+
+Block 2: Fix the training for loop
+SEARCH: `        for xt, xw, y in dl_tr:`
+REPLACE: `        for xt, xw, x2, y in dl_tr:`
+
+Let me verify these are unique in the file. 
+
+`return views[0], views[1], r.get("cls", -1)` — yes, appears once.
+`for xt, xw, y in dl_tr:` — yes, appears once.
+
+Good. Let me finalize.

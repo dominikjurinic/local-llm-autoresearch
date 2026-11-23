@@ -1,0 +1,1201 @@
+===== attempt 1 =====
+Let me think carefully about the situation.
+
+Current best: e001, 5-seed mean 0.6302. Per-class: pore 0.517, deposit 0.622, discontinuity 0.776, stain 0.605.
+
+Reference numbers:
+- One-step 4-class detector: 0.638 (the baseline we need to beat — we are at 0.6302, just below it!)
+- Stage-1 boxes with perfect classes (ceiling): 0.758
+- Stage-1 boxes as class-agnostic: 0.755
+
+So the ceiling is 0.758, and we're at 0.6302. The gap of about 0.128 is due to class misassignment (and the ranking of false alarms). Interesting point: the class-agnostic score is 0.755, and the perfect-class score is 0.758 — nearly identical. This means that the boxes of the stage-1 detector are almost all true defects (very few false alarms), and the main loss is in the class decision. If the classes were perfect, mAP would be 0.758. So the class decision is the dominant error.
+
+A crop classifier given perfect boxes reaches macro-F1 ~0.87 with the starting recipe. So even a perfect-box classifier only gets F1 ~0.87, which is consistent with the 0.63 vs. 0.758 gap.
+
+History:
+- e001 (best): added low-res training data. 0.6302.
+- e002: crashed (single-crop attempt).
+- e003: fixed e002, single tight crop → 0.6247, rejected (worse than e001). So the two-crop averaging is better than a single tight crop, and doubling the steps doesn't help.
+- e004: undertraining hypothesis... something about training longer? Rejected (0.6296). The hypothesis says the classifier is undertrained. The change is probably... the log of e004 is unclear. Rejected.
+- e005: IMG_SIZE 160→128, more steps → 0.6217, rejected. So more steps with a smaller image is worse.
+- e006: train on detector boxes instead of GT boxes → 0.6338 on seed 0, 0.6278 on 5-seed, not confirmed. So this was noise/actually slightly worse.
+- e007: duplicate pore/stain 2x → 0.6280, rejected.
+
+Patterns:
+- "Tuning hyperparameters alone barely helped in prior experiments; method changes helped more" — that's what the brief says.
+- Increasing steps (e003, e004, e005) did not help. So the model is not simply undertrained; more steps at the same or smaller resolution doesn't help.
+- Class weighting (e007) hurt.
+- e006 (domain adaptation to detector boxes) was not confirmed — slightly worse on 5 seeds.
+
+What's left? The dominant error is class misassignment. Pore (0.517) and stain (0.605) are the weak classes. Stain is often confused with deposit.
+
+Ideas that change what the model sees or learns:
+
+1. **Better features / larger model**: convnext_nano or tf_efficientnetv2_b0 or efficientnet_b2. With two views at 160px, per-step cost is higher. Budget: 180 seconds total, 14-second load, 55-second reserve → about 111 seconds for training. Currently 428 steps in about 108 seconds → about 0.25 sec/step. A larger model (efficientnet_b2 is about 3.5x the FLOPs of b0) would be about 0.9 sec/step → about 120 steps. Fewer steps, but each step is stronger. Hmm, but e005 showed that more steps with a smaller image is worse, suggesting the model capacity/resolution matters more than the number of steps. Actually wait — e005 was 128px with more steps and was worse. e003 was single-crop (half the compute) with more steps and was also worse. So it seems the model is not starved for steps; it's starved for information/capacity. A larger model with fewer steps might help. tf_efficientnetv2_b0 has deeper feature extraction (gated linear units), about 19M parameters vs. b0's 4M. efficientnet_b2 is 7.7M but 260px input... we're using 160px. convnext_nano is about 14M parameters.
+
+Actually, let me think about the budget: 180 seconds, 14-second load, 55-second reserve → 111 seconds for training. effnet_b0 two views at 160: 0.25 sec/step (64 batch, 2 forward passes). efficientnet_b2 at 160: probably 0.7-0.9 sec/step → about 130-150 steps. That's a big drop in steps. Risky. convnext_nano at 160: probably 0.4-0.5 sec/step → about 230 steps. Hmm.
+
+But is capacity the issue? The crop classifier with perfect boxes gets macro-F1 0.87. The remaining error is confusion between pore/deposit/stain. These are visually similar. A larger model might help distinguish them.
+
+2. **Test-time augmentation**: at inference, average over flips (4 flips) and possibly scales. This changes the ranking of predictions. Cost: 4x the inference compute. Inference currently: 41879 detections × 2 views. How long does inference take? Total 162 seconds, training ends around 125 seconds (epoch 1 ends at 125 seconds), so inference + writing takes about 37 seconds. 4x TTA → about 148 seconds + 14-second load = 162 seconds, cutting it close to 180. We could reduce the reserve. Actually, the reserve is 55 seconds; training runs until deadline - 55. If inference is 4x slower (37→148), we need training to end by 180-148-14... hmm, load is 14 seconds, then training starts. Inference 148 seconds + writing about 5 seconds → training can run for at most 180-14-148-5 = 13 seconds?? That's way too little. No wait, let me recompute: T0 is at import time. Load is 14 seconds. Training runs until deadline - RESERVE_S = T0 + 180 - 55 = T0 + 125. So training has 111 seconds. Inference then takes 37 seconds (125→162). With 4x TTA, inference is about 148 seconds → total 125+148 = 273 > 180. Too slow. Unless we reduce the number of views or the image size at inference. Hmm.
+
+Actually, TTA with just horizontal flip (2x): inference 74 seconds → 125+74 = 199 > 180. Still too slow unless we shrink the reserve. We could set RESERVE_S lower, e.g. 20 seconds: training until T0+160, inference 74 seconds → 234. No. The problem is that inference itself is 37 seconds for 41879 boxes × 2 views = 83758 forward passes in 37 seconds → about 2.3ms/pass... hmm, that's with batch 256. With 2x TTA it's 74 seconds. To fit in 180: 14 (load) + training + 74 (inference) + about 5 (writing) ≤ 180 → training ≤ 87 seconds. Currently training takes 111 seconds. So we'd lose about 20% of the training steps. Combined effect: slightly undertrained + TTA. TTA usually gives 0.5-1% AP on classification... but here the score is conf × prob; TTA makes the probability estimate more robust, which helps the ranking. But is the ranking the issue? The ceiling with perfect classes is 0.758, and class-agnostic is 0.755 — the detector boxes are almost all true positives. The per-class mAP ranking: for each class, predictions are sorted by score = conf × p_c. A hit requires IoU > 0.5 with a true box of that class. If the class is wrong, the prediction for the correct class of that box is low-scoring (p_correct is low), and it may rank below other predictions. TTA would sharpen the probability estimates → better ranking.
+
+But honestly, TTA at 2x costs 20% of the training time. The net effect is uncertain, probably small.
+
+3. **Ensemble of models**: train two different models (e.g. effnet_b0 + convnext_nano) each for half the time, and average the probabilities. This changes both capacity and diversity. Budget: two models, each trained for about 55 seconds. Each gets about 210 steps. The combined probability is more robust. Cost: inference 2 models × 2 views = 4x the current forward passes → 37×2 = 74 seconds (each model is about the same speed). 14 + 111 (training both) + 74 = 199 > 180. Too slow unless we shrink the reserve or the image. Hmm, with RESERVE_S = 25: training until T0+155, inference 74 seconds → 229 seconds. No good.
+
+Actually wait — the inference time of 37 seconds includes data loading for eval (41879 boxes × 2 crops, PIL resize). The crop preparation is done in the workers. GPU forward: 83758 passes. If the GPU is fast, most of the 37 seconds might be CPU crop preparation (PIL resize to 160). With 2x TTA, the crop preparation cost also doubles (flips are cheap, but if we do scale TTA, the crops also double).
+
+Hmm, let me think about what's fundamentally different and likely to have an effect of ≥0.01.
+
+4. **Use the detector confidence / box size as features**: the box aspect ratio, size, and conf could be informative for the class (e.g. pores are small round things, stains are large). But the model only sees the crop. We could add the box's aspect ratio as an input channel or as a post-hoc score adjustment. A post-hoc adjustment changes the ranking — the metric only cares about the ranking. E.g. multiply the stain score by a function of box area. But this is heuristic and hard to tune well.
+
+5. **Train with the detector's confidence as a label proxy / use pseudo-labels from the detector on eval boxes**: no, we can't use eval labels. But we can pseudo-label train-split detector boxes: dets.csv has "train" boxes on training images, whose true class can be found by overlap with crops.csv. So we can train on those too (e006 tried training on detector boxes instead of GT boxes — not confirmed).
+
+6. **Two-crop with different contexts**: currently 1.5x and 2.5x. The wide crop gives context. We could try 1.5x + 4x (wider context). Stain vs. deposit confusion might be resolved by wider context (stains are diffuse, deposits are localized). This is a method change to what the model sees. Cost: same. Plausible effect: moderate.
+
+7. **Larger model**: the brief says pretrained weights are available for a list. tf_efficientnetv2_b0 is a strong choice — same input range but better accuracy than effnet_b0, similar speed (about 1.5-2x the FLOPs). convnext_nano is about 3x the FLOPs. Let me estimate: effnet_b0 at 160px, batch 64, 2 views: 0.25 sec/step. tf_efficientnetv2_b0: about 2x the FLOPs → about 0.45-0.5 sec/step → about 220 steps in 111 seconds. Fewer steps but a stronger model. Given that e003/e004/e005 all showed that more steps doesn't help (the model converges quickly; the loss plateaus), a stronger backbone with fewer steps is a fundamentally different direction: capacity rather than optimization.
+
+Actually, what did e004 do? The hypothesis is "the classifier is undertrained rather than feature-limited" — the change is probably... the log is unclear. Rejected (0.6296). Probably trained longer with a lower LR, or removed the reserve. Rejected.
+
+So the "more steps" direction has been tried 3 times (e003 single-crop for 2x steps, e004, e005 smaller image for 1.56x steps) — all rejected. By the rules, this direction is exhausted: don't propose another step-increase variant.
+
+The "data" direction: e001 (add low-res) confirmed as the best. e006 (detector boxes) not confirmed. So data changes: 1 confirmed, 1 not confirmed. Not exhausted but mixed.
+
+"Sampling" (e007): rejected. Class weighting is known to hurt. Exhausted for weighting; sampling in general tried once.
+
+What hasn't been tried:
+- Architecture/capacity: only e002/e003 (single crop, same model) and e005 (resolution). A stronger backbone (convnext_nano / tf_efficientnetv2_b0 / efficientnet_b2 / resnet50) is untried.
+- Inference TTA: untried.
+- Score calibration: untried (but the metric only cares about the ranking; e.g. temperature scaling doesn't change the ranking; a per-class prior adjustment does change the ranking).
+- Wider context crop: untried.
+- Adding box geometry features: untried.
+
+Let me think about where the error is. Ceiling 0.758 (perfect classes, same boxes, score = conf). We're at 0.6302. If the classes were perfect, 0.758. So about 0.128 of the mAP is lost to class errors. Per-class AP: pore 0.517, stain 0.605, deposit 0.622, disc 0.776.
+
+What's the per-class breakdown of the ceiling? Unknown. But the class-agnostic 0.755 ≈ perfect-class 0.758 suggests that the boxes are almost all TP.
+
+The classifier's F1 with perfect boxes is about 0.87. So even with perfect boxes, the class decision is about 87% accurate. The remaining error is genuinely hard visual confusion (pore vs. deposit vs. stain).
+
+How to improve the class decision:
+(a) A stronger model (capacity).
+(b) Better input (wider context, higher resolution).
+(c) TTA for a more robust probability.
+(d) Post-hoc score adjustment using box geometry (aspect ratio, size, conf) — e.g. a small second model or logistic regression on (pore, deposit, disc, stain probabilities + box features) that re-ranks. Actually, we could train a simple re-ranker: on train-split detector boxes (with known class via overlap), fit a model that maps (4 class probabilities, log box area, aspect ratio, conf) → class. Then at eval, use the re-ranker's probabilities. This is a "scoring" change. It uses the detector's box geometry, which the crop classifier cannot see. This is fundamentally different from everything tried so far. But it adds complexity and the gain might be small.
+
+Hmm, but actually, there's a subtle point: the crop classifier already sees the box content at 1.5x and 2.5x, which encodes size to some extent. Box geometry adds the absolute size (in pixels) — but the crop is resized to 160, so absolute size is lost! The crop side = context × box long side, resized to 160. So a 10px pore and a 100px stain both become 160px crops. Absolute scale information is destroyed by the resize. This is a real information loss! Pores are small, stains are large. If we give the model the absolute box size, it could help distinguish pore vs. stain/deposit.
+
+How to give it: add box size as an input. Options:
+- Add a 4th channel with a constant value = normalized log area (or aspect ratio). The model can learn to use it.
+- Or concatenate to the logits: train a linear head on [logits, features].
+
+The simplest and most robust: add constant channels. E.g. make the input 5 channels: RGB + log(box_area)/log(max_area) + aspect ratio. timm models accept in_chans=5. Pretrained weights are only for in_chans=3 — we'd need to adapt the conv1/patch layer (copy the 3 channels and average or zero-pad). This is easy: for the first conv, new_weight[:, :3] = old, new_weight[:, 3:] = old.mean(1, keepdim) or 0.
+
+But wait — the crop is resized to 160; the box's aspect ratio is also distorted... no, the crop is a square centered on the box with side = context × long side, so the box's aspect ratio is preserved in the crop (the box occupies a known fraction). Actually, since the crop side is proportional to the long side, the short/long ratio is visible in the crop. But the absolute size is not visible. So the main missing feature is absolute size (area). Also, the detector's conf might be informative.
+
+Hmm, but is absolute size really useful? In weld images, pores are small round dark spots; stains are diffuse large patches; deposits are raised material. The detector's box size correlates with the defect size. I think it's plausible.
+
+But modifying the input channels breaks the pretrained weights (needs adaptation) — manageable. And the per-step cost is the same (one extra channel, negligible).
+
+Alternatively, a simpler and very testable idea: **wider context** (2.5 → 4.0 or 3.0). Stain vs. deposit confusion: stains are diffuse, and wider context shows the diffuse nature. Pores: small, and wider context shows the surrounding bead. This changes what the model sees. Same cost.
+
+Let me weigh the options:
+
+Option A: stronger backbone (convnext_nano or tf_efficientnetv2_b0).
+- Fundamentally different: capacity. Untried.
+- Risk: fewer steps (about 220 for v2_b0, about 150 for convnext_nano). But evidence suggests steps are not the bottleneck (3 rejections of step-increase). The loss at 428 steps is 0.31 and still dropping, but more steps didn't help — suggesting the model quickly reaches the limit of what it can fit and the rest is irreducible confusion; a stronger model might fit more.
+- Expected gain: 0.005-0.02 if capacity is the bottleneck; 0 if not.
+- Budget: need to check it fits. convnext_nano at 160, batch 64, 2 views: estimate. effnet_b0: 0.25 sec/step. convnext_nano has about 3x the FLOPs (14M vs. 4M parameters; FLOPs about 1.0 GFLOP vs. 0.4 GFLOP at 224... at 160 maybe 0.5 vs. 0.18). So about 0.6-0.7 sec/step → about 160-180 steps. Inference: 2x slower → 37→about 90 seconds. Total: 14 + 111 + 90 = 215 > 180. Too slow! We'd need to reduce the reserve or the image size. Hmm.
+
+Wait, let me recompute the current inference time more carefully. Log: epoch 1 ends at 125 seconds (cumulative from T0). "done" at 162 seconds. So inference + writing = 37 seconds. This includes eval data loading (41879 × 2 crops) and GPU forward (83758 passes at batch 256 = 164 batches). If a convnext_nano forward is about 3x slower, inference ≈ 14 (CPU crop, same) + 3×23 (GPU) ≈ 83 seconds. Total = 14 + training (until T0+125) + 83 = 222 seconds > 180. Fails. Unless we shrink RESERVE_S to about 10 and accept the risk, or reduce the inference image size (e.g. 128 at inference only — but that changes the input distribution... the model is trained at 160; resizing to 128 at inference is a mild distribution shift, probably OK but it adds a confound).
+
+tf_efficientnetv2_b0: about 1.9x the FLOPs of b0 (200 vs. 100 MFLOP at 224... actually effnet_b0 is 39 MFLOP at 224, v2_b0 is 76 MFLOP at 224 → about 2x). So about 0.5 sec/step → about 220 steps; inference about 14 + 2×23 = 60 seconds; total 14+111+60 = 185 seconds. Slightly over. If we set RESERVE_S = 30, training until T0+150 → total 150+60 = 210. No wait, the total must be under 180. Training until T0+(180-60-5) = T0+115 → only 101 seconds of training (about 200 steps). Total = 14 load... hmm, actually the load is included in T0→. Let me redo: T0 is at import. Load: 14 seconds. Training: starts at about 14 seconds, runs until deadline - RESERVE. If RESERVE = 65 (to cover inference 60 + writing 5): training until T0+115, i.e. 101 seconds of training → about 200 steps at 0.5 sec/step. Then inference 60 seconds, writing 5 seconds → total about 180 seconds. Too tight; the harness kills at exactly 180. We need a margin. RESERVE = 75: training until T0+105 → 91 seconds → about 180 steps. Total = 105 + 60 + 5 = 170 seconds. OK, about 10 seconds of margin.
+
+So tf_efficientnetv2_b0: about 180-200 steps vs. the current 428. A big drop in steps. Given the evidence that steps don't matter much (the model converges fast), 180 steps at 2x the capacity might be comparable or better. Uncertain.
+
+Option B: add absolute box size / geometry as extra input channels (5-channel input).
+- Fundamentally different: gives the model information that is currently destroyed by the resize (absolute defect size). Targets the pore (small) vs. stain/deposit (large) confusion — the two weakest classes.
+- Same step cost (negligible). Same inference cost.
+- Risk: pretrained weight adaptation (easy), the model might ignore the extra channels, or the feature might be weak. Expected gain: 0.005-0.015.
+- This is a "data" (input) change.
+
+Hmm wait, actually there's a subtlety: does the model really lose absolute size? The crop side = context × long side, then resized to 160. So yes, the absolute size is normalized away. Two defects of different sizes look identical except for the surrounding texture scale. The surrounding texture scale is actually a proxy for size! If the image is at a fixed magnification, a 10px pore crop shows a lot of bead texture around the pore, while a 100px stain crop shows less texture per defect. Hmm, actually the crop is resized to 160 either way, so the texture frequency in the crop differs: for a small defect, the crop covers a large image region (many texture cycles), for a large defect, the crop covers a small region (few cycles). So the model can infer relative size from the texture scale! But only relative to the training distribution, and it's indirect. An explicit channel is cleaner.
+
+But hmm, is the texture-scale proxy already being used? Probably partially. An explicit channel makes it direct.
+
+Option C: TTA (horizontal flip at inference, 2x).
+- The ranking becomes more robust. Cost: inference 2x (about 60 seconds), training time reduced by about 15% (RESERVE 55→70). Net: uncertain, probably small (0.002-0.005). Flips are already in the training augmentation, so the model is somewhat flip-invariant; the TTA gain might be small.
+
+Option D: wider context crop (2.5 → 4.0).
+- Stain vs. deposit: wider context. Same cost. Expected gain: uncertain 0.003-0.01.
+
+Option E: re-ranker using box geometry + probabilities (scoring).
+- More complex, more moving parts.
+
+Let me reconsider the error decomposition. The ceiling with perfect classes is 0.758. The class-agnostic is 0.755. The difference (0.003) is negligible. So the boxes are fine; it's all about the class decision and its ranking.
+
+Now, the current per-class AP vs. the ceiling: if the classes were perfect, what would the per-class AP be? Unknown, but roughly the 0.758 average. The weakest is pore 0.517. Why is pore so low? Pores are small; the detector boxes for pores might be slightly off (IoU > 0.5 is hard for small boxes). Also pores are confused with other classes.
+
+Actually, here's a thought: the score is conf × p_c. For a true pore, p_pore is high (say 0.6), so the score is 0.6×conf. For the same box, p_deposit 0.2 → a lower-scoring deposit prediction. In mAP, the pore prediction must rank above other pore predictions that are false alarms... but there are almost no false-alarm boxes (class-agnostic ≈ perfect-class). So the ranking within a class is mostly about true positives. Hmm, then the AP is mostly determined by: for each true defect, does the prediction with the correct class get a hit? A hit requires IoU > 0.5 with the true box — the box is the detector's box, and the true box is the GT. The detector box and the GT box: if the detector box is well aligned, IoU(det, GT) > 0.5 → hit regardless of score (as long as it's the top unmatched). Score only matters for ordering among multiple predictions for the same true box and for the precision at each threshold.
+
+Wait, actually, if there are almost no false boxes, mAP is dominated by: for each class, the fraction of true boxes that get a correct-class prediction with IoU > 0.5 (recall-like), plus the precision effect from wrong-class predictions that don't match anything (they don't count as FP for that class... actually, a deposit prediction on a true pore box: for the deposit class, it's a prediction that doesn't overlap a true deposit box → FP for deposit, lowering deposit's precision!). So wrong-class predictions hurt the precision of the predicted class.
+
+So improving the class decision (fewer wrong classes) directly improves mAP. The classifier's F1 of about 0.87 → about 13% of boxes are misclassified. To reach the ceiling, we need better classification.
+
+So the core question: how do we improve the crop classification from F1 0.87? Options: stronger model, better input, TTA, better training data.
+
+Given the history (steps don't matter, weighting hurts, detector-box training not confirmed), I think the strongest untried direction is **capacity via a stronger backbone**, or **input information (absolute size channel / wider context)**.
+
+Let me reconsider the budget for a stronger backbone more carefully. Actually, I could also reduce the inference cost: use a single crop at inference (tight only) — e003 showed that a single tight crop at training is worse, but inference-only single crop might keep most of the performance while halving the inference time. But that's a confound.
+
+Alternatively, use a larger model at a smaller image: e.g. convnext_nano at 128px. e005 showed that effnet_b0 at 128 is worse than at 160 — but that was the same model with more steps; a larger model at 128 might be better than b0 at 160. convnext_nano at 128: FLOPs about 0.35 vs. b0@160 about 0.18 → about 2x → 0.5 sec/step. Inference 2x → 60 seconds. Similar to v2_b0@160.
+
+Hmm, let me think about which is more likely to have an effect of ≥0.01.
+
+The brief says: "ideas that change what the model sees or learns from usually matter more than turning one more knob." Both capacity and input channels qualify.
+
+Let me look at the per-class numbers again: pore 0.517, stain 0.605, deposit 0.622, disc 0.776. Pore is the weakest. Pores are small, round, dark. They're confused with...? Probably with deposit (small deposits) or with nothing (missed). Stain is confused with deposit (known).
+
+Absolute size: pores are the smallest defects. If the model knew the box size, pore classification would improve a lot. I'll bet on the size channel.
+
+Actually, wait. Let me reconsider: is the box size in the crop really invisible? The crop is square, side = 1.5×long side (tight) and 2.5×long side (wide), both resized to 160. In the tight crop, the box's long side is 160/1.5 ≈ 107px, short side = 107×(short/long). In the wide crop, the long side is 160/2.5 = 64px. So the box occupies a fixed fraction of the crop. The absolute size (in image pixels) is lost. The texture scale is a proxy, as discussed. So yes, an explicit size channel adds new information.
+
+How to encode: log10 of the box area (in image pixels) normalized to [0,1], and the aspect ratio (short/long) in [0,1]. Two extra channels → 5-channel input. Or just one: log area. Let's do both (cheap).
+
+Implementation:
+- make_crop returns the crop; we also compute the features. The dataset returns the views + features.
+- The model: timm.create_model(MODEL, pretrained=True, num_classes=4, in_chans=5). Then adapt the stem: find the first conv2d with in_channels=3 and rebuild the weight: new weight shape (out, 5, k, k); copy the old 3 channels; set channels 3, 4 to the mean of the old channels (or 0). For EfficientNet, the stem is a Conv2d(3, 32, 3). Easy.
+- In the dataset, add the feature channels: feat = np.stack([log_area_norm, aspect]) broadcast to (s, s, 2), concatenate to the crop (s, s, 3) → (s, s, 5). Apply the same normalization? The feature channels are in [0,1]; normalize with mean 0.5, std 0.5 or just leave them (the model can handle it). Better: (x - MEAN)/STD for RGB, and for the feature channels (x - 0.5)/1.0 or just x. Let's normalize the features with mean 0.5, std 0.25 to be of similar scale... actually simpler: leave the feature channels as-is in [0,1] and don't normalize (the stem conv can handle it). Hmm, for safety, normalize: (feat - 0.5) / 0.5 → [-1, 1]. Either way; the model adapts.
+
+Wait, but the jitter: during training, the crop center/side is jittered. The box features (area, aspect) are computed from the GT box r, not the jittered crop — that's fine, the features describe the box.
+
+Normalization of log area: we need a range. Box long side: from MIN_CROP 16 to... the image is high-res (probably about 1000px). Area range: pore about 5×5=25 to stain about 200×200=40000. log10: 1.4 to 4.6. Normalize: (log10(area) - 1.0) / 4.0 → [0,1]. Or use the long side: log10(long) - 0.7 / 2.3. Let's compute robustly from the training data: take the 1st and 99th percentiles of log10(area) over the training crops, and normalize to [0,1]. That's clean and data-driven. But it must be computed before the dataset is built — easy, one pass over the crops.
+
+Actually, simpler and more robust: hardcode the normalization with log10(long_side): long side is probably 3 to 300px → log10 is 0.48 to 2.48 → (x - 0.5)/2.0 → [0,1]. Hmm, hardcoding is risky if the range differs. Data-driven percentiles are safer. Let's do this:
+```python
+areas = np.array([math.log10(max(1.0, (r["x2"]-r["x1"]) * (r["y2"]-r["y1"]))) for r in crops])
+lo, hi = np.percentile(areas, 1), np.percentile(areas, 99)
+```
+And the feature = clip((log10(area) - lo)/(hi - lo), 0, 1).
+
+Aspect ratio = short/long, in (0,1], no normalization needed.
+
+- The model's stem adaptation:
+```python
+def adapt_stem(model, new_in=5):
+    m = model
+    # find the first conv2d with in_channels == 3
+    for mod in m.modules():
+        if isinstance(mod, nn.Conv2d) and mod.in_channels == 3:
+            w = mod.weight.data
+            nw = torch.zeros(mod.out_channels, new_in, *w.shape[2:], device=w.device, dtype=w.dtype)
+            nw[:, :3] = w
+            nw[:, 3:] = w.mean(dim=1, keepdim=True).expand(mod.out_channels, new_in - 3, *w.shape[2:])
+            mod.weight = nn.Parameter(nw)
+            break
+    return model
+```
+For EfficientNet-B0, the first module is a Conv2d(3, 32). Good. Note: timm's efficientnet_b0 stem is a single conv. convnext uses a patch conv (1x1? no, 3x3 stride 2). Either way, this works.
+
+- The dataset change: make_crop needs to also return the features, or the dataset computes them. Let me restructure: make_crop returns the canvas (s,s,3); the dataset computes the feature channels and concatenates.
+
+Actually, the cleanest: change make_crop to also return the feature values (log_area_norm, aspect) — but make_crop is called per view with the same box, so the features are the same for both views. Compute them in __getitem__ from r.
+
+Let me write the code:
+
+In main, after reading the crops:
+```python
+areas = np.array([math.log10(max(1.0, (r["x2"] - r["x1"]) * (r["y2"] - r["y1"]))) for r in crops])
+A_LO, A_HI = float(np.percentile(areas, 1)), float(np.percentile(areas, 99))
+```
+Pass to the dataset (or make it global). The dataset currently takes (rows, images, train). We can add a global or pass it. To minimize the diff, let's use a module-level variable set in main. Hmm, the dataset is defined before main; a global is fine.
+
+In __getitem__, for each view x (s,s,3 float in [0,1]):
+```python
+lw = max(r["x2"] - r["x1"], r["y2"] - r["y1"])
+sh = min(r["x2"] - r["x1"], r["y2"] - r["y1"])
+fa = min(1.0, max(0.0, (math.log10(max(1.0, lw * sh)) - A_LO) / (A_HI - A_LO)))
+ar = sh / max(lw, 1e-6)
+feat = np.stack([np.full((s, s), fa), np.full((s, s), ar)], axis=-1)
+x = np.concatenate([x, (feat - 0.5) / 0.5], axis=-1)
+```
+Wait, s is the crop side before resize; make_crop resizes to IMG_SIZE. The feature is constant over the crop, so we can just build it at IMG_SIZE: np.full((IMG_SIZE, IMG_SIZE, 2), ...). Simpler: after x is (IMG_SIZE, IMG_SIZE, 3) and normalized... note: the current code normalizes after the flip/brightness: x = (x - MEAN)/STD. The feature channels should not receive the RGB normalization. So: do the RGB normalization, then concatenate the normalized features.
+
+Let me restructure __getitem__:
+```python
+def __getitem__(self, i):
+    r = self.rows[i]
+    img = self.images[r["image"]]
+    fh = fv = False
+    bright = 1.0
+    if self.train:
+        fh, fv, bright = random.random() < 0.5, random.random() < 0.5, random.uniform(0.8, 1.2)
+    views = []
+    for ctx in (TIGHT_CONTEXT, CONTEXT):
+        x = make_crop(img, r, ctx, self.train)
+        if fh:
+            x = x[:, ::-1]
+        if fv:
+            x = x[::-1, :]
+        if self.train:
+            x = np.clip(x * bright, 0, 1)
+        x = (x - MEAN) / STD
+        lw = max(r["x2"] - r["x1"], r["y2"] - r["y1"])
+        sh = min(r["x2"] - r["x1"], r["y2"] - r["y1"])
+        fa = min(1.0, max(0.0, (math.log10(max(1.0, lw * sh)) - A_LO) / (A_HI - A_LO)))
+        ar = sh / max(lw, 1e-6)
+        feat = np.stack([np.full((IMG_SIZE, IMG_SIZE), fa, np.float32),
+                         np.full((IMG_SIZE, IMG_SIZE), ar, np.float32)], axis=-1)
+        x = np.concatenate([x, (feat - 0.5) / 0.5], axis=-1)
+        views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))
+    return views[0], views[1], r.get("cls", -1)
+```
+This recomputes fa/ar per view — a tiny waste, fine. We could compute it once outside the loop. Let's do that for cleanliness.
+
+Model creation:
+```python
+model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4, in_chans=5)
+adapt_stem(model)
+```
+And the adapt_stem function.
+
+One concern: timm's create_model with in_chans=5 — does it build the stem with 5 input channels from scratch? No — timm builds the stem with in_chans=5, but the pretrained weights are loaded with strict=False? Actually, timm handles in_chans changes: it loads the pretrained weights and adapts... let me recall. timm's `create_model(model, pretrained=True, in_chans=5)` — the model is built with in_chans=5, and the pretrained state dict is loaded with `load_pretrained` which handles the stem shape mismatch... I think timm's load_fn for efficientnet uses `load_state_dict` with strict=False and warns about the stem mismatch. Actually, timm has explicit handling: `timm.models._factory` — when in_chans != 3, it builds the model with the new in_chans and loads the pretrained weights with `strict=False`, so the stem (5 channels) is randomly initialized (not pretrained). Hmm, that would lose the pretrained stem. That's why we do the manual adaptation: build with in_chans=5, load the pretrained weights (stem mismatch → random stem), then copy the 3 pretrained channels into the 5-channel stem.
+
+Wait, does timm actually handle this? There's a known pattern: timm's `create_model` with `in_chans=5` and pretrained=True — I recall timm's load_pretrained uses `model.load_state_dict(state_dict, strict=False)` and prints missing/unexpected keys. The stem conv would be missing (shape mismatch → the key is unexpected/missing). So the stem is randomly initialized. My adapt_stem then fills it from the pretrained 3-channel weights — but wait, if the stem is randomly initialized, I can't copy from it; I need the pretrained 3-channel stem weights.
+
+Better approach: build the model with in_chans=3 (pretrained), extract the stem weights, then rebuild with in_chans=5 and copy. Or: build with in_chans=5, and load the pretrained state dict myself with the adaptation.
+
+Simplest and most robust:
+```python
+model3 = timm.create_model(MODEL, pretrained=True, num_classes=4, in_chans=3)
+stem_w = model3.conv1.weight.data  # efficientnet's stem attribute name?
+```
+Hmm, the attribute name varies. Generic: find the first Conv2d with in_channels==3.
+
+Plan:
+```python
+model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4, in_chans=3)
+# adapt stem to 5 channels
+for mod in model.modules():
+    if isinstance(mod, nn.Conv2d) and mod.in_channels == 3:
+        with torch.no_grad():
+            w = mod.weight.data
+            nw = torch.zeros((mod.out_channels, 5, w.shape[2], w.shape[3]), dtype=w.dtype, device=w.device)
+            nw[:, :3] = w
+            nw[:, 3:] = w.mean(dim=1, keepdim=True).expand(mod.out_channels, 2, w.shape[2], w.shape[3])
+            mod.weight = nn.Parameter(nw)
+        break
+```
+This keeps the pretrained stem (3 channels copied) + 2 extra channels initialized to the mean.
+
+But wait: does timm's efficientnet have exactly one conv with in_channels==3 at the start? The first conv is Conv2d(3, 32, 3, stride 2). Yes. And no other conv has in_channels==3 (subsequent convs have larger channels). So the loop finds the right one.
+
+Note: `mod.weight = nn.Parameter(nw)` — fine.
+
+Also, channels_last conversion happens after; fine.
+
+Now, the eval dataset: the ev boxes have x1..x2, so the features are computed the same way. Good.
+
+Budget: same compute as before (one extra channel is negligible). Inference: same. So the run fits as before (162 seconds).
+
+Expected effect: the model gets absolute size + aspect ratio. Pores are small → helps pore (0.517) and stain (0.605, large). Hypothesis: +0.005-0.015 mAP.
+
+Risks:
+- The stem adaptation is wrong → the model is broken → a score far below the best. I'll be careful.
+- The feature normalization is off (A_LO/A_HI from the training crops; the eval boxes are detector boxes, probably a similar range; clip to [0,1] handles outliers).
+- The model ignores the features → about the same score (noise).
+
+This is a clean, single, testable change. Category: "data" (input information) — or "architecture"? It changes the input representation; I'd say data (what the model sees). The category list: data, augmentation, architecture, loss, sampling, optimisation, inference, scoring, other. Adding input channels is closest to "data" (input) or "architecture". Let's go with "data" — hmm, actually it's an input representation change; "data" fits "what the model sees". Let's use data.
+
+Wait, let me double-check one more thing: the two views (tight 1.5x, wide 2.5x) — the feature channels are the same for both views. That's fine.
+
+Also, the jitter: the training crop center/side is jittered, but the features come from the GT box — consistent.
+
+One more consideration: should I also add the detector conf for the eval boxes? No — the training crops don't have a conf (they're GT boxes). We could use the conf of the overlapping train-split detector box, but that's the e006 territory (not confirmed). Keep it simple: just area + aspect.
+
+Hmm, actually, let me reconsider whether to include the aspect ratio. The aspect ratio is already visible in the crop (the box's shape within the crop). Adding it explicitly is redundant but harmless (the model can ignore it). The main new information is the absolute area. To keep the change minimal and focused, maybe just the area channel (4-channel input)? The hypothesis is about absolute size. Let's do just area — one channel, in_chans=4. Cleaner, and the hypothesis is more focused: "absolute defect size is destroyed by the crop resize; pores are small and stains are large; giving the model the box area directly should improve the pore/stain decisions."
+
+Actually, the aspect ratio is also partly destroyed: the crop is a square with side = context × long side, so the box's aspect is preserved (short side = long × ar, both scaled by the same factor). So the aspect is visible. Only the absolute size is lost. → One channel: log area. in_chans=4.
+
+Let me finalize the code changes:
+
+1. Add a global for the area normalization (set in main):
+```python
+A_LO = A_HI = None
+```
+Actually, let's pass it to the dataset via a constructor argument. The dataset is instantiated twice (train, eval). Add a parameter `area_norm=(lo, hi)`.
+
+Let me write the diff:
+
+Change 1: the dataset class.
+```python
+class BoxDataset(torch.utils.data.Dataset):
+    def __init__(self, rows, images, train):
+        self.rows, self.images, self.train = rows, images, train
+```
+→
+```python
+class BoxDataset(torch.utils.data.Dataset):
+    def __init__(self, rows, images, train, area_norm):
+        self.rows, self.images, self.train, self.area_norm = rows, images, train, area_norm
+```
+
+Change 2: __getitem__ — add the feature channel.
+Current:
+```python
+    def __getitem__(self, i):
+        r = self.rows[i]
+        img = self.images[r["image"]]
+        fh = fv = False
+        bright = 1.0
+        if self.train:  # same flips and brightness for both views
+            fh, fv, bright = random.random() < 0.5, random.random() < 0.5, random.uniform(0.8, 1.2)
+        views = []
+        for ctx in (TIGHT_CONTEXT, CONTEXT):
+            x = make_crop(img, r, ctx, self.train)
+            if fh:
+                x = x[:, ::-1]
+            if fv:
+                x = x[::-1, :]
+            if self.train:
+                x = np.clip(x * bright, 0, 1)
+            x = (x - MEAN) / STD
+            views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))
+        return views[0], views[1], r.get("cls", -1)
+```
+New:
+```python
+    def __getitem__(self, i):
+        r = self.rows[i]
+        img = self.images[r["image"]]
+        fh = fv = False
+        bright = 1.0
+        if self.train:  # same flips and brightness for both views
+            fh, fv, bright = random.random() < 0.5, random.random() < 0.5, random.uniform(0.8, 1.2)
+        lw = max(r["x2"] - r["x1"], r["y2"] - r["y1"], 1.0)
+        area = min(1.0, max(0.0, (math.log10(lw * max(min(r["x2"] - r["x1"], r["y2"] - r["y1"]), 1.0)) - self.area_norm[0]) / (self.area_norm[1] - self.area_norm[0])))
+        views = []
+        for ctx in (TIGHT_CONTEXT, CONTEXT):
+            x = make_crop(img, r, ctx, self.train)
+            if fh:
+                x = x[:, ::-1]
+            if fv:
+                x = x[::-1, :]
+            if self.train:
+                x = np.clip(x * bright, 0, 1)
+            x = (x - MEAN) / STD
+            x = np.concatenate([x, np.full((IMG_SIZE, IMG_SIZE, 1), (area - 0.5) / 0.5, dtype=np.float32)], axis=-1)
+            views.append(torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))))
+        return views[0], views[1], r.get("cls", -1)
+```
+Hmm, the area line is long. Let me clean it up:
+```python
+        lw = max(r["x2"] - r["x1"], r["y2"] - r["y1"], 1.0)
+        sh = max(min(r["x2"] - r["x1"], r["y2"] - r["y1"]), 1.0)
+        area = min(1.0, max(0.0, (math.log10(lw * sh) - self.area_norm[0]) / (self.area_norm[1] - self.area_norm[0])))
+        area = (area - 0.5) / 0.5
+```
+And inside the loop: `x = np.concatenate([x, np.full((IMG_SIZE, IMG_SIZE, 1), area, dtype=np.float32)], axis=-1)`.
+
+Change 3: main — compute area_norm and pass it to the datasets; create the model with in_chans=4 and adapt the stem.
+
+Current:
+```python
+    dl_tr = torch.utils.data.DataLoader(BoxDataset(crops, images, True), batch_size=BATCH_SIZE, shuffle=True,
+```
+and
+```python
+    dl_ev = torch.utils.data.DataLoader(BoxDataset(ev, images, False), batch_size=256, shuffle=False,
+```
+Add before dl_tr:
+```python
+    log_areas = np.array([math.log10(max((r["x2"] - r["x1"]) * (r["y2"] - r["y1"]), 1.0)) for r in crops])
+    area_norm = (float(np.percentile(log_areas, 1)), float(np.percentile(log_areas, 99)))
+```
+And pass `area_norm` to both datasets.
+
+Model:
+```python
+    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
+   
+===== attempt 2 =====
+Let me think about what to try next.
+
+History:
+- e001: adding low-res crops → new best 0.6302
+- e002: single crop → crashed
+- e003: fixed single crop → 0.6247 rejected (worse)
+- e004: more training steps (probably smaller model or something) → 0.6296 rejected
+- e005: IMG_SIZE 160→128 → 0.6217 rejected
+- e006: training on detector boxes → 0.6278 not confirmed
+- e007: duplicating pore/stain → 0.6280 rejected
+
+Current best: 0.6302, 428 steps, 2 epochs, loss still dropping at 0.31.
+
+Per-class AP: pore 0.517, deposit 0.622, discontinuity 0.776, stain 0.605.
+
+Reference numbers: one-step 4-class 0.638, stage-1 with perfect classes 0.758, class-agnostic 0.755. So the ceiling is 0.758 and we're at 0.630. Big room for improvement. The classifier on perfect boxes reaches macro-F1 ~0.87. So the gap is large.
+
+Important observation: the model is severely undertrained — 428 steps, 2 epochs, loss 0.31 and still dropping. But attempts to increase steps (e004, e005) were rejected. Wait, what was e004? "The training loss is still dropping fast at the end of the budget (0.31 after only about 2 epochs / 428 steps), so the classifier is undertrained..." score 0.6296 — rejected. So it was some change to increase steps but didn't help. And e005's IMG_SIZE 128 → 0.6217 rejected. Hmm, so more steps didn't help? Interesting. Maybe the issue is that the model converges to a bad state, or the data is the bottleneck.
+
+Wait — actually the problem might not be the number of steps but the data. The classifier is trained on GT boxes but tested on detector boxes. e006 tried training on detector boxes → 0.6278, not confirmed.
+
+What else could matter?
+
+Ideas:
+1. Test-time augmentation (TTA): average predictions over flips at eval time. Doubles eval cost but eval is fast (41879 boxes × 2 views... actually eval is 41879 detections, batch 256, 162s total run with training 148s). Eval is probably ~30-40s. TTA with 4 flips doubles that. Could help with classification accuracy. But does TTA help mAP? It improves class probabilities → better ranking. Could help.
+
+2. Score calibration: currently score = conf × p(c). mAP depends only on ordering within a class. The conf factor: boxes with low conf get lower scores. But the ordering within a class is conf × p(c). If we use only p(c), the ordering changes. Hmm, which is better? For mAP@0.5, within-class ordering matters. True detections with high p(c) should rank above false alarms. False alarms (boxes not overlapping any defect) — their class probability might be garbage. Multiplying by conf downweights false alarms. That's probably good. But the interaction of conf × p might be suboptimal.
+
+Actually, let me think about where the error is. Ceiling with perfect classes is 0.758. Class-agnostic is 0.755. Our mAP is 0.630. So we're losing about 0.13 relative to the ceiling. The loss comes from:
+- Wrong class assignment on true boxes (hits become wrong-class predictions → miss for true class + false positive for wrong class)
+- Ranking: false alarms ranked above true detections.
+
+Classifier macro-F1 ~0.87 on perfect boxes means ~13% of boxes get wrong class. That's consistent with the gap.
+
+To improve: better classifier. Undertrained? Loss 0.31 after 2 epochs. But attempts to increase steps (e004, e005) didn't help. Wait, what exactly did e004 do? Hypothesis text is cut off: "The training loss is still dropping fast at the end of the budget (0.31 after only about 2 epochs / 428 steps), so the classifier is undertrained rather than feature-limited, and the main error is class misassignment on true d..." — the change is cut off. Score 0.6296, rejected. So some change to address undertraining didn't help. e005's IMG_SIZE 128 → 0.6217, worse.
+
+Hmm, so more steps at lower resolution didn't help. Maybe the model is fine and the data representation is the bottleneck.
+
+Ideas not yet tried:
+- Different model (convnext_nano, regnety, etc.) — pretrained features might be better. E.g., convnext_nano or tf_efficientnetv2_b0.
+- TTA at inference (flips).
+- Score changes: e.g., use p(c) only, or p(c)^α, or rank by p(c) - λ·p(other). Actually, a "best class" approach: predict only the argmax class per box, score = p(argmax) × conf. This reduces false positives from wrong-class rows. Wait — each box emits 4 rows. In mAP, a box that's a true pore but predicted as deposit with high score becomes a false positive in deposit. If we emit all 4 rows, every box contributes to all classes. The per-class ordering is conf × p(c).
+
+Hmm, let me think: for class c, predictions are all boxes sorted by conf × p_c. True boxes of class c have high p_c. False alarms have random p_c. Boxes that are true of class d≠c have low p_c (hopefully). Emitting all rows is fine; AP handles it.
+
+Alternative scoring: only emit the top-1 class per box? Then for class c, only boxes with argmax=c are predictions. That changes the set of predictions, not just the ordering. Might reduce false positives in each class. But true boxes with argmax wrong are lost anyway.
+
+Actually, emitting all 4 rows per box: within class c, the ranking includes boxes that are truly class c (good, high p_c) and boxes that are truly other classes (low p_c) and false alarms (random p_c). If we emit only argmax, class c gets boxes whose argmax is c. The ordering within each is different. Hard to say which is better.
+
+Let me think about the biggest lever. The gap to the ceiling is 0.128. The classifier's F1 ~0.87 on perfect boxes. To close the gap, we need a better classifier.
+
+Undertrained: 428 steps, 2 epochs, loss 0.31 and dropping. e004 tried something (probably more steps via smaller batch or something) → 0.6296, essentially same as best 0.6302 (within noise). e005's IMG_SIZE 128 → 0.6217, worse. Hmm, e005 should have increased steps by ~56%... but it was worse. So maybe the model isn't undertrained in the sense that more steps help; or the lower resolution hurt more than the extra steps helped.
+
+Wait, but e004's change is cut off. Maybe it changed RESERVE or batch size. Score 0.6296 ≈ same as best. So "more of the same training" doesn't help.
+
+So the model quality at this training budget is what it is. To improve, change what the model sees or learns:
+
+1. **Better model architecture**: try convnext_nano or tf_efficientnetv2_b0. Might have better features. But same step budget; convnext_nano is slightly bigger. EfficientNet-B0 is 4M params. convnext_nano is ~5M. Should fit.
+
+2. **TTA**: average 4 flips at eval. Improves probability estimates. Cheap (only doubles eval time). Eval time: total 162s, load 14s, training to ~148s (125s at epoch 1 end, then part of epoch 2... actually "done: 2 epochs, 428 steps, 162s total" — training ends at ~148s (deadline 180 - reserve 55 = 125s? wait deadline = T0 + 180, t_end = deadline - 55 = T0 + 125. So training ends at 125s, eval + write is 125→162 = 37s). TTA with 4 flips → eval ~148s, total ~173s. Cutting it close to 180. Hmm, 37s × 4 = 148s, total 173s. Safety margin is thin but okay? 7s margin. Risky. 2 flips (hflip only) → 74s, total ~142s. Safe.
+
+Actually, would TTA help mAP? It sharpens class probabilities. For true boxes, the correct class probability goes up; for false alarms, probabilities might become more uniform or more confidently wrong. If false alarms become more confidently wrong class, they rank lower in the correct class... hmm, actually for class c's AP, false alarm ranking depends on conf × p_c. TTA might reduce p_c for false alarms if the averaged prediction is more uniform. Probably a small gain, maybe 0.005-0.01.
+
+3. **Train with detector conf weighting or false alarm mining**: use train-split detector boxes! dets.csv has train-split boxes. For each train detector box, we can find the overlapping GT crop (IoU > 0.5) → that's a labeled detector box. Boxes with no overlap → false alarms, label as... what? We could add a "background" class! Train a 5-class classifier (4 defects + background) on detector boxes: true overlaps → their class; non-overlaps → background. At eval, for each box, p(background) tells us if it's a false alarm. Then score = conf × p(c) / (1 - p_bg) or score = p(c) - p_bg × something.
+
+This is a big idea: currently the classifier is only trained on GT boxes (which are clean, well-centered crops). Eval boxes include false alarms (non-defect regions) that the classifier has never seen as "not a defect". The classifier assigns some class to everything, so false alarms get random class scores, polluting the per-class rankings. If we train on detector boxes with a background class, the model learns to reject false alarms, and we can downweight their scores.
+
+This targets the ranking of false alarms vs true detections — one of the error components. Also, training on detector boxes (not GT boxes) addresses the box distribution mismatch (e006 tried training on detector boxes but kept 4 classes and got 0.6278, not confirmed — but that was without background class and probably without false alarms).
+
+Wait, e006: "replaces each GT box with the best overlapping detector box (IoU > 0.3) during training" → 0.6278. That's training crops from detector box coordinates but still only on true defects. Adding false alarms as a 5th class is fundamentally different.
+
+How to implement:
+- Build training set from train-split dets: for each det box, find GT crops on the same image with IoU > 0.5 → class = crop's cls; else class = 4 (background).
+- Train 5-class model on these detector boxes (single crop or two crops).
+- At eval: 5-class probability. Score for class c: p(c) × conf, but penalize background: e.g., score = conf × p(c) × (1 - p_bg), or score = conf × p(c) / (p(c) + p_bg) ... simplest: score = conf × p(c) × (1 - p_bg). Or normalize: p'(c) = p(c) / (1 - p_bg) for c<4, score = conf × p'(c). This is a monotone transform per box, changes cross-box ordering within a class (good, that's what we want: false alarms with high p_bg get downweighted).
+
+Budget: training set size = number of train det boxes. Total dets: 41879 eval + some train. Eval is 41879. Train probably similar scale, maybe ~30-40k. Training on 40k boxes vs current 14128 — more data, ~3x more steps per epoch. Current: 220 steps/epoch on 14128 boxes (batch 64). On 40k boxes: ~625 steps/epoch. At ~0.36s/step (85s/220 steps... wait epoch 0: 220 steps in 71s (14s load → 85s) = 0.32s/step). In 111s training budget (125 - 14) → ~345 steps → less than 1 epoch. Hmm, that's fewer steps than now (428). But each step sees different data (false alarms + detector boxes).
+
+Actually wait, should we keep GT boxes too? Mix: GT boxes (14128) + detector boxes with overlap (labeled) + detector boxes without overlap (background). Or just detector boxes. The detector boxes with overlap are essentially the same defects as GT boxes but with detector coordinates. Using all train det boxes (both overlap and non-overlap) covers everything: each true defect probably has at least one detector box overlapping it.
+
+Hmm, but some true defects might not have any detector box (missed by stage 1) — those GT boxes wouldn't be in the training set. That's fine — they're not in the eval either (stage 1 fixed, if it missed them on train, it's consistent... actually eval is different images; stage 1 recall on eval is what it is).
+
+Let me estimate the number of train det boxes. Total dets 41879 eval. Train split is unknown, maybe ~20-30k. Let's say 25k. Training on 25k boxes: 390 steps/epoch. In 111s → ~345 steps ≈ 0.9 epoch. Similar number of steps as now but on a harder, more relevant distribution.
+
+Also, with 5 classes, background class is probably ~40-60% of boxes (detector has false alarms). That's a lot of background data.
+
+This is a genuinely different idea (category: data or sampling). I think this is the best next experiment.
+
+Simpler alternative: keep 4-class model but train on detector boxes (overlap → class, non-overlap → ... can't label). No, background class is key.
+
+Implementation details:
+- IoU computation between det boxes and GT crops per image. Vectorize with numpy: group crops by image, for each det box compute IoU with crops on same image. 25k dets × avg crops per image (14128/2255 ≈ 6.3, but train images are a subset). Efficient enough.
+
+- Training set: for each train det: best IoU with GT crops on same image; if IoU > 0.5 → that class; else → 4.
+
+Wait, should we use IoU > 0.5? A detector box overlapping a GT box at IoU 0.3 might still be "that defect" but misplaced. The eval metric uses IoU > 0.5 for hits. For training, using IoU > 0.5 as the match criterion is consistent. Boxes at IoU 0.3-0.5 are ambiguous; treat as background? That might teach the model to reject boxes that are actually defects but misplaced. Hmm. Maybe use IoU > 0.3 for matching (like e006 did) but... e006's approach wasn't confirmed. Let me use IoU > 0.5 for clean labels; ambiguous boxes → background (safe: rejecting a misplaced box costs us a miss, but ranking it as a confident detection costs us a false positive... actually if the box is at IoU 0.3 with a GT, it's a miss at eval anyway (IoU ≤ 0.5), so labeling it as background is correct for the metric!). Yes: at eval, a box only counts as a hit if IoU > 0.5 with an unmatched GT. So boxes with IoU ≤ 0.5 to all GTs are effectively false alarms for the metric. Labeling them as background is exactly right.
+
+- Model: keep efficientnet_b0, num_classes=5.
+- Two crops: keep (e003 showed single crop is worse).
+- Score: p'(c) = p(c) / (1 - p_bg + eps) for c in 0..3, score = conf × p'(c). Or score = conf × p(c) × (1 - p_bg). Which? Normalizing p'(c) makes scores comparable to before for clean boxes (1 - p_bg ≈ 1). For false alarms, p_bg high → all class scores suppressed. I'll use p'(c) = p(c)/(1-p_bg).
+
+Hmm wait, one concern: the denominator (1 - p_bg) varies per box, so within-class ordering changes — that's the point (downweighting false alarms). Good.
+
+- Keep MIN_SCORE.
+- Keep everything else.
+
+Budget check: training set ~25-30k boxes vs 14128. Steps per epoch ~400-470 vs 220. Step time similar (~0.32s). Training budget 111s → ~345 steps ≈ 0.75-0.85 epoch. Fewer epochs but each step trains on detector-distribution data including background. Eval: 41879 boxes, same cost as now (~37s). Total should fit: load 14s + IoU computation (~1-2s) + training 111s + eval 37s ≈ 163s < 180s. OK.
+
+One risk: if train det boxes are much more than eval (e.g., 60k), steps per epoch ~940, still fine — we just do partial epoch, data is shuffled so it's fine.
+
+Another consideration: should we include GT boxes in training? If a true defect has multiple detector boxes, and some defects have no detector box, the GT boxes add coverage. But mixing GT boxes (clean, centered) with detector boxes (noisy) — the model sees both. I think pure detector boxes is cleaner and directly matches the eval distribution. But we lose defects with no detector box on train images — those are rare (stage 1 recall is decent, class-agnostic mAP 0.755).
+
+Hmm, actually wait: is it possible that some GT defects have no detector box? Stage 1 is 0.755 class-agnostic on val... that's mAP not recall. Recall might be ~0.85-0.9. So ~10-15% of defects have no detector box. Excluding them from training loses some class diversity but the training set is large.
+
+Let me go with pure detector boxes + background class. This is a fundamentally different data idea (e006 changed coordinates but kept the same 4-class GT-only set; this adds false alarms as a learnable class).
+
+Actually, let me reconsider whether to keep GT boxes too. The 5-class training on detector boxes: class balance — background probably 40-50%, defects split among 4 classes. That's fine for cross-entropy.
+
+One more thought: the "background" label for detector boxes with IoU ≤ 0.5 to all GTs — includes boxes that partially overlap defects (IoU 0.2-0.5). Crops of those boxes contain partial defect. Teaching "background" on partial defect crops might make the model reject borderline boxes. At eval, borderline boxes (IoU 0.3-0.5) are misses anyway, so rejecting them is metric-correct. And boxes at IoU > 0.5 get defect labels. Consistent.
+
+Let me also double-check the IoU matching efficiency: group crops by image name. For each det, get crops on same image, compute IoU vectorized. Total pairs: 25k dets × ~6 crops = 150k IoU computations — trivial in numpy.
+
+Now, the code changes:
+
+1. After loading crops and dets, build training rows from train dets:
+
+```python
+    tr_dets = [d for d in dets if d["split"] == "train"]
+    from collections import defaultdict
+    by_img = defaultdict(list)
+    for r in crops:
+        by_img[r["image"]].append(r)
+    train_rows = []
+    for d in tr_dets:
+        best = 0.0; cls = 4
+        for r in by_img.get(d["image"], ()):
+            ix1, iy1 = max(d["x1"], r["x1"]), max(d["y1"], r["y1"])
+            ix2, iy2 = min(d["x2"], r["x2"]), min(d["y2"], r["y2"])
+            inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+            union = (d["x2"] - d["x1"]) * (d["y2"] - d["y1"]) + (r["x2"] - r["x1"]) * (r["y2"] - r["y1"]) - inter
+            iou = inter / union if union > 0 else 0.0
+            if iou > best:
+                best, cls = iou, r["cls"]
+        if best <= 0.5:
+            cls = 4
+        train_rows.append({**d, "cls": cls})
+```
+
+Wait, careful: if best > 0.5 → cls is the matched crop's class; else → 4. But my loop sets cls only when iou > best; initial best=0.0, cls=4. If all IoUs ≤ 0.5, cls stays 4 (or gets set to some crop's class with iou 0.3 — bug!). Fix: track best_iou and best_cls separately, then decide at end.
+
+```python
+    for d in tr_dets:
+        bi, bc = 0.0, 4
+        for r in by_img.get(d["image"], ()):
+            ...
+            if iou > bi:
+                bi, bc = iou, r["cls"]
+        train_rows.append({**d, "cls": bc if bi > 0.5 else 4})
+```
+
+2. Use train_rows instead of crops for training dataset.
+
+3. num_classes=5.
+
+4. Scoring: 5-class probs; p_bg = p[:, 4]; p_c = p[:, :4] / (1 - p_bg); score = conf × p_c.
+
+Let me write the edits.
+
+Edit 1: after loading ev, build train_rows. Insert after `ev = [d for d in dets if d["split"] == "eval"]` line... actually the `needed` set uses crops for images — train dets are on train images which are already in crops' images (same image set). Fine.
+
+Let me write:
+
+```python
+    ev = [d for d in dets if d["split"] == "eval"]
+    # stage-2 training set: every train detector box, labelled by the GT crop it overlaps (IoU>0.5) or "background"
+    by_img = {}
+    for r in crops:
+        by_img.setdefault(r["image"], []).append(r)
+    train_rows = []
+    for d in dets:
+        if d["split"] != "train":
+            continue
+        bi, bc = 0.0, 4
+        for r in by_img.get(d["image"], ()):
+            inter = max(0.0, min(d["x2"], r["x2"]) - max(d["x1"], r["x1"])) * max(0.0, min(d["y2"], r["y2"]) - max(d["y1"], r["y1"]))
+            union = (d["x2"] - d["x1"]) * (d["y2"] - d["y1"]) + (r["x2"] - r["x1"]) * (r["y2"] - r["y1"]) - inter
+            if union > 0:
+                iou = inter / union
+                if iou > bi:
+                    bi, bc = iou, r["cls"]
+        train_rows.append({**d, "cls": bc if bi > 0.5 else 4})
+```
+
+Then `dl_tr = ... BoxDataset(train_rows, images, True)`.
+
+Edit 2: model num_classes=5.
+
+Edit 3: scoring:
+
+```python
+    probs = torch.cat(probs).numpy()
+    ...
+    for d, p in zip(ev, probs):
+        keep = 1.0 - p[4]
+        for c in range(4):
+            s = d["conf"] * float(p[c] / keep)
+            if s > MIN_SCORE:
+                ...
+```
+
+Wait, but there's a subtlety: with 5 classes, the softmax denominator changes; p[c]/(1-p[4]) renormalizes over the 4 defect classes. Good.
+
+Also the print line: "train {len(crops)} boxes" → update to len(train_rows).
+
+Let me also double-check the dataset __getitem__: uses r.get("cls", -1) — train_rows have cls. Good. make_crop uses x1,y1,x2,y2 — dets have those. Good.
+
+Budget: training rows probably ~20-30k. Steps per epoch ~350-470. Fine.
+
+Hypothesis: the classifier has never seen non-defect crops, so false alarms get random class scores and pollute per-class rankings; adding a background class trained on unmatched detector boxes lets the model suppress false alarms, targeting the ranking error between false alarms and true detections. Different from e006 (which only changed the box coordinates of true defects, kept 4 classes, no false alarms).
+
+Expected gain: 0.01-0.03.
+
+Category: data.
+
+BASE: best.
+
+Now let me write the SEARCH/REPLACE blocks carefully, copying exact lines from the file.
+
+Block 1: insert training set construction after ev line.
+
+SEARCH:
+```
+    ev = [d for d in dets if d["split"] == "eval"]
+    needed = {r["image"] for r in crops} | {d["image"] for d in ev}
+```
+
+REPLACE:
+```
+    ev = [d for d in dets if d["split"] == "eval"]
+    # stage-2 training set: every train detector box, labelled by the GT crop it overlaps (IoU > 0.5) or background (4)
+    by_img = {}
+    for r in crops:
+        by_img.setdefault(r["image"], []).append(r)
+    train_rows = []
+    for d in dets:
+        if d["split"] != "train":
+            continue
+        bi, bc = 0.0, 4
+        for r in by_img.get(d["image"], ()):
+            inter = max(0.0, min(d["x2"], r["x2"]) - max(d["x1"], r["x1"])) * max(0.0, min(d["y2"], r["y2"]) - max(d["y1"], r["y1"]))
+            union = (d["x2"] - d["x1"]) * (d["y2"] - d["y1"]) + (r["x2"] - r["x1"]) * (r["y2"] - r["y1"]) - inter
+            if union > 0:
+                iou = inter / union
+                if iou > bi:
+                    bi, bc = iou, r["cls"]
+        train_rows.append({**d, "cls": bc if bi > 0.5 else 4})
+    needed = {r["image"] for r in crops} | {d["image"] for d in ev}
+```
+
+Block 2: print line.
+SEARCH:
+```
+    print(f"train {len(crops)} boxes, eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
+```
+REPLACE:
+```
+    print(f"train {len(train_rows)} det boxes ({sum(1 for t in train_rows if t['cls'] == 4)} background), eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
+```
+
+Block 3: dataset.
+SEARCH:
+```
+    dl_tr = torch.utils.data.DataLoader(BoxDataset(crops, images, True), batch_size=BATCH_SIZE, shuffle=True,
+```
+REPLACE:
+```
+    dl_tr = torch.utils.data.DataLoader(BoxDataset(train_rows, images, True), batch_size=BATCH_SIZE, shuffle=True,
+```
+
+Block 4: model.
+SEARCH:
+```
+    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
+```
+REPLACE:
+```
+    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=5)
+```
+
+Block 5: scoring.
+SEARCH:
+```
+    for d, p in zip(ev, probs):
+        for c in range(4):
+            s = d["conf"] * float(p[c])
+```
+REPLACE:
+```
+    for d, p in zip(ev, probs):
+        keep = max(1.0 - p[4], 1e-4)
+        for c in range(4):
+            s = d["conf"] * float(p[c] / keep)
+```
+
+Wait — one issue: `p` here is a numpy row (probs is numpy). p[4] is background. Good.
+
+Another consideration: the `needed` set for images — train dets are on train images, which are covered by crops' images? crops are from crops.csv (all GT boxes, both resolutions). Train det boxes are on "training images" — same images as crops. So `needed` is unchanged. Good.
+
+Also, the eval dataset uses `ev` — unchanged.
+
+Time check: IoU loop: 25k dets × ~6 crops = 150k iterations in pure Python... each iteration is a few float ops, ~1-2 µs each → ~0.3s. Fine.
+
+One more: with 5 classes and background probably being a large fraction, the model's defect-class probabilities will be lower overall; the renormalization handles that.
+
+Risk: if the train det boxes are few (e.g., < 10k), training set is smaller than before. But dets.csv has 41879 eval; train is probably comparable. If train dets are much fewer, we could mix in GT boxes. I'll accept the risk; the log will show the count.
+
+Let me also sanity-check the hypothesis wording: change = train on stage-1 detector boxes with a 5th "background" class for boxes not overlapping any GT, and rescale scores by 1/(1-p_bg). Why it helps: currently every box gets 4 class scores; false alarms (which the model has never seen as non-defects) get random class probabilities and compete with true detections in per-class rankings. Teaching background rejection directly targets false-alarm ranking, and training on detector boxes also matches the eval box distribution. Different from e006: e006 only re-centered true-defect crops on detector boxes, still 4 classes, no false alarms.
+
+Expected gain: 0.01-0.03.
+
+Budget: same model/resolution; training set ~2-3x larger but we train for wall time, so step count is similar; eval unchanged. Fits.
+
+Now, reply format: BASE: best, CATEGORY: data, HYPOTHESIS, then blocks. Keep it concise.
+===== attempt 3 =====
+The search text in block 5 was not found. I need to verify the exact indentation of the current file. Looking at the current best train.py:
+
+```python
+    for d, p in zip(ev, probs):
+        for c in range(4):
+            s = d["conf"] * float(p[c])
+            if s > MIN_SCORE:
+                w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+
+The indentation is 4 spaces, 8 spaces, 12 spaces. In my previous reply I used 4 spaces for `for d, p in zip(ev, probs):`... no wait, let me check. In the previous reply I wrote:
+
+```
+<<<<<<< SEARCH
+    for d, p in zip(ev, probs):
+        for c in range(4):
+            s = d["conf"] * float(p[c])
+=======
+```
+
+Hmm, this looks correct. But the error says it wasn't found. Maybe the harness applied blocks 1–4 successfully and block 5 failed because... wait, block 5's search text is `for d, p in zip(ev, probs):` — no, it should be found. Unless the file contents differ. Let me reread the current best file:
+
+```python
+    probs = torch.cat(probs).numpy()
+    os.makedirs(args.out, exist_ok=True)
+    n = 0
+    with open(os.path.join(args.out, "preds.csv"), "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["det_id", "cls", "score"])
+        for d, p in zip(ev, probs):
+            for c in range(4):
+                s = d["conf"] * float(p[c])
+                if s > MIN_SCORE:
+                    w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+
+Ah! The `for d, p in zip(ev, probs):` loop is inside the `with open(...)` block, so it has 8 spaces of indentation, not 4. That's the problem. Correct indentation:
+
+```
+        for d, p in zip(ev, probs):
+            for c in range(4):
+                s = d["conf"] * float(p[c])
+                if s > MIN_SCORE:
+                    w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+
+So block 5 needs 8/12/16 spaces. Let me redo it with the correct indentation.
+
+Also, I should double-check that blocks 1–4 were fine. The error only pointed out block 5, so blocks 1–4 were found. However, since the whole reply was rejected, I need to resubmit all blocks (the harness probably applies all blocks in a single reply. If one fails, the whole thing fails). Let me resubmit all 5 blocks with block 5 corrected.
+
+Actually, wait — the error says "Block 5: the SEARCH text was not found in the file". So I should resubmit the whole reply including the corrected block 5. Let me keep everything else the same.
+
+Let me carefully verify the exact lines from the file:
+
+Block 1:
+```
+    ev = [d for d in dets if d["split"] == "eval"]
+    needed = {r["image"] for r in crops} | {d["image"] for d in ev}
+```
+Yes, this matches the file.
+
+Block 2:
+```
+    print(f"train {len(crops)} boxes, eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
+```
+Matches.
+
+Block 3:
+```
+    dl_tr = torch.utils.data.DataLoader(BoxDataset(crops, images, True), batch_size=BATCH_SIZE, shuffle=True,
+```
+Matches.
+
+Block 4:
+```
+    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
+```
+Matches.
+
+Block 5 (corrected):
+```
+        for d, p in zip(ev, probs):
+            for c in range(4):
+                s = d["conf"] * float(p[c])
+```
+With 8, 12, 16 spaces.
+
+Replacement:
+```
+        for d, p in zip(ev, probs):
+            keep = max(1.0 - p[4], 1e-4)
+            for c in range(4):
+                s = d["conf"] * float(p[c] / keep)
+```
+
+Also, a consideration: `keep` uses p[4], the background probability. Renormalizing by 1/(1-p_bg) makes the 4 defect probabilities sum to 1, and the score = conf * p_c/(1-p_bg). Boxes suspected to be false alarms (high p_bg) get overall lower scores... no wait, that's wrong. If p_bg is high, then 1-p_bg is small, so p_c/(1-p_bg) — hmm, since p_c is small when p_bg is high, p_c/(1-p_bg) is roughly the conditional probability of class c given defect. So the sum of the 4 scores is conf * 1 = conf. This means the ranking of false alarms within a class is determined by the conditional class probability, and their absolute scores are conf * p_c/(1-p_bg).
+
+Hmm, wait, there's a subtle point: if I renormalize, the total score mass per box stays at conf (sum of 4 scores ≈ conf). So a false alarm with conf 0.9 gets a score of 0.9 * p_c/(1-p_bg) for the most likely class c. This is the same as if it were a true defect of class c. This doesn't downweight false alarms — it just assigns them to a class!
+
+Hmm, is this the right scoring? Let me think about what's best for mAP.
+
+For mAP, per class, predictions are sorted by score. A false alarm (no GT box) is always a miss, and hurts precision at every rank where it appears. True detections should rank above false alarms as much as possible.
+
+Option A: score = conf * p_c (no renormalization). False alarms with high p_bg get low scores overall (sum of 4 scores = conf*(1-p_bg) < conf). True defects get sum ≈ conf * (1 - small p_bg) ≈ conf. So false alarms get pushed down in ranking relative to true detections. This is the natural scoring.
+
+Option B: score = conf * p_c/(1-p_bg). False alarms get the same total score mass as true defects. No downweighting.
+
+Option A is better for mAP! With Option A, a false alarm with p_bg = 0.9 gets total score 0.1*conf, well below true defects with total ~conf. This directly improves the false-alarm-vs-true-detection ranking.
+
+Wait, but is it a problem that p_bg is high for true defects? The model is trained on detector boxes, so true defect boxes (IoU > 0.5 with GT) get class labels 0–3, and non-overlapping boxes get 4. So the model learns to assign low p_bg to boxes that overlap defects. At test time, true defects (detector boxes overlapping GT) should have low p_bg, and false alarms should have high p_bg. So Option A: score = conf * p_c naturally downweights false alarms.
+
+So I should use Option A: score = d["conf"] * float(p[c]), no renormalization. Then the scoring block doesn't change at all! The only change is training with 5 classes.
+
+Wait, but there's a subtlety: the sum of p_c for c in 0..3 is 1 - p_bg. For a true defect, p_bg is small, and sum ≈ 1, so scores ≈ conf * p_c, same as before. For a false alarm, p_bg is large, sum is small, and scores are low.
+
+Hmm, but there's a risk: what if the model assigns high p_bg to some true defects (especially small ones or ones at image edges)? Then those true defects get downweighted and could rank below false alarms with high conf. That's a tradeoff. But since I'm training on detector boxes with IoU > 0.5 GT overlap as defect classes, the model should learn p_bg ≈ 0 for boxes that look like the training defect boxes.
+
+Actually, wait. Let me reconsider: is it better to keep the renormalization (Option B) or not (Option A)?
+
+The reference number: stage-1 boxes scored as a single class 'defect' give 0.755. That means if I output only 1 row per box (class 0, score = conf), I get 0.755... no wait, "scored as a single class 'defect'" — hmm, that's a single-class mAP of 0.755. In 4-class mAP, false alarms matter more.
+
+Key insight from the reference numbers: the ceiling of 0.758 keeps false alarms as class 0 with detector conf. So false alarms are kept and ranked by conf. In my 4-class system, each false alarm produces 4 rows (one per class), each with score conf * p_c. In each class's ranking, false alarms appear at score conf * p_c.
+
+If the model is well-trained, for true defects of class c, p_c is high (say 0.7), so the score for that class is 0.7*conf, and the scores for the other 3 classes are lower. For a false alarm, the p_c values are spread out and the max is maybe 0.3, so in each class it appears at 0.3*conf or less.
+
+The question is whether to renormalize. With Option A (no renormalization), a false alarm with p_bg=0.8, p_c=0.05 for each class, gets score 0.05*conf in each class — very low. With Option B (renormalization), it gets 0.25*conf in each class. Option A pushes false alarms lower, which is good for mAP.
+
+So Option A is better. And it means the scoring code doesn't change — I just train with 5 classes and keep the scoring as `s = d["conf"] * float(p[c])`.
+
+Hmm wait, but there's another consideration. What if p_bg is systematically high even for true defects? Then all scores get compressed, but the ranking within a class is preserved (all multiplied by ~1/(1-p_bg)... no, not exactly, since p_bg varies per box).
+
+Actually, there's a subtle point: with Option A, the score for class c is conf * p_c. The ranking of class c predictions is by conf * p_c. p_c = p_c | defect * (1 - p_bg). So the ranking is by conf * (1-p_bg) * p_c|defect. This downweights boxes the model thinks are likely false alarms. That's exactly what we want.
+
+So the plan: train with 5 classes (4 defects + background), keep the scoring as conf * p_c. The only code changes are:
+1. Build train_rows from train detector boxes with background labels.
+2. num_classes=5.
+3. (Optional) update the print.
+
+The scoring block stays the same! So I can remove block 5 entirely.
+
+But wait — one more consideration. Do I even need to change the training data to detector boxes? Alternative: keep training on GT boxes (crops.csv) and add background samples from non-overlapping detector boxes. That would be a mix. But training on detector boxes directly addresses the train/test mismatch (e006 tried re-centering to detector boxes for true defects and didn't confirm improvement). Training on all detector boxes including background is a bigger change: it adds background examples and aligns the training distribution with the test distribution.
+
+Hmm, but there's a risk: training on detector boxes with IoU > 0.5 GT overlap — the label is the GT class. Boxes with IoU in (0.3, 0.5] get background labels, but they might be true defects with misplaced boxes. That's a label noise problem. But IoU > 0.5 is a reasonable threshold (matches the mAP threshold).
+
+Also, how many train detector boxes are there? The eval has 41879 detections. The train split is probably similar in magnitude. With 14128 GT boxes and probably ~30000+ detector boxes in the train split, the training set grows substantially. The DataLoader just iterates until time runs out, so more data = more diverse batches, and each epoch is longer. Since I train by wall clock, no problem.
+
+Actually wait, one concern: if train detector boxes are ~3x the GT boxes, the effective number of epochs drops to 1/3. But the model sees more diverse data per wall-clock time. The previous under-training experiments (e004, e005) showed that more steps with the same data didn't help (0.6296, 0.6217 vs 0.6354). So the bottleneck isn't the number of steps, it's the data/labels. Adding background labels changes what the model learns.
+
+Let me also think about class balance: train detector boxes include both overlapping (defect class) and non-overlapping (background). The proportion of background is probably 40–60%. The defect classes are imbalanced (pore and stain are weaker). But e007 (duplicating pore/stain) was rejected, and class-weighted loss hurt. So I won't do reweighting.
+
+One more point: BoxDataset's `__getitem__` uses `r.get("cls", -1)` — for train rows, cls is always set (0–4). No problem. The eval rows have no cls, so -1, but that's only used in eval. No problem.
+
+The `make_crop` function uses the box coordinates — for detector boxes, the crop is centered on the detector box. Good, that's the test distribution.
+
+Now, about the scoring: should I drop rows with very low scores? MIN_SCORE = 0.001 already handles that.
+
+Let me also reconsider: does adding background class hurt the defect classification itself? The model now has to distinguish "defect vs no defect" in addition to "which defect". The crop is centered on a detector box, and most detector boxes are either defects or background, so the background task is learnable. The defect subtask should be about the same as before. And the false-alarm downweighting should improve mAP.
+
+Actually, wait. Let me reconsider whether to renormalize or not once more, since it's important.
+
+Per-class mAP: predictions of class c sorted by score. Hits = overlap with unmatched GT of class c. AP_c depends on the order.
+
+Consider class c. Predictions include: true defects of class c (score conf * p_c), true defects of other classes (score conf * p_c, usually low), false alarms (score conf * p_c).
+
+For a good AP_c, we want true defects of class c to rank above false alarms and true defects of other classes (which are misses for class c).
+
+With Option A (score = conf * p_c):
+- True defect of class c: p_c is high (say 0.6–0.9), p_bg is low. Score ≈ 0.6–0.9 * conf.
+- False alarm: p_c is low (say 0.05–0.2), p_bg is high. Score ≈ 0.05–0.2 * conf.
+- So true defects of class c rank above false alarms.
+
+With Option B (renormalized):
+- True defect of class c: p_c/(1-p_bg) ≈ p_c (since p_bg is low). Score ≈ 0.6–0.9 * conf.
+- False alarm: p_c/(1-p_bg) can be 0.25–0.5 (if the model is uncertain about which class). Score ≈ 0.25–0.5 * conf.
+- False alarms rank higher than with Option A.
+
+So Option A is strictly better for pushing false alarms down. Confirmed: no renormalization.
+
+Hmm, but wait — one more subtle point. With Option A, the scores of true defects of class c are conf * p_c, where p_c includes the (1-p_bg) factor. If the model is uncertain about whether a box is a defect (p_bg = 0.3) but confident about the class (p_c|defect = 0.8, so p_c = 0.56), the score is 0.56*conf. A false alarm with p_bg = 0.7, p_c|defect = 0.5 (p_c = 0.15) gets 0.15*conf. Still below. OK, Option A works.
+
+So the final plan:
+1. Build train_rows from train detector boxes: label = GT class if IoU > 0.5 with any GT crop, else 4 (background).
+2. num_classes=5.
+3. Keep the scoring as conf * p_c (no change to the scoring block).
+4. Update the print statement.
+
+Wait, but should I keep the GT crops (crops.csv) in training too? The detector boxes with IoU > 0.5 roughly cover the GT boxes (each GT box probably has a detector box overlapping it). Training only on detector boxes is cleaner (matches the test distribution). But if some GT boxes have no detector box overlapping them, they're dropped from training. That's probably fine — those are hard cases the detector misses, and stage 2 can't fix them anyway.
+
+Actually, hmm, let me reconsider. If I train only on detector boxes, the training set is the detector boxes. The number of train detector boxes — I don't know exactly, but dets.csv has both train and eval splits. The eval has 41879. The train is probably similar, say 30000–50000. That's 2–4x the GT boxes (14128). Training on 40000 boxes vs 14128 boxes: each epoch is 3x longer, so in the same wall-clock budget I see ~1/3 the number of epochs. But each epoch covers more diverse data.
+
+The previous experiments showed that more steps with the same data didn't help (under-training wasn't the issue, or at least adding steps didn't help). So the data change (adding background + detector box distribution) is the point, not the number of steps.
+
+I think training only on detector boxes is the right call. It directly aligns train and test.
+
+Let me write the code.
+
+Actually, let me reconsider the background threshold. IoU > 0.5 matches the mAP hit threshold. A detector box with IoU 0.4 with a GT is a "miss" for mAP (doesn't count as a hit for that GT). But it's still a true defect (the detector found it, just misplaced). Labeling it as background teaches the model "this looks like background", but it's actually a defect. That's label noise.
+
+Alternative: use IoU > 0.3 for the defect label (like e006), and only boxes with IoU <= 0.3 as background. But then boxes with IoU in (0.3, 0.5] are labeled as defects but are mAP misses. Hmm.
+
+Actually, for the purpose of teaching "defect vs background", what matters is whether the box contains a defect. A box with IoU 0.4 with a GT defect does contain the defect (partially). So it should be labeled as a defect (the GT class), not background. The mAP "hit" threshold of 0.5 is about whether the box is positioned well enough, but for the classification task, IoU 0.4 still overlaps the defect.
+
+But if I label IoU 0.4 boxes as defects and they're mAP misses, then at test time the model gives them high defect scores, and they rank high but are misses (hurting precision). Hmm.
+
+This is getting complicated. Let me keep it simple: IoU > 0.5 → defect class (matches mAP hits), else → background. This is clean and aligns with the metric. Boxes with IoU in (0, 0.5] are labeled as background. Some of those are true defects (misplaced), but the model learns to be less confident about them, which is reasonable since they're mAP misses anyway.
+
+Actually, this is a good property: the model learns to downweight boxes that don't overlap GT well, which is exactly what we want for mAP (those boxes are misses regardless of class).
+
+OK, let me go with IoU > 0.5 → defect, else background.
+
+Now let me write the code. I'll keep the edits minimal.
+
+Block 1: Build train_rows.
+```python
+    ev = [d for d in dets if d["split"] == "eval"]
+    needed = {r["image"] for r in crops} | {d["image"] for d in ev}
+```
+Replace with:
+```python
+    ev = [d for d in dets if d["split"] == "eval"]
+    # stage-2 training set: every train detector box, labelled by the GT crop it overlaps (IoU > 0.5) or background (4)
+    by_img = {}
+    for r in crops:
+        by_img.setdefault(r["image"], []).append(r)
+    train_rows = []
+    for d in dets:
+        if d["split"] != "train":
+            continue
+        bi, bc = 0.0, 4
+        for r in by_img.get(d["image"], ()):
+            inter = max(0.0, min(d["x2"], r["x2"]) - max(d["x1"], r["x1"])) * max(0.0, min(d["y2"], r["y2"]) - max(d["y1"], r["y1"]))
+            union = (d["x2"] - d["x1"]) * (d["y2"] - d["y1"]) + (r["x2"] - r["x1"]) * (r["y2"] - r["y1"]) - inter
+            if union > 0:
+                iou = inter / union
+                if iou > bi:
+                    bi, bc = iou, r["cls"]
+        train_rows.append({**d, "cls": bc if bi > 0.5 else 4})
+    needed = {r["image"] for r in crops} | {d["image"] for d in ev}
+```
+
+Wait, there's a bug: `bc if bi > 0.5 else 4`. If bi > 0.5, then bc is the GT class (0–3). If bi <= 0.5, then bc might be a GT class from a box with IoU in (0, 0.5], but we want 4. So `bc if bi > 0.5 else 4` is correct.
+
+But wait, there's an issue: if the box overlaps multiple GT crops, I take the one with max IoU. Good.
+
+Block 2: Update the print.
+```python
+    print(f"train {len(crops)} boxes, eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
+```
+Replace with:
+```python
+    print(f"train {len(train_rows)} det boxes ({sum(1 for t in train_rows if t['cls'] == 4)} background), eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
+```
+
+Block 3: Use train_rows in the DataLoader.
+```python
+    dl_tr = torch.utils.data.DataLoader(BoxDataset(crops, images, True), batch_size=BATCH_SIZE, shuffle=True,
+```
+Replace with:
+```python
+    dl_tr = torch.utils.data.DataLoader(BoxDataset(train_rows, images, True), batch_size=BATCH_SIZE, shuffle=True,
+```
+
+Block 4: num_classes=5.
+```python
+    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
+```
+Replace with:
+```python
+    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=5)
+```
+
+That's it. The scoring stays the same (conf * p_c), which naturally downweights false alarms via the background class.
+
+Wait, but I need to double-check: the eval DataLoader uses `BoxDataset(ev, images, False)`, and ev rows have no "cls" key, so `r.get("cls", -1)` returns -1. That's fine for eval (the label isn't used). Good.
+
+Also, the train_rows have "cls" as an int (0–4). BoxDataset returns `r.get("cls", -1)`, which is the int. Good.
+
+Let me also verify: `train_rows.append({**d, "cls": bc if bi > 0.5 else 4})`. The dict d has keys det_id, split, image, x1, y1, x2, y2, img_w, img_h, conf. Adding cls. Good. make_crop uses x1, y1, x2, y2, image. Good.
+
+Now, one concern: the number of train detector boxes. If it's very large (say 50000), the DataLoader with num_workers=8 and persistent_workers should handle it. The training loop iterates until time runs out, so it's fine.
+
+Let me also reconsider the budget. The previous run: 220 steps in the first epoch (85s), 428 total steps in 162s. So ~0.38s/step. With 5 classes instead of 4, the model's final layer is slightly bigger, but negligible. The training set is bigger, but I train by wall-clock, so the number of steps is the same (~428). Actually, wait — the number of steps depends on the batch size and the iteration, not the dataset size (I break on time). So the number of steps is the same. Good, the budget is fine.
+
+Actually, the dataset size affects how many batches are in one epoch, but since I break on time, the total number of steps is determined by the time budget and step time, not the dataset size. So the budget is unchanged.
+
+Let me finalize. I'll keep the hypothesis concise.
+
+Let me reconsider the hypothesis statement. The change: train stage 2 on all train detector boxes with a 5th background class for non-overlapping boxes, and keep scoring as conf * p_c so the background probability downweights suspected false alarms. This targets the false-alarm ranking error. Expected gain 0.01–0.03.
+
+Actually, I realize I should double-check: does keeping the scoring as conf * p_c (without renormalization) actually downweight false alarms in a way that helps? Let me reconsider.
+
+For a false alarm, the model outputs p_bg high, p_c low for each c. Score for class c = conf * p_c (low). So in each class's ranking, this false alarm appears at a low score. Good.
+
+For a true defect of class c, p_bg low, p_c high. Score = conf * p_c (high). Ranks high. Good.
+
+So yes, it helps. The false alarms are pushed to the bottom of each class's ranking, improving precision at high ranks.
+
+But there's a subtlety: a false alarm produces 4 rows (one per class), each at a low score. A true defect of class c produces 4 rows too, but the row for class c is high and the others are low. So in class c's ranking, the true defect's class-c row is high, and the false alarm's class-c row is low. Good.
+
+I'm confident. Let me write the reply.
+
+Actually, let me reconsider whether I should also keep the GT crops in training (union of GT crops and detector boxes). The concern is that training only on detector boxes might lose some GT boxes that have no detector box overlapping them. But those are rare and are mAP misses anyway. I'll train only on detector boxes for a clean train/test match.
+
+Hmm, but actually, there's a risk: if the detector misses many defects (no detector box overlaps the GT), then those GT boxes are not in the training set, and the model never sees those defect appearances. But the detector's recall is probably decent (the class-agnostic mAP is 0.755, so it finds most defects). I'll go with detector boxes only.
+
+Wait, let me reconsider once more. The class-agnostic mAP of 0.755 means the detector finds 75.5% of defects (as a single class). So ~24.5% of GT boxes have no detector box overlapping them (IoU > 0.5). Those are dropped from training. That's a lot. But again, stage 2 can't recover them (no box to classify). And the model doesn't need to see them for the boxes it does get.
+
+Actually, the model does benefit from seeing diverse defect appearances. If 24.5% of GT boxes are missed by the detector, they might have different appearances (smaller, fainter). By not training on them, the model might be less robust. But training on detector boxes (which are the actual test input) is more important for the train/test match.
+
+I'll go with detector boxes only. If it hurts, I can add the GT boxes back later.
+
+Let me finalize the reply.
+
+Actually, I want to reconsider the whole approach once more, since it's a big change. Let me make sure I'm not missing something.
+
+Current best: 0.6302 (5-seed). Per class: pore 0.517, deposit 0.622, discontinuity 0.776, stain 0.605.
+
+The ceiling (perfect classes on stage-1 boxes) is 0.758. The class-agnostic (single class) is 0.755. So the detector is good; the error is in the class assignment.
+
+The gap between 0.6302 and 0.758 is 0.128. That's a lot. Where is it?
+
+Two sources:
+1. Wrong class assigned to a true defect (a box that overlaps a GT but gets the wrong class). This is a miss for the correct class and a false positive for the wrong class.
+2. False alarms (boxes that don't overlap any GT) ranked high.
+
+The reference "stage-1 boxes with perfect classes (ceiling) 0.758" keeps false alarms as class 0 with conf. So the ceiling includes false alarms. The gap from 0.6302 to 0.758 is due to wrong classes on true defects (and the fact that false alarms are all class 0 in the ceiling, whereas in my system they're spread across classes).
+
+Hmm, actually the ceiling keeps false alarms as class 0. So in the ceiling, class 0 has many false alarms (all of them), and classes 1–3 have none. That's why the ceiling is high — the false alarms are concentrated in one class (class 0), and classes 1–3 have only true positives, giving them high AP.
+
+In my system, false alarms are spread across all 4 classes (each false alarm produces 4 rows). So each class has false alarms, lowering all APs.
+
+So the key to approaching the ceiling is to either (a) concentrate false alarms in one class, or (b) push false alarms to low scores so they don't hurt precision.
+
+My background-class approach does (b): push false alarms to low scores in all classes. That should help.
+
+Alternatively, I could learn to assign false alarms to a single "dump" class, but that's harder and the background approach is cleaner.
+
+OK, I'm confident. Let me also estimate the gain. If false alarms currently hurt each class by, say, 0.05 AP, pushing them down could recover 0.02–0.05. So 0.01–0.03 is a reasonable estimate.
+
+Let me write the reply now. I'll keep the hypothesis to 2–3 sentences.
+
+Let me make sure the SEARCH blocks are exact. Let me re-verify each against the current file.
+
+Current file (relevant parts):
+```python
+    crops = [r for r in read_csv(os.path.join(args.data, "crops.csv")) if r["res"] in TRAIN_ON]
+    dets = read_csv(os.path.join(args.data, "dets.csv"))
+    ev = [d for d in dets if d["split"] == "eval"]
+    needed = {r["image"] for r in crops} | {d["image"] for d in ev}
+    images = {p: np.asarray(Image.open(os.path.join(args.data, "images", p)).convert("RGB")) for p in needed}
+    print(f"train {len(crops)} boxes, eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
+```
+
+Block 1 SEARCH:
+```
+    ev = [d for d in dets if d["split"] == "eval"]
+    needed = {r["image"] for r in crops} | {d["image"] for d in ev}
+```
+Exact match. Good.
+
+Block 2 SEARCH:
+```
+    print(f"train {len(crops)} boxes, eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
+```
+Exact match. Good.
+
+Block 3 SEARCH:
+```
+    dl_tr = torch.utils.data.DataLoader(BoxDataset(crops, images, True), batch_size=BATCH_SIZE, shuffle=True,
+```
+Let me check the file:
+```python
+    dl_tr = torch.utils.data.DataLoader(BoxDataset(crops, images, True), batch_size=BATCH_SIZE, shuffle=True,
+                                        num_workers=workers, pin_memory=True, drop_last=True,
+                                        persistent_workers=True, generator=g, worker_init_fn=worker_init)
+```
+So the first line is `    dl_tr = torch.utils.data.DataLoader(BoxDataset(crops, images, True), batch_size=BATCH_SIZE, shuffle=True,`. Exact match. Good.
+
+Block 4 SEARCH:
+```
+    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
+```
+File:
+```python
+    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=4)
+```
+Exact match. Good.
+
+Now the REPLACE blocks. Let me write them carefully.
+
+Block 1 REPLACE:
+```python
+    ev = [d for d in dets if d["split"] == "eval"]
+    # stage-2 training set: every train detector box, labelled by the GT crop it overlaps (IoU > 0.5) or background (4)
+    by_img = {}
+    for r in crops:
+        by_img.setdefault(r["image"], []).append(r)
+    train_rows = []
+    for d in dets:
+        if d["split"] != "train":
+            continue
+        bi, bc = 0.0, 4
+        for r in by_img.get(d["image"], ()):
+            inter = max(0.0, min(d["x2"], r["x2"]) - max(d["x1"], r["x1"])) * max(0.0, min(d["y2"], r["y2"]) - max(d["y1"], r["y1"]))
+            union = (d["x2"] - d["x1"]) * (d["y2"] - d["y1"]) + (r["x2"] - r["x1"]) * (r["y2"] - r["y1"]) - inter
+            if union > 0:
+                iou = inter / union
+                if iou > bi:
+                    bi, bc = iou, r["cls"]
+        train_rows.append({**d, "cls": bc if bi > 0.5 else 4})
+    needed = {r["image"] for r in crops} | {d["image"] for d in ev}
+```
+
+Block 2 REPLACE:
+```python
+    print(f"train {len(train_rows)} det boxes ({sum(1 for t in train_rows if t['cls'] == 4)} background), eval {len(ev)} detections, {len(images)} images ({time.time() - T0:.0f}s)", flush=True)
+```
+
+Block 3 REPLACE:
+```python
+    dl_tr = torch.utils.data.DataLoader(BoxDataset(train_rows, images, True), batch_size=BATCH_SIZE, shuffle=True,
+```
+
+Block 4 REPLACE:
+```python
+    model = timm.create_model(MODEL, pretrained=PRETRAINED, num_classes=5)
+```
+
+That's 4 blocks. No change to the scoring (it stays conf * p_c, which now naturally downweights false alarms via the background class).
+
+Wait, I should double check: is there any issue with the background class and the CrossEntropyLoss? No, it's a standard 5-class classification. The model learns p_bg. Good.
+
+Let me also make sure the eval doesn't break. The eval uses the same model (5 classes), and I take probs[0:4] implicitly by iterating c in range(4). The 5th class (background) is ignored in the output. Good.
+
+Actually, the scoring loop:
+```python
+        for d, p in zip(ev, probs):
+            for c in range(4):
+                s = d["conf"] * float(p[c])
+                if s > MIN_SCORE:
+                    w.writerow([d["det_id"], c, f"{s:.6f}"]); n += 1
+```
+This uses p[c] for c in 0..3, ignoring p[4] (background). So the score is conf * p_c, where p_c is the raw probability (not renormalized). Since p_0 + p_1 + p_2 + p_3 + p_4 = 1, the sum of the 4 scores is conf * (1 - p_4). For a false alarm (high p_4), the sum is low. For a true defect (low p_4), the sum is ~conf. This is exactly the downweighting I want.
+
+So the scoring is correct as-is. No change needed.
+
+Let me finalize.
+
+Actually, I realize I should double-check the hypothesis to make sure it's accurate and testable. Let me write it.
+
+HYPOTHESIS: The classifier is only trained on crops of true defects, so detector false alarms get arbitrary class probabilities and pollute the per-class score rankings, and the ceiling keeps all false alarms in one class (0) which is why it is so high. I will train stage 2 on all train detector boxes with a 5th "background" class for boxes with no GT overlap (IoU > 0.5), and keep the score as conf * p_c so the background probability downweights suspected false alarms in every class. This targets the false-alarm-vs-true-detection ranking error that e006 (which only re-centred true-defect crops, 4 classes) never touched. Expected gain 0.01-0.03; the wall-clock budget is unchanged since I still train by time with the same model and resolution.
+
+That's good. Let me write the reply.
+
+Let me count the thinking words to make sure I'm under the limit. I've been thorough. Let me write the reply now.

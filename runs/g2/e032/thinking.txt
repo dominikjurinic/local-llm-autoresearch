@@ -1,0 +1,156 @@
+===== attempt 1 =====
+Let me carefully analyze the situation.
+
+**Current state:**
+- Best: e012, 5-seed 0.6363, three-view (1.5x, 2.5x, 4x) logit averaging, EfficientNet-B0, 160px, trained on true boxes only.
+- The most recent experiment e031 timed out because precomputing eval crops took 167s.
+- The plan says: consolidate (detector-box training data), close the box-quality gap (jitter simulation, box-quality weighting, better view combination), buy training steps, fine-grained classes.
+
+**What has been tried (from earlier runs + this run):**
+- Detector boxes as training data: e001 crashed, e002 rejected (0.6282), e020 rejected (0.6229). In earlier runs it was accepted twice with +0.004/0.005 on a looser rule. The guide says "implement it carefully and confirm. If accepted, build on top of it; if it fails twice, drop it." It has now failed twice this run (e002, e020). Hmm, but wait — the guide says "the only idea accepted twice in earlier runs is training on detector boxes from the train split." In this run, e002 was 0.6282 (rejected against 0.630 start), e020 was 0.6229 (rejected against e012's 0.6363). So it has failed twice this run. Per the guide: "if it fails twice, drop it and move on." Hmm, but the guide also says "if it fails twice, drop it and move on." So I should drop detector-box training data.
+
+Wait, let me re-read: "1. **Consolidate (first 2–4 experiments).** The only idea accepted twice in earlier runs is training on detector boxes from the train split (IoU > 0.5 with a true box, labelled with that class), alongside the true boxes. Implement it carefully (vectorised IoU, correct shapes) and confirm. If accepted, build on top of it; if it fails twice, drop it and move on."
+
+It has now been tried this run: e001 (crash), e002 (0.6282 rejected), e020 (0.6229 rejected). So two proper attempts, both rejected. Per the guide, drop it.
+
+Hmm, but wait. Actually, let me think about whether e020's failure was due to some interaction with e012's 3-view setup. e020 was based on e012 and added detector boxes "down-weighted." Result 0.6229 — worse than e012's seed-0 0.6336. That's a big drop. And e002 (based on e000, the 2-view start) was 0.6282 vs start 0.629-0.630. So no gain either way.
+
+Actually, wait. Let me reconsider. In the earlier runs' table: "detector boxes from the train split as additional training data: accepted twice (5-seed 0.6337 and 0.6342, ~+0.004); rejected 3 times at seed 0 (0.626–0.628); 1 crash in IoU code." So on the old looser rule it was accepted twice with ~+0.004-0.005. Under today's stricter rule (which also counts validation-image noise), +0.004 may not pass. The guide anticipated this: "if it fails twice, drop it and move on." It has failed twice. Drop it.
+
+**What else has been tried this run:**
+- e003: targeted box-error jitter (random shift up to 0.45x long side, scale) — 0.6259 rejected.
+- e005: precompute the actual box-error distribution and jitter to match it — 0.6275 rejected.
+- e004: shared backbone with tight+wide features concatenated — 0.6329 not confirmed (worse than e012's 0.6363).
+- e007: crashed.
+- e008: box size/aspect as extra input — 0.6279 not confirmed.
+- e009: split LR — 0.5854 rejected (bad).
+- e010, e011: precompute training crops — timeout, then 0.6254 rejected.
+- e013: learned weighted view combination — 0.6326 rejected.
+- e014: 4th view at 320px — timeout.
+- e015: ConvNeXt-Nano — timeout.
+- e016: precompute eval crops (partial?) — timeout.
+- e017, e018, e019: drop the 4x view at inference — timeout, crash, 0.6176 rejected.
+- e021-e023: shared backbone with concat — crashed 3 times.
+- e024: 9-channel single forward — 0.6355 not confirmed (slightly below e012's 0.6363).
+- e025, e026: precompute training crops with K variants — crash, then 0.0997 bug.
+- e027: SWA/EMA — crash.
+- e028: free prediction time — 0.6178 rejected.
+- e029, e030, e031: precompute eval crops — crash, crash, timeout.
+
+**Diagnosis:**
+- Per-class: pore 0.546, deposit 0.615, discontinuity 0.778, stain 0.606.
+- Confusion: pore→stain 18 (of 75 true pore boxes), deposit→stain 63 (of 271), stain→deposit 45 (of 610), stain→pore 9. So the stain/deposit/pore confusion is the main error.
+- "mAP@0.5 if every box had the right class but kept your scores: 0.7400 (yours: 0.6363)." So wrong classes cost 0.1037! That's huge. Wait, that seems too large. Let me re-read.
+
+"mAP@0.5 if every box had the right class but kept your scores: 0.7400 (yours: 0.6363). The difference is what wrong classes cost; the remaining gap to the perfect-class ceiling in the brief is what your scores cost relative to the detector's conf."
+
+So if every box had the right class (presumably boxes overlapping a true defect get the right class, others keep their class... hmm, or all boxes get the class of the true box they overlap, and non-overlapping boxes keep their predicted class?), mAP would be 0.7400. The gap from 0.6363 to 0.7400 = 0.1037 is what wrong classes cost. That's the dominant error. The remaining gap to the 0.758 ceiling (0.018) is what scores cost.
+
+Wait, but the confusion matrix shows 67% correct for pore, 75% for deposit, 94% for discontinuity, 89% for stain. Weighted: pore has 75 overlapping boxes (51+5+1+18+1 = 76?), deposit 271, discontinuity 458, stain 610. Total ≈ 1415. Correct ≈ 51+203+431+548 = 1233 → 87% correct. If 13% of boxes are misclassified, why does fixing all of them gain 0.1037 mAP? Because mAP is sensitive to wrong-class predictions: a box predicted as stain when it's deposit creates a false stain (hurting stain AP) AND misses a deposit (hurting deposit AP). So each wrong-class box costs twice. Also, the "no row" count is small (1,2,2,4), so recall isn't an issue.
+
+So the dominant error is class decision on detector boxes. The guide says: "Treat this first as a train/test mismatch problem, second as a model-capacity problem."
+
+**Directions from the guide's main phase:**
+1. Simulate detector errors on true boxes during training: random shifts and scale changes so that the IoU between the jittered box and the true box covers the range the detector produces (~0.5–1.0), rather than the current small crop jitter.
+   - But e003 tried "targeted simulation of stage-1 box error: shift up to ~0.45x long side, scale" and was rejected (0.6259). And e005 tried "precompute the actual box-error distribution and jitter to match it" — rejected (0.6275). Hmm. So the jitter direction has been tried twice this run and failed both times. But wait — those were based on e000 (the 2-view start). The current best is e012 (3-view). Would jitter behave differently on top of e012? The guide says "two failed variants of a direction: move to the next direction." The jitter direction has two failed variants (e003, e005). Hmm, but both were on the 2-view base. Is that "fundamentally different"? Not really — the idea is the same.
+
+   Actually, wait, let me re-read e003: "replace the small crop jitter with a targeted simulation of stage-1 box error: during training, with probability 0.5 each box's center is shifted in a random direction by up to ~0.45x its long side, and its size is scaled by..." Result 0.6259, rejected. e005: "precompute the detector's actual box-error distribution from the train split (center offset and side scale of each detection box relative to the true box it overlaps, IoU>0.5) and, during training, jitter true boxes to match that measure" — 0.6275, rejected.
+
+   So box-error jitter: 2 attempts, both rejected. Per the guide's rule of thumb, move to the next direction.
+
+2. Weight or sample training boxes by box quality, so the model sees enough poorly-placed boxes.
+   - Has this been tried? Looking at the history... e020 added detector boxes "down-weighted" — that's a kind of weighting, but it's adding new data, not weighting existing true boxes. "Weight or sample training boxes by box quality" — I don't see a direct attempt. Hmm, what does "box quality" mean for true boxes? True boxes are perfect (IoU 1.0 with themselves). This direction probably means: for each true box, generate training samples with different jitter levels (box quality) and weight them so the model sees a mix of good and bad boxes. That's related to jitter... but the guide lists it as a separate direction.
+
+   Actually, I think the intent is: currently training uses true boxes with small jitter (0.1 shift, 0.85-1.2 scale). The "box quality" direction would be to explicitly construct training boxes at various IoU levels with the true box and ensure a good coverage. That's essentially a more careful version of direction 1. Since direction 1 has failed twice, direction 2 is a variant of it. Hmm.
+
+3. Combine the two views better than logit averaging, e.g., a shared backbone whose pooled features from both crops are concatenated before a small head (one forward pass per view, no extra cost).
+   - e004 tried exactly this (tight+wide concat, 2-view base): 0.6329 not confirmed. e021-e023 tried it on the e012 base: crashed 3 times (plumbing). e013 tried learned weighted averaging: rejected. e024 tried 9-channel single pass: 0.6355 not confirmed.
+
+   So "better view combination" has been tried multiple times: e004 (concat, 2-view), e013 (weighted avg), e021-23 (concat, 3-view, crashed), e024 (9-channel). The concat on the 3-view base has never actually run (crashed 3 times). Hmm. Is it worth trying one more time? The guide says "a bug: fix once; a second failure: drop it." e021 crashed, e022 crashed (fix), e023 crashed (fix). That's three failures of the same plumbing. I should drop the shared-backbone-concat direction... unless I can identify the exact bug and be confident.
+
+   Let me think about what the bug was. e023: "timm's EfficientNet exposes no `head` attribute (the stock classifier is `...`" — cut off. The issue: to build a shared backbone with two heads (one per view) or a concat head, you need to split backbone and head. In timm, `model.forward_features` returns a feature map, and the head is `model.head` for most models... actually for EfficientNet in timm, the model has `.features` (backbone) and `.head` (classifier). Hmm, e022 said "timm's EfficientNet exposes no `head` attribute (the stock classifier is `...`)." Actually, in timm, EfficientNet has both `self.head` (the classifier, a `nn.Linear` or `SqueezeLinear`) and `self.num_features`. Let me recall: timm's EfficientNet: `self.num_features = num_features`, `self.head = nn.Linear(num_features, num_classes)` (or `SqueezeExcLinear`? no, that's for SE). Actually, in recent timm versions, EfficientNet's head is `self.head = nn.Linear(...)`. Hmm, but the crash message says it exposes no `head` attribute. Maybe in their version it's `model.classifier`. The exact plumbing is version-dependent and I can't test it, so it's risky.
+
+   Alternative: I can avoid the plumbing entirely by using `timm.create_model(..., num_classes=4)` and then `backbone = model.features`... no wait. A cleaner approach that avoids attribute guessing: create the model with num_classes=0? Some timm models support `num_classes=0` to drop the head, and `model.forward_features` returns pooled features. Then build my own head. Actually, for EfficientNet, `timm.create_model("efficientnet_b0", num_classes=0)` — does that work? In timm, passing num_classes=0 typically removes the classifier head and `forward_features` returns pooled features (after global_pool). Let me think... in timm, for most models, `num_classes=0` sets the head to `nn.Identity()` or removes it, and `forward_features` returns the pooled global features. Yes, I believe for EfficientNet, `forward_features` applies `self.global_pool` to the feature map and then `self.head`. If head is Identity, it returns the pooled 1280-dim vector. That's clean and avoids attribute guessing.
+
+   So: `backbone = timm.create_model("efficientnet_b0", pretrained=True, num_classes=0)`, then `feat = backbone(x)` gives (B, 1280). Then my own head: concat tight and wide features (2560) → MLP → 4 classes. And the 4x view... what to do with it? e021's idea was "tight+wide concat, 4x view on the stock classifier" — i.e., 3 heads? That's messy. Simpler: use all 3 views through the shared backbone and concat all three (3840-dim) → head. Or just tight+wide (drop 4x) — but 4x gave a gain (e012's gain was "almost entirely from the pore class" per the earlier runs' table, and e012 was confirmed as best).
+
+   Hmm, wait, actually, let me reconsider. The earlier runs' table says the 4x view was "accepted twice (5-seed 0.6342 both times, +0.005), gain almost entirely from the pore class." And e012 this run: 0.6363, confirmed. So the 3-view setup is solid.
+
+   OK, here's the point. Let me think about what's most likely to work and what the guide wants.
+
+**Re-reading the guide's plan:**
+1. Consolidate: detector-box training — failed twice, drop.
+2. Close the box-quality gap:
+   a. Jitter simulation — tried twice (e003, e005), both rejected. Per "two failed variants: move on," drop.
+   b. Weight/sample by box quality — not directly tried. But it's close to jitter.
+   c. Better view combination — tried (e004, e013, e024), not confirmed; shared-backbone-concat on 3-view crashed 3 times.
+3. Buy training steps — the inference category is EXHAUSTED (13 ideas, 9 crashed/timeout, 0 new best). Hmm, but that's about the precompute approach specifically. "Buy training steps" in general: the log shows 285 steps in 111s, loss still dropping at 0.242. Prediction takes ~60s, reserve 55s — already over. e006 tried lowering reserve to 45: rejected (0.6253). e028 tried freeing prediction time: 0.6178 rejected. e016, e029-031 tried precomputing eval crops: timeout/crash.
+
+   Hmm, so buying steps via reserve reduction or precompute has been tried a lot and failed. What about making the per-step cost cheaper so more steps fit? E.g., reduce batch work, use fewer views during training (train 2-view, infer 3-view?), or train at lower resolution?
+
+   Wait — actually, here's a thought: the 4x view was added for inference and training. What if the 4x view is expensive and doesn't help as much as the 2.5x? e017 tried "train 3-view, infer 2-view (drop 4x at inference)": timeout (because the dataset still computed 3 crops for eval). e019 (the fixed version) was 0.6176, rejected. So dropping 4x at inference hurt. What about training without 4x (2-view training) and using 4x only at inference? That's a different idea — train 2-view (cheaper steps → more steps), infer 3-view. Hmm, but that's train/test mismatch on views; the model has never seen the 4x view during training, so its 4x logits would be from a randomly-initialized... no wait, the backbone is shared and pretrained; the 4x view would go through the same backbone+head that was trained on 1.5x and 2.5x crops. It might still give useful signal. But this is speculative, and e017/e019 explored the neighborhood.
+
+   Actually, let me think about the step budget more carefully. Current: 285 steps in ~111s of training (14s load, 111s train, 60s predict = 185s). Per step: 111/285 = 0.39s. Each step processes 3 views × 64 images = 192 forward+backward passes worth of 160px EfficientNet-B0. If I train with only 2 views (drop 4x during training), per-step cost drops by ~1/3 → ~0.26s/step → ~430 steps in 111s. That's 50% more steps. But the model loses the 4x signal. Trade-off. The 4x gain was +0.005 (pore class). More steps at lower loss... loss at cut was 0.242 at 285 steps; with 50% more steps it might reach ~0.20. Hard to say which wins.
+
+   Alternatively: reduce IMG_SIZE from 160 to 128 during training? The guide says "a smaller or faster model, lower resolution, or fewer views can beat a stronger but slower one." But "resolution and small-box handling (224px, larger MIN_CROP...)" was tried in earlier runs: "no gain: best 5-seed 0.634 (unconfirmed); 2 crashes." That was on the old base. Lowering resolution (128) hasn't been tried this run. Hmm, but the earlier runs' table says the resolution family was "no gain." The guide says don't spend experiments on families listed as "no gain." Resolution is in that list. So skip.
+
+4. Fine-grained classes (after 2 and 3): "look for one change that helps the whole pore/deposit/stain confusion, not one class."
+
+**So where am I now?**
+- Consolidation: done (failed, drop).
+- Box-quality gap: jitter failed twice; view combination mostly failed/crashed; box-quality weighting not directly tried.
+- Buy steps: inference EXHAUSTED per the harness's summary. But that summary is about the precompute approach. Hmm, the harness says "inference | 13 | 5 | 0 | 0 | 9 | EXHAUSTED? (3+ ideas, no new best)." So the harness considers inference exhausted. I should respect that and not do more inference-category experiments.
+
+Wait, but the guide explicitly has "3. **Buy training steps (whenever the log shows the GPU waiting or the loss still dropping at cut).**" And the log shows loss still dropping (0.242). But the harness marks inference as exhausted. Tension. The guide says "follow it unless your own results clearly contradict it." The harness's "EXHAUSTED?" is a computed label, and the guide is the senior researcher's strategy. Hmm.
+
+Let me think about what's actually the highest-value move.
+
+**Key insight from the diagnosis:** wrong classes cost 0.1037 mAP. That's the dominant error by far (vs 0.018 for scores). So anything that improves class accuracy on detector boxes is the play. The confusion is pore↔stain and deposit↔stain.
+
+What hasn't been tried that could improve class accuracy broadly?
+
+Ideas not yet tried (checking against the history):
+1. **Box-quality-weighted sampling** (guide direction 2b): not directly tried. But how to implement? True boxes are all "perfect." To create "poorly-placed boxes" I'd need to jitter, which is direction 2a (failed twice). So 2b is essentially a variant of 2a. Skip? Or... hmm.
+
+   Actually wait. Let me reconsider. Maybe "weight or sample training boxes by box quality" means something else: the detector boxes from the train split DO have a quality (IoU with the true box). e020 added them "down-weighted" and was rejected (0.6229). But e020 was a specific implementation. The "weight by box quality" direction as applied to detector boxes: use detector boxes with weight proportional to their IoU quality, so the model sees more high-quality detector boxes and fewer garbage ones. That's a variant of the detector-box direction (which failed twice). Skip.
+
+2. **Better view combination via shared backbone** — crashed 3 times on the 3-view base. The 2-view version (e004) ran but wasn't confirmed (0.6329 vs 0.6363... wait, e004 was based on e000 which was 0.629-0.630, and e004 got 0.6329 5-seed. So e004 was +0.003-0.004 over its base, but "not confirmed" under the stricter rule. And e012 (3-view) is 0.6363. So the concat idea on the 2-view base gave 0.6329, below the 3-view logit-avg's 0.6363. So concat isn't clearly better than logit-avg. And the 3-view concat crashed. Given e004's modest result and 3 crashes, I'd say the concat direction is low-value. Skip.
+
+3. **Train 2-view, infer 3-view** (buy steps by dropping 4x during training only): not directly tried. e017 was "train 3-view, infer 2-view" (opposite). This is different: drop the expensive view during training to buy ~50% more steps, keep it at inference. Risk: the 4x view's contribution at inference is untrained. But the backbone is shared and pretrained, and the 4x view is just another crop scale — the model has seen 1.5x and 2.5x, so 4x (even wider) is in-distribution-ish for a pretrained backbone. The head is trained on 1.5x/2.5x features; 4x features would be somewhat different but the head is a small MLP on top of a pretrained backbone, so it might generalize. This is a genuine "buy steps" idea that isn't in the inference-exhausted precompute family — it's a training-data/compute trade-off. Category: could be "sampling" or "inference" or "other." Hmm. Actually it changes what the model trains on (fewer views) and the inference views. Let me call it "sampling" (training sampling over views) or "other."
+
+   Wait, but is this likely to gain ≥0.01? The 4x view gave +0.005 (mostly pore). Dropping it from training loses that, but gains 50% more steps. Loss at cut: 0.242 at 285 steps. If loss scales like 1/sqrt(steps) or so, 430 steps → ~0.20. Is that worth more than 0.005? Unclear. It's a reasonable experiment but I'm not confident it's the best use of a run.
+
+4. **A different, untried direction for the fine-grained confusion.** The guide says fine-grained is "only after 2 and 3." I've done 1 (failed), partially 2 (jitter failed, view-combination failed/crashed), and 3 is marked exhausted by the harness. So maybe I'm at the stage to think about fine-grained. But the guide says "after 2 and 3," implying I should exhaust 2 and 3 first. I haven't fully exhausted 2 (box-quality weighting untried) or 3 (buy steps — but harness says exhausted).
+
+Hmm, let me reconsider the whole thing. Let me look at what's actually left that's high-value and untried.
+
+**Re-examining the "buy steps" problem.** The real issue: prediction takes 60s, reserve is 55s, so training only gets 111s (180-14-55). The loss is still dropping. If I could cut prediction time, I'd get more training. But all the prediction-speedup ideas (precompute, drop views) have crashed/timeout. The harness marks inference exhausted.
+
+But wait — there's a simpler "buy steps" idea that isn't about prediction: **reduce the training per-step cost so more steps fit in the same 111s.** Options:
+- Fewer views during training (idea 3 above).
+- Smaller batch? No, batch doesn't change per-step time much (GPU-bound), and smaller batch = more steps but noisier. Actually, smaller batch → more steps in the same time, each step faster. E.g., batch 32 instead of 64: per-step time ~half, so ~2x steps. But that's just the same total compute, more steps. With a fixed LR schedule over the time budget, more steps at the same total FLOPs... doesn't help much. Actually it might help slightly via more optimizer updates, but it's a known weak lever. And "optimisation" category: e009 (split LR) rejected, e027 (SWA) crashed. The harness shows optimisation: 2 ideas, 1 ran, 0 new best, 1 crashed. Not marked exhausted but weak.
+
+Hmm, let me step back and think about the biggest lever.
+
+**The biggest lever is clearly class accuracy (0.1037 at stake).** What improves class accuracy?
+- More/better training data (detector boxes — failed; box-quality weighting — untried but close to failed jitter).
+- Better model (bigger backbone — "no gain" in earlier runs; ConvNeXt — timeout).
+- Better input (resolution — "no gain"; views — 3-view is best; TTA — "no gain").
+- Better training (more steps — loss still dropping; but inference exhausted).
+- **Better handling of the fine-grained confusion** — untried this run.
+
+What specific untried idea targets the pore/deposit/stain confusion?
+
+The confusion: pore→stain (18), deposit→stain (63), stain→deposit (45), stain→pore (9), deposit→pore (2), pore→deposit (5). So stain is both a big confuser (deposit→stain 63) and confused with (stain→deposit 45). Pore→stain 18.
+
+Ideas for fine-grained:
+- **Higher resolution for the tight crop** — but resolution is "no gain" family. Skip.
+- **A dedicated fine-grained head or feature** — architecture, mostly tried.
+- **Class-specific augmentation or loss** — "class-balanced sampling or class-weighted loss: no gain," "focal loss: no gain." Skip.
+- **Mixup/CutMix** — "training augmentation (rotation, mixup, stronger color or geometry): no gain: best 5-seed 0.633 (unconfirmed)." So mixup was tried in the augmentation family. Skip? The family is "training augmentation" and it's "no gain." Skip.
+
+Hmm. It seems like most of the obvious levers have been pulled. Let me reconsider.
+
+Actually, wait. Let me reconsider the "buy steps" direction more carefully, because the loss is still dropping at 0.242 and that's a real signal. The harness marks "inference" exhausted, but that's specifically about the precompute/prediction-speedup family. The guide's "buy steps" is broader: "prepare crops once instead of per step, fewer or cheaper data-loader operations, a reserve that matches the measured prediction time with a safety margin."
+
+The reserve idea: e006 tried lowering reserve 5Thinking budget reached. Stop thinking now and write the reply in the required format.
